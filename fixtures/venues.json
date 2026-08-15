@@ -1,0 +1,34 @@
+[
+  {
+    "id": "TH-A",
+    "name": "Council Chamber",
+    "capacity": 30,
+    "wheelchair_accessible": true,
+    "fee_pence": 4500,
+    "demo_role": "happy_path"
+  },
+  {
+    "id": "TH-B",
+    "name": "Heritage Room",
+    "capacity": 25,
+    "wheelchair_accessible": false,
+    "fee_pence": 3500,
+    "demo_role": "fails_accessibility"
+  },
+  {
+    "id": "TH-C",
+    "name": "Civic Hall",
+    "capacity": 80,
+    "wheelchair_accessible": true,
+    "fee_pence": 9000,
+    "demo_role": "fails_max_fee"
+  },
+  {
+    "id": "TH-D",
+    "name": "Meeting Room",
+    "capacity": 12,
+    "wheelchair_accessible": true,
+    "fee_pence": 2000,
+    "demo_role": "fails_capacity"
+  }
+]

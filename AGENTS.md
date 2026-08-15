@@ -2,6 +2,8 @@
 
 This repository implements the BLD Town Hall technical specification in `docs/technical-spec-v0.4.2.md`.
 
+Before making architectural changes, read `docs/bld-implementation-guide.md`. It is the normative guide explaining why BLD exists, what must remain true, and the implementation rules that must not be weakened.
+
 ## Execution protocol
 
 - Work milestone-by-milestone.

@@ -66,22 +66,35 @@ BookingExists + BookingInProgress      -> booking_confirmed -> Booked
 BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
 ```
 
-### Negative facts need the expiry gate (ADR-016)
+### Negative facts: absence is the council's determination (ADR-016)
 
 `BookingExists` is monotonic — true once true — so re-evaluating it after a lost CAS is
-safe. **Absence is not.** A `BookingAbsent` verified while the original request was still in
-flight would, if re-applied after a cancel won the race, commit a terminal `Cancelled` while
-the room is actually booked.
+safe. **Absence is not**, and a stale `BookingAbsent` re-applied after a cancel won the race
+would commit a terminal `Cancelled` while the room is booked.
 
-ADR-016 closes this: every effect intent carries `expires_at_ms`, the council never acts on
-an expired intent, and therefore
+ADR-016 closes this, and the shape matters:
 
-> `BookingAbsent` is admissible evidence **only once `now > expires_at`**. Before that, the
-> council's "not found" is `Unknown` and drives no transition.
+> **We never evaluate `now > expires_at`.** The council reports definitive absence, using
+> its own clock, at the same serialization point that prevents creation. The verifier turns
+> that answer into `BookingAbsent`; anything weaker stays `Unknown`.
 
-Past the deadline the council has no record *and can never create one*, so absence becomes
-permanently true and the re-apply rule works unchanged. See ADR-016 for the worked
-interleavings and the alternatives rejected.
+Three requirements on the mock council, all load-bearing:
+
+1. **Expiry binds at commit, atomically** — not at receipt. A council that accepts at
+   10:00:29.9, passes a receipt-time check, and writes at 10:00:30.2 reproduces the exact
+   defect with an expiry field that appears to prevent it.
+2. **The council owns the clock.** If our clock ran ahead we would declare absence while the
+   council still considered the intent live. The comparison never happens on our side, which
+   also keeps the domain clock-free as ADR-013 requires.
+3. **A definitive-absence answer serializes after every possible commit** for that intent, so
+   the lookup cannot slip between "accepted" and "written".
+
+And one requirement that pulls the other way, easy to miss: **a booking committed just before
+expiry must stay discoverable and idempotently returnable forever after.** Expiry bounds when
+an effect may be *created*, never how long a created effect remains visible — otherwise a
+retry past the deadline sees nothing and books the room twice.
+
+See ADR-016 for the worked interleavings, the costs, and the alternatives rejected.
 
 ### `Verified<T>` is provenance, not blanket trust, and not unforgeable
 
@@ -481,12 +494,17 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 13. cancellation retried after a dropped response — same cancellation intent id returns the
     original provider result rather than cancelling twice;
 14. **"not found" before expiry is `Unknown`, not absence** — the reconciler must not commit
-    `Cancelled` while the intent could still be acted on;
-15. **the ADR-016 race**: request in flight, reconciler verifies not-found, cancel wins the
-    CAS, the request then lands and books. Local state must NOT end up `Cancelled` with a
-    live booking;
-16. **the council refuses an expired intent** — a request arriving after `expires_at_ms`
-    creates nothing, which is what makes post-expiry absence permanent.
+    `Cancelled` while the intent could still be committed;
+15. **accepted before expiry, commit paused until after expiry, lookup concurrent with it** —
+    this is the test that distinguishes commit-time expiry from receipt-time expiry, and a
+    council doing the latter must fail it;
+16. **BLD clock deliberately ahead of the council's** — we must still not manufacture
+    absence, because we never evaluate the deadline ourselves;
+17. **post-expiry `BookingAbsent` loses a CAS, is re-applied, while a competing request was
+    accepted** — the original race, run through the full re-apply path;
+18. **a booking committed immediately before expiry stays discoverable afterwards**, and a
+    same-identity retry past the deadline returns that original result rather than creating
+    a second booking.
 
 ## M4 implementation order
 
@@ -514,6 +532,8 @@ Stop and raise an architecture question instead of improvising if any implementa
 - accepting provider-shaped/model-shaped evidence without authoritative lookup or trusted adapter provenance;
 - allowing cancellation to erase an already possible external effect;
 - bypassing M3 CAS/version semantics;
-- treating a pre-expiry "not found" as absence (ADR-016);
-- a mock council that acts on an expired effect intent - every ADR-016 guarantee rests on
-  it refusing.
+- evaluating `now > expires_at` locally instead of taking the council's determination
+  (ADR-016);
+- a mock council that checks expiry at receipt rather than atomically at commit;
+- a council that stops returning an effect that was committed before its expiry - that
+  breaks stable identity and duplicates bookings on retry.

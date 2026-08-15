@@ -158,9 +158,9 @@ that untrue.
    -> terminal local state, live external booking, and nothing will reconcile it
 ```
 
-**Resolved by ADR-016:** effect intents expire, the council never acts on an expired
-intent, and `BookingAbsent` is admissible only once `now > expires_at`. Before that the
-council's "not found" is `Unknown`.
+**Resolved by ADR-016:** `BookingAbsent` is admissible **only from the council's definitive
+absence response**, which atomically tombstones the effect intent. We never evaluate a
+deadline ourselves — anything short of that response is `Unknown`.
 
 The verifier establishes *what is true externally*. The domain decides *what that truth
 means here*. A verifier that emitted state-specific observation variants would have to
@@ -493,7 +493,30 @@ reasoning.
 Otherwise the lookup can slip between "accepted" and "written". The council must answer
 absence only from a point where no commit for that intent can still be in progress.
 
-With all three, absence is monotonic — the property the re-apply rule needs — and the race
+### 4. Definitive absence is a durable tombstone, not a clock reading
+
+The three rules above still leave absence resting on time, and time can move backwards:
+
+```text
+1. council clock reads past expiry; the lookup serializes and answers "absent"
+2. the council's clock steps backward (NTP correction, VM migration, operator)
+3. a delayed request reaches the commit point, now appears unexpired, and commits
+4. the already-verified absence is re-applied -> terminal Cancelled, live booking
+```
+
+So the answer must not be *"the deadline has passed"*. It must be **"this effect intent is
+permanently closed and nothing was created for it"**, written down:
+
+> Answering definitive absence **atomically persists a tombstone** for that effect intent.
+> Every later create attempt for that identity is rejected by the presence of the tombstone,
+> regardless of any subsequent clock reading.
+
+Absence then stops being a temporal claim and becomes a fact about a durable record — which
+is monotonic by construction and needs no assumption about clock behaviour. Expiry is merely
+what makes the council *willing* to write the tombstone; the tombstone is what makes the
+answer permanent.
+
+With all four, absence is monotonic — the property the re-apply rule needs — and the race
 above cannot occur.
 
 ### What it costs

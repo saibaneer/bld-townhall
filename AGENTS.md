@@ -13,4 +13,4 @@ This repository implements the BLD Town Hall technical specification in `docs/te
 
 ## Current repository milestone
 
-M0–M2 foundation. The next implementation target is M3 durable aggregate + optimistic concurrency.
+M0–M3 foundation. M3 durable aggregate + optimistic concurrency is implemented in `townhall-store`. The next implementation target is M4 external effect protocol. Read `docs/m3-persistence.md` and `docs/m4-effects-guidance.md` before changing storage or adding provider calls.

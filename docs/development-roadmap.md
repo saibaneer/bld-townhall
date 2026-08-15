@@ -7,7 +7,7 @@ The specification is authoritative. This file is the concise implementation chec
 | M0 Workspace | — | workspace layout, formatting/lint/test commands |
 | M1 Kernel | M0 | Undefined/Denied/Committed sequencing proven |
 | M2 Domain | M1 | exhaustive topology + in-memory booking/cancel |
-| M3 Persistence | M2 | CAS/versioning; state survives restart |
+| M3 Persistence | M2 | **Implemented:** SQLite/SQLx CAS, restart durability, atomic local audit |
 | M4 Effects | M3 | stable effect intent + retry/reconciliation |
 | M5 Axum | M4 | curl can drive flow; stale `If-Match` => 412 |
 | M6 HumanChannel | M5 | SMS simulator drives deterministic flow, no LLM |
@@ -22,3 +22,9 @@ The specification is authoritative. This file is the concise implementation chec
 ## Rule
 
 Never add a later-layer dependency into an earlier crate merely to make a demo easier.
+
+
+## Milestone notes
+
+- M3 design and justification: [`m3-persistence.md`](m3-persistence.md)
+- M4 implementation guidance: [`m4-effects-guidance.md`](m4-effects-guidance.md)

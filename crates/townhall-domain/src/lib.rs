@@ -122,7 +122,7 @@ pub struct VerifiedAuthority {
     pub may_cancel: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VenueFacts {
     pub venue_id: VenueId,
     pub slot_id: SlotId,
@@ -130,6 +130,26 @@ pub struct VenueFacts {
     pub wheelchair_accessible: bool,
     pub fee: Money,
     pub available: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedVenueRef {
+    pub venue_id: VenueId,
+    pub slot_id: SlotId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookingAggregate {
+    pub id: BookingId,
+    pub version: u64,
+    pub state: BookingState,
+    pub requirements: BookingRequirements,
+    pub selected_venue: Option<SelectedVenueRef>,
+    pub availability: Option<VenueFacts>,
+    pub booking_ref: Option<CouncilBookingRef>,
+    pub active_effect: Option<EffectIntentId>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug)]

@@ -1423,6 +1423,7 @@ dependencies = [
  "bld-kernel",
  "bld-types",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

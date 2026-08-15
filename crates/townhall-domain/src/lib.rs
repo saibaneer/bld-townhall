@@ -18,8 +18,31 @@ pub struct VenueSelected {
     pub slot_id: SlotId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NeedsRevalidation;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NeedsRevalidation {
+    /// The venue selection carried forward from the state this was reached
+    /// from, so `RevalidateVenue` can bind loaded facts back to what the user
+    /// actually chose.
+    ///
+    /// `None` only for rows persisted before this field existed. Those deny
+    /// revalidation and must re-select — fail-closed, because the alternative
+    /// is revalidating against a venue nobody can vouch for.
+    pub selected: Option<SelectedVenueRef>,
+}
+
+/// Accepts a `null` state payload as the default.
+///
+/// `NeedsRevalidation` was a unit struct, so existing rows carry
+/// `{"state":"NeedsRevalidation","data":null}`. Serde will not decode `null`
+/// into a struct even with `#[serde(default)]`, so without this every such row
+/// fails to load and M3's restart-survival gate breaks.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwaitingBooking {
@@ -57,7 +80,7 @@ pub struct NeedsHuman;
 pub enum BookingState {
     Draft(Draft),
     VenueSelected(VenueSelected),
-    NeedsRevalidation(NeedsRevalidation),
+    NeedsRevalidation(#[serde(deserialize_with = "null_as_default")] NeedsRevalidation),
     AwaitingBooking(AwaitingBooking),
     BookingInProgress(BookingInProgress),
     CancellationRequested(CancellationRequested),
@@ -156,6 +179,9 @@ pub struct BookingAggregate {
 pub struct BookingContext {
     pub booking_id: BookingId,
     pub requirements: BookingRequirements,
+    /// Facts loaded by a capability. Never authoritative on their own: every
+    /// behaviour that consumes them must first bind them to what the user
+    /// actually chose, which lives in the *state*, not here.
     pub selected_facts: Option<VenueFacts>,
     pub next_effect: u64,
     pub fake_booking_ref: CouncilBookingRef,
@@ -310,10 +336,24 @@ impl BoundaryDomain for TownHallDomain {
             (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => {
                 Resolution::Ready(BookingPlan::CancelLocal)
             }
-            (BookingState::NeedsRevalidation(_), BookingProposal::RevalidateVenue) => {
+            (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
                 let Some(facts) = context.selected_facts.clone() else {
                     return Resolution::Denied(BookingError::VenueFactsMissing);
                 };
+                // Bind the loaded facts back to what the user actually chose,
+                // exactly as `VerifySlot` does against `VenueSelected`.
+                //
+                // The binding target is state data, not context, so this holds
+                // without trusting whoever assembled the context. Without it,
+                // an ordinary `UpdateRequirements` is enough to launder any
+                // venue into the booking: every per-venue guard in
+                // `validate_facts` passes for a venue the user never chose.
+                let Some(selected) = pending.selected.as_ref() else {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                };
+                if facts.venue_id != selected.venue_id || facts.slot_id != selected.slot_id {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                }
                 match Self::validate_facts(&facts, &context.requirements, authority) {
                     Ok(()) => Resolution::Ready(BookingPlan::RevalidateVenue { facts }),
                     Err(error) => Resolution::Denied(error),
@@ -403,7 +443,7 @@ impl BoundaryDomain for TownHallDomain {
 
     async fn validate(
         &self,
-        _current: &Self::State,
+        current: &Self::State,
         plan: &Self::Plan,
         evidence: &Self::Evidence,
         _context: &Self::Context,
@@ -428,7 +468,23 @@ impl BoundaryDomain for TownHallDomain {
                 Ok(BookingState::Draft(Draft))
             }
             (BookingPlan::MarkNeedsRevalidation, BookingEvidence::NoExternalEffect) => {
-                Ok(BookingState::NeedsRevalidation(NeedsRevalidation))
+                // Carry the selection forward from whichever state we came
+                // from, so revalidation has an authoritative binding target
+                // that does not depend on the caller-supplied context.
+                let selected = match current {
+                    BookingState::VenueSelected(selected) => Some(SelectedVenueRef {
+                        venue_id: selected.venue_id.clone(),
+                        slot_id: selected.slot_id.clone(),
+                    }),
+                    BookingState::AwaitingBooking(waiting) => Some(SelectedVenueRef {
+                        venue_id: waiting.venue_id.clone(),
+                        slot_id: waiting.slot_id.clone(),
+                    }),
+                    _ => None,
+                };
+                Ok(BookingState::NeedsRevalidation(NeedsRevalidation {
+                    selected,
+                }))
             }
             (
                 BookingPlan::RevalidateVenue { facts },
@@ -618,6 +674,158 @@ mod tests {
         assert_eq!(
             out,
             BoundaryOutcome::Committed(BookingState::Cancelled(Cancelled))
+        );
+    }
+
+    /// The user's authoritative venue selection must survive a requirements
+    /// update. This is the reachable path, not a synthetic one: `VenueSelected`
+    /// + `UpdateRequirements` produces `NeedsRevalidation` today, and if
+    /// `RevalidateVenue` does not bind the loaded facts back to the selection,
+    /// whatever venue the context happens to carry silently becomes the booking.
+    #[tokio::test]
+    async fn revalidation_cannot_substitute_a_different_venue() {
+        let domain = TownHallDomain;
+        let kernel = Kernel;
+        let auth = authority();
+        let mut ctx = context();
+        let mut state = BookingState::Draft(Draft);
+
+        // Lucy selects TH-A.
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                &auth,
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::VenueSelected(_))
+        ));
+
+        // She changes the attendee count, which invalidates the verification.
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                &auth,
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::NeedsRevalidation(_))
+        ));
+
+        // Now the context carries facts for a DIFFERENT venue. Every guard in
+        // `validate_facts` passes for TH-B in isolation - it is available,
+        // large enough, accessible and within budget. Only the binding back to
+        // the authoritative selection can catch this.
+        ctx.selected_facts = Some(VenueFacts {
+            venue_id: VenueId::new("TH-B"),
+            slot_id: SlotId::new("SLOT-B"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        });
+
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::RevalidateVenue,
+                &auth,
+                &mut ctx,
+            )
+            .await;
+
+        assert_eq!(
+            out,
+            BoundaryOutcome::Denied(BookingError::VenueFactsMissing),
+            "revalidation accepted facts for a venue the user never selected"
+        );
+        assert!(
+            matches!(state, BookingState::NeedsRevalidation(_)),
+            "a denied revalidation must not advance state"
+        );
+    }
+
+    /// The same path with matching facts must still succeed, so the guard above
+    /// is not simply refusing everything.
+    #[tokio::test]
+    async fn revalidation_succeeds_when_facts_match_the_selection() {
+        let domain = TownHallDomain;
+        let kernel = Kernel;
+        let auth = authority();
+        let mut ctx = context();
+        let mut state = BookingState::Draft(Draft);
+
+        for proposal in [
+            BookingProposal::SelectVenue {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            },
+            BookingProposal::UpdateRequirements {
+                attendees: Some(25),
+            },
+            BookingProposal::RevalidateVenue,
+        ] {
+            let out = kernel
+                .apply(&domain, &mut state, proposal, &auth, &mut ctx)
+                .await;
+            assert!(
+                matches!(out, BoundaryOutcome::Committed(_)),
+                "expected a commit, got {out:?}"
+            );
+        }
+
+        assert!(matches!(state, BookingState::VenueSelected(_)));
+    }
+
+    /// A row persisted before `NeedsRevalidation` carried a selection decodes
+    /// with `selected: None`. It must refuse to revalidate rather than fall
+    /// back to trusting the context.
+    #[tokio::test]
+    async fn legacy_revalidation_state_without_a_selection_is_denied() {
+        let mut state = BookingState::NeedsRevalidation(NeedsRevalidation { selected: None });
+        let mut ctx = context();
+
+        let outcome = Kernel
+            .apply(
+                &TownHallDomain,
+                &mut state,
+                BookingProposal::RevalidateVenue,
+                &authority(),
+                &mut ctx,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::VenueFactsMissing)
+        );
+        assert!(matches!(state, BookingState::NeedsRevalidation(_)));
+    }
+
+    /// The wire form of a legacy row must still decode, or M3's
+    /// restart-survival gate breaks for every existing `NeedsRevalidation`.
+    #[test]
+    fn legacy_null_state_payload_still_decodes() {
+        let legacy = r#"{"state":"NeedsRevalidation","data":null}"#;
+        let decoded: BookingState =
+            serde_json::from_str(legacy).expect("legacy NeedsRevalidation row must still load");
+        assert_eq!(
+            decoded,
+            BookingState::NeedsRevalidation(NeedsRevalidation { selected: None })
         );
     }
 

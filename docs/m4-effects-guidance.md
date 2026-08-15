@@ -66,26 +66,22 @@ BookingExists + BookingInProgress      -> booking_confirmed -> Booked
 BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
 ```
 
-### ⚠ Unresolved: negative facts are not stable across races
+### Negative facts need the expiry gate (ADR-016)
 
-The re-evaluate-after-a-lost-CAS rule is safe for **monotonic** facts. `BookingExists` stays
-true once true. It is **not** safe for absence:
+`BookingExists` is monotonic — true once true — so re-evaluating it after a lost CAS is
+safe. **Absence is not.** A `BookingAbsent` verified while the original request was still in
+flight would, if re-applied after a cancel won the race, commit a terminal `Cancelled` while
+the room is actually booked.
 
-```text
-1. reconciler queries while the original booking call is still completing
-   -> verifies BookingAbsent
-2. Lucy's Cancel wins the CAS   -> CancellationRequested
-3. the council finishes creating the booking
-4. the stale BookingAbsent is re-applied -> commits Cancelled
-   -> local state is terminal while an external booking exists, and
-      Cancelled is terminal so nothing will ever reconcile it
-```
+ADR-016 closes this: every effect intent carries `expires_at_ms`, the council never acts on
+an expired intent, and therefore
 
-**Do not implement `BookingAbsent -> Cancelled` until this is decided.** The options are a
-provider watermark or revision that lets a stale absence be recognised and refused, or
-requiring the council to distinguish "definitively no booking for this effect id" from "I
-do not currently see one" and treating the latter as `Unknown`. This is an open
-architectural decision, not an implementation detail.
+> `BookingAbsent` is admissible evidence **only once `now > expires_at`**. Before that, the
+> council's "not found" is `Unknown` and drives no transition.
+
+Past the deadline the council has no record *and can never create one*, so absence becomes
+permanently true and the re-apply rule works unchanged. See ADR-016 for the worked
+interleavings and the alternatives rejected.
 
 ### `Verified<T>` is provenance, not blanket trust, and not unforgeable
 
@@ -242,6 +238,7 @@ CREATE TABLE effect_intents (
     canonical_plan_json TEXT NOT NULL,
     plan_hash           TEXT NOT NULL,
     status              TEXT NOT NULL,
+    expires_at_ms       INTEGER NOT NULL,   -- ADR-016: absence is only definitive past this
     provider_reference  TEXT,
     last_error          TEXT,
     created_at_ms       INTEGER NOT NULL,
@@ -482,7 +479,14 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 12. **crash between committing `CancellingBooking` and calling the cancellation capability**
     — recovery finds the durable cancellation intent and resumes under the same identity;
 13. cancellation retried after a dropped response — same cancellation intent id returns the
-    original provider result rather than cancelling twice.
+    original provider result rather than cancelling twice;
+14. **"not found" before expiry is `Unknown`, not absence** — the reconciler must not commit
+    `Cancelled` while the intent could still be acted on;
+15. **the ADR-016 race**: request in flight, reconciler verifies not-found, cancel wins the
+    CAS, the request then lands and books. Local state must NOT end up `Cancelled` with a
+    live booking;
+16. **the council refuses an expired intent** — a request arriving after `expires_at_ms`
+    creates nothing, which is what makes post-expiry absence permanent.
 
 ## M4 implementation order
 
@@ -509,4 +513,7 @@ Stop and raise an architecture question instead of improvising if any implementa
 - creating a new intent on every retry;
 - accepting provider-shaped/model-shaped evidence without authoritative lookup or trusted adapter provenance;
 - allowing cancellation to erase an already possible external effect;
-- bypassing M3 CAS/version semantics.
+- bypassing M3 CAS/version semantics;
+- treating a pre-expiry "not found" as absence (ADR-016);
+- a mock council that acts on an expired effect intent - every ADR-016 guarantee rests on
+  it refusing.

@@ -117,7 +117,8 @@ enum VerifiedProviderFact {
         fee: Money,
         principal: PrincipalId,
     },
-    /// ⚠ BLOCKED pending the negative-fact decision - see ADR-012 below.
+    /// Admissible only once the intent has expired - see ADR-016. Before that
+    /// the council's "not found" is Unknown and drives no transition.
     BookingAbsent { effect_intent_id: EffectIntentId },
     CancellationExists { effect_intent_id: EffectIntentId, booking_ref: CouncilBookingRef },
     ProviderRejected { effect_intent_id: EffectIntentId, reason: BoundedString },
@@ -157,10 +158,9 @@ that untrue.
    -> terminal local state, live external booking, and nothing will reconcile it
 ```
 
-`BookingAbsent -> Cancelled` **must not be implemented** until this is decided. Options: a
-provider watermark or revision so a stale absence can be refused, or requiring the council
-to distinguish "definitively no booking for this effect id" from "I do not currently see
-one" and treating the latter as `Unknown`. Open architectural decision.
+**Resolved by ADR-016:** effect intents expire, the council never acts on an expired
+intent, and `BookingAbsent` is admissible only once `now > expires_at`. Before that the
+council's "not found" is `Unknown`.
 
 The verifier establishes *what is true externally*. The domain decides *what that truth
 means here*. A verifier that emitted state-specific observation variants would have to
@@ -437,3 +437,74 @@ Do **not** drop the pre-`UPDATE` `SELECT`. It is not redundant: it supplies `fro
 `if result.rows_affected() != 1` is unreachable under SQLite WAL — a writer holding the
 write lock has a valid snapshot, so the row still matches — but it stays for the anticipated
 Postgres port, where READ COMMITTED re-reads per statement.
+
+## ADR-016 — Effect intents expire, and absence is definitive only after expiry
+
+ADR-012 said a verified fact that loses a compare-and-set is re-evaluated against the new
+state rather than discarded. That is sound for **monotonic** facts — `BookingExists` stays
+true once true — and unsound for absence, which is a claim about *now*:
+
+```text
+10:00:00.0  we send E-9271 to the council; the request is in flight
+10:00:00.1  reconciler asks "anything for E-9271?" -> verified BookingAbsent
+10:00:00.2  Lucy's cancel wins the CAS  -> CancellationRequested
+10:00:00.3  the request lands; the council books the room
+10:00:00.4  the stale BookingAbsent is re-applied -> commits Cancelled
+```
+
+Terminal local state, live external booking, and `Cancelled` is terminal so nothing ever
+reconciles it. The evidence was genuinely verified. It simply went stale in 200ms.
+
+**Decision.** Every effect intent carries an expiry, and the council promises:
+
+> **No effect intent is ever acted on after its expiry.**
+
+That one promise makes absence monotonic, which is the property the re-apply rule needs:
+
+```text
+request lost entirely
+10:00:00.0  send E-9271, expires 10:00:30 - packet lost
+10:00:31.0  reconciler asks. Past expiry, so the council has no record AND can never
+            create one. Absence is now permanently true -> safe to commit Cancelled
+
+request merely slow
+10:00:00.1  reconciler asks, gets "not found" at 10:00:00 - INSIDE the window, so this
+            is Unknown, not absence. No transition.
+10:00:00.3  the request lands and is booked, because it is still inside the window
+10:00:31.0  reconciler asks -> BookingExists -> correct outcome
+```
+
+So `BookingAbsent` is only admissible evidence once `now > expires_at`. Before that the
+council's "not found" is `Unknown` and drives nothing.
+
+### What this requires
+
+- `effect_intents` gains `expires_at_ms`, set when the intent is minted.
+- The mock council must honour it and refuse expired intents. Spec §11 does not currently
+  ask this of it; that is an addition to the mock council's contract, not an optional
+  behaviour, because every guarantee here rests on it.
+- The reconciler must not treat "not found" as absence before expiry.
+
+### What it costs
+
+Cancellation during an ambiguous window is not instant: Lucy's "cancel it" cannot resolve to
+`Cancelled` until the deadline passes. With a 30-second expiry that is a 30-second worst
+case. That latency is honest — before the deadline, whether a booking exists is genuinely
+unknown, and a faster answer would be a guess.
+
+### Alternatives rejected
+
+**Provider revision numbers.** The council stamps each answer with a monotonic revision and
+we refuse answers older than what we have seen. This fails our actual case: the stale answer
+*was* the newest thing we had. Making it work needs the council to also promise "at revision
+N I had finished processing everything I had received", which is a much stronger claim than
+a counter, and heavier than a POC needs.
+
+**Two flavours of "no".** The council distinguishes "definitively absent" from "not
+currently visible". It still cannot tell "never sent" from "sent and still in flight", so
+the ambiguous case stays ambiguous forever and cancellation could never complete.
+
+Expiry is chosen because it is one field plus one rule, it needs no new answer vocabulary,
+it matches how payment providers handle the same problem, and it gives the M4 fault-injection
+suite a deterministic knob: set a one-second expiry, drop the response, wait, assert
+convergence.

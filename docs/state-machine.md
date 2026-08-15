@@ -60,11 +60,10 @@ The same `BookingExists` fact means *booking confirmed* at `BookingInProgress` a
 found* at `CancellationRequested`. That is what lets a fact which lost a compare-and-set be
 re-evaluated against the new state rather than discarded.
 
-> ⚠ `CancellationRequested --BookingAbsent--> Cancelled` is **blocked pending an
-> architectural decision**. Absence is not stable over time: a stale `BookingAbsent`
-> verified before the provider finished creating the booking would commit a terminal
-> `Cancelled` while the room is actually booked. See the negative-fact section of
-> [`m4-effects-guidance.md`](m4-effects-guidance.md).
+> `CancellationRequested --BookingAbsent--> Cancelled` is gated on **ADR-016**: absence is
+> admissible only once the effect intent has expired, because before that the council may
+> still act on the in-flight request. A pre-expiry "not found" is `Unknown` and drives
+> nothing.
 
 ## System-event edges — deterministic runtime facts
 

@@ -283,6 +283,84 @@ No proposal may enlarge its own authority.
 
 ---
 
+## 6a. Intent and Evidence Are Different Doors
+
+A proposal says what someone *wants*. An observation says what *happened*.
+
+These must not share a type, and the proposer must be able to reach only the first.
+
+```text
+INTENT EDGES                      OBSERVATION EDGES
+a human or agent may request      only verified evidence may drive
+
+select_venue                      booking_confirmed
+verify_slot                       booking_failed
+change_venue                      booking_found
+update_requirements               no_booking_found
+revalidate_venue                  cancellation_confirmed
+book                              cancellation_failed
+cancel                            reconciliation_failed
+```
+
+Wrong:
+
+```rust
+enum Proposal {
+    Book,
+    BookingConfirmed { reference: String },   // the agent can now say this
+}
+```
+
+An agent submits `BookingConfirmed`, the workflow reaches a success state, and the
+provider was never called. The model announced its own success.
+
+Right:
+
+```rust
+enum Proposal    { Book, Cancel { .. }, /* ... */ }
+enum Observation { BookingConfirmed(Verified<BookingEvidence>), /* ... */ }
+
+resolve_proposal(state, proposal, authority, context) -> Resolution<Plan, Error>
+apply_observation(state, verified_observation)        -> Result<NextState, Error>
+```
+
+> **A proposer may request that something happen. It may not announce that something
+> happened.**
+
+> **Consequential success states must never be reachable from proposer vocabulary.**
+
+This is stronger than validating a proposal's contents. A guard can be forgotten at one
+call site; a type that does not exist cannot be constructed anywhere.
+
+### The second door is verified evidence, not "the provider"
+
+Do not let a raw provider response mutate state either. An attacker who can shape a
+response would otherwise drive the workflow. Only evidence an adapter has verified and
+bound to the expected effect identity, resource and principal may construct an
+observation.
+
+```text
+AgentClaim<T>   != truth
+RawProvider<T>  != truth
+Verified<T>     == admissible evidence
+```
+
+### Recovery is not a proposal
+
+Reconciliation is runtime machinery, not a business intention. If a user or model has to
+ask for recovery, then recovery does not happen when the model is offline, hostile or
+absent — which is precisely when it is needed. Uncertain outcomes enqueue a job; the
+reconciler asks the provider what happened; the verified answer enters through the
+observation door.
+
+### A third category, without a third door
+
+Timer expiry, retry-budget exhaustion, lease expiry and provider timeout are neither
+intent nor external fact. They are deterministic runtime events. Model them separately if
+they begin changing domain state; do not smuggle them into either existing door.
+
+---
+
 ## 7. Provenance Matters More Than Shape
 
 A valid-looking object is not necessarily true.

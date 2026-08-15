@@ -23,6 +23,78 @@ M4 is accepted only when this failure is handled correctly:
 
 If that scenario can duplicate a booking, M4 is not complete.
 
+## The two doors (ADR-012) — settle this before writing code
+
+M4 is where the single-vocabulary design breaks. Every exit from `BookingInProgress`,
+`CancellationRequested` and `CancellingBooking` is an *evidence* outcome, not a request.
+
+```text
+INTENT                              OBSERVATION
+Lucy or the agent asks              only verified evidence drives
+
+BookingInProgress + cancel          BookingInProgress + booking_confirmed -> Booked
+                                    BookingInProgress + booking_failed    -> AwaitingBooking
+                                    CancellationRequested + booking_found -> CancellingBooking
+                                    CancellationRequested + no_booking_found -> Cancelled
+                                    CancellingBooking + cancellation_confirmed -> Cancelled
+                                    CancellingBooking + cancellation_failed    -> Booked
+                                    * + reconciliation_failed              -> NeedsHuman
+```
+
+Adding the observation edges to `BookingProposal` would let a hostile proposer submit
+`BookingConfirmed` and reach `Booked` with no council call. M4 must therefore add:
+
+```rust
+enum BookingObservation {
+    BookingConfirmed(VerifiedBookingEvidence),
+    BookingFailed(VerifiedBookingFailure),
+    BookingNotFound(VerifiedNoBookingEvidence),
+    CancellationConfirmed(VerifiedCancellationEvidence),
+    CancellationFailed(VerifiedCancellationFailure),
+    ReconciliationFailed(VerifiedReconciliationFailure),
+}
+
+apply_observation(state, verified_observation) -> Result<NextState, Error>
+```
+
+Only an adapter that has verified the raw response and bound it to the expected
+`EffectIntentId`, venue, slot and principal may construct one of these. A raw council
+response is not admissible on its own.
+
+`BookingProposal::Reconcile` is **removed** in M4. Reconciliation is runtime recovery, not
+a user intention — it must run when the model is offline, hostile or absent. Removing it
+takes the proposal vocabulary from 8 variants to 7 and the topology matrix in
+`townhall-domain` from 80 cells to 70; update `LOCKED` in the same commit.
+
+`BookingInProgress + Cancel` is the one intent edge that lands here too — it is currently
+in the matrix's `PENDING` table, deferred because `CancellationRequested` had no exit.
+The observation door gives it one.
+
+## Commit before calling (ADR-013)
+
+The `resolve -> execute -> validate` pipeline conflates requesting an effect with learning
+its result. Harmless with M2's synchronous fake; not harmless with a real council.
+
+```text
+AwaitingBooking v3
+    -> resolve Book, derive canonical plan
+    -> persist EffectIntentId + canonical plan
+    -> COMMIT BookingInProgress v4          <-- durable BEFORE any external call
+    -> call the council
+    -> raw response / timeout / lost response
+    -> adapter verifies and binds -> VerifiedBookingEvidence
+    -> apply_observation -> COMMIT Booked v5
+```
+
+Crash anywhere after the first commit and recovery finds `BookingInProgress` plus its
+`EffectIntentId`, which is exactly what the reconciler needs. Crash before it and no
+external call was ever made.
+
+This is also why the repository's prepare/finalize methods must **return committed
+state**: it leaves no signature through which a capability could be invoked while a
+transaction is open. Since `commit` now uses `BEGIN IMMEDIATE`, a transaction held across
+a council call would block every unrelated booking for the busy timeout.
+
 ## Do not hold a database transaction across a network call
 
 The external provider and SQLite cannot participate in one atomic transaction. Holding the SQLite transaction open while making an HTTP call creates lock contention and still does not make the provider call atomic with the database.

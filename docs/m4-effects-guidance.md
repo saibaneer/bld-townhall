@@ -69,14 +69,14 @@ BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
 ### Negative facts: absence is the council's determination (ADR-016)
 
 `BookingExists` is monotonic — true once true — so re-evaluating it after a lost CAS is
-safe. **Absence is not**, and a stale `BookingAbsent` re-applied after a cancel won the race
+safe. **Absence is not**, and a stale `EffectAbsent` re-applied after a cancel won the race
 would commit a terminal `Cancelled` while the room is booked.
 
 ADR-016 closes this, and the shape matters:
 
 > **We never evaluate `now > expires_at`.** The council reports definitive absence, using
 > its own clock, at the same serialization point that prevents creation. The verifier turns
-> that answer into `BookingAbsent`; anything weaker stays `Unknown`.
+> that answer into `EffectAbsent`; anything weaker stays `Unknown`.
 
 Three requirements on the mock council, all load-bearing:
 
@@ -377,7 +377,11 @@ mark effect Confirmed
 
 ### Confirmed failure
 
-If the provider authoritatively says no booking was created, record the failure and transition according to domain policy, for example back to `AwaitingBooking`.
+If the provider authoritatively says the effect was not created — `ProviderRejected`, or
+`EffectAbsent` once the intent is tombstoned — the resource returns to the state it can be
+re-proposed from: `AwaitingBooking` for a booking intent, `Booked` for a cancellation intent.
+The transition finalises the effect intent and clears `active_effect`. A re-proposal mints a
+**fresh** intent, because a tombstoned one can never succeed.
 
 ### Ambiguous / unavailable
 
@@ -412,7 +416,10 @@ Possible authoritative results:
 ```text
 Booked(reference, canonical facts)        -> BookingExists
 Cancelled(reference)                      -> CancellationExists
-DefinitivelyAbsent                        -> BookingAbsent   (tombstone written & committed)
+DefinitivelyAbsent                        -> EffectAbsent    (tombstone written & committed)
+     at BookingInProgress (booking intent)          -> AwaitingBooking
+     at CancellationRequested (booking intent)      -> Cancelled
+     at CancellingBooking (cancellation intent)     -> Booked
 NotYetVisible                             -> Unknown         (may still be created)
 Unavailable                               -> Unknown
 ```
@@ -585,7 +592,7 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
     council doing the latter must fail it;
 16. **BLD clock deliberately ahead of the council's** — we must still not manufacture
     absence, because we never evaluate the deadline ourselves;
-17. **post-expiry `BookingAbsent` loses a CAS, is re-applied, while a competing request was
+17. **post-expiry `EffectAbsent` loses a CAS, is re-applied, while a competing request was
     accepted** — the original race, run through the full re-apply path;
 18. **a booking committed immediately before expiry stays discoverable afterwards**, and a
     same-identity retry past the deadline returns that original result rather than creating

@@ -47,30 +47,40 @@ in that state.
 ```mermaid
 stateDiagram-v2
     BookingInProgress --> Booked: BookingExists
-    BookingInProgress --> AwaitingBooking: BookingAbsent
+    BookingInProgress --> AwaitingBooking: EffectAbsent
     BookingInProgress --> AwaitingBooking: ProviderRejected
 
     CancellationRequested --> CancellingBooking: BookingExists
-    CancellationRequested --> Cancelled: BookingAbsent
+    CancellationRequested --> Cancelled: EffectAbsent
 
     CancellingBooking --> Cancelled: CancellationExists
+    CancellingBooking --> Booked: EffectAbsent
     CancellingBooking --> Booked: ProviderRejected
 ```
 
-`BookingInProgress + BookingAbsent -> AwaitingBooking` is the commonest recovery path, not a
-corner: the create request never arrived, its deadline passed, and the council has now
-tombstoned the intent. The booking definitively did not happen, so the resource returns to
-`AwaitingBooking` where it can be re-proposed under a *fresh* effect intent — the tombstoned
-one can never succeed. The transition finalises the old intent and clears `active_effect`.
+One `EffectAbsent` fact, three meanings — derived from the persisted intent and the current
+state, never from the fact itself:
+
+| At | The absent intent was | Means | Goes to |
+|---|---|---|---|
+| `BookingInProgress` | a booking | the booking never happened | `AwaitingBooking` |
+| `CancellationRequested` | a booking | there is nothing to cancel | `Cancelled` |
+| `CancellingBooking` | a cancellation | the cancellation never happened | `Booked` |
+
+The first is the commonest recovery path, not a corner case: the create request never
+arrived, its deadline passed, and the council tombstoned the intent. The third is its exact
+mirror on the cancellation side. Each finalises the old intent and clears `active_effect`,
+and any re-proposal mints a **fresh** intent — a tombstoned one can never succeed, so reusing
+it would guarantee an effect that never happens.
 
 The same `BookingExists` fact means *booking confirmed* at `BookingInProgress` and *booking
 found* at `CancellationRequested`. That is what lets a fact which lost a compare-and-set be
 re-evaluated against the new state rather than discarded.
 
-> `CancellationRequested --BookingAbsent--> Cancelled` is gated on **ADR-016**: absence is
-> admissible only once the effect intent has expired, because before that the council may
-> still act on the in-flight request. A pre-expiry "not found" is `Unknown` and drives
-> nothing.
+> Every `EffectAbsent` edge above is gated on **ADR-016**: absence is admissible only from
+> the council's definitive-absence response, which durably tombstones the intent. Before
+> that, a "not found" is `Unknown` and drives nothing — the council may still act on an
+> in-flight request.
 
 ## System-event edges — deterministic runtime facts
 

@@ -117,9 +117,16 @@ enum VerifiedProviderFact {
         fee: Money,
         principal: PrincipalId,
     },
-    /// Admissible only once the intent has expired - see ADR-016. Before that
-    /// the council's "not found" is Unknown and drives no transition.
-    BookingAbsent { effect_intent_id: EffectIntentId },
+    /// Nothing was created for this intent, and nothing ever can be.
+    ///
+    /// Deliberately kind-agnostic: absence carries only the identity, so one
+    /// variant covers a booking intent and a cancellation intent alike. Which
+    /// it means is derived from the persisted intent and the current state,
+    /// exactly as `BookingExists` is - see ADR-012.
+    ///
+    /// Admissible only from the council's definitive-absence response, which
+    /// tombstones the intent - see ADR-016. Anything weaker is Unknown.
+    EffectAbsent { effect_intent_id: EffectIntentId },
     CancellationExists { effect_intent_id: EffectIntentId, booking_ref: CouncilBookingRef },
     ProviderRejected { effect_intent_id: EffectIntentId, reason: BoundedString },
 }
@@ -151,14 +158,14 @@ that untrue.
 **Absence is not stable**, and the rule above was stated too broadly:
 
 ```text
-1. reconciler queries while the booking call is still completing -> verifies BookingAbsent
+1. reconciler queries while the booking call is still completing -> verifies EffectAbsent
 2. Cancel wins the CAS -> CancellationRequested
 3. the council finishes creating the booking
-4. the stale BookingAbsent is re-applied -> commits Cancelled
+4. the stale EffectAbsent is re-applied -> commits Cancelled
    -> terminal local state, live external booking, and nothing will reconcile it
 ```
 
-**Resolved by ADR-016:** `BookingAbsent` is admissible **only from the council's definitive
+**Resolved by ADR-016:** `EffectAbsent` is admissible **only from the council's definitive
 absence response**, which atomically tombstones the effect intent. We never evaluate a
 deadline ourselves — anything short of that response is `Unknown`.
 
@@ -449,10 +456,10 @@ true — and unsound for absence, which is a claim about *now*:
 
 ```text
 10:00:00.0  we send E-9271 to the council; the request is in flight
-10:00:00.1  reconciler asks "anything for E-9271?" -> verified BookingAbsent
+10:00:00.1  reconciler asks "anything for E-9271?" -> verified EffectAbsent
 10:00:00.2  Lucy's cancel wins the CAS -> CancellationRequested
 10:00:00.3  the request lands; the council books the room
-10:00:00.4  the stale BookingAbsent is re-applied -> commits Cancelled
+10:00:00.4  the stale EffectAbsent is re-applied -> commits Cancelled
 ```
 
 Terminal local state, live external booking, and `Cancelled` is terminal so nothing ever
@@ -485,9 +492,9 @@ If our clock runs ahead we would declare absence while the council still conside
 intent live. So the comparison never happens on our side. The council returns a definitive
 answer — *"expired, and nothing was committed for E-9271"* — computed with its own clock at
 the same serialization point that prevents creation. The verifier turns that answer into
-`BookingAbsent`; anything weaker stays `Unknown`.
+`EffectAbsent`; anything weaker stays `Unknown`.
 
-This also keeps the domain clock-free, as ADR-013's split requires. `BookingAbsent` existing
+This also keeps the domain clock-free, as ADR-013's split requires. `EffectAbsent` existing
 at all *is* the assertion that absence is permanent; the domain performs no temporal
 reasoning.
 

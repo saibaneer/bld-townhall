@@ -135,9 +135,13 @@ know the state, which is the wrong coupling.
 
 `Verified<T>` means the external claim passed its provenance verifier. It does **not** mean
 every relationship between that evidence and the current resource is valid. The domain
-still checks the binding: does the `EffectIntentId` match the active effect, do the
-`BookingId`, venue, slot and principal match the persisted canonical plan, is the current
-state one where this fact applies at all.
+still checks the binding: **every consequential field the fact carries** must match the
+persisted canonical plan — effect identity, resource, venue, slot, attendees, fee and
+principal — and the current state must be one where this fact applies at all.
+
+`fee` and `attendees` are not optional in that list. A council booking made for a different
+price or headcount than the plan authorised is exactly what the fee ceiling and capacity
+guards exist to prevent, and the evidence binding is the only place it is detectable.
 
 The canonical plan lives in the `effect_intents` row rather than in `BookingState`, and
 `active_effect` is normally cleared once an effect finalises — so the coordinator loads the

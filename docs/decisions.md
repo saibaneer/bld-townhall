@@ -90,7 +90,7 @@ The durable thing is not an observation. It is a fact:
 
 ```rust
 VerifiedProviderFact::BookingExists {
-    effect_intent_id, booking_ref, venue_id, slot_id, principal,
+    effect_intent_id, booking_ref, venue_id, slot_id, attendees, fee, principal,
 }
 ```
 

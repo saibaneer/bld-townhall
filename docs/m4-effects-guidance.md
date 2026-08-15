@@ -51,7 +51,12 @@ which is the wrong coupling. It emits what is externally true:
 
 ```rust
 enum VerifiedProviderFact {
-    BookingExists { effect_intent_id, booking_ref, venue_id, slot_id, principal },
+    // Every field the domain must bind against the canonical plan - spec 8.2
+    // requires evidence to be bound to effect intent, venue, slot, fee and
+    // principal. `fee` is not decoration: a council booking made at a price
+    // the plan never authorised is precisely the failure the fee ceiling
+    // exists to prevent, and it is only detectable here.
+    BookingExists { effect_intent_id, booking_ref, venue_id, slot_id, attendees, fee, principal },
     BookingAbsent { effect_intent_id, /* see the temporal caveat below */ },
     CancellationExists { effect_intent_id, booking_ref },
     ProviderRejected { effect_intent_id, reason },

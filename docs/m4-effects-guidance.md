@@ -23,52 +23,151 @@ M4 is accepted only when this failure is handled correctly:
 
 If that scenario can duplicate a booking, M4 is not complete.
 
-## The two doors (ADR-012) — settle this before writing code
+## Three doors (ADR-012) — settle this before writing code
 
 M4 is where the single-vocabulary design breaks. Every exit from `BookingInProgress`,
-`CancellationRequested` and `CancellingBooking` is an *evidence* outcome, not a request.
+`CancellationRequested` and `CancellingBooking` is either an externally verified fact or a
+runtime fact — never a request.
 
 ```text
-INTENT                              OBSERVATION
-Lucy or the agent asks              only verified evidence drives
-
-BookingInProgress + cancel          BookingInProgress + booking_confirmed -> Booked
-                                    BookingInProgress + booking_failed    -> AwaitingBooking
-                                    CancellationRequested + booking_found -> CancellingBooking
-                                    CancellationRequested + no_booking_found -> Cancelled
-                                    CancellingBooking + cancellation_confirmed -> Cancelled
-                                    CancellingBooking + cancellation_failed    -> Booked
-                                    * + reconciliation_failed              -> NeedsHuman
+1. Proposal              what a human or agent WANTS
+2. VerifiedProviderFact  what is externally TRUE
+3. SystemEvent           what the runtime KNOWS
 ```
 
-Adding the observation edges to `BookingProposal` would let a hostile proposer submit
-`BookingConfirmed` and reach `Booked` with no council call. M4 must therefore add:
+Adding the second or third class to `BookingProposal` would let a hostile proposer submit
+`BookingConfirmed` and reach `Booked` with no council call.
 
 ```rust
-enum BookingObservation {
-    BookingConfirmed(VerifiedBookingEvidence),
-    BookingFailed(VerifiedBookingFailure),
-    BookingNotFound(VerifiedNoBookingEvidence),
-    CancellationConfirmed(VerifiedCancellationEvidence),
-    CancellationFailed(VerifiedCancellationFailure),
-    ReconciliationFailed(VerifiedReconciliationFailure),
-}
-
-apply_observation(state, verified_observation) -> Result<NextState, Error>
+kernel.resolve_proposal(...)      // intent
+kernel.resolve_fact(...)          // verified reality
+kernel.resolve_system_event(...)  // runtime fact
 ```
 
-Only an adapter that has verified the raw response and bound it to the expected
-`EffectIntentId`, venue, slot and principal may construct one of these. A raw council
-response is not admissible on its own.
+### Facts are state-neutral; the domain interprets them
 
-`BookingProposal::Reconcile` is **removed** in M4. Reconciliation is runtime recovery, not
-a user intention — it must run when the model is offline, hostile or absent. Removing it
-takes the proposal vocabulary from 8 variants to 7 and the topology matrix in
-`townhall-domain` from 80 cells to 70; update `LOCKED` in the same commit.
+The verifier must **not** emit state-specific variants — it would have to know the state,
+which is the wrong coupling. It emits what is externally true:
 
-`BookingInProgress + Cancel` is the one intent edge that lands here too — it is currently
-in the matrix's `PENDING` table, deferred because `CancellationRequested` had no exit.
-The observation door gives it one.
+```rust
+enum VerifiedProviderFact {
+    BookingExists { effect_intent_id, booking_ref, venue_id, slot_id, principal },
+    BookingAbsent { effect_intent_id, /* see the temporal caveat below */ },
+    CancellationExists { effect_intent_id, booking_ref },
+    ProviderRejected { effect_intent_id, reason },
+}
+```
+
+The same fact means different things depending on where the resource is:
+
+```text
+BookingExists + BookingInProgress      -> booking_confirmed -> Booked
+BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
+```
+
+### ⚠ Unresolved: negative facts are not stable across races
+
+The re-evaluate-after-a-lost-CAS rule is safe for **monotonic** facts. `BookingExists` stays
+true once true. It is **not** safe for absence:
+
+```text
+1. reconciler queries while the original booking call is still completing
+   -> verifies BookingAbsent
+2. Lucy's Cancel wins the CAS   -> CancellationRequested
+3. the council finishes creating the booking
+4. the stale BookingAbsent is re-applied -> commits Cancelled
+   -> local state is terminal while an external booking exists, and
+      Cancelled is terminal so nothing will ever reconcile it
+```
+
+**Do not implement `BookingAbsent -> Cancelled` until this is decided.** The options are a
+provider watermark or revision that lets a stale absence be recognised and refused, or
+requiring the council to distinguish "definitively no booking for this effect id" from "I
+do not currently see one" and treating the latter as `Unknown`. This is an open
+architectural decision, not an implementation detail.
+
+### `Verified<T>` is provenance, not blanket trust, and not unforgeable
+
+It means the claim passed its verifier. The domain still binds it: effect identity matches
+the active effect, resource and parameters match the **persisted canonical plan**, current
+state is one where the fact applies.
+
+What the type system actually gives:
+
+- `Verified<T>` and `VerifiedProviderFact` live in `bld-kernel`, with private fields and
+  **no `Deserialize`** — deserialising verified evidence from JSON is precisely the forgery
+  it is meant to prevent.
+- `agent-runtime` and `bld-client` may not depend on `bld-kernel` (see
+  `docs/architecture.md`), so the untrusted half cannot *name* these types at all.
+- The fact and system-event entry points must not be reachable from proposer-facing
+  transport.
+
+What it does **not** give: construction is still possible anywhere inside the trusted half.
+The constructor is named `assert_verified` so it is greppable and every call site is an
+audit point. Do not claim the type is unforgeable in general — claim what is true, that the
+untrusted half cannot name it.
+
+### `Converged`, and when a repeat is a conflict
+
+A reconciler re-applies the same fact by design:
+
+```text
+BookingExists + BookingInProgress                 -> Ready(Booked)
+BookingExists + Booked, same booking_ref          -> Converged
+BookingExists + Booked, DIFFERENT booking_ref     -> Denied(DuplicateProviderEffect)
+BookingExists + Draft                             -> Undefined
+BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
+```
+
+The third line matters: one effect identity resolving to two different provider bookings
+means duplication, corruption or broken idempotency. It must be an explicit conflict
+requiring investigation, never silent convergence.
+
+### Getting the canonical plan to `resolve_fact`
+
+Binding needs venue, slot, fee and principal, which live in the `effect_intents` row, not in
+`BookingState` — and `active_effect` is normally cleared once an effect finalises. So the
+coordinator loads the effect intent by id and supplies the canonical plan through the
+context passed to `resolve_fact`. The domain must not reconstruct consequential parameters
+from anywhere else, and must refuse rather than guess when the plan is absent.
+
+### `SystemEvent` is in M4 scope, minimally
+
+`reconciliation_failed` is not something the council can tell us — it is our own retry
+budget. It becomes:
+
+```rust
+enum SystemEvent { ReconciliationExhausted { effect_intent_id: EffectIntentId } }
+```
+
+M4 builds this door with exactly that one variant. Without it `NeedsHuman` is unreachable
+and an exhausted reconciliation would sit in-progress forever. Deriving the event from
+durable retry/deadline accounting — not from an in-memory counter — is part of the work.
+
+### `Reconcile` leaves the proposal vocabulary
+
+Recovery must run with a helpful model, a hostile model, a broken model, or no model.
+Removing the variant takes proposals from 8 to 7 and the topology matrix from 80 cells to
+70; update `LOCKED` in the same commit.
+
+### What `TransitionPlan` covers, and what it does not
+
+```rust
+enum TransitionPlan<S, E> { Local { next_state: S }, ExternalEffect { next_state: S, effect: E } }
+```
+
+`S` is the next `BookingState` only. The aggregate's other fields — `booking_ref`,
+`active_effect`, `availability` — are derived from the transition by the repository and
+written **atomically with** the state, the audit row, the effect-intent row and any
+reconciliation job. One transaction, or the guarantees are worthless.
+
+Querying the provider is deliberately **not** a plan variant. "Ask the council what
+happened" is a coordinator/reconciler operation that produces a `VerifiedProviderFact`,
+which then enters through `resolve_fact`. Modelling it as a transition would invite minting
+a second effect intent during recovery, which is the failure M4 exists to prevent.
+Similarly, loading authoritative availability before `VerifySlot` is a coordinator
+responsibility that populates context; it is not a transition.
+
 
 ## Commit before calling (ADR-013)
 

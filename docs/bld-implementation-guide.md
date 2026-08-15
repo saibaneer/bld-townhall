@@ -320,8 +320,16 @@ kernel.resolve_system_event(...)  // runtime fact
 
 > **Consequential success states must not be reachable from proposer vocabulary.**
 
-Stronger than validating a proposal's contents: a guard can be forgotten at one call site;
-a type that does not exist cannot be constructed anywhere.
+Stronger than validating a proposal's contents: a guard can be forgotten at one call site,
+whereas a proposer that cannot *name* the type has nothing to submit.
+
+Be precise about what that buys, though. Separate enums give **vocabulary separation**.
+Provenance comes from three things together: the crate graph (the untrusted half cannot
+depend on the crate where verified types live, so cannot name them), the types carrying
+private fields and **no `Deserialize`**, and the fact/system-event entry points not being
+reachable from proposer-facing transport. Inside the trusted half, construction is still
+possible — name the constructor so every call site is greppable and treat it as an audit
+point. Do not claim the type is unforgeable in general.
 
 ### Evidence says what is true. State determines what that truth means.
 
@@ -345,6 +353,16 @@ never discarded — the provider really did act, and losing a CAS does not make 
 > **A verified fact that loses a concurrency race must be re-evaluated against the new
 > authoritative state, never discarded.**
 
+This holds for **monotonic** facts — ones that stay true once true, like "a booking
+exists". It does **not** hold for absence. "No booking exists" can stop being true a
+moment later, so a stale negative re-applied after a lost race can commit a terminal state
+while the effect actually happened. Negative evidence needs a provider watermark, or must
+distinguish *definitively absent* from *not currently visible* and treat the latter as
+unknown.
+
+> **Monotonic facts may be re-evaluated after a lost race. Negative facts need temporal
+> ordering before they may drive a terminal transition.**
+
 ### `Verified<T>` is provenance, not blanket trust
 
 It means the external claim passed its verifier. It does *not* mean the claim applies here.
@@ -363,11 +381,16 @@ Verified<T>     == admissible evidence, still to be bound
 A reconciler re-applies the same fact by design, so a repeat is normal:
 
 ```text
-BookingExists + BookingInProgress  -> Ready(Booked)
-BookingExists + Booked             -> Converged
-BookingExists + Draft              -> Undefined
+BookingExists + BookingInProgress                  -> Ready(Booked)
+BookingExists + Booked, same reference             -> Converged
+BookingExists + Booked, DIFFERENT reference        -> Denied(DuplicateProviderEffect)
+BookingExists + Draft                              -> Undefined
 BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
 ```
+
+The third line matters. One effect identity resolving to two different provider records
+means duplication, corruption or broken idempotency — an explicit conflict requiring
+investigation, never silent convergence.
 
 > **Repeated verified facts may converge to an already-satisfied state and must not be
 > treated as failure solely because the transition already occurred.**
@@ -811,6 +834,13 @@ proposal
 → audit
 → commit
 ```
+
+> **Amended.** That sequence is right, but the town-hall reference implementation moved
+> ownership of the steps once real external effects arrived. The kernel classifies
+> transitions and no longer mutates state; the repository commits; a coordinator sequences
+> the two commits around the network call; `execute` and `validate` became `Capability` and
+> `Verifier`. See ADR-012 and ADR-013 in `docs/decisions.md`. The ordering guarantee is
+> unchanged — what changed is which component owns each step.
 
 Town-hall rules belong in `TownHallDomain`.
 

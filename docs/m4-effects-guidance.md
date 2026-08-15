@@ -420,6 +420,15 @@ DefinitivelyAbsent                        -> EffectAbsent    (tombstone written 
      at BookingInProgress (booking intent)          -> AwaitingBooking
      at CancellationRequested (booking intent)      -> Cancelled
      at CancellingBooking (cancellation intent)     -> Booked
+
+ProviderRejected                          -> the effect was refused outright
+     at BookingInProgress                           -> AwaitingBooking
+     at CancellationRequested                       -> Cancelled
+     at CancellingBooking                           -> Booked
+
+See `docs/state-machine.md` for the completeness matrix: every in-flight state has an edge
+for every outcome its active intent can produce. A fact whose effect id does not match
+`active_effect` is `Denied(EffectMismatch)` rather than an unhandled gap.
 NotYetVisible                             -> Unknown         (may still be created)
 Unavailable                               -> Unknown
 ```

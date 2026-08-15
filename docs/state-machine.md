@@ -52,6 +52,7 @@ stateDiagram-v2
 
     CancellationRequested --> CancellingBooking: BookingExists
     CancellationRequested --> Cancelled: EffectAbsent
+    CancellationRequested --> Cancelled: ProviderRejected
 
     CancellingBooking --> Cancelled: CancellationExists
     CancellingBooking --> Booked: EffectAbsent
@@ -60,6 +61,23 @@ stateDiagram-v2
 
 One `EffectAbsent` fact, three meanings — derived from the persisted intent and the current
 state, never from the fact itself:
+
+### Completeness
+
+Every in-flight state must have an edge for every authoritative outcome its active intent
+can produce, or recovery can stick. Checked exhaustively rather than case by case:
+
+| In-flight state | active intent | `BookingExists` | `CancellationExists` | `EffectAbsent` | `ProviderRejected` |
+|---|---|---|---|---|---|
+| `BookingInProgress` | booking | `Booked` | n/a¹ | `AwaitingBooking` | `AwaitingBooking` |
+| `CancellationRequested` | booking | `CancellingBooking` | n/a¹ | `Cancelled` | `Cancelled` |
+| `CancellingBooking` | cancellation | n/a¹ | `Cancelled` | `Booked` | `Booked` |
+
+¹ Not applicable, and not merely unhandled: the fact's `effect_intent_id` would not match
+`active_effect`, so the binding fails and the outcome is `Denied(EffectMismatch)` — a refusal
+with a reason, not a silent gap.
+
+### The three meanings of absence
 
 | At | The absent intent was | Means | Goes to |
 |---|---|---|---|

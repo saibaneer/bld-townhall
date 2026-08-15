@@ -507,9 +507,14 @@ The three rules above still leave absence resting on time, and time can move bac
 So the answer must not be *"the deadline has passed"*. It must be **"this effect intent is
 permanently closed and nothing was created for it"**, written down:
 
-> Answering definitive absence **atomically persists a tombstone** for that effect intent.
-> Every later create attempt for that identity is rejected by the presence of the tombstone,
-> regardless of any subsequent clock reading.
+> Answering definitive absence **persists a tombstone for that effect intent, durably
+> committed before the response is observable**. Every later create attempt for that identity
+> is rejected by the tombstone's presence, regardless of any subsequent clock reading.
+
+Commit-before-response is not pedantry: no database commit and network response are atomic
+with each other, so a council could otherwise answer "absent", crash before the write lands,
+and then accept a booking for the same identity. It is the same persist-before-effect
+discipline as ADR-014, applied to the council's own answer.
 
 Absence then stops being a temporal claim and becomes a fact about a durable record — which
 is monotonic by construction and needs no assumption about clock behaviour. Expiry is merely

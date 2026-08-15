@@ -88,12 +88,19 @@ Three requirements on the mock council, all load-bearing:
    also keeps the domain clock-free as ADR-013 requires.
 3. **A definitive-absence answer serializes after every possible commit** for that intent, so
    the lookup cannot slip between "accepted" and "written".
-4. **Answering definitive absence atomically writes a tombstone** for that effect intent, and
-   every later create attempt for that identity is rejected by the tombstone's presence —
-   regardless of any subsequent clock reading. Without this, absence still rests on time, and
-   a clock that steps backwards lets a delayed request commit after absence was verified.
+4. **Answering definitive absence writes a tombstone, and that write is durably committed
+   *before* the response is observable.** Every later create attempt for that identity is
+   rejected by the tombstone's presence, regardless of any subsequent clock reading.
+
+   Two failure modes this closes. Without the tombstone, absence rests on time, and a clock
+   that steps backwards lets a delayed request commit after absence was verified. Without
+   commit-before-response, the council can answer "absent", crash before the write lands,
+   and then accept a booking for the same identity — no database commit and network response
+   are atomic with each other, so the ordering has to be stated.
+
    The tombstone is what makes the answer permanent; expiry is only what makes the council
-   willing to write it.
+   willing to write it. This is the same persist-before-effect discipline as ADR-014, applied
+   to the council's own answer.
 
 And one requirement that pulls the other way, easy to miss: **a booking committed just before
 expiry must stay discoverable and idempotently returnable forever after.** Expiry bounds when
@@ -512,7 +519,12 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
     same-identity retry past the deadline returns that original result rather than creating
     a second booking;
 19. **the council's clock steps backwards after a definitive-absence answer** — a delayed
-    request must still be rejected, by the tombstone rather than by a time comparison.
+    request must still be rejected, by the tombstone rather than by a time comparison;
+20. **the council crashes immediately before the tombstone write commits** — no absence
+    answer may have been observed, so a later booking for that identity is still legitimate;
+21. **the council crashes immediately after the tombstone write commits but before
+    responding** — the retried lookup must return the same definitive absence, and a later
+    create attempt must still be rejected.
 
 ## M4 implementation order
 

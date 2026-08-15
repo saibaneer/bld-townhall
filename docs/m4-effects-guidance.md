@@ -94,9 +94,14 @@ state is one where the fact applies.
 
 What the type system actually gives:
 
-- `Verified<T>` and `VerifiedProviderFact` live in `bld-kernel`, with private fields and
-  **no `Deserialize`** — deserialising verified evidence from JSON is precisely the forgery
-  it is meant to prevent.
+- `Verified<T>` is the generic wrapper and lives in `bld-kernel`. `VerifiedProviderFact` is
+  town-hall vocabulary and lives in `townhall-domain`, reaching the kernel as the
+  `BoundaryDomain::ProviderFact` associated type — putting it in the kernel would make the
+  kernel domain-aware.
+- Both have private fields and **no `Deserialize`** — deserialising verified evidence from
+  JSON is precisely the forgery it is meant to prevent.
+- The verifier establishes **provenance**; the domain does the **binding**. A verifier that
+  bound facts to state would need to know the state, which is the coupling we are avoiding.
 - `agent-runtime` and `bld-client` may not depend on `bld-kernel` (see
   `docs/architecture.md`), so the untrusted half cannot *name* these types at all.
 - The fact and system-event entry points must not be reachable from proposer-facing
@@ -184,8 +189,8 @@ AwaitingBooking v3
     -> COMMIT BookingInProgress v4          <-- durable BEFORE any external call
     -> call the council
     -> raw response / timeout / lost response
-    -> adapter verifies and binds -> VerifiedBookingEvidence
-    -> apply_observation -> COMMIT Booked v5
+    -> adapter verifies and binds -> Verified<ProviderFact>
+    -> resolve_fact -> COMMIT Booked v5
 ```
 
 Crash anywhere after the first commit and recovery finds `BookingInProgress` plus its

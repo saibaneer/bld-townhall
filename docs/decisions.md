@@ -144,11 +144,21 @@ The canonical plan lives in the `effect_intents` row rather than in `BookingStat
 effect intent and supplies the plan through `resolve_fact`'s context. The domain refuses
 rather than guesses when it is absent.
 
-**What the type system actually provides, stated precisely.** `Verified<T>` and
-`VerifiedProviderFact` live in `bld-kernel` with private fields and **no `Deserialize`**;
-deserialising verified evidence from JSON is exactly the forgery the type is meant to
-prevent. `agent-runtime` and `bld-client` may not depend on `bld-kernel`, so the untrusted
-half cannot *name* these types. The fact and system-event entry points must not be
+**Where these types live.** `Verified<T>` is the generic provenance wrapper and belongs in
+`bld-kernel`. `VerifiedProviderFact` is town-hall vocabulary — `BookingExists` names a
+venue and a slot — so it belongs in `townhall-domain`, surfaced to the kernel as the
+`BoundaryDomain::ProviderFact` associated type. Putting it in the kernel would make the
+kernel domain-aware, which ADR-001 forbids.
+
+Division of labour: the **verifier establishes provenance** (this response genuinely came
+from the council and is intact); the **domain binds** it (this fact concerns the effect we
+are actually running, and this resource in this state). A verifier that did the binding
+would need to know the state, which is the coupling ADR-012 exists to avoid.
+
+Both carry private fields and **no `Deserialize`** — deserialising verified evidence from
+JSON is exactly the forgery they are meant to prevent. `agent-runtime` and `bld-client` may
+depend on neither `bld-kernel` nor `townhall-domain`, so the untrusted half cannot *name*
+these types. The fact and system-event entry points must not be
 reachable from proposer-facing transport.
 
 What it does **not** provide is unforgeability in general: any code inside the trusted half

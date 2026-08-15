@@ -47,6 +47,7 @@ in that state.
 ```mermaid
 stateDiagram-v2
     BookingInProgress --> Booked: BookingExists
+    BookingInProgress --> AwaitingBooking: BookingAbsent
     BookingInProgress --> AwaitingBooking: ProviderRejected
 
     CancellationRequested --> CancellingBooking: BookingExists
@@ -55,6 +56,12 @@ stateDiagram-v2
     CancellingBooking --> Cancelled: CancellationExists
     CancellingBooking --> Booked: ProviderRejected
 ```
+
+`BookingInProgress + BookingAbsent -> AwaitingBooking` is the commonest recovery path, not a
+corner: the create request never arrived, its deadline passed, and the council has now
+tombstoned the intent. The booking definitively did not happen, so the resource returns to
+`AwaitingBooking` where it can be re-proposed under a *fresh* effect intent — the tombstoned
+one can never succeed. The transition finalises the old intent and clears `active_effect`.
 
 The same `BookingExists` fact means *booking confirmed* at `BookingInProgress` and *booking
 found* at `CancellationRequested`. That is what lets a fact which lost a compare-and-set be

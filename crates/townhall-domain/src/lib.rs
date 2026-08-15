@@ -156,6 +156,14 @@ pub struct BookingAggregate {
 pub struct BookingContext {
     pub booking_id: BookingId,
     pub requirements: BookingRequirements,
+    /// The user's authoritative venue selection, reloaded from the aggregate.
+    ///
+    /// This is what `selected_facts` must be bound *against*. The two are not
+    /// the same thing: this is what the user chose, `selected_facts` is what a
+    /// capability loaded. A behaviour that consumes loaded facts without
+    /// checking them against this is laundering an unverified venue into the
+    /// booking.
+    pub selected_venue: Option<SelectedVenueRef>,
     pub selected_facts: Option<VenueFacts>,
     pub next_effect: u64,
     pub fake_booking_ref: CouncilBookingRef,
@@ -314,6 +322,22 @@ impl BoundaryDomain for TownHallDomain {
                 let Some(facts) = context.selected_facts.clone() else {
                     return Resolution::Denied(BookingError::VenueFactsMissing);
                 };
+                // Bind the loaded facts back to the user's authoritative
+                // selection, exactly as `VerifySlot` does.
+                //
+                // `VerifySlot` can read the selection off `VenueSelected`
+                // itself; `NeedsRevalidation` carries no venue, so the binding
+                // target is the aggregate's `selected_venue`. Without it, an
+                // ordinary `UpdateRequirements` is enough to launder whatever
+                // venue the context happens to hold into the booking - the
+                // per-venue guards in `validate_facts` all pass for a venue the
+                // user never chose.
+                let Some(selected) = context.selected_venue.as_ref() else {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                };
+                if facts.venue_id != selected.venue_id || facts.slot_id != selected.slot_id {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                }
                 match Self::validate_facts(&facts, &context.requirements, authority) {
                     Ok(()) => Resolution::Ready(BookingPlan::RevalidateVenue { facts }),
                     Err(error) => Resolution::Denied(error),
@@ -492,6 +516,10 @@ mod tests {
                 wheelchair_accessible: true,
                 max_fee: Money::from_pence(5_000),
             },
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
             selected_facts: Some(VenueFacts {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
@@ -619,6 +647,120 @@ mod tests {
             out,
             BoundaryOutcome::Committed(BookingState::Cancelled(Cancelled))
         );
+    }
+
+    /// The user's authoritative venue selection must survive a requirements
+    /// update. This is the reachable path, not a synthetic one: `VenueSelected`
+    /// + `UpdateRequirements` produces `NeedsRevalidation` today, and if
+    /// `RevalidateVenue` does not bind the loaded facts back to the selection,
+    /// whatever venue the context happens to carry silently becomes the booking.
+    #[tokio::test]
+    async fn revalidation_cannot_substitute_a_different_venue() {
+        let domain = TownHallDomain;
+        let kernel = Kernel;
+        let auth = authority();
+        let mut ctx = context();
+        let mut state = BookingState::Draft(Draft);
+
+        // Lucy selects TH-A.
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                &auth,
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::VenueSelected(_))
+        ));
+
+        // She changes the attendee count, which invalidates the verification.
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                &auth,
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::NeedsRevalidation(_))
+        ));
+
+        // Now the context carries facts for a DIFFERENT venue. Every guard in
+        // `validate_facts` passes for TH-B in isolation - it is available,
+        // large enough, accessible and within budget. Only the binding back to
+        // the authoritative selection can catch this.
+        ctx.selected_facts = Some(VenueFacts {
+            venue_id: VenueId::new("TH-B"),
+            slot_id: SlotId::new("SLOT-B"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        });
+
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::RevalidateVenue,
+                &auth,
+                &mut ctx,
+            )
+            .await;
+
+        assert_eq!(
+            out,
+            BoundaryOutcome::Denied(BookingError::VenueFactsMissing),
+            "revalidation accepted facts for a venue the user never selected"
+        );
+        assert!(
+            matches!(state, BookingState::NeedsRevalidation(_)),
+            "a denied revalidation must not advance state"
+        );
+    }
+
+    /// The same path with matching facts must still succeed, so the guard above
+    /// is not simply refusing everything.
+    #[tokio::test]
+    async fn revalidation_succeeds_when_facts_match_the_selection() {
+        let domain = TownHallDomain;
+        let kernel = Kernel;
+        let auth = authority();
+        let mut ctx = context();
+        let mut state = BookingState::Draft(Draft);
+
+        for proposal in [
+            BookingProposal::SelectVenue {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            },
+            BookingProposal::UpdateRequirements {
+                attendees: Some(25),
+            },
+            BookingProposal::RevalidateVenue,
+        ] {
+            let out = kernel
+                .apply(&domain, &mut state, proposal, &auth, &mut ctx)
+                .await;
+            assert!(
+                matches!(out, BoundaryOutcome::Committed(_)),
+                "expected a commit, got {out:?}"
+            );
+        }
+
+        assert!(matches!(state, BookingState::VenueSelected(_)));
     }
 
     #[tokio::test]

@@ -434,10 +434,20 @@ before responding**, so no later attempt on that identity can succeed. A refusal
 durable and terminal — a transient 503, a rate limit, a dropped connection — is `Unknown`,
 not `ProviderRejected`.
 
-Two bindings, not one. The fact's `effect_intent_id` must match `active_effect`, **and** its
-kind must match the active intent's kind. An effect id does not encode whether it is a
-booking or a cancellation, so a wrong-kind fact can carry the right id and pass identity
-binding. Kind mismatch is `Denied(EffectKindMismatch)`.
+**Kind binding applies to the kind-specific facts only.** The four facts split in two:
+
+| Fact | Kind-specific? | Binding |
+|---|---|---|
+| `BookingExists` | yes — it *is* a booking outcome | id **and** kind must match the active intent |
+| `CancellationExists` | yes — a cancellation outcome | id **and** kind must match |
+| `EffectAbsent` | no — carries only an identity | id only; the intent's kind supplies the meaning |
+| `ProviderRejected` | no — carries only an identity and a reason | id only; likewise |
+
+So the kind-agnostic pair is *interpreted by* the intent's kind, while the kind-specific pair
+is *checked against* it. `BookingExists` arriving while a cancellation intent is active is
+`Denied(EffectKindMismatch)` — an effect id does not encode its kind, so it can carry the very
+id in `active_effect` and pass identity binding. That is why the kind check is separate and
+cannot be folded into the id check.
 
 See `docs/state-machine.md` for the completeness matrix: every in-flight state has an edge for
 every outcome its active intent can produce.
@@ -592,6 +602,12 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 
 1. crash/failure before provider call — intent exists, provider has nothing;
 2. provider rejects before effect — no booking exists;
+2a. **the rejection is committed before the response is observable** — crash between the two,
+    and the retried lookup must still report rejection;
+2b. **a rejected intent stays rejected across a clock rollback** — a same-id retry must be
+    refused by the tombstone, not by a time comparison;
+2c. **a wrong-kind fact carrying the active effect id** — `BookingExists` while a cancellation
+    intent is active must be `Denied(EffectKindMismatch)`, not accepted because the id matched;
 3. provider commits then response is dropped — reconciliation finds one booking;
 4. retry after dropped response — same effect identity returns original result;
 5. process restart between provider commit and local evidence commit;

@@ -45,6 +45,338 @@ M3 persists an optional active-effect field but does not execute provider calls.
 
 The repository trait isolates persistence. SQLite + SQLx is selected for the POC's single-file durability and real transactions; a later Postgres adapter must preserve the same CAS and atomic-audit semantics.
 
+## ADR-012 — Three provenance classes, three doors
+
+Until now every transition arrived through one type, `BookingProposal`, which is the
+vocabulary the untrusted proposer submits from. But the state machine mixes edges of
+fundamentally different provenance.
+
+```text
+1. Proposal              human or agent intent
+2. VerifiedProviderFact  externally verified reality
+3. SystemEvent           deterministic runtime fact
+```
+
+**Intent** is what someone *requests*: `select_venue`, `verify_slot`, `change_venue`,
+`update_requirements`, `revalidate_venue`, `book`, `cancel`.
+
+**Verified provider facts** are what is *externally true*: a booking exists, a booking does
+not exist, a cancellation exists, the provider rejected the request.
+
+**System events** are what the *runtime knows*: retry budget exhausted, reconciliation
+deadline exceeded, lease expired, approval expired.
+
+Putting these in one proposer-facing type lets a hostile proposer submit
+`BookingConfirmed` and reach `Booked` with no council call — the model announcing its own
+success. Guarding against that is a check someone must remember to write everywhere,
+forever.
+
+**Decision.** Separate types and separate entry points, one per provenance class:
+
+```rust
+kernel.resolve_proposal(...)      // what someone wants
+kernel.resolve_fact(...)          // what reality says
+kernel.resolve_system_event(...)  // what the runtime knows
+```
+
+Not one enum with three groups of variants. The type-level boundary is the point.
+
+The forbidden transition is **absent from the proposer-facing type system** rather than
+rejected by a guard.
+
+### Evidence is a fact; the transition is state-relative
+
+The durable thing is not an observation. It is a fact:
+
+```rust
+// CANONICAL DEFINITIONS. Other documents reference this section rather than
+// restating these shapes - restating them in four places is what caused the
+// drift this ADR had to be revised for.
+
+/// Intent. Reachable by a human or agent through `resolve_proposal`.
+enum BookingProposal {
+    SelectVenue { venue_id: VenueId, slot_id: SlotId },
+    VerifySlot,
+    ChangeVenue,
+    UpdateRequirements(RequirementsPatch),
+    RevalidateVenue,
+    Book,
+    Cancel { reason: CancellationReason },
+    // no Reconcile - recovery is runtime-owned, see below
+}
+
+/// Externally verified reality. State-neutral: the domain interprets these.
+/// Every field is bound against the persisted canonical plan.
+enum VerifiedProviderFact {
+    BookingExists {
+        effect_intent_id: EffectIntentId,
+        booking_ref: CouncilBookingRef,
+        venue_id: VenueId,
+        slot_id: SlotId,
+        attendees: u16,
+        fee: Money,
+        principal: PrincipalId,
+    },
+    /// ⚠ BLOCKED pending the negative-fact decision - see ADR-012 below.
+    BookingAbsent { effect_intent_id: EffectIntentId },
+    CancellationExists { effect_intent_id: EffectIntentId, booking_ref: CouncilBookingRef },
+    ProviderRejected { effect_intent_id: EffectIntentId, reason: BoundedString },
+}
+
+/// Deterministic runtime fact. Neither intent nor external truth.
+enum SystemEvent {
+    ReconciliationExhausted { effect_intent_id: EffectIntentId },
+}
+```
+
+The same fact means different things depending on where the resource currently is:
+
+```text
+BookingExists + BookingInProgress      -> booking_confirmed -> Booked
+BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
+```
+
+This is what makes a lost race safe. If Lucy's `Cancel` wins `v4 -> v5` while a verified
+`BookingExists` was in flight, the fact is **re-evaluated against the new state**, not
+discarded. The council really did book the room; losing a compare-and-set does not make
+that untrue.
+
+> **Evidence identity is stable across races; transition meaning is derived from evidence
+> plus current authoritative state.**
+
+### This holds for monotonic facts only — negative facts are unresolved
+
+`BookingExists` stays true once true, so re-evaluating it after a lost CAS is safe.
+**Absence is not stable**, and the rule above was stated too broadly:
+
+```text
+1. reconciler queries while the booking call is still completing -> verifies BookingAbsent
+2. Cancel wins the CAS -> CancellationRequested
+3. the council finishes creating the booking
+4. the stale BookingAbsent is re-applied -> commits Cancelled
+   -> terminal local state, live external booking, and nothing will reconcile it
+```
+
+`BookingAbsent -> Cancelled` **must not be implemented** until this is decided. Options: a
+provider watermark or revision so a stale absence can be refused, or requiring the council
+to distinguish "definitively no booking for this effect id" from "I do not currently see
+one" and treating the latter as `Unknown`. Open architectural decision.
+
+The verifier establishes *what is true externally*. The domain decides *what that truth
+means here*. A verifier that emitted state-specific observation variants would have to
+know the state, which is the wrong coupling.
+
+### `Verified<T>` is provenance, not blanket trust — and not unforgeable
+
+`Verified<T>` means the external claim passed its provenance verifier. It does **not** mean
+every relationship between that evidence and the current resource is valid. The domain
+still checks the binding: **every consequential field the fact carries** must match the
+persisted canonical plan — effect identity, resource, venue, slot, attendees, fee and
+principal — and the current state must be one where this fact applies at all.
+
+`fee` and `attendees` are not optional in that list. A council booking made for a different
+price or headcount than the plan authorised is exactly what the fee ceiling and capacity
+guards exist to prevent, and the evidence binding is the only place it is detectable.
+
+The canonical plan lives in the `effect_intents` row rather than in `BookingState`, and
+`active_effect` is normally cleared once an effect finalises — so the coordinator loads the
+effect intent and supplies the plan through `resolve_fact`'s context. The domain refuses
+rather than guesses when it is absent.
+
+**Where these types live.** `Verified<T>` is the generic provenance wrapper and belongs in
+`bld-kernel`. `VerifiedProviderFact` is town-hall vocabulary — `BookingExists` names a
+venue and a slot — so it belongs in `townhall-domain`, surfaced to the kernel as the
+`BoundaryDomain::ProviderFact` associated type. Putting it in the kernel would make the
+kernel domain-aware, which ADR-001 forbids.
+
+Division of labour: the **verifier establishes provenance** (this response genuinely came
+from the council and is intact); the **domain binds** it (this fact concerns the effect we
+are actually running, and this resource in this state). A verifier that did the binding
+would need to know the state, which is the coupling ADR-012 exists to avoid.
+
+Both carry private fields and **no `Deserialize`** — deserialising verified evidence from
+JSON is exactly the forgery they are meant to prevent. `agent-runtime` and `bld-client` may
+depend on neither `bld-kernel` nor `townhall-domain`, so the untrusted half cannot *name*
+these types. The fact and system-event entry points must not be
+reachable from proposer-facing transport.
+
+What it does **not** provide is unforgeability in general: any code inside the trusted half
+can still construct one. The constructor is named `assert_verified` so every call site is
+greppable and auditable. Separate enums give vocabulary separation; provenance comes from
+the crate graph plus that audit discipline. Claiming more than that would be the
+overclaiming this project exists to avoid.
+
+### The fact door needs a fourth outcome
+
+Recovery loops re-apply the same fact by design, so a repeat is normal rather than a
+failure:
+
+```rust
+enum FactResolution<P, E> {
+    Undefined,      // BookingExists + Draft - no applicable edge
+    Denied(E),      // BookingExists + BookingInProgress, wrong EffectIntentId
+    Ready(P),       // BookingExists + BookingInProgress -> Booked
+    Converged,      // BookingExists + Booked - already reflects this fact
+}
+```
+
+`Converged` is not success-by-ignoring. It is success because authoritative local state
+already reflects the verified external fact. Without it a reconciler reads healthy
+convergence as breakage.
+
+`Converged` requires the evidence to **match** what is recorded. A `BookingExists` arriving
+at `Booked` with a *different* `booking_ref` is not convergence — one effect identity has
+resolved to two provider bookings, which means duplication, corruption or broken
+idempotency. That is `Denied(DuplicateProviderEffect)` and needs investigation.
+
+`Converged` is deliberately **not** added to the proposal door: for intent, a silent no-op
+hides mistakes, and `Book` when already `Booked` is better as `Undefined` or `Denied`.
+
+### `Reconcile` leaves the proposal vocabulary
+
+Reconciliation is not Lucy's intent and not the model's. It is runtime recovery machinery,
+and it must run with a helpful model, a hostile model, a broken model, or no model at all.
+Removing the variant takes proposals from 8 to 7 and the intent topology from 80 cells to
+70; update `LOCKED` in the same commit.
+
+### `reconciliation_failed` is a system event, not a provider observation
+
+The council can tell us a booking exists or does not. It cannot tell us our retry budget is
+exhausted. `ReconciliationExhausted { effect_intent_id }` belongs to the third class, and
+`NeedsHuman` is reachable only through that door.
+
+**Therefore M4 builds that door**, with exactly that one variant. Deferring it would leave
+`NeedsHuman` unreachable and an exhausted reconciliation sitting in-progress forever. The
+event must be derived from durable retry/deadline accounting, not an in-memory counter, or
+a restart resets the budget.
+
+## ADR-013 — The kernel classifies; the coordinator commits
+
+`Kernel::apply` currently runs `resolve -> execute -> validate` in one call and assigns
+`*state = next` at the end. That worked while the capability was an in-process fake. It
+cannot express what a real external effect requires:
+
+```text
+commit  ->  external call  ->  commit again
+```
+
+**Decision.** The kernel stops mutating state. Its job becomes: *given authoritative
+current state and an input, derive a legal transition decision.* The repository performs
+the compare-and-set; the coordinator sequences the two commits around the network call.
+
+```rust
+kernel.resolve_proposal(domain, &state, proposal, authority, context)
+    -> Resolution<TransitionPlan<S, E>, DomainError>
+
+enum TransitionPlan<S, E> {
+    Local          { next_state: S },
+    ExternalEffect { next_state: S, effect: E },
+}
+```
+
+A local transition (`Draft -> VenueSelected`) completes immediately. An external-effect
+transition (`AwaitingBooking -> BookingInProgress`) yields a durable effect plan that must
+be persisted before execution. This avoids forcing every transition through an effect
+workflow.
+
+`S` is the **complete next aggregate value** the domain has decided on — state plus
+`booking_ref`, `active_effect` and `availability` — not the state discriminator alone.
+
+Having the repository derive those from a state-only plan would put domain mutation
+semantics in the persistence layer, which ADR-001 and the guide's dependency direction both
+forbid: the repository would have to know that confirming a booking sets `booking_ref` and
+clears `active_effect`. It must not know that. The domain decides every business field; the
+repository owns only the version increment, timestamps and atomicity.
+
+The repository then writes that value **atomically with** the audit row, the effect-intent
+row and any reconciliation job. One transaction, or the guarantees are worthless.
+
+Querying the provider is deliberately **not** a third variant. "Ask the council what
+happened" is a coordinator operation producing a `VerifiedProviderFact` that then enters
+through `resolve_fact`; modelling it as a transition would invite minting a second effect
+intent during recovery, which is the failure M4 exists to prevent. Loading authoritative
+availability before `VerifySlot` is likewise a coordinator responsibility that populates
+context, not a transition.
+
+`execute` and `validate` leave `BoundaryDomain`; they were never domain concerns:
+
+```rust
+trait Capability<E> { async fn execute(&self, effect: &E) -> Result<RawProviderResult, CapabilityError>; }
+trait Verifier<R, F> { fn verify(&self, raw: R) -> Result<Verified<F>, VerificationError>; }
+```
+
+Responsibilities settle as:
+
+```text
+Domain       legal meaning
+Kernel       deterministic transition resolution
+Repository   authoritative CAS commit
+Coordinator  external-effect choreography
+Capability   external action
+Verifier     provenance establishment
+Reconciler   recovery loop
+```
+
+The four existing kernel tests migrate from "kernel mutates state" to "kernel
+deterministically classifies and derives legal transitions" — a stronger contract, and
+worth changing the API for rather than preserving a misleading abstraction.
+
+### What this supersedes, stated explicitly
+
+The implementation guide requires an agent to stop and surface contradictions rather than
+silently choose a new architecture, so the conflicts are named here rather than left for a
+reader to trip over:
+
+| Superseded | Where | By |
+|---|---|---|
+| `BoundaryDomain::{resolve, execute, validate}` | spec §5; guide §17 | ADR-013 — `execute` and `validate` move to `Capability` and `Verifier` |
+| Kernel owning `&mut State` and committing | spec §5.1 | ADR-013 — the kernel classifies; the repository commits |
+| `BookingProposal::Reconcile` | spec §7.1 | ADR-012 — reconciliation is runtime-owned |
+| Single proposal vocabulary for all edges | spec §7 | ADR-012 — three provenance classes |
+
+The specification is not edited: it remains the v0.4.2 execution contract of record, and
+these ADRs are the amendment trail against it. Spec §5.1's sequencing *intent* is preserved
+— resolve, then effect, then evidence, then commit — what changes is which component owns
+each step.
+
+## ADR-014 — `BookingInProgress` is committed before the council is called
+
+If we call first and commit afterwards:
+
+```text
+call council -> council books the room -> process crashes -> local state still AwaitingBooking
+```
+
+We have lost the fact that an external consequence may exist, and there is nothing for
+recovery to reconcile against.
+
+**Decision.** The intent is persisted and committed before any external call:
+
+```text
+AwaitingBooking v3
+    -> resolve_proposal(Book) -> Ready(ExternalEffect { BookingInProgress, E-9271 })
+    -> CAS v3 -> v4, persisting BookingInProgress + canonical plan + EffectIntentId
+    -> COMMIT
+    -> capability.execute(E-9271)          <-- only now
+    -> raw result / timeout / lost response
+    -> verifier -> VerifiedProviderFact
+    -> reload authoritative state
+    -> resolve_fact -> Ready | Converged | Undefined | Denied
+    -> CAS if a transition is required
+```
+
+Crash anywhere after the first commit and recovery finds `BookingInProgress` plus its
+`EffectIntentId`. Crash before it and no external call was ever made.
+
+After a lost CAS the coordinator **reloads and re-applies the same
+`VerifiedProviderFact`** — it does not replay a stale state-specific observation.
+
+A network call must never happen inside a database transaction. The protection is
+structural: the repository's prepare and finalize methods return *committed* state, so
+there is no signature through which a capability can be invoked mid-transaction. This
+matters more since `commit` takes its write lock at `BEGIN` (ADR-015): a transaction held
+across a council call would block every unrelated booking for the busy timeout.
+
 ## ADR-015 — `commit` uses `BEGIN IMMEDIATE`
 
 `SqliteBookingRepository::commit` opened a deferred transaction, read the version, then

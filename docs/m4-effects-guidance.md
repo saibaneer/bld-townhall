@@ -23,6 +23,185 @@ M4 is accepted only when this failure is handled correctly:
 
 If that scenario can duplicate a booking, M4 is not complete.
 
+## Three doors (ADR-012) — settle this before writing code
+
+M4 is where the single-vocabulary design breaks. Those three in-flight states —
+`BookingInProgress`, `CancellationRequested`, `CancellingBooking` — are where the two
+non-intent classes appear. Most of their exits are verified provider facts or runtime
+facts.
+
+They are not *exclusively* so: `BookingInProgress + cancel -> CancellationRequested` is a
+genuine intent edge, and mid-flight cancellation depends on it. The point is not that these
+states take no requests; it is that their *outcome* edges are never requests.
+
+```text
+1. Proposal              what a human or agent WANTS
+2. VerifiedProviderFact  what is externally TRUE
+3. SystemEvent           what the runtime KNOWS
+```
+
+Adding the second or third class to `BookingProposal` would let a hostile proposer submit
+`BookingConfirmed` and reach `Booked` with no council call.
+
+```rust
+kernel.resolve_proposal(...)      // intent
+kernel.resolve_fact(...)          // verified reality
+kernel.resolve_system_event(...)  // runtime fact
+```
+
+### Facts are state-neutral; the domain interprets them
+
+The verifier must **not** emit state-specific variants — it would have to know the state,
+which is the wrong coupling. It emits what is externally true:
+
+See **ADR-012 in [`decisions.md`](decisions.md)** for the canonical `BookingProposal`,
+`VerifiedProviderFact` and `SystemEvent` definitions. They are deliberately not restated
+here — duplicating them across documents is what caused this design to drift out of sync
+four separate times during review.
+
+The same fact means different things depending on where the resource is:
+
+```text
+BookingExists + BookingInProgress      -> booking_confirmed -> Booked
+BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
+```
+
+### ⚠ Unresolved: negative facts are not stable across races
+
+The re-evaluate-after-a-lost-CAS rule is safe for **monotonic** facts. `BookingExists` stays
+true once true. It is **not** safe for absence:
+
+```text
+1. reconciler queries while the original booking call is still completing
+   -> verifies BookingAbsent
+2. Lucy's Cancel wins the CAS   -> CancellationRequested
+3. the council finishes creating the booking
+4. the stale BookingAbsent is re-applied -> commits Cancelled
+   -> local state is terminal while an external booking exists, and
+      Cancelled is terminal so nothing will ever reconcile it
+```
+
+**Do not implement `BookingAbsent -> Cancelled` until this is decided.** The options are a
+provider watermark or revision that lets a stale absence be recognised and refused, or
+requiring the council to distinguish "definitively no booking for this effect id" from "I
+do not currently see one" and treating the latter as `Unknown`. This is an open
+architectural decision, not an implementation detail.
+
+### `Verified<T>` is provenance, not blanket trust, and not unforgeable
+
+It means the claim passed its verifier. The domain still binds it: effect identity matches
+the active effect, resource and parameters match the **persisted canonical plan**, current
+state is one where the fact applies.
+
+What the type system actually gives:
+
+- `Verified<T>` is the generic wrapper and lives in `bld-kernel`. `VerifiedProviderFact` is
+  town-hall vocabulary and lives in `townhall-domain`, reaching the kernel as the
+  `BoundaryDomain::ProviderFact` associated type — putting it in the kernel would make the
+  kernel domain-aware.
+- Both have private fields and **no `Deserialize`** — deserialising verified evidence from
+  JSON is precisely the forgery it is meant to prevent.
+- The verifier establishes **provenance**; the domain does the **binding**. A verifier that
+  bound facts to state would need to know the state, which is the coupling we are avoiding.
+- `agent-runtime` and `bld-client` may not depend on `bld-kernel` (see
+  `docs/architecture.md`), so the untrusted half cannot *name* these types at all.
+- The fact and system-event entry points must not be reachable from proposer-facing
+  transport.
+
+What it does **not** give: construction is still possible anywhere inside the trusted half.
+The constructor is named `assert_verified` so it is greppable and every call site is an
+audit point. Do not claim the type is unforgeable in general — claim what is true, that the
+untrusted half cannot name it.
+
+### `Converged`, and when a repeat is a conflict
+
+A reconciler re-applies the same fact by design:
+
+```text
+BookingExists + BookingInProgress                 -> Ready(Booked)
+BookingExists + Booked, same booking_ref          -> Converged
+BookingExists + Booked, DIFFERENT booking_ref     -> Denied(DuplicateProviderEffect)
+BookingExists + Draft                             -> Undefined
+BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
+```
+
+The third line matters: one effect identity resolving to two different provider bookings
+means duplication, corruption or broken idempotency. It must be an explicit conflict
+requiring investigation, never silent convergence.
+
+### Getting the canonical plan to `resolve_fact`
+
+Binding needs venue, slot, fee and principal, which live in the `effect_intents` row, not in
+`BookingState` — and `active_effect` is normally cleared once an effect finalises. So the
+coordinator loads the effect intent by id and supplies the canonical plan through the
+context passed to `resolve_fact`. The domain must not reconstruct consequential parameters
+from anywhere else, and must refuse rather than guess when the plan is absent.
+
+### `SystemEvent` is in M4 scope, minimally
+
+`reconciliation_failed` is not something the council can tell us — it is our own retry
+budget. It becomes:
+
+Canonical definition in ADR-012.
+
+M4 builds this door with exactly that one variant. Without it `NeedsHuman` is unreachable
+and an exhausted reconciliation would sit in-progress forever. Deriving the event from
+durable retry/deadline accounting — not from an in-memory counter — is part of the work.
+
+### `Reconcile` leaves the proposal vocabulary
+
+Recovery must run with a helpful model, a hostile model, a broken model, or no model.
+Removing the variant takes proposals from 8 to 7 and the topology matrix from 80 cells to
+70; update `LOCKED` in the same commit.
+
+### What `TransitionPlan` covers, and what it does not
+
+```rust
+enum TransitionPlan<S, E> { Local { next_state: S }, ExternalEffect { next_state: S, effect: E } }
+```
+
+`S` is the **complete next aggregate value** the domain decided on — state plus
+`booking_ref`, `active_effect` and `availability` — not the state discriminator alone. If
+the repository had to derive those it would need to know that confirming a booking sets
+`booking_ref` and clears `active_effect`, which is domain knowledge in the persistence
+layer. The domain decides every business field; the repository owns the version increment,
+timestamps and atomicity, writing that value together with the audit row, the effect-intent
+row and any reconciliation job in one transaction.
+
+Querying the provider is deliberately **not** a plan variant. "Ask the council what
+happened" is a coordinator/reconciler operation that produces a `VerifiedProviderFact`,
+which then enters through `resolve_fact`. Modelling it as a transition would invite minting
+a second effect intent during recovery, which is the failure M4 exists to prevent.
+Similarly, loading authoritative availability before `VerifySlot` is a coordinator
+responsibility that populates context; it is not a transition.
+
+
+## Commit before calling (ADR-014)
+
+The `resolve -> execute -> validate` pipeline conflates requesting an effect with learning
+its result. Harmless with M2's synchronous fake; not harmless with a real council.
+
+```text
+AwaitingBooking v3
+    -> resolve Book, derive canonical plan
+    -> persist EffectIntentId + canonical plan
+    -> COMMIT BookingInProgress v4          <-- durable BEFORE any external call
+    -> call the council
+    -> raw response / timeout / lost response
+    -> verifier establishes PROVENANCE only -> Verified<ProviderFact>
+    -> load canonical plan from the effect intent
+    -> resolve_fact does the BINDING (effect id, plan, state) -> COMMIT Booked v5
+```
+
+Crash anywhere after the first commit and recovery finds `BookingInProgress` plus its
+`EffectIntentId`, which is exactly what the reconciler needs. Crash before it and no
+external call was ever made.
+
+This is also why the repository's prepare/finalize methods must **return committed
+state**: it leaves no signature through which a capability could be invoked while a
+transaction is open. Since `commit` now uses `BEGIN IMMEDIATE`, a transaction held across
+a council call would block every unrelated booking for the busy timeout.
+
 ## Do not hold a database transaction across a network call
 
 The external provider and SQLite cannot participate in one atomic transaction. Holding the SQLite transaction open while making an HTTP call creates lock contention and still does not make the provider call atomic with the database.
@@ -176,6 +355,60 @@ booking exists
 
 This is a compensation protocol, not history rewriting.
 
+### The general rule: entering an in-flight state is always an `ExternalEffect`
+
+Stated once so it does not have to be restated per path:
+
+> **Every transition whose target is `BookingInProgress` or `CancellingBooking` is an
+> `ExternalEffect` plan, never `Local`. Those states mean "an external call is about to
+> happen or may already have happened", so entering one without a committed durable intent
+> is a contradiction.**
+
+That covers all three routes into an in-flight state:
+
+| Transition | Door | Effect intent created |
+|---|---|---|
+| `AwaitingBooking + book -> BookingInProgress` | intent | booking |
+| `Booked + cancel -> CancellingBooking` | intent | cancellation |
+| `BookingExists + CancellationRequested -> CancellingBooking` | fact | cancellation |
+
+The middle row is the ordinary case — Lucy cancelling a confirmed booking — and it needs
+the identical contract. ADR-014 applies unchanged to all three: nothing external happens
+until a durable intent for *that* effect is committed.
+
+For the fact-driven route, in one transaction before the cancellation capability is called:
+
+```text
+CancellationRequested v5
+    -> mark the BOOKING intent (E-9271) complete - its outcome is now known
+    -> create the CANCELLATION intent (E-9272) with its own canonical plan
+    -> set active_effect = E-9272
+    -> commit CancellingBooking v6
+    -> COMMIT
+    -> only now cancellation_capability.execute(E-9272)
+```
+
+The handoff must be atomic. Committing `CancellingBooking` and *then* persisting the
+cancellation intent leaves a window where a crash gives recovery a state that implies an
+in-flight cancellation with no identity to reconcile against — and a retry would mint a
+second cancellation attempt, which is the duplicate-effect failure in a different costume.
+
+The direct route from `Booked` is simpler — there is no booking intent still open to
+complete — but otherwise identical:
+
+```text
+Booked v5
+    -> create the CANCELLATION intent (E-9272) with its own canonical plan,
+       derived from the booking_ref recorded on the aggregate
+    -> set active_effect = E-9272
+    -> commit CancellingBooking v6
+    -> COMMIT
+    -> only now cancellation_capability.execute(E-9272)
+```
+
+A booking and its cancellation are two effects with two identities. Reusing E-9271 for the
+cancellation would make "has this effect completed?" unanswerable.
+
 ## Effect identity requirements
 
 An `EffectIntentId` must identify the intended consequence, not the attempt.
@@ -243,7 +476,13 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 7. provider lookup unavailable — workflow remains unknown/in-progress;
 8. two workers attempt the same pending effect — provider still creates one booking;
 9. cancellation arrives while booking outcome is ambiguous;
-10. reconciliation discovers a provider effect that local state has not yet adopted.
+10. reconciliation discovers a provider effect that local state has not yet adopted;
+11. **cancellation** commits at the provider then the response is dropped — reconciliation
+    finds exactly one cancellation, not two;
+12. **crash between committing `CancellingBooking` and calling the cancellation capability**
+    — recovery finds the durable cancellation intent and resumes under the same identity;
+13. cancellation retried after a dropped response — same cancellation intent id returns the
+    original provider result rather than cancelling twice.
 
 ## M4 implementation order
 

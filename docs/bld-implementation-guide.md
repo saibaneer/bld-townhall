@@ -283,6 +283,133 @@ No proposal may enlarge its own authority.
 
 ---
 
+## 6a. Intent, Evidence and Runtime Events Are Different Doors
+
+Three different things can move a workflow, and they have different provenance:
+
+```text
+1. Proposal              what a human or agent WANTS
+2. VerifiedProviderFact  what is externally TRUE
+3. SystemEvent           what the runtime KNOWS
+```
+
+They must not share a type, and the proposer must reach only the first.
+
+Wrong:
+
+```rust
+enum Proposal {
+    Book,
+    BookingConfirmed { reference: String },   // the agent can now say this
+}
+```
+
+An agent submits `BookingConfirmed`, the workflow reaches a success state, the provider was
+never called. The model announced its own success.
+
+Right — separate types, separate entry points, one per provenance class:
+
+```rust
+kernel.resolve_proposal(...)      // intent
+kernel.resolve_fact(...)          // verified reality
+kernel.resolve_system_event(...)  // runtime fact
+```
+
+> **A proposer may request that reality change; only verified evidence may report that
+> reality has changed.**
+
+> **Consequential success states must not be reachable from proposer vocabulary.**
+
+Stronger than validating a proposal's contents: a guard can be forgotten at one call site,
+whereas a proposer that cannot *name* the type has nothing to submit.
+
+Be precise about what that buys, though. Separate enums give **vocabulary separation**.
+Provenance comes from three things together: the crate graph (the untrusted half cannot
+depend on the crate where verified types live, so cannot name them), the types carrying
+private fields and **no `Deserialize`**, and the fact/system-event entry points not being
+reachable from proposer-facing transport. Inside the trusted half, construction is still
+possible — name the constructor so every call site is greppable and treat it as an audit
+point. Do not claim the type is unforgeable in general.
+
+### Evidence says what is true. State determines what that truth means.
+
+Do not let the verifier emit state-specific transitions. It would have to know the state,
+which is the wrong coupling. The verifier establishes an external *fact*; the domain
+interprets it against current authoritative state:
+
+```text
+BookingExists + BookingInProgress      -> booking_confirmed -> Booked
+BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
+```
+
+Same fact. Different legal meaning, because the state changed.
+
+This is what makes a lost race safe. If a cancellation wins the compare-and-set while
+verified evidence was in flight, that evidence is **re-evaluated against the new state**,
+never discarded — the provider really did act, and losing a CAS does not make it untrue.
+
+> **External evidence represents facts, not transitions.**
+
+> **A verified fact that loses a concurrency race must be re-evaluated against the new
+> authoritative state, never discarded.**
+
+This holds for **monotonic** facts — ones that stay true once true, like "a booking
+exists". It does **not** hold for absence. "No booking exists" can stop being true a
+moment later, so a stale negative re-applied after a lost race can commit a terminal state
+while the effect actually happened. Negative evidence needs a provider watermark, or must
+distinguish *definitively absent* from *not currently visible* and treat the latter as
+unknown.
+
+> **Monotonic facts may be re-evaluated after a lost race. Negative facts need temporal
+> ordering before they may drive a terminal transition.**
+
+### `Verified<T>` is provenance, not blanket trust
+
+It means the external claim passed its verifier. It does *not* mean the claim applies here.
+The domain still binds it: does the effect identity match the active effect, do the
+resource, parameters and principal match the persisted canonical plan, is the current state
+one where this fact applies at all.
+
+```text
+AgentClaim<T>   != truth
+RawProvider<T>  != truth
+Verified<T>     == admissible evidence, still to be bound
+```
+
+### Recovery loops need a convergence outcome
+
+A reconciler re-applies the same fact by design, so a repeat is normal:
+
+```text
+BookingExists + BookingInProgress                  -> Ready(Booked)
+BookingExists + Booked, same reference             -> Converged
+BookingExists + Booked, DIFFERENT reference        -> Denied(DuplicateProviderEffect)
+BookingExists + Draft                              -> Undefined
+BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
+```
+
+The third line matters. One effect identity resolving to two different provider records
+means duplication, corruption or broken idempotency — an explicit conflict requiring
+investigation, never silent convergence.
+
+> **Repeated verified facts may converge to an already-satisfied state and must not be
+> treated as failure solely because the transition already occurred.**
+
+`Converged` is success because local state already reflects the verified fact — not success
+by ignoring something. Do **not** add it to the proposal door: for intent, a silent no-op
+hides mistakes, and `Book` when already `Booked` should be `Undefined` or `Denied`.
+
+### Recovery is not a proposal
+
+If a user or model has to ask for recovery, recovery does not happen when the model is
+offline, hostile or absent — precisely when it is needed. Uncertain outcomes enqueue a job;
+the reconciler asks the provider; the verified answer enters through the fact door.
+
+> **User intent, verified external facts, and deterministic runtime events are distinct
+> provenance classes and should not share an untyped transition vocabulary.**
+
+---
+
 ## 7. Provenance Matters More Than Shape
 
 A valid-looking object is not necessarily true.
@@ -708,6 +835,13 @@ proposal
 → commit
 ```
 
+> **Amended.** That sequence is right, but the town-hall reference implementation moved
+> ownership of the steps once real external effects arrived. The kernel classifies
+> transitions and no longer mutates state; the repository commits; a coordinator sequences
+> the two commits around the network call; `execute` and `validate` became `Capability` and
+> `Verifier`. See ADR-012 and ADR-013 in `docs/decisions.md`. The ordering guarantee is
+> unchanged — what changed is which component owns each step.
+
 Town-hall rules belong in `TownHallDomain`.
 
 Payment rules belong in the payment domain/service.
@@ -805,12 +939,14 @@ NeedsHuman
 Example:
 
 ```rust
-enum BookingProposal {
+// Illustrative only. The town-hall vocabulary of record is in ADR-012.
+enum ExampleProposal {
     SelectVenue { venue_id: VenueId, slot_id: SlotId },
     VerifySlot,
     Book,
     Cancel,
-    Reconcile,
+    // deliberately no Reconcile - see 6a. Recovery is not a proposal:
+    // it must run when the model is offline, hostile or absent.
 }
 ```
 

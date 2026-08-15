@@ -944,7 +944,8 @@ enum BookingProposal {
     VerifySlot,
     Book,
     Cancel,
-    Reconcile,
+    // deliberately no Reconcile - see 6a. Recovery is not a proposal:
+    // it must run when the model is offline, hostile or absent.
 }
 ```
 

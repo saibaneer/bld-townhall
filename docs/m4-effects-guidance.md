@@ -156,10 +156,13 @@ Removing the variant takes proposals from 8 to 7 and the topology matrix from 80
 enum TransitionPlan<S, E> { Local { next_state: S }, ExternalEffect { next_state: S, effect: E } }
 ```
 
-`S` is the next `BookingState` only. The aggregate's other fields — `booking_ref`,
-`active_effect`, `availability` — are derived from the transition by the repository and
-written **atomically with** the state, the audit row, the effect-intent row and any
-reconciliation job. One transaction, or the guarantees are worthless.
+`S` is the **complete next aggregate value** the domain decided on — state plus
+`booking_ref`, `active_effect` and `availability` — not the state discriminator alone. If
+the repository had to derive those it would need to know that confirming a booking sets
+`booking_ref` and clears `active_effect`, which is domain knowledge in the persistence
+layer. The domain decides every business field; the repository owns the version increment,
+timestamps and atomicity, writing that value together with the audit row, the effect-intent
+row and any reconciliation job in one transaction.
 
 Querying the provider is deliberately **not** a plan variant. "Ask the council what
 happened" is a coordinator/reconciler operation that produces a `VerifiedProviderFact`,
@@ -169,7 +172,7 @@ Similarly, loading authoritative availability before `VerifySlot` is a coordinat
 responsibility that populates context; it is not a transition.
 
 
-## Commit before calling (ADR-013)
+## Commit before calling (ADR-014)
 
 The `resolve -> execute -> validate` pipeline conflates requesting an effect with learning
 its result. Harmless with M2's synchronous fake; not harmless with a real council.

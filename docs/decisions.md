@@ -230,10 +230,17 @@ transition (`AwaitingBooking -> BookingInProgress`) yields a durable effect plan
 be persisted before execution. This avoids forcing every transition through an effect
 workflow.
 
-`S` is the next `BookingState` only. The aggregate's other fields — `booking_ref`,
-`active_effect`, `availability` — are derived from the transition by the repository and
-written **atomically with** the state, the audit row, the effect-intent row and any
-reconciliation job. One transaction, or the guarantees are worthless.
+`S` is the **complete next aggregate value** the domain has decided on — state plus
+`booking_ref`, `active_effect` and `availability` — not the state discriminator alone.
+
+Having the repository derive those from a state-only plan would put domain mutation
+semantics in the persistence layer, which ADR-001 and the guide's dependency direction both
+forbid: the repository would have to know that confirming a booking sets `booking_ref` and
+clears `active_effect`. It must not know that. The domain decides every business field; the
+repository owns only the version increment, timestamps and atomicity.
+
+The repository then writes that value **atomically with** the audit row, the effect-intent
+row and any reconciliation job. One transaction, or the guarantees are worthless.
 
 Querying the provider is deliberately **not** a third variant. "Ask the council what
 happened" is a coordinator operation producing a `VerifiedProviderFact` that then enters

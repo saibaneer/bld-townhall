@@ -355,6 +355,32 @@ booking exists
 
 This is a compensation protocol, not history rewriting.
 
+### Cancellation is an external effect too — same discipline
+
+`BookingExists + CancellationRequested -> CancellingBooking` is an `ExternalEffect` plan,
+not a `Local` one. ADR-014 applies unchanged: nothing external happens until a durable
+intent for *that* effect is committed.
+
+In one transaction, before the cancellation capability is called:
+
+```text
+CancellationRequested v5
+    -> mark the BOOKING intent (E-9271) complete - its outcome is now known
+    -> create the CANCELLATION intent (E-9272) with its own canonical plan
+    -> set active_effect = E-9272
+    -> commit CancellingBooking v6
+    -> COMMIT
+    -> only now cancellation_capability.execute(E-9272)
+```
+
+The handoff must be atomic. Committing `CancellingBooking` and *then* persisting the
+cancellation intent leaves a window where a crash gives recovery a state that implies an
+in-flight cancellation with no identity to reconcile against — and a retry would mint a
+second cancellation attempt, which is the duplicate-effect failure in a different costume.
+
+A booking and its cancellation are two effects with two identities. Reusing E-9271 for the
+cancellation would make "has this effect completed?" unanswerable.
+
 ## Effect identity requirements
 
 An `EffectIntentId` must identify the intended consequence, not the attempt.
@@ -422,7 +448,13 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 7. provider lookup unavailable — workflow remains unknown/in-progress;
 8. two workers attempt the same pending effect — provider still creates one booking;
 9. cancellation arrives while booking outcome is ambiguous;
-10. reconciliation discovers a provider effect that local state has not yet adopted.
+10. reconciliation discovers a provider effect that local state has not yet adopted;
+11. **cancellation** commits at the provider then the response is dropped — reconciliation
+    finds exactly one cancellation, not two;
+12. **crash between committing `CancellingBooking` and calling the cancellation capability**
+    — recovery finds the durable cancellation intent and resumes under the same identity;
+13. cancellation retried after a dropped response — same cancellation intent id returns the
+    original provider result rather than cancelling twice.
 
 ## M4 implementation order
 

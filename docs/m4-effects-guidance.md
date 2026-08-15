@@ -25,9 +25,14 @@ If that scenario can duplicate a booking, M4 is not complete.
 
 ## Three doors (ADR-012) — settle this before writing code
 
-M4 is where the single-vocabulary design breaks. Every exit from `BookingInProgress`,
-`CancellationRequested` and `CancellingBooking` is either an externally verified fact or a
-runtime fact — never a request.
+M4 is where the single-vocabulary design breaks. Those three in-flight states —
+`BookingInProgress`, `CancellationRequested`, `CancellingBooking` — are where the two
+non-intent classes appear. Most of their exits are verified provider facts or runtime
+facts.
+
+They are not *exclusively* so: `BookingInProgress + cancel -> CancellationRequested` is a
+genuine intent edge, and mid-flight cancellation depends on it. The point is not that these
+states take no requests; it is that their *outcome* edges are never requests.
 
 ```text
 1. Proposal              what a human or agent WANTS
@@ -49,19 +54,10 @@ kernel.resolve_system_event(...)  // runtime fact
 The verifier must **not** emit state-specific variants — it would have to know the state,
 which is the wrong coupling. It emits what is externally true:
 
-```rust
-enum VerifiedProviderFact {
-    // Every field the domain must bind against the canonical plan - spec 8.2
-    // requires evidence to be bound to effect intent, venue, slot, fee and
-    // principal. `fee` is not decoration: a council booking made at a price
-    // the plan never authorised is precisely the failure the fee ceiling
-    // exists to prevent, and it is only detectable here.
-    BookingExists { effect_intent_id, booking_ref, venue_id, slot_id, attendees, fee, principal },
-    BookingAbsent { effect_intent_id, /* see the temporal caveat below */ },
-    CancellationExists { effect_intent_id, booking_ref },
-    ProviderRejected { effect_intent_id, reason },
-}
-```
+See **ADR-012 in [`decisions.md`](decisions.md)** for the canonical `BookingProposal`,
+`VerifiedProviderFact` and `SystemEvent` definitions. They are deliberately not restated
+here — duplicating them across documents is what caused this design to drift out of sync
+four separate times during review.
 
 The same fact means different things depending on where the resource is:
 
@@ -146,9 +142,7 @@ from anywhere else, and must refuse rather than guess when the plan is absent.
 `reconciliation_failed` is not something the council can tell us — it is our own retry
 budget. It becomes:
 
-```rust
-enum SystemEvent { ReconciliationExhausted { effect_intent_id: EffectIntentId } }
-```
+Canonical definition in ADR-012.
 
 M4 builds this door with exactly that one variant. Without it `NeedsHuman` is unreachable
 and an exhausted reconciliation would sit in-progress forever. Deriving the event from

@@ -89,8 +89,43 @@ rejected by a guard.
 The durable thing is not an observation. It is a fact:
 
 ```rust
-VerifiedProviderFact::BookingExists {
-    effect_intent_id, booking_ref, venue_id, slot_id, attendees, fee, principal,
+// CANONICAL DEFINITIONS. Other documents reference this section rather than
+// restating these shapes - restating them in four places is what caused the
+// drift this ADR had to be revised for.
+
+/// Intent. Reachable by a human or agent through `resolve_proposal`.
+enum BookingProposal {
+    SelectVenue { venue_id: VenueId, slot_id: SlotId },
+    VerifySlot,
+    ChangeVenue,
+    UpdateRequirements(RequirementsPatch),
+    RevalidateVenue,
+    Book,
+    Cancel { reason: CancellationReason },
+    // no Reconcile - recovery is runtime-owned, see below
+}
+
+/// Externally verified reality. State-neutral: the domain interprets these.
+/// Every field is bound against the persisted canonical plan.
+enum VerifiedProviderFact {
+    BookingExists {
+        effect_intent_id: EffectIntentId,
+        booking_ref: CouncilBookingRef,
+        venue_id: VenueId,
+        slot_id: SlotId,
+        attendees: u16,
+        fee: Money,
+        principal: PrincipalId,
+    },
+    /// ⚠ BLOCKED pending the negative-fact decision - see ADR-012 below.
+    BookingAbsent { effect_intent_id: EffectIntentId },
+    CancellationExists { effect_intent_id: EffectIntentId, booking_ref: CouncilBookingRef },
+    ProviderRejected { effect_intent_id: EffectIntentId, reason: BoundedString },
+}
+
+/// Deterministic runtime fact. Neither intent nor external truth.
+enum SystemEvent {
+    ReconciliationExhausted { effect_intent_id: EffectIntentId },
 }
 ```
 
@@ -201,7 +236,7 @@ hides mistakes, and `Book` when already `Booked` is better as `Undefined` or `De
 
 Reconciliation is not Lucy's intent and not the model's. It is runtime recovery machinery,
 and it must run with a helpful model, a hostile model, a broken model, or no model at all.
-Removing the variant takes proposals from 8 to 7 and the topology matrix from 80 cells to
+Removing the variant takes proposals from 8 to 7 and the intent topology from 80 cells to
 70; update `LOCKED` in the same commit.
 
 ### `reconciliation_failed` is a system event, not a provider observation

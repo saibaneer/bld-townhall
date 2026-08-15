@@ -95,5 +95,5 @@ not exist here at all, the second that it exists but a guard refused it.
 The same trichotomy applies to the fact door, which adds a fourth outcome, `Converged`, for
 a fact that local state already reflects. See ADR-012.
 
-The full 80-cell intent topology is pinned by the `topology` test module in
+The full 70-cell intent topology (10 states x 7 proposals, once `Reconcile` is removed) is pinned by the `topology` test module in
 `crates/townhall-domain`; `LOCKED` there is the executable form of the intent graph above.

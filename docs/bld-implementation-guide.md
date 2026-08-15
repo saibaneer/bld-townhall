@@ -939,7 +939,8 @@ NeedsHuman
 Example:
 
 ```rust
-enum BookingProposal {
+// Illustrative only. The town-hall vocabulary of record is in ADR-012.
+enum ExampleProposal {
     SelectVenue { venue_id: VenueId, slot_id: SlotId },
     VerifySlot,
     Book,

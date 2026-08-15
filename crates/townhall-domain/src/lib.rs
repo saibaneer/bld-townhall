@@ -893,3 +893,332 @@ mod tests {
         );
     }
 }
+
+/// The state × proposal topology, pinned.
+///
+/// Spec §7 draws arrows in two vocabularies, and only one of them is a
+/// `BookingProposal`. These are: `SelectVenue`, `VerifySlot`, `ChangeVenue`,
+/// `UpdateRequirements`, `RevalidateVenue`, `Book`, `Cancel`, `Reconcile`.
+/// These are **not** — they are evidence or read outcomes, and no agent can
+/// submit them: `booking_confirmed`, `booking_failed`, `no_booking_found`,
+/// `booking_found`, `reconciliation_failed`, `cancellation_confirmed`,
+/// `cancellation_failed`, `view_booking`.
+///
+/// Counting proposal arrows only, the spec defines 15 cells and this code
+/// implements 14. The single difference is recorded in [`PENDING`].
+///
+/// `Reconcile` is listed in §7.1 but drawn on **no arrow anywhere**, so
+/// returning `Undefined` for it on every state matches the spec literally.
+#[cfg(test)]
+mod topology {
+    use super::*;
+    use bld_kernel::Resolution;
+    use bld_types::{BookingRequirements, Money, SlotId, TimeWindow, VenueId};
+
+    const STATE_COUNT: usize = 10;
+    const PROPOSAL_COUNT: usize = 8;
+
+    /// Exhaustive by construction: adding a `BookingState` variant stops this
+    /// compiling, and the out-of-range index then trips
+    /// `every_state_variant_has_a_representative`. Together they make it
+    /// impossible to add a state that the sweep silently ignores.
+    fn state_index(state: &BookingState) -> usize {
+        match state {
+            BookingState::Draft(_) => 0,
+            BookingState::VenueSelected(_) => 1,
+            BookingState::NeedsRevalidation(_) => 2,
+            BookingState::AwaitingBooking(_) => 3,
+            BookingState::BookingInProgress(_) => 4,
+            BookingState::CancellationRequested(_) => 5,
+            BookingState::Booked(_) => 6,
+            BookingState::CancellingBooking(_) => 7,
+            BookingState::Cancelled(_) => 8,
+            BookingState::NeedsHuman(_) => 9,
+        }
+    }
+
+    fn proposal_index(proposal: &BookingProposal) -> usize {
+        match proposal {
+            BookingProposal::SelectVenue { .. } => 0,
+            BookingProposal::VerifySlot => 1,
+            BookingProposal::ChangeVenue => 2,
+            BookingProposal::UpdateRequirements { .. } => 3,
+            BookingProposal::RevalidateVenue => 4,
+            BookingProposal::Book => 5,
+            BookingProposal::Cancel { .. } => 6,
+            BookingProposal::Reconcile => 7,
+        }
+    }
+
+    fn selection() -> SelectedVenueRef {
+        SelectedVenueRef {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+        }
+    }
+
+    fn all_states() -> Vec<BookingState> {
+        vec![
+            BookingState::Draft(Draft),
+            BookingState::VenueSelected(VenueSelected {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            BookingState::NeedsRevalidation(NeedsRevalidation {
+                selected: Some(selection()),
+            }),
+            BookingState::AwaitingBooking(AwaitingBooking {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                verified_fee: Money::from_pence(4_500),
+            }),
+            BookingState::BookingInProgress(BookingInProgress {
+                effect_intent_id: EffectIntentId::new("BOOK-BKG-1001-1"),
+            }),
+            BookingState::CancellationRequested(CancellationRequested),
+            BookingState::Booked(Booked {
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+            }),
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+            }),
+            BookingState::Cancelled(Cancelled),
+            BookingState::NeedsHuman(NeedsHuman),
+        ]
+    }
+
+    fn all_proposals() -> Vec<BookingProposal> {
+        vec![
+            BookingProposal::SelectVenue {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            },
+            BookingProposal::VerifySlot,
+            BookingProposal::ChangeVenue,
+            BookingProposal::UpdateRequirements {
+                attendees: Some(25),
+            },
+            BookingProposal::RevalidateVenue,
+            BookingProposal::Book,
+            BookingProposal::Cancel {
+                reason: "user_cancelled".to_owned(),
+            },
+            BookingProposal::Reconcile,
+        ]
+    }
+
+    #[test]
+    fn every_state_variant_has_a_representative() {
+        let mut seen = [false; STATE_COUNT];
+        for state in all_states() {
+            seen[state_index(&state)] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "all_states() is missing a BookingState variant; the topology sweep would silently skip it"
+        );
+    }
+
+    #[test]
+    fn every_proposal_variant_has_a_representative() {
+        let mut seen = [false; PROPOSAL_COUNT];
+        for proposal in all_proposals() {
+            seen[proposal_index(&proposal)] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "all_proposals() is missing a BookingProposal variant"
+        );
+    }
+
+    /// Spec-grounded. **A diff to this table means the legal transition graph
+    /// changed and needs an ADR** — it is a review stop-sign, not routine
+    /// maintenance.
+    const LOCKED: &[(&str, &[&str])] = &[
+        ("Draft", &["SelectVenue", "Cancel"]),
+        (
+            "VenueSelected",
+            &["VerifySlot", "ChangeVenue", "UpdateRequirements", "Cancel"],
+        ),
+        (
+            "NeedsRevalidation",
+            &["RevalidateVenue", "ChangeVenue", "Cancel"],
+        ),
+        (
+            "AwaitingBooking",
+            &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+        ),
+        ("BookingInProgress", &[]),
+        ("CancellationRequested", &[]),
+        ("Booked", &["Cancel"]),
+        ("CancellingBooking", &[]),
+        ("Cancelled", &[]),
+        ("NeedsHuman", &[]),
+    ];
+
+    /// Cells the spec draws that this code deliberately does not implement yet.
+    ///
+    /// Editing this table during M4 is *expected*; editing [`LOCKED`] is not.
+    const PENDING: &[(&str, &str, &str)] = &[(
+        "BookingInProgress",
+        "Cancel",
+        "Spec §7 L364 draws this and `Cancel` is a real proposal, so it is a genuine gap. \
+         Deferred because `CancellationRequested` has zero outbound behaviours and no \
+         reconciliation ingress: committing an accepted cancellation the system cannot \
+         fulfil is worse than refusing honestly. Lands with the M4 slice that can consume it.",
+    )];
+
+    fn permissive_authority() -> VerifiedAuthority {
+        VerifiedAuthority {
+            principal: PrincipalId::new("lucy"),
+            actor: ActorId::new("townhall-agent"),
+            max_fee: Money::from_pence(5_000),
+            may_book: true,
+            may_cancel: true,
+        }
+    }
+
+    fn permissive_context() -> BookingContext {
+        BookingContext {
+            booking_id: BookingId::new("BKG-1001"),
+            requirements: BookingRequirements {
+                purpose: "meeting".to_owned(),
+                requested_date: "2026-08-20".to_owned(),
+                time_window: TimeWindow {
+                    from: "13:00".to_owned(),
+                    to: "17:00".to_owned(),
+                },
+                attendees: 20,
+                wheelchair_accessible: true,
+                max_fee: Money::from_pence(5_000),
+            },
+            selected_facts: Some(VenueFacts {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                capacity: 30,
+                wheelchair_accessible: true,
+                fee: Money::from_pence(4_500),
+                available: true,
+            }),
+            next_effect: 1,
+            fake_booking_ref: CouncilBookingRef::new("TH-92718"),
+        }
+    }
+
+    /// Every guard fails. Used to prove that whether a behaviour *exists* does
+    /// not depend on authority or context — only on `(state, proposal)`.
+    fn hostile_authority() -> VerifiedAuthority {
+        VerifiedAuthority {
+            may_book: false,
+            may_cancel: false,
+            max_fee: Money::from_pence(0),
+            ..permissive_authority()
+        }
+    }
+
+    fn hostile_context() -> BookingContext {
+        BookingContext {
+            selected_facts: None,
+            ..permissive_context()
+        }
+    }
+
+    fn expected_defined(state: &str, proposal: &str) -> bool {
+        LOCKED.iter().find(|(name, _)| *name == state).map_or_else(
+            || panic!("state {state} missing from LOCKED"),
+            |(_, allowed)| allowed.contains(&proposal),
+        )
+    }
+
+    async fn sweep(label: &str, authority: &VerifiedAuthority, context: &BookingContext) {
+        let domain = TownHallDomain;
+        let mut checked = 0_usize;
+
+        for state in all_states() {
+            for proposal in all_proposals() {
+                let state_name = state.name();
+                let proposal_name = proposal.name();
+                let want_defined = expected_defined(state_name, proposal_name);
+
+                let got = domain
+                    .resolve(&state, proposal.clone(), authority, context)
+                    .await;
+                let is_undefined = matches!(got, Resolution::Undefined);
+
+                assert_eq!(
+                    !is_undefined,
+                    want_defined,
+                    "[{label}] {state_name} + {proposal_name}: expected {}, resolve returned {}",
+                    if want_defined {
+                        "a behaviour"
+                    } else {
+                        "Undefined"
+                    },
+                    if is_undefined {
+                        "Undefined"
+                    } else {
+                        "a behaviour"
+                    }
+                );
+                checked += 1;
+            }
+        }
+
+        assert_eq!(checked, all_states().len() * all_proposals().len());
+    }
+
+    /// The whole matrix, under a fixture where every guard passes.
+    #[tokio::test]
+    async fn topology_matches_the_pinned_matrix() {
+        sweep("permissive", &permissive_authority(), &permissive_context()).await;
+    }
+
+    /// The same matrix under a fixture where every guard fails. A behaviour
+    /// that exists must still exist — it just gets `Denied` instead of `Ready`.
+    ///
+    /// This is what catches the guide's Mistake 13: collapsing `Undefined` into
+    /// `Denied` would light up all 66 impossible cells at once.
+    #[tokio::test]
+    async fn topology_does_not_depend_on_authority_or_context() {
+        sweep("hostile", &hostile_authority(), &hostile_context()).await;
+    }
+
+    /// Under the permissive fixture a legal cell must actually reach `Ready`.
+    ///
+    /// Without this, a future guard change could make every cell `Denied` and
+    /// both sweeps above would still pass while proving nothing.
+    #[tokio::test]
+    async fn permissive_fixture_reaches_ready_on_legal_cells() {
+        let domain = TownHallDomain;
+        let authority = permissive_authority();
+        let context = permissive_context();
+
+        for state in all_states() {
+            for proposal in all_proposals() {
+                if !expected_defined(state.name(), proposal.name()) {
+                    continue;
+                }
+                let got = domain
+                    .resolve(&state, proposal.clone(), &authority, &context)
+                    .await;
+                assert!(
+                    matches!(got, Resolution::Ready(_)),
+                    "permissive fixture no longer reaches Ready on {} + {}; the opposed-fixture \
+                     sweep would degrade to comparing two Denied results",
+                    state.name(),
+                    proposal.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cells_are_absent_from_locked() {
+        for (state, proposal, why) in PENDING {
+            assert!(
+                !expected_defined(state, proposal),
+                "{state} + {proposal} is in both LOCKED and PENDING ({why})"
+            );
+        }
+    }
+}

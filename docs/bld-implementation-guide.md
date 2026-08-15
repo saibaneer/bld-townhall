@@ -283,24 +283,17 @@ No proposal may enlarge its own authority.
 
 ---
 
-## 6a. Intent and Evidence Are Different Doors
+## 6a. Intent, Evidence and Runtime Events Are Different Doors
 
-A proposal says what someone *wants*. An observation says what *happened*.
-
-These must not share a type, and the proposer must be able to reach only the first.
+Three different things can move a workflow, and they have different provenance:
 
 ```text
-INTENT EDGES                      OBSERVATION EDGES
-a human or agent may request      only verified evidence may drive
-
-select_venue                      booking_confirmed
-verify_slot                       booking_failed
-change_venue                      booking_found
-update_requirements               no_booking_found
-revalidate_venue                  cancellation_confirmed
-book                              cancellation_failed
-cancel                            reconciliation_failed
+1. Proposal              what a human or agent WANTS
+2. VerifiedProviderFact  what is externally TRUE
+3. SystemEvent           what the runtime KNOWS
 ```
+
+They must not share a type, and the proposer must reach only the first.
 
 Wrong:
 
@@ -311,53 +304,86 @@ enum Proposal {
 }
 ```
 
-An agent submits `BookingConfirmed`, the workflow reaches a success state, and the
-provider was never called. The model announced its own success.
+An agent submits `BookingConfirmed`, the workflow reaches a success state, the provider was
+never called. The model announced its own success.
 
-Right:
+Right — separate types, separate entry points, one per provenance class:
 
 ```rust
-enum Proposal    { Book, Cancel { .. }, /* ... */ }
-enum Observation { BookingConfirmed(Verified<BookingEvidence>), /* ... */ }
-
-resolve_proposal(state, proposal, authority, context) -> Resolution<Plan, Error>
-apply_observation(state, verified_observation)        -> Result<NextState, Error>
+kernel.resolve_proposal(...)      // intent
+kernel.resolve_fact(...)          // verified reality
+kernel.resolve_system_event(...)  // runtime fact
 ```
 
-> **A proposer may request that something happen. It may not announce that something
-> happened.**
+> **A proposer may request that reality change; only verified evidence may report that
+> reality has changed.**
 
-> **Consequential success states must never be reachable from proposer vocabulary.**
+> **Consequential success states must not be reachable from proposer vocabulary.**
 
-This is stronger than validating a proposal's contents. A guard can be forgotten at one
-call site; a type that does not exist cannot be constructed anywhere.
+Stronger than validating a proposal's contents: a guard can be forgotten at one call site;
+a type that does not exist cannot be constructed anywhere.
 
-### The second door is verified evidence, not "the provider"
+### Evidence says what is true. State determines what that truth means.
 
-Do not let a raw provider response mutate state either. An attacker who can shape a
-response would otherwise drive the workflow. Only evidence an adapter has verified and
-bound to the expected effect identity, resource and principal may construct an
-observation.
+Do not let the verifier emit state-specific transitions. It would have to know the state,
+which is the wrong coupling. The verifier establishes an external *fact*; the domain
+interprets it against current authoritative state:
+
+```text
+BookingExists + BookingInProgress      -> booking_confirmed -> Booked
+BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
+```
+
+Same fact. Different legal meaning, because the state changed.
+
+This is what makes a lost race safe. If a cancellation wins the compare-and-set while
+verified evidence was in flight, that evidence is **re-evaluated against the new state**,
+never discarded — the provider really did act, and losing a CAS does not make it untrue.
+
+> **External evidence represents facts, not transitions.**
+
+> **A verified fact that loses a concurrency race must be re-evaluated against the new
+> authoritative state, never discarded.**
+
+### `Verified<T>` is provenance, not blanket trust
+
+It means the external claim passed its verifier. It does *not* mean the claim applies here.
+The domain still binds it: does the effect identity match the active effect, do the
+resource, parameters and principal match the persisted canonical plan, is the current state
+one where this fact applies at all.
 
 ```text
 AgentClaim<T>   != truth
 RawProvider<T>  != truth
-Verified<T>     == admissible evidence
+Verified<T>     == admissible evidence, still to be bound
 ```
+
+### Recovery loops need a convergence outcome
+
+A reconciler re-applies the same fact by design, so a repeat is normal:
+
+```text
+BookingExists + BookingInProgress  -> Ready(Booked)
+BookingExists + Booked             -> Converged
+BookingExists + Draft              -> Undefined
+BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
+```
+
+> **Repeated verified facts may converge to an already-satisfied state and must not be
+> treated as failure solely because the transition already occurred.**
+
+`Converged` is success because local state already reflects the verified fact — not success
+by ignoring something. Do **not** add it to the proposal door: for intent, a silent no-op
+hides mistakes, and `Book` when already `Booked` should be `Undefined` or `Denied`.
 
 ### Recovery is not a proposal
 
-Reconciliation is runtime machinery, not a business intention. If a user or model has to
-ask for recovery, then recovery does not happen when the model is offline, hostile or
-absent — which is precisely when it is needed. Uncertain outcomes enqueue a job; the
-reconciler asks the provider what happened; the verified answer enters through the
-observation door.
+If a user or model has to ask for recovery, recovery does not happen when the model is
+offline, hostile or absent — precisely when it is needed. Uncertain outcomes enqueue a job;
+the reconciler asks the provider; the verified answer enters through the fact door.
 
-### A third category, without a third door
-
-Timer expiry, retry-budget exhaustion, lease expiry and provider timeout are neither
-intent nor external fact. They are deterministic runtime events. Model them separately if
-they begin changing domain state; do not smuggle them into either existing door.
+> **User intent, verified external facts, and deterministic runtime events are distinct
+> provenance classes and should not share an untyped transition vocabulary.**
 
 ---
 

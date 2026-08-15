@@ -166,6 +166,21 @@ The third line matters: one effect identity resolving to two different provider 
 means duplication, corruption or broken idempotency. It must be an explicit conflict
 requiring investigation, never silent convergence.
 
+### Where `expires_at_ms` comes from
+
+Safety-critical, so it is not left to the implementer:
+
+- **Derived, not chosen.** `expires_at_ms = <Phase A commit instant> + EFFECT_TTL`, where
+  `EFFECT_TTL` is a single configured constant for the service. Neither the agent nor the
+  caller supplies or influences it — a proposer that could choose a deadline could set it in
+  the past and force premature absence, cancelling a booking that was about to succeed.
+- **Persisted before use.** It is written into the `effect_intents` row in the same Phase A
+  transaction that commits `BookingInProgress`, before any create or lookup happens.
+- **Read back, never recomputed.** Both the create request and the reconciliation lookup send
+  the exact stored value. Recomputing it anywhere would let a restart or clock change produce
+  a different deadline for the same identity, which the council would then reject.
+- The clock used for that one derivation is the injected `Clock`, so tests can pin it.
+
 ### Getting the canonical plan to `resolve_fact`
 
 Binding needs venue, slot, fee and principal, which live in the `effect_intents` row, not in
@@ -298,15 +313,35 @@ The capability adapter receives the canonical plan, not model instructions:
 BookingCapability.execute(canonical_plan, effect_intent_id)
 ```
 
-The mock council must implement provider-side idempotency:
+The create request carries the expiry — it is not optional, and ADR-016's guarantees rest
+on the council seeing it:
 
 ```text
-first request with BOOK-BKG-1001-1
+POST /bookings
+  effect_intent_id : E-9271
+  expires_at_ms    : 1787230830000     <- mandatory
+  ...canonical plan...
+```
+
+The mock council must implement provider-side idempotency, and enforce expiry atomically at
+the commit point:
+
+```text
+first request with E-9271, before expiry
     -> create TH-92718
 
-retry with BOOK-BKG-1001-1
+retry with E-9271
     -> return TH-92718
     -> DO NOT create another booking
+
+request with E-9271 whose commit would land after expires_at_ms
+    -> refuse, create nothing
+
+request with E-9271 for which a tombstone exists
+    -> refuse, create nothing, regardless of the clock
+
+request with E-9271 presenting a DIFFERENT expires_at_ms than first recorded
+    -> refuse: the deadline is immutable once seen
 ```
 
 `RequestId` must never be used as this identity because a transport retry receives a new request ID.
@@ -353,17 +388,28 @@ Never create a second effect identity merely because the first response was lost
 The mock council needs a lookup surface keyed by effect identity, not only by a provider-generated booking reference:
 
 ```text
-GET /effects/{effect_intent_id}
+GET /effects/{effect_intent_id}?expires_at_ms={expires_at_ms}
+
+The expiry is **mandatory** on the lookup too. If the create request never arrived, this is
+the only way the council learns the deadline — and without it, it cannot distinguish "not yet"
+from "never". It records the value on first sight of that identity and treats it as immutable
+thereafter.
 ```
 
 Possible authoritative results:
 
 ```text
-NotFound
-Booked(reference, canonical facts)
-Cancelled(reference)
-Unavailable / Unknown
+Booked(reference, canonical facts)        -> BookingExists
+Cancelled(reference)                      -> CancellationExists
+DefinitivelyAbsent                        -> BookingAbsent   (tombstone written & committed)
+NotYetVisible                             -> Unknown         (may still be created)
+Unavailable                               -> Unknown
 ```
+
+The distinction between the middle two is the whole of ADR-016. A generic `NotFound` is
+**not** acceptable: it collapses "nothing has arrived yet" with "nothing can ever arrive",
+and the first must never advance the workflow. `DefinitivelyAbsent` may be returned only
+once the council has durably committed the tombstone.
 
 Only externally grounded results may advance the workflow.
 

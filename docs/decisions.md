@@ -333,6 +333,9 @@ reader to trip over:
 | Kernel owning `&mut State` and committing | spec §5.1 | ADR-013 — the kernel classifies; the repository commits |
 | `BookingProposal::Reconcile` | spec §7.1 | ADR-012 — reconciliation is runtime-owned |
 | Single proposal vocabulary for all edges | spec §7 | ADR-012 — three provenance classes |
+| `POST /bookings` without an expiry | spec §11 | ADR-016 — `expires_at_ms` is mandatory on create |
+| `GET /effects/{id}` without an expiry | spec §11 | ADR-016 — mandatory on lookup too, or absence is undecidable |
+| A generic `NotFound` reconciliation result | spec §11 | ADR-016 — `DefinitivelyAbsent` and `NotYetVisible` are different answers |
 
 The specification is not edited: it remains the v0.4.2 execution contract of record, and
 these ADRs are the amendment trail against it. Spec §5.1's sequencing *intent* is preserved

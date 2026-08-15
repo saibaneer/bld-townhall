@@ -71,6 +71,21 @@ A transition is valid against a **specific revision** of the booking. This is th
 
 M5 will expose the same concept over HTTP as `ETag` / `If-Match`; the database CAS remains the final authority.
 
+## Why `BEGIN IMMEDIATE`
+
+The CAS is only half the story. `commit` originally opened a *deferred* transaction, which
+under WAL cannot promote its read to a write once anyone has written anywhere in the
+database — and because the version `SELECT` has already opened a read transaction, SQLite
+skips the busy handler entirely, so `busy_timeout` never applies.
+
+Measured: **52 of 60** concurrent commits to *disjoint* bookings failed with "database is
+locked", despite having no version contention at all. A genuine CAS loser received
+`SQLITE_BUSY` rather than `StaleVersion`.
+
+Taking the write lock at `BEGIN` fixes both. SQLite permits one writer regardless, so this
+costs no concurrency; it moves the serialisation point from mid-transaction, where it
+failed, to `BEGIN`, where it waits. See ADR-015 for the tradeoff it carries into M4.
+
 ## Why the repository owns version increments
 
 Callers supply only `expected_version`. They do not submit an authoritative new version number. The repository computes `expected_version + 1` after proving that the expected revision still exists.

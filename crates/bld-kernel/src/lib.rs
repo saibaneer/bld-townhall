@@ -70,10 +70,7 @@ impl Kernel {
         authority: &D::Authority,
         context: &mut D::Context,
     ) -> BoundaryOutcome<D::State, D::Error> {
-        let plan = match domain
-            .resolve(state, proposal, authority, context)
-            .await
-        {
+        let plan = match domain.resolve(state, proposal, authority, context).await {
             Resolution::Undefined => return BoundaryOutcome::Undefined,
             Resolution::Denied(error) => return BoundaryOutcome::Denied(error),
             Resolution::Ready(plan) => plan,
@@ -192,7 +189,10 @@ mod tests {
 
     #[tokio::test]
     async fn undefined_does_not_execute_or_commit() {
-        let domain = Domain { fail_execute: false, fail_validate: false };
+        let domain = Domain {
+            fail_execute: false,
+            fail_validate: false,
+        };
         let mut state = State::Start;
         let mut context = Context::default();
 
@@ -213,7 +213,10 @@ mod tests {
 
     #[tokio::test]
     async fn denied_does_not_execute_or_commit() {
-        let domain = Domain { fail_execute: false, fail_validate: false };
+        let domain = Domain {
+            fail_execute: false,
+            fail_validate: false,
+        };
         let mut state = State::Start;
         let mut context = Context::default();
 
@@ -234,7 +237,10 @@ mod tests {
 
     #[tokio::test]
     async fn validation_failure_does_not_commit() {
-        let domain = Domain { fail_execute: false, fail_validate: true };
+        let domain = Domain {
+            fail_execute: false,
+            fail_validate: true,
+        };
         let mut state = State::Start;
         let mut context = Context::default();
 
@@ -255,7 +261,10 @@ mod tests {
 
     #[tokio::test]
     async fn valid_turn_commits() {
-        let domain = Domain { fail_execute: false, fail_validate: false };
+        let domain = Domain {
+            fail_execute: false,
+            fail_validate: false,
+        };
         let mut state = State::Start;
         let mut context = Context::default();
 

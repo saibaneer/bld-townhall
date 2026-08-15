@@ -189,8 +189,9 @@ AwaitingBooking v3
     -> COMMIT BookingInProgress v4          <-- durable BEFORE any external call
     -> call the council
     -> raw response / timeout / lost response
-    -> adapter verifies and binds -> Verified<ProviderFact>
-    -> resolve_fact -> COMMIT Booked v5
+    -> verifier establishes PROVENANCE only -> Verified<ProviderFact>
+    -> load canonical plan from the effect intent
+    -> resolve_fact does the BINDING (effect id, plan, state) -> COMMIT Booked v5
 ```
 
 Crash anywhere after the first commit and recovery finds `BookingInProgress` plus its

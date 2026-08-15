@@ -102,6 +102,21 @@ Three requirements on the mock council, all load-bearing:
    willing to write it. This is the same persist-before-effect discipline as ADR-014, applied
    to the council's own answer.
 
+5. **The council must actually learn the expiry**, or it cannot tell pre-expiry `Unknown`
+   from post-expiry definitive absence. This matters most in the case the whole design exists
+   for — the create request never arrived, so the council has only an effect id and no record.
+
+   So `expires_at_ms` travels on **both** paths: with the create request, and with the
+   reconciliation lookup (`GET /effects/{id}?expires_at_ms=...`). The council records it the
+   first time it sees that identity, from whichever path arrives first, and **once recorded it
+   is immutable** — a later request presenting a different expiry for the same identity is
+   rejected. Without that binding, a caller could shorten a deadline to force premature
+   absence and cancel a booking that was about to succeed.
+
+   Note this makes the reconciliation lookup a **trusted** surface: it asserts a deadline. It
+   must not be reachable from proposer-facing transport, which the crate graph already
+   enforces.
+
 And one requirement that pulls the other way, easy to miss: **a booking committed just before
 expiry must stay discoverable and idempotently returnable forever after.** Expiry bounds when
 an effect may be *created*, never how long a created effect remains visible — otherwise a
@@ -264,7 +279,7 @@ CREATE TABLE effect_intents (
     canonical_plan_json TEXT NOT NULL,
     plan_hash           TEXT NOT NULL,
     status              TEXT NOT NULL,
-    expires_at_ms       INTEGER NOT NULL,   -- ADR-016: absence is only definitive past this
+    expires_at_ms       INTEGER NOT NULL,   -- ADR-016: sent to the council on create AND on lookup
     provider_reference  TEXT,
     last_error          TEXT,
     created_at_ms       INTEGER NOT NULL,
@@ -520,8 +535,10 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
     a second booking;
 19. **the council's clock steps backwards after a definitive-absence answer** — a delayed
     request must still be rejected, by the tombstone rather than by a time comparison;
-20. **the council crashes immediately before the tombstone write commits** — no absence
-    answer may have been observed, so a later booking for that identity is still legitimate;
+20. **the council crashes immediately before the tombstone write commits** — the reconciler
+    must observe no absence answer, so the workflow stays `Unknown` and retries. (Do not
+    assert that a later booking succeeds: past expiry the council must refuse the commit
+    anyway. What is under test is that unobserved absence never becomes observed absence.)
 21. **the council crashes immediately after the tombstone write commits but before
     responding** — the retried lookup must return the same definitive absence, and a later
     create attempt must still be rejected.

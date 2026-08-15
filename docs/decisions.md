@@ -511,6 +511,15 @@ permanently closed and nothing was created for it"**, written down:
 > committed before the response is observable**. Every later create attempt for that identity
 > is rejected by the tombstone's presence, regardless of any subsequent clock reading.
 
+The council must also *learn* the expiry, or it cannot distinguish pre-expiry `Unknown` from
+post-expiry absence — most importantly in the case this design exists for, where the create
+request never arrived and the council has only an effect id. So `expires_at_ms` travels both
+with the create request and with the reconciliation lookup; the council records it on first
+sight of that identity and treats it as immutable thereafter, rejecting any later request
+presenting a different deadline for the same id. That binding stops a caller shortening a
+deadline to force premature absence, and it makes the lookup a trusted surface that must stay
+unreachable from proposer-facing transport.
+
 Commit-before-response is not pedantry: no database commit and network response are atomic
 with each other, so a council could otherwise answer "absent", crash before the write lands,
 and then accept a booking for the same identity. It is the same persist-before-effect

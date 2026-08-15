@@ -66,26 +66,63 @@ BookingExists + BookingInProgress      -> booking_confirmed -> Booked
 BookingExists + CancellationRequested  -> booking_found     -> CancellingBooking
 ```
 
-### ⚠ Unresolved: negative facts are not stable across races
+### Negative facts: absence is the council's determination (ADR-016)
 
-The re-evaluate-after-a-lost-CAS rule is safe for **monotonic** facts. `BookingExists` stays
-true once true. It is **not** safe for absence:
+`BookingExists` is monotonic — true once true — so re-evaluating it after a lost CAS is
+safe. **Absence is not**, and a stale `EffectAbsent` re-applied after a cancel won the race
+would commit a terminal `Cancelled` while the room is booked.
 
-```text
-1. reconciler queries while the original booking call is still completing
-   -> verifies BookingAbsent
-2. Lucy's Cancel wins the CAS   -> CancellationRequested
-3. the council finishes creating the booking
-4. the stale BookingAbsent is re-applied -> commits Cancelled
-   -> local state is terminal while an external booking exists, and
-      Cancelled is terminal so nothing will ever reconcile it
-```
+ADR-016 closes this, and the shape matters:
 
-**Do not implement `BookingAbsent -> Cancelled` until this is decided.** The options are a
-provider watermark or revision that lets a stale absence be recognised and refused, or
-requiring the council to distinguish "definitively no booking for this effect id" from "I
-do not currently see one" and treating the latter as `Unknown`. This is an open
-architectural decision, not an implementation detail.
+> **We never evaluate `now > expires_at`.** The council reports definitive absence, using
+> its own clock, at the same serialization point that prevents creation. The verifier turns
+> that answer into `EffectAbsent`; anything weaker stays `Unknown`.
+
+Three requirements on the mock council, all load-bearing:
+
+1. **Expiry binds at commit, atomically** — not at receipt. A council that accepts at
+   10:00:29.9, passes a receipt-time check, and writes at 10:00:30.2 reproduces the exact
+   defect with an expiry field that appears to prevent it.
+2. **The council owns the clock.** If our clock ran ahead we would declare absence while the
+   council still considered the intent live. The comparison never happens on our side, which
+   also keeps the domain clock-free as ADR-013 requires.
+3. **A definitive-absence answer serializes after every possible commit** for that intent, so
+   the lookup cannot slip between "accepted" and "written".
+4. **Answering definitive absence writes a tombstone, and that write is durably committed
+   *before* the response is observable.** Every later create attempt for that identity is
+   rejected by the tombstone's presence, regardless of any subsequent clock reading.
+
+   Two failure modes this closes. Without the tombstone, absence rests on time, and a clock
+   that steps backwards lets a delayed request commit after absence was verified. Without
+   commit-before-response, the council can answer "absent", crash before the write lands,
+   and then accept a booking for the same identity — no database commit and network response
+   are atomic with each other, so the ordering has to be stated.
+
+   The tombstone is what makes the answer permanent; expiry is only what makes the council
+   willing to write it. This is the same persist-before-effect discipline as ADR-014, applied
+   to the council's own answer.
+
+5. **The council must actually learn the expiry**, or it cannot tell pre-expiry `Unknown`
+   from post-expiry definitive absence. This matters most in the case the whole design exists
+   for — the create request never arrived, so the council has only an effect id and no record.
+
+   So `expires_at_ms` travels on **both** paths: with the create request, and with the
+   reconciliation lookup (`GET /effects/{id}?expires_at_ms=...`). The council records it the
+   first time it sees that identity, from whichever path arrives first, and **once recorded it
+   is immutable** — a later request presenting a different expiry for the same identity is
+   rejected. Without that binding, a caller could shorten a deadline to force premature
+   absence and cancel a booking that was about to succeed.
+
+   Note this makes the reconciliation lookup a **trusted** surface: it asserts a deadline. It
+   must not be reachable from proposer-facing transport, which the crate graph already
+   enforces.
+
+And one requirement that pulls the other way, easy to miss: **a booking committed just before
+expiry must stay discoverable and idempotently returnable forever after.** Expiry bounds when
+an effect may be *created*, never how long a created effect remains visible — otherwise a
+retry past the deadline sees nothing and books the room twice.
+
+See ADR-016 for the worked interleavings, the costs, and the alternatives rejected.
 
 ### `Verified<T>` is provenance, not blanket trust, and not unforgeable
 
@@ -128,6 +165,30 @@ BookingExists + BookingInProgress, wrong effect id -> Denied(EffectMismatch)
 The third line matters: one effect identity resolving to two different provider bookings
 means duplication, corruption or broken idempotency. It must be an explicit conflict
 requiring investigation, never silent convergence.
+
+### Where `expires_at_ms` comes from
+
+Safety-critical, so it is not left to the implementer:
+
+- **Derived, not chosen.** `expires_at_ms = prepared_at_ms + EFFECT_TTL`, where
+  `prepared_at_ms` is the clock sampled **once, immediately before the Phase A transaction
+  opens**, and `EFFECT_TTL` is a single configured constant for the service.
+
+  Sampling before the transaction rather than at commit is deliberate: the commit instant is
+  not knowable from inside the transaction that must persist the value, so deriving from it
+  would be circular. Sampling early is also the safe direction — it makes the deadline
+  marginally *earlier* than a commit-time reading would, never later, so the council can never
+  act on an intent the coordinator already considers dead.
+
+  Neither the agent nor the caller supplies or influences it. A proposer that could choose a
+  deadline could set it in the past and force premature absence, cancelling a booking that was
+  about to succeed.
+- **Persisted before use.** It is written into the `effect_intents` row in the same Phase A
+  transaction that commits `BookingInProgress`, before any create or lookup happens.
+- **Read back, never recomputed.** Both the create request and the reconciliation lookup send
+  the exact stored value. Recomputing it anywhere would let a restart or clock change produce
+  a different deadline for the same identity, which the council would then reject.
+- The clock used for that one derivation is the injected `Clock`, so tests can pin it.
 
 ### Getting the canonical plan to `resolve_fact`
 
@@ -242,6 +303,7 @@ CREATE TABLE effect_intents (
     canonical_plan_json TEXT NOT NULL,
     plan_hash           TEXT NOT NULL,
     status              TEXT NOT NULL,
+    expires_at_ms       INTEGER NOT NULL,   -- ADR-016: sent to the council on create AND on lookup
     provider_reference  TEXT,
     last_error          TEXT,
     created_at_ms       INTEGER NOT NULL,
@@ -260,15 +322,37 @@ The capability adapter receives the canonical plan, not model instructions:
 BookingCapability.execute(canonical_plan, effect_intent_id)
 ```
 
-The mock council must implement provider-side idempotency:
+The create request carries the expiry — it is not optional, and ADR-016's guarantees rest
+on the council seeing it:
 
 ```text
-first request with BOOK-BKG-1001-1
+POST /bookings
+  effect_intent_id : E-9271
+  expires_at_ms    : 1787230830000     <- mandatory
+  ...canonical plan...
+```
+
+The mock council must implement provider-side idempotency, and enforce expiry atomically at
+the commit point:
+
+```text
+first request with E-9271, before expiry
     -> create TH-92718
 
-retry with BOOK-BKG-1001-1
+retry with E-9271
     -> return TH-92718
     -> DO NOT create another booking
+
+request with E-9271 whose commit would land after expires_at_ms
+    -> refuse, create nothing, AND durably commit the tombstone before responding
+    -> (without the tombstone the refusal rests on the clock: a rollback would
+       let the same intent commit later)
+
+request with E-9271 for which a tombstone exists
+    -> refuse, create nothing, regardless of the clock
+
+request with E-9271 presenting a DIFFERENT expires_at_ms than first recorded
+    -> refuse: the deadline is immutable once seen
 ```
 
 `RequestId` must never be used as this identity because a transport retry receives a new request ID.
@@ -293,7 +377,11 @@ mark effect Confirmed
 
 ### Confirmed failure
 
-If the provider authoritatively says no booking was created, record the failure and transition according to domain policy, for example back to `AwaitingBooking`.
+If the provider authoritatively says the effect was not created — `ProviderRejected`, or
+`EffectAbsent` once the intent is tombstoned — the resource returns to the state it can be
+re-proposed from: `AwaitingBooking` for a booking intent, `Booked` for a cancellation intent.
+The transition finalises the effect intent and clears `active_effect`. A re-proposal mints a
+**fresh** intent, because a tombstoned one can never succeed.
 
 ### Ambiguous / unavailable
 
@@ -315,17 +403,62 @@ Never create a second effect identity merely because the first response was lost
 The mock council needs a lookup surface keyed by effect identity, not only by a provider-generated booking reference:
 
 ```text
-GET /effects/{effect_intent_id}
+GET /effects/{effect_intent_id}?expires_at_ms={expires_at_ms}
+
+The expiry is **mandatory** on the lookup too. If the create request never arrived, this is
+the only way the council learns the deadline — and without it, it cannot distinguish "not yet"
+from "never". It records the value on first sight of that identity and treats it as immutable
+thereafter.
 ```
 
 Possible authoritative results:
 
 ```text
-NotFound
-Booked(reference, canonical facts)
-Cancelled(reference)
-Unavailable / Unknown
+Booked(reference, canonical facts)        -> BookingExists
+Cancelled(reference)                      -> CancellationExists
+DefinitivelyAbsent                        -> EffectAbsent    (tombstone written & committed)
+     at BookingInProgress (booking intent)          -> AwaitingBooking
+     at CancellationRequested (booking intent)      -> Cancelled
+     at CancellingBooking (cancellation intent)     -> Booked
+
+ProviderRejected                          -> the effect was refused, permanently
+     at BookingInProgress                           -> AwaitingBooking
+     at CancellationRequested                       -> Cancelled
+     at CancellingBooking                           -> Booked
+
+`ProviderRejected` carries the same durability requirement as `EffectAbsent`, and for the
+same reason: it drives terminal transitions, so a rejection that is merely a *request-level*
+refusal would let a delayed same-id request commit afterwards — the exact divergence ADR-016
+exists to prevent. The council must **durably record the rejection and tombstone the intent
+before responding**, so no later attempt on that identity can succeed. A refusal that is not
+durable and terminal — a transient 503, a rate limit, a dropped connection — is `Unknown`,
+not `ProviderRejected`.
+
+**Kind binding applies to the kind-specific facts only.** The four facts split in two:
+
+| Fact | Kind-specific? | Binding |
+|---|---|---|
+| `BookingExists` | yes — it *is* a booking outcome | id **and** kind must match the active intent |
+| `CancellationExists` | yes — a cancellation outcome | id **and** kind must match |
+| `EffectAbsent` | no — carries only an identity | id only; the intent's kind supplies the meaning |
+| `ProviderRejected` | no — carries only an identity and a reason | id only; likewise |
+
+So the kind-agnostic pair is *interpreted by* the intent's kind, while the kind-specific pair
+is *checked against* it. `BookingExists` arriving while a cancellation intent is active is
+`Denied(EffectKindMismatch)` — an effect id does not encode its kind, so it can carry the very
+id in `active_effect` and pass identity binding. That is why the kind check is separate and
+cannot be folded into the id check.
+
+See `docs/state-machine.md` for the completeness matrix: every in-flight state has an edge for
+every outcome its active intent can produce.
+NotYetVisible                             -> Unknown         (may still be created)
+Unavailable                               -> Unknown
 ```
+
+The distinction between the middle two is the whole of ADR-016. A generic `NotFound` is
+**not** acceptable: it collapses "nothing has arrived yet" with "nothing can ever arrive",
+and the first must never advance the workflow. `DefinitivelyAbsent` may be returned only
+once the council has durably committed the tombstone.
 
 Only externally grounded results may advance the workflow.
 
@@ -469,6 +602,12 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 
 1. crash/failure before provider call — intent exists, provider has nothing;
 2. provider rejects before effect — no booking exists;
+2a. **the rejection is committed before the response is observable** — crash between the two,
+    and the retried lookup must still report rejection;
+2b. **a rejected intent stays rejected across a clock rollback** — a same-id retry must be
+    refused by the tombstone, not by a time comparison;
+2c. **a wrong-kind fact carrying the active effect id** — `BookingExists` while a cancellation
+    intent is active must be `Denied(EffectKindMismatch)`, not accepted because the id matched;
 3. provider commits then response is dropped — reconciliation finds one booking;
 4. retry after dropped response — same effect identity returns original result;
 5. process restart between provider commit and local evidence commit;
@@ -482,7 +621,31 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
 12. **crash between committing `CancellingBooking` and calling the cancellation capability**
     — recovery finds the durable cancellation intent and resumes under the same identity;
 13. cancellation retried after a dropped response — same cancellation intent id returns the
-    original provider result rather than cancelling twice.
+    original provider result rather than cancelling twice;
+14. **"not found" before expiry is `Unknown`, not absence** — the reconciler must not commit
+    `Cancelled` while the intent could still be committed;
+15. **accepted before expiry, commit paused until after expiry, lookup concurrent with it** —
+    this is the test that distinguishes commit-time expiry from receipt-time expiry, and a
+    council doing the latter must fail it;
+16. **BLD clock deliberately ahead of the council's** — we must still not manufacture
+    absence, because we never evaluate the deadline ourselves;
+17. **post-expiry `EffectAbsent` loses a CAS, is re-applied, while a competing request was
+    accepted** — the original race, run through the full re-apply path;
+18. **a booking committed immediately before expiry stays discoverable afterwards**, and a
+    same-identity retry past the deadline returns that original result rather than creating
+    a second booking;
+19. **the council's clock steps backwards after a definitive-absence answer** — a delayed
+    request must still be rejected, by the tombstone rather than by a time comparison;
+20. **the council crashes immediately before the tombstone write commits** — the reconciler
+    must observe no absence answer, so the workflow stays `Unknown` and retries. (Do not
+    assert that a later booking succeeds: past expiry the council must refuse the commit
+    anyway. What is under test is that unobserved absence never becomes observed absence.)
+21. **the council crashes immediately after the tombstone write commits but before
+    responding** — the retried lookup must return the same definitive absence, and a later
+    create attempt must still be rejected;
+22. **a create refused for expiry, then the council's clock rolls back, then the same intent
+    is retried** — the retry must still be refused, by the tombstone the refusal wrote rather
+    than by a time comparison.
 
 ## M4 implementation order
 
@@ -509,4 +672,11 @@ Stop and raise an architecture question instead of improvising if any implementa
 - creating a new intent on every retry;
 - accepting provider-shaped/model-shaped evidence without authoritative lookup or trusted adapter provenance;
 - allowing cancellation to erase an already possible external effect;
-- bypassing M3 CAS/version semantics.
+- bypassing M3 CAS/version semantics;
+- evaluating `now > expires_at` locally instead of taking the council's determination
+  (ADR-016);
+- a mock council that checks expiry at receipt rather than atomically at commit;
+- a council that stops returning an effect that was committed before its expiry - that
+  breaks stable identity and duplicates bookings on retry;
+- answering definitive absence without durably tombstoning the intent, which leaves the
+  guarantee resting on the clock never moving backwards.

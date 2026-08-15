@@ -47,24 +47,62 @@ in that state.
 ```mermaid
 stateDiagram-v2
     BookingInProgress --> Booked: BookingExists
+    BookingInProgress --> AwaitingBooking: EffectAbsent
     BookingInProgress --> AwaitingBooking: ProviderRejected
 
     CancellationRequested --> CancellingBooking: BookingExists
-    CancellationRequested --> Cancelled: BookingAbsent
+    CancellationRequested --> Cancelled: EffectAbsent
+    CancellationRequested --> Cancelled: ProviderRejected
 
     CancellingBooking --> Cancelled: CancellationExists
+    CancellingBooking --> Booked: EffectAbsent
     CancellingBooking --> Booked: ProviderRejected
 ```
+
+One `EffectAbsent` fact, three meanings — derived from the persisted intent and the current
+state, never from the fact itself:
+
+### Completeness
+
+Every in-flight state must have an edge for every authoritative outcome its active intent
+can produce, or recovery can stick. Checked exhaustively rather than case by case:
+
+| In-flight state | active intent | `BookingExists` | `CancellationExists` | `EffectAbsent` | `ProviderRejected` |
+|---|---|---|---|---|---|
+| `BookingInProgress` | booking | `Booked` | n/a¹ | `AwaitingBooking` | `AwaitingBooking` |
+| `CancellationRequested` | booking | `CancellingBooking` | n/a¹ | `Cancelled` | `Cancelled` |
+| `CancellingBooking` | cancellation | n/a¹ | `Cancelled` | `Booked` | `Booked` |
+
+¹ Not applicable because the fact's **kind** does not match the active intent's kind — a
+booking outcome arriving while a cancellation intent is active, or the reverse.
+
+Note this is *not* caught by identity binding: an effect id does not encode its kind, so a
+wrong-kind fact can carry the very id in `active_effect` and pass that check. The binding must
+compare kinds explicitly and refuse with `Denied(EffectKindMismatch)`. A refusal with a
+reason, not a silent gap.
+
+### The three meanings of absence
+
+| At | The absent intent was | Means | Goes to |
+|---|---|---|---|
+| `BookingInProgress` | a booking | the booking never happened | `AwaitingBooking` |
+| `CancellationRequested` | a booking | there is nothing to cancel | `Cancelled` |
+| `CancellingBooking` | a cancellation | the cancellation never happened | `Booked` |
+
+The first is the commonest recovery path, not a corner case: the create request never
+arrived, its deadline passed, and the council tombstoned the intent. The third is its exact
+mirror on the cancellation side. Each finalises the old intent and clears `active_effect`,
+and any re-proposal mints a **fresh** intent — a tombstoned one can never succeed, so reusing
+it would guarantee an effect that never happens.
 
 The same `BookingExists` fact means *booking confirmed* at `BookingInProgress` and *booking
 found* at `CancellationRequested`. That is what lets a fact which lost a compare-and-set be
 re-evaluated against the new state rather than discarded.
 
-> ⚠ `CancellationRequested --BookingAbsent--> Cancelled` is **blocked pending an
-> architectural decision**. Absence is not stable over time: a stale `BookingAbsent`
-> verified before the provider finished creating the booking would commit a terminal
-> `Cancelled` while the room is actually booked. See the negative-fact section of
-> [`m4-effects-guidance.md`](m4-effects-guidance.md).
+> Every `EffectAbsent` edge above is gated on **ADR-016**: absence is admissible only from
+> the council's definitive-absence response, which durably tombstones the intent. Before
+> that, a "not found" is `Unknown` and drives nothing — the council may still act on an
+> in-flight request.
 
 ## System-event edges — deterministic runtime facts
 

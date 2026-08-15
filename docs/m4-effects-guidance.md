@@ -421,14 +421,26 @@ DefinitivelyAbsent                        -> EffectAbsent    (tombstone written 
      at CancellationRequested (booking intent)      -> Cancelled
      at CancellingBooking (cancellation intent)     -> Booked
 
-ProviderRejected                          -> the effect was refused outright
+ProviderRejected                          -> the effect was refused, permanently
      at BookingInProgress                           -> AwaitingBooking
      at CancellationRequested                       -> Cancelled
      at CancellingBooking                           -> Booked
 
-See `docs/state-machine.md` for the completeness matrix: every in-flight state has an edge
-for every outcome its active intent can produce. A fact whose effect id does not match
-`active_effect` is `Denied(EffectMismatch)` rather than an unhandled gap.
+`ProviderRejected` carries the same durability requirement as `EffectAbsent`, and for the
+same reason: it drives terminal transitions, so a rejection that is merely a *request-level*
+refusal would let a delayed same-id request commit afterwards — the exact divergence ADR-016
+exists to prevent. The council must **durably record the rejection and tombstone the intent
+before responding**, so no later attempt on that identity can succeed. A refusal that is not
+durable and terminal — a transient 503, a rate limit, a dropped connection — is `Unknown`,
+not `ProviderRejected`.
+
+Two bindings, not one. The fact's `effect_intent_id` must match `active_effect`, **and** its
+kind must match the active intent's kind. An effect id does not encode whether it is a
+booking or a cancellation, so a wrong-kind fact can carry the right id and pass identity
+binding. Kind mismatch is `Denied(EffectKindMismatch)`.
+
+See `docs/state-machine.md` for the completeness matrix: every in-flight state has an edge for
+every outcome its active intent can produce.
 NotYetVisible                             -> Unknown         (may still be created)
 Unavailable                               -> Unknown
 ```

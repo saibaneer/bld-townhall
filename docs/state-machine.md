@@ -73,9 +73,13 @@ can produce, or recovery can stick. Checked exhaustively rather than case by cas
 | `CancellationRequested` | booking | `CancellingBooking` | n/a¹ | `Cancelled` | `Cancelled` |
 | `CancellingBooking` | cancellation | n/a¹ | `Cancelled` | `Booked` | `Booked` |
 
-¹ Not applicable, and not merely unhandled: the fact's `effect_intent_id` would not match
-`active_effect`, so the binding fails and the outcome is `Denied(EffectMismatch)` — a refusal
-with a reason, not a silent gap.
+¹ Not applicable because the fact's **kind** does not match the active intent's kind — a
+booking outcome arriving while a cancellation intent is active, or the reverse.
+
+Note this is *not* caught by identity binding: an effect id does not encode its kind, so a
+wrong-kind fact can carry the very id in `active_effect` and pass that check. The binding must
+compare kinds explicitly and refuse with `Denied(EffectKindMismatch)`. A refusal with a
+reason, not a silent gap.
 
 ### The three meanings of absence
 

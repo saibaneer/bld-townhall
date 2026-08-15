@@ -510,8 +510,11 @@ The three rules above still leave absence resting on time, and time can move bac
 So the answer must not be *"the deadline has passed"*. It must be **"this effect intent is
 permanently closed and nothing was created for it"**, written down:
 
-> Answering definitive absence **persists a tombstone for that effect intent, durably
-> committed before the response is observable**. Every later create attempt for that identity
+> **Both** answering definitive absence **and** refusing a create for expiry persist a
+> tombstone for that effect intent, durably committed before the response is observable.
+
+Refusal must tombstone for the same reason the lookup must: a refusal that rests only on a
+clock comparison is undone by a clock that rolls back, and the same intent could then commit. Every later create attempt for that identity
 > is rejected by the tombstone's presence, regardless of any subsequent clock reading.
 
 The council must also *learn* the expiry, or it cannot distinguish pre-expiry `Unknown` from

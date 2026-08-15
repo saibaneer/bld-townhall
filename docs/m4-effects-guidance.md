@@ -170,10 +170,19 @@ requiring investigation, never silent convergence.
 
 Safety-critical, so it is not left to the implementer:
 
-- **Derived, not chosen.** `expires_at_ms = <Phase A commit instant> + EFFECT_TTL`, where
-  `EFFECT_TTL` is a single configured constant for the service. Neither the agent nor the
-  caller supplies or influences it — a proposer that could choose a deadline could set it in
-  the past and force premature absence, cancelling a booking that was about to succeed.
+- **Derived, not chosen.** `expires_at_ms = prepared_at_ms + EFFECT_TTL`, where
+  `prepared_at_ms` is the clock sampled **once, immediately before the Phase A transaction
+  opens**, and `EFFECT_TTL` is a single configured constant for the service.
+
+  Sampling before the transaction rather than at commit is deliberate: the commit instant is
+  not knowable from inside the transaction that must persist the value, so deriving from it
+  would be circular. Sampling early is also the safe direction — it makes the deadline
+  marginally *earlier* than a commit-time reading would, never later, so the council can never
+  act on an intent the coordinator already considers dead.
+
+  Neither the agent nor the caller supplies or influences it. A proposer that could choose a
+  deadline could set it in the past and force premature absence, cancelling a booking that was
+  about to succeed.
 - **Persisted before use.** It is written into the `effect_intents` row in the same Phase A
   transaction that commits `BookingInProgress`, before any create or lookup happens.
 - **Read back, never recomputed.** Both the create request and the reconciliation lookup send
@@ -335,7 +344,9 @@ retry with E-9271
     -> DO NOT create another booking
 
 request with E-9271 whose commit would land after expires_at_ms
-    -> refuse, create nothing
+    -> refuse, create nothing, AND durably commit the tombstone before responding
+    -> (without the tombstone the refusal rests on the clock: a rollback would
+       let the same intent commit later)
 
 request with E-9271 for which a tombstone exists
     -> refuse, create nothing, regardless of the clock
@@ -587,7 +598,10 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
     anyway. What is under test is that unobserved absence never becomes observed absence.)
 21. **the council crashes immediately after the tombstone write commits but before
     responding** — the retried lookup must return the same definitive absence, and a later
-    create attempt must still be rejected.
+    create attempt must still be rejected;
+22. **a create refused for expiry, then the council's clock rolls back, then the same intent
+    is retried** — the retry must still be refused, by the tombstone the refusal wrote rather
+    than by a time comparison.
 
 ## M4 implementation order
 

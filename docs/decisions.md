@@ -83,9 +83,13 @@ fast on the offending path, whereas `IMMEDIATE` turns it into every unrelated co
 blocking five seconds. The symptom becomes "the service stalls in five-second steps" rather
 than "this one booking errored".
 
-The protection is structural rather than advisory (ADR-014): the repository's
-prepare/finalize methods return *committed* state, leaving no signature through which a
-capability could be invoked while a transaction is open.
+**This is a requirement on M4, not a property the repository has today.** Nothing in the
+current surface prevents a caller holding a transaction across a network call — there is
+simply no capability to call yet. When M4 introduces one, the protection must be
+structural rather than advisory: the repository's prepare and finalize methods should
+return *committed* state, so there is no signature through which a capability can be
+invoked while a transaction is open. Do not read this ADR as saying that guard already
+exists.
 
 ### Deliberately not done
 

@@ -355,13 +355,28 @@ booking exists
 
 This is a compensation protocol, not history rewriting.
 
-### Cancellation is an external effect too — same discipline
+### The general rule: entering an in-flight state is always an `ExternalEffect`
 
-`BookingExists + CancellationRequested -> CancellingBooking` is an `ExternalEffect` plan,
-not a `Local` one. ADR-014 applies unchanged: nothing external happens until a durable
-intent for *that* effect is committed.
+Stated once so it does not have to be restated per path:
 
-In one transaction, before the cancellation capability is called:
+> **Every transition whose target is `BookingInProgress` or `CancellingBooking` is an
+> `ExternalEffect` plan, never `Local`. Those states mean "an external call is about to
+> happen or may already have happened", so entering one without a committed durable intent
+> is a contradiction.**
+
+That covers all three routes into an in-flight state:
+
+| Transition | Door | Effect intent created |
+|---|---|---|
+| `AwaitingBooking + book -> BookingInProgress` | intent | booking |
+| `Booked + cancel -> CancellingBooking` | intent | cancellation |
+| `BookingExists + CancellationRequested -> CancellingBooking` | fact | cancellation |
+
+The middle row is the ordinary case — Lucy cancelling a confirmed booking — and it needs
+the identical contract. ADR-014 applies unchanged to all three: nothing external happens
+until a durable intent for *that* effect is committed.
+
+For the fact-driven route, in one transaction before the cancellation capability is called:
 
 ```text
 CancellationRequested v5
@@ -377,6 +392,19 @@ The handoff must be atomic. Committing `CancellingBooking` and *then* persisting
 cancellation intent leaves a window where a crash gives recovery a state that implies an
 in-flight cancellation with no identity to reconcile against — and a retry would mint a
 second cancellation attempt, which is the duplicate-effect failure in a different costume.
+
+The direct route from `Booked` is simpler — there is no booking intent still open to
+complete — but otherwise identical:
+
+```text
+Booked v5
+    -> create the CANCELLATION intent (E-9272) with its own canonical plan,
+       derived from the booking_ref recorded on the aggregate
+    -> set active_effect = E-9272
+    -> commit CancellingBooking v6
+    -> COMMIT
+    -> only now cancellation_capability.execute(E-9272)
+```
 
 A booking and its cancellation are two effects with two identities. Reusing E-9271 for the
 cancellation would make "has this effect completed?" unanswerable.

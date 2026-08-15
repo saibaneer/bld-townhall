@@ -163,6 +163,21 @@ pub struct BookingContext {
     /// capability loaded. A behaviour that consumes loaded facts without
     /// checking them against this is laundering an unverified venue into the
     /// booking.
+    ///
+    /// # What this does and does not guarantee
+    ///
+    /// The domain cannot prove this field was copied faithfully from the
+    /// persisted aggregate. An adapter that assembled a context with both
+    /// `selected_venue` and `selected_facts` naming a venue the user never
+    /// chose would satisfy every guard here. The binding is therefore only as
+    /// strong as the assembly point.
+    ///
+    /// That assembly point does not exist yet — M2 builds this context from a
+    /// fixture. **When M5 introduces the service layer, constructing
+    /// `BookingContext` from anything other than the loaded
+    /// `BookingAggregate` is a boundary violation, and that invariant needs its
+    /// own test there.** Recorded here rather than left implicit, because a
+    /// guard that looks stronger than it is, is worse than no guard.
     pub selected_venue: Option<SelectedVenueRef>,
     pub selected_facts: Option<VenueFacts>,
     pub next_effect: u64,

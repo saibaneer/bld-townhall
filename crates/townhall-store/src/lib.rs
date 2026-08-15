@@ -3,15 +3,16 @@
 use async_trait::async_trait;
 use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId};
 use sqlx::{
+    Row, SqlitePool,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Row, SqlitePool,
 };
-use std::{path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
-use townhall_domain::{
-    BookingAggregate, BookingState, Draft, SelectedVenueRef, VenueFacts,
-};
+use townhall_domain::{BookingAggregate, BookingState, Draft, SelectedVenueRef, VenueFacts};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -122,6 +123,11 @@ pub struct SqliteBookingRepository {
 }
 
 impl SqliteBookingRepository {
+    /// Open (creating if absent) the `SQLite` database at `path` and run migrations.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Sqlx`] if the file cannot be opened or the pool
+    /// cannot connect, and [`StoreError::Migration`] if migrations fail to apply.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -154,13 +160,13 @@ impl BookingRepository for SqliteBookingRepository {
         let requirements_json = serde_json::to_string(&booking.requirements)?;
 
         let result = sqlx::query(
-            r#"
+            r"
             INSERT OR IGNORE INTO bookings (
                 id, version, state_name, state_json, requirements_json,
                 selected_venue_json, availability_json, booking_ref, active_effect,
                 created_at_ms, updated_at_ms
             ) VALUES (?, 0, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
-            "#,
+            ",
         )
         .bind(booking.id.as_str())
         .bind(state.name())
@@ -191,13 +197,13 @@ impl BookingRepository for SqliteBookingRepository {
 
     async fn load(&self, id: &BookingId) -> Result<BookingAggregate, StoreError> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT id, version, state_name, state_json, requirements_json,
                    selected_venue_json, availability_json, booking_ref, active_effect,
                    created_at_ms, updated_at_ms
             FROM bookings
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -223,11 +229,12 @@ impl BookingRepository for SqliteBookingRepository {
 
         let mut tx = self.pool.begin().await?;
 
-        let current = sqlx::query("SELECT version, state_name, created_at_ms FROM bookings WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        let current =
+            sqlx::query("SELECT version, state_name, created_at_ms FROM bookings WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(id.clone()))?;
 
         let actual_version = version_from_i64(current.try_get::<i64, _>("version")?)?;
         if actual_version != expected_version {
@@ -242,19 +249,19 @@ impl BookingRepository for SqliteBookingRepository {
 
         let state_json = serde_json::to_string(&next.state)?;
         let requirements_json = serde_json::to_string(&next.requirements)?;
-        let selected_venue_json = serialize_optional(&next.selected_venue)?;
-        let availability_json = serialize_optional(&next.availability)?;
+        let selected_venue_json = serialize_optional(next.selected_venue.as_ref())?;
+        let availability_json = serialize_optional(next.availability.as_ref())?;
         let booking_ref = next.booking_ref.as_ref().map(ToString::to_string);
         let active_effect = next.active_effect.as_ref().map(ToString::to_string);
 
         let result = sqlx::query(
-            r#"
+            r"
             UPDATE bookings
             SET version = ?, state_name = ?, state_json = ?, requirements_json = ?,
                 selected_venue_json = ?, availability_json = ?, booking_ref = ?,
                 active_effect = ?, updated_at_ms = ?
             WHERE id = ? AND version = ?
-            "#,
+            ",
         )
         .bind(next_db)
         .bind(next.state.name())
@@ -280,12 +287,12 @@ impl BookingRepository for SqliteBookingRepository {
 
         let event_id = format!("AUDIT-{id}-{next_version}");
         sqlx::query(
-            r#"
+            r"
             INSERT INTO audit_events (
                 event_id, booking_id, from_version, to_version,
                 from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(&event_id)
         .bind(id.as_str())
@@ -318,13 +325,13 @@ impl BookingRepository for SqliteBookingRepository {
 
     async fn audit_events(&self, id: &BookingId) -> Result<Vec<AuditEvent>, StoreError> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT sequence, event_id, booking_id, from_version, to_version,
                    from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
             FROM audit_events
             WHERE booking_id = ?
             ORDER BY sequence ASC
-            "#,
+            ",
         )
         .bind(id.as_str())
         .fetch_all(&self.pool)
@@ -334,9 +341,10 @@ impl BookingRepository for SqliteBookingRepository {
     }
 }
 
-fn serialize_optional<T: serde::Serialize>(value: &Option<T>) -> Result<Option<String>, StoreError> {
+fn serialize_optional<T: serde::Serialize>(
+    value: Option<&T>,
+) -> Result<Option<String>, StoreError> {
     value
-        .as_ref()
         .map(serde_json::to_string)
         .transpose()
         .map_err(StoreError::from)
@@ -426,7 +434,7 @@ fn now_ms() -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bld_types::{Money, TimeWindow, SlotId, VenueId};
+    use bld_types::{Money, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
     use townhall_domain::{BookingState, SelectedVenueRef, VenueSelected};
 

@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use bld_kernel::{BoundaryDomain, Resolution};
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId, Money,
-    PrincipalId, SlotId, VenueId,
+    ActorId, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId, Money, PrincipalId,
+    SlotId, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -163,18 +163,27 @@ pub struct BookingContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BookingPlan {
-    SelectVenue { venue_id: VenueId, slot_id: SlotId },
-    VerifySlot { facts: VenueFacts },
+    SelectVenue {
+        venue_id: VenueId,
+        slot_id: SlotId,
+    },
+    VerifySlot {
+        facts: VenueFacts,
+    },
     ChangeVenue,
     MarkNeedsRevalidation,
-    RevalidateVenue { facts: VenueFacts },
+    RevalidateVenue {
+        facts: VenueFacts,
+    },
     Book {
         effect_intent_id: EffectIntentId,
         principal: PrincipalId,
         facts: VenueFacts,
     },
     CancelLocal,
-    CancelBooked { booking_ref: CouncilBookingRef },
+    CancelBooked {
+        booking_ref: CouncilBookingRef,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,6 +264,17 @@ impl BoundaryDomain for TownHallDomain {
     type Evidence = BookingEvidence;
     type Error = BookingError;
 
+    // `clippy::pedantic` flags the ChangeVenue/UpdateRequirements/Cancel arms as
+    // having identical bodies and wants them merged into `(A, X) | (B, X) => ..`.
+    // We deliberately keep one arm per (state, proposal) pair, grouped by state.
+    //
+    // This match IS the state x proposal topology, and the topology is the
+    // security surface (implementation guide sections 5 and 19, step 4). Reading it
+    // state-by-state answers "which behaviours does VenueSelected have?" directly
+    // and mirrors docs/state-machine.md. Merging by body would scatter each
+    // state's behaviour set across the match and make an accidentally-added or
+    // accidentally-removed pair harder to spot in review.
+    #[allow(clippy::match_same_arms)]
     async fn resolve(
         &self,
         state: &Self::State,
@@ -360,7 +380,9 @@ impl BoundaryDomain for TownHallDomain {
             BookingPlan::VerifySlot { facts } | BookingPlan::RevalidateVenue { facts } => {
                 Ok(BookingEvidence::AvailabilityVerified(facts.clone()))
             }
-            BookingPlan::Book { effect_intent_id, .. } => {
+            BookingPlan::Book {
+                effect_intent_id, ..
+            } => {
                 context.next_effect += 1;
                 Ok(BookingEvidence::BookingConfirmed {
                     effect_intent_id: effect_intent_id.clone(),
@@ -387,13 +409,12 @@ impl BoundaryDomain for TownHallDomain {
         _context: &Self::Context,
     ) -> Result<Self::State, Self::Error> {
         match (plan, evidence) {
-            (
-                BookingPlan::SelectVenue { venue_id, slot_id },
-                BookingEvidence::NoExternalEffect,
-            ) => Ok(BookingState::VenueSelected(VenueSelected {
-                venue_id: venue_id.clone(),
-                slot_id: slot_id.clone(),
-            })),
+            (BookingPlan::SelectVenue { venue_id, slot_id }, BookingEvidence::NoExternalEffect) => {
+                Ok(BookingState::VenueSelected(VenueSelected {
+                    venue_id: venue_id.clone(),
+                    slot_id: slot_id.clone(),
+                }))
+            }
             (BookingPlan::VerifySlot { facts }, BookingEvidence::AvailabilityVerified(actual))
                 if facts == actual =>
             {
@@ -417,7 +438,9 @@ impl BoundaryDomain for TownHallDomain {
                 slot_id: facts.slot_id.clone(),
             })),
             (
-                BookingPlan::Book { effect_intent_id, .. },
+                BookingPlan::Book {
+                    effect_intent_id, ..
+                },
                 BookingEvidence::BookingConfirmed {
                     effect_intent_id: actual_effect,
                     booking_ref,
@@ -461,7 +484,10 @@ mod tests {
             requirements: BookingRequirements {
                 purpose: "meeting".into(),
                 requested_date: "2026-08-20".into(),
-                time_window: TimeWindow { from: "13:00".into(), to: "17:00".into() },
+                time_window: TimeWindow {
+                    from: "13:00".into(),
+                    to: "17:00".into(),
+                },
                 attendees: 20,
                 wheelchair_accessible: true,
                 max_fee: Money::from_pence(5_000),
@@ -485,7 +511,13 @@ mod tests {
         let mut ctx = context();
 
         let outcome = Kernel
-            .apply(&TownHallDomain, &mut state, BookingProposal::Book, &authority(), &mut ctx)
+            .apply(
+                &TownHallDomain,
+                &mut state,
+                BookingProposal::Book,
+                &authority(),
+                &mut ctx,
+            )
             .await;
 
         assert_eq!(outcome, BoundaryOutcome::Undefined);
@@ -518,7 +550,10 @@ mod tests {
             )
             .await;
 
-        assert_eq!(outcome, BoundaryOutcome::Denied(BookingError::AccessibilityRequired));
+        assert_eq!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::AccessibilityRequired)
+        );
         assert!(matches!(state, BookingState::VenueSelected(_)));
     }
 
@@ -542,28 +577,48 @@ mod tests {
                 &mut ctx,
             )
             .await;
-        assert!(matches!(out, BoundaryOutcome::Committed(BookingState::VenueSelected(_))));
-
-        let out = kernel
-            .apply(&domain, &mut state, BookingProposal::VerifySlot, &auth, &mut ctx)
-            .await;
-        assert!(matches!(out, BoundaryOutcome::Committed(BookingState::AwaitingBooking(_))));
-
-        let out = kernel
-            .apply(&domain, &mut state, BookingProposal::Book, &auth, &mut ctx)
-            .await;
-        assert!(matches!(out, BoundaryOutcome::Committed(BookingState::Booked(_))));
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::VenueSelected(_))
+        ));
 
         let out = kernel
             .apply(
                 &domain,
                 &mut state,
-                BookingProposal::Cancel { reason: "user_cancelled".into() },
+                BookingProposal::VerifySlot,
                 &auth,
                 &mut ctx,
             )
             .await;
-        assert_eq!(out, BoundaryOutcome::Committed(BookingState::Cancelled(Cancelled)));
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::AwaitingBooking(_))
+        ));
+
+        let out = kernel
+            .apply(&domain, &mut state, BookingProposal::Book, &auth, &mut ctx)
+            .await;
+        assert!(matches!(
+            out,
+            BoundaryOutcome::Committed(BookingState::Booked(_))
+        ));
+
+        let out = kernel
+            .apply(
+                &domain,
+                &mut state,
+                BookingProposal::Cancel {
+                    reason: "user_cancelled".into(),
+                },
+                &auth,
+                &mut ctx,
+            )
+            .await;
+        assert_eq!(
+            out,
+            BoundaryOutcome::Committed(BookingState::Cancelled(Cancelled))
+        );
     }
 
     #[tokio::test]

@@ -1876,15 +1876,18 @@ mod characterization {
 
     /// Today `Book` fakes a synchronous confirmation and lands on `Booked`.
     ///
-    /// # This test is the forcing function for its `#[ignore]`d counterpart
+    /// # Tripwire for its `#[ignore]`d counterpart — and what that is worth
     ///
-    /// An `#[ignore]`d test cannot be enforced by CI before the change it
-    /// describes exists — so on its own it is a TODO that B2 could forget.
-    /// What *is* enforced is this test: the moment B2 makes `Book` stop at
-    /// `BookingInProgress`, this fails. Whoever is standing here reading that
-    /// failure must delete this test and remove `#[ignore]` from
-    /// `book_after_b2_stops_at_booking_in_progress`. Green B2 without doing
-    /// both is impossible.
+    /// The moment B2 makes `Book` stop at `BookingInProgress`, this test fails.
+    /// Whoever reads that failure must delete this test and remove `#[ignore]`
+    /// from `book_after_b2_stops_at_booking_in_progress`.
+    ///
+    /// Stated honestly: that is a **review tripwire, not CI enforcement**. It
+    /// catches "B2 changed the behaviour and forgot to unignore". It cannot
+    /// catch "B2 never changed the behaviour at all" — that run stays green,
+    /// because no test can require a change that has not happened yet. The
+    /// guard against *that* is B2's acceptance gate in the slicing plan, which
+    /// is a human check.
     #[tokio::test]
     async fn book_today_jumps_straight_to_booked() {
         let got = turn(
@@ -1909,10 +1912,30 @@ mod characterization {
             &mut context(),
         )
         .await;
-        match got {
-            BoundaryOutcome::Committed(BookingState::BookingInProgress(_)) => {}
-            other => panic!("Book must stop at BookingInProgress after B2, got {other:?}"),
-        }
+        let BoundaryOutcome::Committed(BookingState::BookingInProgress(in_progress)) = &got else {
+            panic!("Book must stop at BookingInProgress after B2, got {got:?}");
+        };
+
+        // Matching the variant is not enough: B2 could produce the right state
+        // with the wrong effect identity and this would still pass. The id must
+        // be present, and it must be *deterministic* — the same operation
+        // proposed twice must derive the same identity, because that is what
+        // makes a retry idempotent rather than a second booking (ADR-014).
+        assert!(
+            !in_progress.effect_intent_id.as_str().is_empty(),
+            "BookingInProgress must carry an effect identity"
+        );
+        let again = turn(
+            awaiting_booking(),
+            BookingProposal::Book,
+            &authority(),
+            &mut context(),
+        )
+        .await;
+        assert_eq!(
+            got, again,
+            "the same operation must derive the same effect identity"
+        );
     }
 
     /// Today cancelling a confirmed booking fakes the council call and lands on
@@ -1954,12 +1977,16 @@ mod characterization {
             &mut context(),
         )
         .await;
-        match got {
-            BoundaryOutcome::Committed(BookingState::CancellingBooking(_)) => {}
-            other => {
-                panic!("Booked + Cancel must stop at CancellingBooking after B2, got {other:?}")
-            }
-        }
+        // Full equality, not just the variant. The reference must be carried
+        // through from `Booked` — cancelling the wrong council booking is
+        // exactly what this state exists to make impossible.
+        assert_eq!(
+            got,
+            BoundaryOutcome::Committed(BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+            })),
+            "Booked + Cancel must stop at CancellingBooking carrying the same reference"
+        );
     }
 
     /// `Reconcile` is `Undefined` everywhere today, and B2 removes the variant

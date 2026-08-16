@@ -12,7 +12,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use townhall_domain::{BookingAggregate, BookingState, Draft, SelectedVenueRef, VenueFacts};
+use townhall_domain::{
+    BookingAggregate, BookingPlan, BookingState, Draft, EffectIntent, EffectStatus, OperationKind,
+    SelectedVenueRef, VenueFacts,
+};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -92,6 +95,17 @@ pub enum StoreError {
     ClockOutOfRange,
     #[error("persisted booking row is corrupt: {0}")]
     CorruptRow(String),
+    #[error("effect intent {0} was not found")]
+    EffectNotFound(EffectIntentId),
+    #[error(
+        "an effect intent already exists for booking {booking_id} operation {operation_kind} \
+         at version {source_version}, with a different canonical plan"
+    )]
+    ConflictingPlan {
+        booking_id: BookingId,
+        operation_kind: &'static str,
+        source_version: u64,
+    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -115,6 +129,26 @@ pub trait BookingRepository: Send + Sync {
     ) -> Result<BookingAggregate, StoreError>;
 
     async fn audit_events(&self, id: &BookingId) -> Result<Vec<AuditEvent>, StoreError>;
+
+    /// Commit a state transition and durably record the external effect it
+    /// intends, atomically. Returns *committed* state, so no capability can be
+    /// invoked while the transaction is open.
+    ///
+    /// Idempotent on `(booking_id, operation_kind, source_version)`: a retry
+    /// after a lost acknowledgement returns the intent and aggregate that were
+    /// already committed, with `replayed: true` and nothing written.
+    ///
+    /// # Errors
+    /// [`StoreError::ConflictingPlan`] if an intent already exists for that key
+    /// with a different canonical plan — that is a boundary violation, not a
+    /// retry, and it fails closed.
+    async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError>;
+
+    /// Read one effect intent.
+    ///
+    /// # Errors
+    /// [`StoreError::EffectNotFound`] if no such intent exists.
+    async fn load_effect(&self, id: &EffectIntentId) -> Result<EffectIntent, StoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -220,131 +254,139 @@ impl BookingRepository for SqliteBookingRepository {
         next: BookingWrite,
         audit: TransitionAudit,
     ) -> Result<BookingAggregate, StoreError> {
-        let expected_db = version_to_i64(expected_version)?;
-        let next_version = expected_version
-            .checked_add(1)
-            .ok_or(StoreError::VersionOutOfRange)?;
-        let next_db = version_to_i64(next_version)?;
         let now = now_ms()?;
 
-        // `BEGIN IMMEDIATE`, not the default `BEGIN` (deferred).
-        //
-        // `commit` unconditionally writes, so a deferred begin buys nothing: it
-        // takes no lock, the version `SELECT` opens a read transaction, and the
-        // `UPDATE` then has to promote that read to a write. Under WAL a
-        // deferred transaction cannot promote once anyone has written anywhere
-        // in the database, and because `inTransaction` is already `TRANS_READ`
-        // the busy handler is skipped entirely - so `busy_timeout` never
-        // applies and the call fails immediately with SQLITE_BUSY.
-        //
-        // Measured on this code: ~52 of 60 concurrent commits to *completely
-        // unrelated* bookings failed with "database is locked", with no version
-        // contention between them at all. A genuine CAS loser got SQLITE_BUSY
-        // rather than StaleVersion ~99.7% of the time.
-        //
-        // IMMEDIATE takes the write lock at BEGIN, when `inTransaction` is
-        // still `TRANS_NONE`, so the busy handler does engage: a second writer
-        // waits (microseconds for a local write), gets a *fresh* snapshot, and
-        // its `SELECT` then reports the truth. SQLite permits only one writer
-        // regardless, so this costs no real concurrency - it moves the
-        // serialisation point from mid-transaction, where it failed, to BEGIN,
-        // where it waits.
-        //
-        // See ADR-015 for the tradeoff this carries into M4.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let aggregate = commit_in_tx(&mut tx, id, expected_version, &next, &audit, now).await?;
+        tx.commit().await?;
+        Ok(aggregate)
+    }
+
+    async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
+        let plan_json = serde_json::to_string(&request.canonical_plan)?;
+        let source_db = version_to_i64(request.source_version)?;
+        let now = now_ms()?;
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        let current =
-            sqlx::query("SELECT version, state_name, created_at_ms FROM bookings WHERE id = ?")
-                .bind(id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| StoreError::NotFound(id.clone()))?;
-
-        let actual_version = version_from_i64(current.try_get::<i64, _>("version")?)?;
-        if actual_version != expected_version {
-            return Err(StoreError::StaleVersion {
-                expected: expected_version,
-                actual: actual_version,
-            });
-        }
-
-        let from_state: String = current.try_get("state_name")?;
-        let created_at_ms: i64 = current.try_get("created_at_ms")?;
-
-        let state_json = serde_json::to_string(&next.state)?;
-        let requirements_json = serde_json::to_string(&next.requirements)?;
-        let selected_venue_json = serialize_optional(next.selected_venue.as_ref())?;
-        let availability_json = serialize_optional(next.availability.as_ref())?;
-        let booking_ref = next.booking_ref.as_ref().map(ToString::to_string);
-        let active_effect = next.active_effect.as_ref().map(ToString::to_string);
-
-        let result = sqlx::query(
+        // Look for an existing intent for this operation FIRST. A retry after a
+        // lost acknowledgement must return what was already committed rather
+        // than attempt the CAS again - the version has already advanced, so the
+        // CAS would fail and recovery would strand with one intent it cannot
+        // resume.
+        let existing = sqlx::query(
             r"
-            UPDATE bookings
-            SET version = ?, state_name = ?, state_json = ?, requirements_json = ?,
-                selected_venue_json = ?, availability_json = ?, booking_ref = ?,
-                active_effect = ?, updated_at_ms = ?
-            WHERE id = ? AND version = ?
+            SELECT effect_intent_id, booking_id, operation_kind, source_version,
+                   canonical_plan_json, status, expires_at_ms, provider_reference,
+                   created_at_ms, updated_at_ms
+            FROM effect_intents
+            WHERE booking_id = ? AND operation_kind = ? AND source_version = ?
             ",
         )
-        .bind(next_db)
-        .bind(next.state.name())
-        .bind(&state_json)
-        .bind(&requirements_json)
-        .bind(&selected_venue_json)
-        .bind(&availability_json)
-        .bind(&booking_ref)
-        .bind(&active_effect)
-        .bind(now)
-        .bind(id.as_str())
-        .bind(expected_db)
-        .execute(&mut *tx)
+        .bind(request.booking_id.as_str())
+        .bind(request.operation_kind.name())
+        .bind(source_db)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        if result.rows_affected() != 1 {
-            let actual = current_version_in_tx(&mut tx, id).await?;
-            return Err(StoreError::StaleVersion {
-                expected: expected_version,
-                actual,
+        if let Some(row) = existing {
+            let intent = decode_effect_row(&row)?;
+
+            // Same operation, different plan, is not a retry. It means two
+            // different consequences are competing for one identity, so fail
+            // closed rather than pick one.
+            let stored_plan: String = row.try_get("canonical_plan_json")?;
+            if stored_plan != plan_json {
+                return Err(StoreError::ConflictingPlan {
+                    booking_id: request.booking_id,
+                    operation_kind: request.operation_kind.name(),
+                    source_version: request.source_version,
+                });
+            }
+
+            let aggregate = load_booking_in_tx(&mut tx, &request.booking_id).await?;
+            tx.commit().await?;
+            return Ok(PreparedEffect {
+                aggregate,
+                intent,
+                replayed: true,
             });
         }
 
-        let event_id = format!("AUDIT-{id}-{next_version}");
+        // No intent yet: commit the transition and record the effect together.
+        let aggregate = commit_in_tx(
+            &mut tx,
+            &request.booking_id,
+            request.source_version,
+            &request.next,
+            &request.audit,
+            now,
+        )
+        .await?;
+
+        let effect_intent_id = derive_effect_intent_id(
+            &request.booking_id,
+            request.operation_kind,
+            request.source_version,
+        );
+
         sqlx::query(
             r"
-            INSERT INTO audit_events (
-                event_id, booking_id, from_version, to_version,
-                from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO effect_intents (
+                effect_intent_id, booking_id, operation_kind, source_version,
+                canonical_plan_json, status, expires_at_ms, provider_reference,
+                last_error, created_at_ms, updated_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
             ",
         )
-        .bind(&event_id)
-        .bind(id.as_str())
-        .bind(expected_db)
-        .bind(next_db)
-        .bind(&from_state)
-        .bind(next.state.name())
-        .bind(&audit.proposal)
-        .bind(&audit.outcome)
-        .bind(&audit.evidence_summary)
+        .bind(effect_intent_id.as_str())
+        .bind(request.booking_id.as_str())
+        .bind(request.operation_kind.name())
+        .bind(source_db)
+        .bind(&plan_json)
+        .bind(EffectStatus::Prepared.name())
+        .bind(request.expires_at_ms)
+        .bind(now)
         .bind(now)
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
 
-        Ok(BookingAggregate {
-            id: id.clone(),
-            version: next_version,
-            state: next.state,
-            requirements: next.requirements,
-            selected_venue: next.selected_venue,
-            availability: next.availability,
-            booking_ref: next.booking_ref,
-            active_effect: next.active_effect,
-            created_at_ms,
-            updated_at_ms: now,
+        Ok(PreparedEffect {
+            aggregate,
+            intent: EffectIntent {
+                effect_intent_id,
+                booking_id: request.booking_id,
+                operation_kind: request.operation_kind,
+                source_version: request.source_version,
+                canonical_plan: request.canonical_plan,
+                status: EffectStatus::Prepared,
+                expires_at_ms: request.expires_at_ms,
+                provider_reference: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            replayed: false,
         })
+    }
+
+    async fn load_effect(&self, id: &EffectIntentId) -> Result<EffectIntent, StoreError> {
+        let row = sqlx::query(
+            r"
+            SELECT effect_intent_id, booking_id, operation_kind, source_version,
+                   canonical_plan_json, status, expires_at_ms, provider_reference,
+                   created_at_ms, updated_at_ms
+            FROM effect_intents
+            WHERE effect_intent_id = ?
+            ",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::EffectNotFound(id.clone()))?;
+
+        decode_effect_row(&row)
     }
 
     async fn audit_events(&self, id: &BookingId) -> Result<Vec<AuditEvent>, StoreError> {
@@ -425,6 +467,152 @@ fn decode_audit_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, StoreEr
         evidence_summary: row.try_get("evidence_summary")?,
         created_at_ms: row.try_get("created_at_ms")?,
     })
+}
+
+/// The compare-and-set, the audit row, and nothing else — no `BEGIN`, no
+/// `COMMIT`. Callers own the transaction so a state change and the effect
+/// intent it implies can be written together.
+///
+/// # The caller must open with `BEGIN IMMEDIATE`
+///
+/// This function unconditionally writes, so a *deferred* transaction buys
+/// nothing: it takes no lock, the version `SELECT` opens a read transaction,
+/// and the `UPDATE` then has to promote that read to a write. Under WAL a
+/// deferred transaction cannot promote once anyone has written anywhere in the
+/// database — and because `inTransaction` is already `TRANS_READ`, `SQLite`
+/// skips the busy handler, so `busy_timeout` never applies and the call fails
+/// immediately.
+///
+/// Measured before the fix: ~52 of 60 concurrent commits to *completely
+/// unrelated* bookings failed with "database is locked", and a genuine CAS
+/// loser got `SQLITE_BUSY` rather than `StaleVersion` ~99.7% of the time.
+/// See ADR-015.
+async fn commit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &BookingId,
+    expected_version: u64,
+    next: &BookingWrite,
+    audit: &TransitionAudit,
+    now: i64,
+) -> Result<BookingAggregate, StoreError> {
+    let expected_db = version_to_i64(expected_version)?;
+    let next_version = expected_version
+        .checked_add(1)
+        .ok_or(StoreError::VersionOutOfRange)?;
+    let next_db = version_to_i64(next_version)?;
+
+    let current =
+        sqlx::query("SELECT version, state_name, created_at_ms FROM bookings WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+
+    let actual_version = version_from_i64(current.try_get::<i64, _>("version")?)?;
+    if actual_version != expected_version {
+        return Err(StoreError::StaleVersion {
+            expected: expected_version,
+            actual: actual_version,
+        });
+    }
+
+    let from_state: String = current.try_get("state_name")?;
+    let created_at_ms: i64 = current.try_get("created_at_ms")?;
+
+    let state_json = serde_json::to_string(&next.state)?;
+    let requirements_json = serde_json::to_string(&next.requirements)?;
+    let selected_venue_json = serialize_optional(next.selected_venue.as_ref())?;
+    let availability_json = serialize_optional(next.availability.as_ref())?;
+    let booking_ref = next.booking_ref.as_ref().map(ToString::to_string);
+    let active_effect = next.active_effect.as_ref().map(ToString::to_string);
+
+    let result = sqlx::query(
+        r"
+        UPDATE bookings
+        SET version = ?, state_name = ?, state_json = ?, requirements_json = ?,
+            selected_venue_json = ?, availability_json = ?, booking_ref = ?,
+            active_effect = ?, updated_at_ms = ?
+        WHERE id = ? AND version = ?
+        ",
+    )
+    .bind(next_db)
+    .bind(next.state.name())
+    .bind(&state_json)
+    .bind(&requirements_json)
+    .bind(&selected_venue_json)
+    .bind(&availability_json)
+    .bind(&booking_ref)
+    .bind(&active_effect)
+    .bind(now)
+    .bind(id.as_str())
+    .bind(expected_db)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        let actual = current_version_in_tx(tx, id).await?;
+        return Err(StoreError::StaleVersion {
+            expected: expected_version,
+            actual,
+        });
+    }
+
+    let event_id = format!("AUDIT-{id}-{next_version}");
+    sqlx::query(
+        r"
+        INSERT INTO audit_events (
+            event_id, booking_id, from_version, to_version,
+            from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(&event_id)
+    .bind(id.as_str())
+    .bind(expected_db)
+    .bind(next_db)
+    .bind(&from_state)
+    .bind(next.state.name())
+    .bind(&audit.proposal)
+    .bind(&audit.outcome)
+    .bind(&audit.evidence_summary)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(BookingAggregate {
+        id: id.clone(),
+        version: next_version,
+        state: next.state.clone(),
+        requirements: next.requirements.clone(),
+        selected_venue: next.selected_venue.clone(),
+        availability: next.availability.clone(),
+        booking_ref: next.booking_ref.clone(),
+        active_effect: next.active_effect.clone(),
+        created_at_ms,
+        updated_at_ms: now,
+    })
+}
+
+/// Read the aggregate from inside an open transaction.
+async fn load_booking_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &BookingId,
+) -> Result<BookingAggregate, StoreError> {
+    let row = sqlx::query(
+        r"
+        SELECT id, version, state_name, state_json, requirements_json,
+               selected_venue_json, availability_json, booking_ref, active_effect,
+               created_at_ms, updated_at_ms
+        FROM bookings
+        WHERE id = ?
+        ",
+    )
+    .bind(id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+
+    decode_booking_row(&row)
 }
 
 async fn current_version_in_tx(
@@ -862,5 +1050,356 @@ mod concurrency {
             failures.len(),
             &failures[..failures.len().min(3)]
         );
+    }
+}
+
+// ---------------------------------------------------------------- M4 slice A
+
+/// A request to durably record an intended external consequence *and* commit
+/// the state transition that creates it, in one transaction.
+///
+/// Deliberately one operation rather than `insert_intent` + `commit_booking`.
+/// Two calls leave a crash window with an orphan intent or an in-flight state
+/// with no identity to reconcile against — and they leave a signature through
+/// which a capability could be invoked while a transaction is open, which
+/// ADR-014 forbids.
+#[derive(Clone, Debug)]
+pub struct PrepareEffect {
+    pub booking_id: BookingId,
+    pub operation_kind: OperationKind,
+    /// The aggregate version this effect is derived from. Also the CAS
+    /// expectation, and part of the uniqueness key.
+    pub source_version: u64,
+    pub canonical_plan: BookingPlan,
+    pub expires_at_ms: i64,
+    pub next: BookingWrite,
+    pub audit: TransitionAudit,
+}
+
+/// The committed result of [`BookingRepository::prepare_effect`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedEffect {
+    pub aggregate: BookingAggregate,
+    pub intent: EffectIntent,
+    /// True when this call found an existing intent for the same operation
+    /// rather than creating one — a retry after a lost acknowledgement.
+    /// Nothing was written.
+    pub replayed: bool,
+}
+
+impl StoreError {
+    fn corrupt(what: impl Into<String>) -> Self {
+        Self::CorruptRow(what.into())
+    }
+}
+
+fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, StoreError> {
+    let kind_text: String = row.try_get("operation_kind")?;
+    let status_text: String = row.try_get("status")?;
+    let plan_json: String = row.try_get("canonical_plan_json")?;
+    let provider_reference: Option<String> = row.try_get("provider_reference")?;
+
+    Ok(EffectIntent {
+        effect_intent_id: EffectIntentId::new(row.try_get::<String, _>("effect_intent_id")?),
+        booking_id: BookingId::new(row.try_get::<String, _>("booking_id")?),
+        operation_kind: OperationKind::parse(&kind_text)
+            .map_err(|bad| StoreError::corrupt(format!("unknown operation_kind {bad:?}")))?,
+        source_version: version_from_i64(row.try_get::<i64, _>("source_version")?)?,
+        canonical_plan: serde_json::from_str(&plan_json)?,
+        status: EffectStatus::parse(&status_text)
+            .map_err(|bad| StoreError::corrupt(format!("unknown effect status {bad:?}")))?,
+        expires_at_ms: row.try_get("expires_at_ms")?,
+        provider_reference: provider_reference.map(CouncilBookingRef::new),
+        created_at_ms: row.try_get("created_at_ms")?,
+        updated_at_ms: row.try_get("updated_at_ms")?,
+    })
+}
+
+/// Derive the identifier for one intended consequence.
+///
+/// Derived from the *operation identity* — resource, kind, source version —
+/// not from the plan's contents. That distinction matters: hashing plan
+/// content would give two legitimate identical operations the same id, whereas
+/// two operations differing in resource or version can never collide here, and
+/// a retry of the same operation reproduces the same id.
+///
+/// The value is written once and read back thereafter; the UNIQUE key on
+/// `(booking_id, operation_kind, source_version)` is what actually guarantees
+/// one intent per operation.
+fn derive_effect_intent_id(
+    booking_id: &BookingId,
+    operation_kind: OperationKind,
+    source_version: u64,
+) -> EffectIntentId {
+    EffectIntentId::new(format!(
+        "EFF-{}-{}-{}",
+        booking_id.as_str(),
+        operation_kind.name().to_uppercase(),
+        source_version
+    ))
+}
+
+#[cfg(test)]
+mod effect_identity {
+    use super::*;
+    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use tempfile::TempDir;
+    use townhall_domain::{BookingInProgress, BookingState, SelectedVenueRef, VenueFacts};
+
+    const TTL_MS: i64 = 30_000;
+
+    fn requirements() -> BookingRequirements {
+        BookingRequirements {
+            purpose: "community meeting".to_owned(),
+            requested_date: "2026-08-20".to_owned(),
+            time_window: TimeWindow {
+                from: "13:00".to_owned(),
+                to: "17:00".to_owned(),
+            },
+            attendees: 20,
+            wheelchair_accessible: true,
+            max_fee: Money::from_pence(5_000),
+        }
+    }
+
+    fn facts(venue: &str) -> VenueFacts {
+        VenueFacts {
+            venue_id: VenueId::new(venue),
+            slot_id: SlotId::new("SLOT-A"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        }
+    }
+
+    fn plan_for(venue: &str, effect: &str) -> BookingPlan {
+        BookingPlan::Book {
+            effect_intent_id: EffectIntentId::new(effect),
+            principal: PrincipalId::new("lucy"),
+            facts: facts(venue),
+        }
+    }
+
+    fn in_progress_write(effect: &str) -> BookingWrite {
+        BookingWrite {
+            state: BookingState::BookingInProgress(BookingInProgress {
+                effect_intent_id: EffectIntentId::new(effect),
+            }),
+            requirements: requirements(),
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            availability: Some(facts("TH-A")),
+            booking_ref: None,
+            active_effect: Some(EffectIntentId::new(effect)),
+        }
+    }
+
+    fn prepare_at(id: &BookingId, version: u64, venue: &str, effect: &str) -> PrepareEffect {
+        PrepareEffect {
+            booking_id: id.clone(),
+            operation_kind: OperationKind::Book,
+            source_version: version,
+            canonical_plan: plan_for(venue, effect),
+            expires_at_ms: 1_787_230_800_000 + TTL_MS,
+            next: in_progress_write(effect),
+            audit: TransitionAudit::committed("Book", None),
+        }
+    }
+
+    async fn repo_in(temp: &TempDir) -> SqliteBookingRepository {
+        SqliteBookingRepository::open(temp.path().join("townhall.sqlite"))
+            .await
+            .expect("repository should open")
+    }
+
+    async fn seeded(repo: &SqliteBookingRepository, id: &BookingId) {
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+    }
+
+    /// The gate. A lost acknowledgement must not strand recovery.
+    ///
+    /// It is not enough that a duplicate is *rejected*: if the retry errors,
+    /// the coordinator has one committed intent it cannot resume, no duplicate
+    /// effect and no way forward. The retry must return exactly what was
+    /// committed — same id, same expiry, same plan, same aggregate — and it
+    /// must do so after a restart, because that is when it matters.
+    #[tokio::test]
+    async fn lost_acknowledgement_retry_returns_the_committed_intent() {
+        let temp = TempDir::new().expect("temp dir");
+        let id = BookingId::new("BKG-RETRY");
+
+        let first = {
+            let repo = repo_in(&temp).await;
+            seeded(&repo, &id).await;
+            repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+                .await
+                .expect("first prepare")
+        };
+        assert!(!first.replayed, "the first call must actually write");
+        assert_eq!(first.aggregate.version, 1);
+        assert_eq!(first.intent.status, EffectStatus::Prepared);
+
+        // Restart, as if the acknowledgement was lost and the process died.
+        let reopened = repo_in(&temp).await;
+        let retry = reopened
+            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .await
+            .expect("retry must resume, not error");
+
+        assert!(retry.replayed, "the retry must be recognised as a replay");
+        assert_eq!(retry.intent.effect_intent_id, first.intent.effect_intent_id);
+        assert_eq!(retry.intent.expires_at_ms, first.intent.expires_at_ms);
+        assert_eq!(retry.intent.canonical_plan, first.intent.canonical_plan);
+        assert_eq!(retry.aggregate, first.aggregate, "same committed aggregate");
+
+        // And nothing was written twice.
+        assert_eq!(reopened.load(&id).await.expect("load").version, 1);
+        assert_eq!(reopened.audit_events(&id).await.expect("audit").len(), 1);
+    }
+
+    /// The same operation key with a *different* canonical plan is not a retry.
+    /// Two different consequences are competing for one identity, so fail
+    /// closed rather than silently pick one.
+    #[tokio::test]
+    async fn same_key_with_a_different_plan_fails_closed() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-CONFLICT");
+        seeded(&repo, &id).await;
+
+        repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .await
+            .expect("first");
+
+        let error = repo
+            .prepare_effect(prepare_at(&id, 0, "TH-B", "E-1"))
+            .await
+            .expect_err("a different plan under the same key must be refused");
+
+        assert!(
+            matches!(error, StoreError::ConflictingPlan { .. }),
+            "expected ConflictingPlan, got {error:?}"
+        );
+        // The refusal must not have disturbed what was already committed.
+        assert_eq!(repo.load(&id).await.expect("load").version, 1);
+    }
+
+    /// A stale prepare writes nothing at all — no version bump, no intent.
+    ///
+    /// # What this does *not* prove
+    ///
+    /// Mutation-tested honestly: moving the intent `INSERT` off the transaction
+    /// onto `&self.pool` — the Phase A violation ADR-014 forbids — does **not**
+    /// fail this test. The stale CAS returns before the insert is reached, so
+    /// there is nothing to orphan either way, and the test passes for the wrong
+    /// reason. (Three sibling tests did fail under that mutation, but only
+    /// incidentally, via lock contention against the open `IMMEDIATE`
+    /// transaction — that is luck, not coverage.)
+    ///
+    /// What actually enforces atomicity here is the `&mut *tx` in the insert's
+    /// signature. A deterministic failure point between the CAS and the intent
+    /// write is what would test it properly, and that needs an injectable
+    /// interruption the coordinator provides — slice C.
+    #[tokio::test]
+    async fn a_stale_prepare_writes_nothing() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-ORPHAN");
+        seeded(&repo, &id).await;
+
+        // Move the aggregate on, so the prepare below is stale.
+        repo.commit(
+            &id,
+            0,
+            BookingWrite {
+                state: BookingState::Draft(townhall_domain::Draft),
+                requirements: requirements(),
+                selected_venue: None,
+                availability: None,
+                booking_ref: None,
+                active_effect: None,
+            },
+            TransitionAudit::committed("ChangeVenue", None),
+        )
+        .await
+        .expect("advance to v1");
+
+        let error = repo
+            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .await
+            .expect_err("a stale prepare must lose");
+        assert!(
+            matches!(error, StoreError::StaleVersion { .. }),
+            "got {error:?}"
+        );
+
+        let orphan = repo
+            .load_effect(&EffectIntentId::new("EFF-BKG-ORPHAN-BOOK-0"))
+            .await;
+        assert!(
+            matches!(orphan, Err(StoreError::EffectNotFound(_))),
+            "a rolled-back prepare must leave no intent, got {orphan:?}"
+        );
+    }
+
+    /// Two operations on the same booking are two effects with two identities.
+    #[tokio::test]
+    async fn distinct_operations_get_distinct_identities() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-DISTINCT");
+        seeded(&repo, &id).await;
+
+        let first = repo
+            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .await
+            .expect("v0");
+        let second = repo
+            .prepare_effect(PrepareEffect {
+                source_version: 1,
+                ..prepare_at(&id, 1, "TH-A", "E-2")
+            })
+            .await
+            .expect("v1");
+
+        assert_ne!(
+            first.intent.effect_intent_id,
+            second.intent.effect_intent_id
+        );
+        assert!(!second.replayed);
+    }
+
+    /// The stored expiry is read back verbatim, never recomputed — a restart or
+    /// clock change must not produce a different deadline for the same identity
+    /// (ADR-016).
+    #[tokio::test]
+    async fn the_expiry_is_stored_and_read_back_unchanged() {
+        let temp = TempDir::new().expect("temp dir");
+        let id = BookingId::new("BKG-EXPIRY");
+        let expected = {
+            let repo = repo_in(&temp).await;
+            seeded(&repo, &id).await;
+            repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+                .await
+                .expect("prepare")
+                .intent
+                .expires_at_ms
+        };
+
+        let reopened = repo_in(&temp).await;
+        let loaded = reopened
+            .load_effect(&EffectIntentId::new("EFF-BKG-EXPIRY-BOOK-0"))
+            .await
+            .expect("load after restart");
+        assert_eq!(loaded.expires_at_ms, expected);
+        assert_eq!(loaded.status, EffectStatus::Prepared);
     }
 }

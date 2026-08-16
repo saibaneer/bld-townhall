@@ -175,6 +175,114 @@ pub struct BookingAggregate {
     pub updated_at_ms: i64,
 }
 
+/// Which external consequence an effect intent represents.
+///
+/// Part of the uniqueness key, because a booking and its cancellation are two
+/// effects with two identities. Reusing one id for both would make "has this
+/// effect completed?" unanswerable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationKind {
+    Book,
+    Cancel,
+}
+
+impl OperationKind {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Book => "Book",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    /// Parse the persisted discriminator.
+    ///
+    /// # Errors
+    /// Returns the unrecognised text if it is not a known operation kind.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "Book" => Ok(Self::Book),
+            "Cancel" => Ok(Self::Cancel),
+            other => Err(other.to_owned()),
+        }
+    }
+}
+
+/// Lifecycle of an intended external consequence.
+///
+/// `Prepared` means the intent is durable but nothing external has been
+/// attempted. Everything after that is set by evidence, never by optimism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectStatus {
+    /// Persisted; the capability has not been called.
+    Prepared,
+    /// The capability was called and the outcome is not yet known. Timeout
+    /// lands here, because timeout is neither success nor failure.
+    Unknown,
+    /// Verified evidence confirmed the effect happened.
+    Confirmed,
+    /// The provider authoritatively refused, durably.
+    Rejected,
+    /// The council tombstoned the intent: it never happened and never can.
+    Absent,
+}
+
+impl EffectStatus {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Prepared => "Prepared",
+            Self::Unknown => "Unknown",
+            Self::Confirmed => "Confirmed",
+            Self::Rejected => "Rejected",
+            Self::Absent => "Absent",
+        }
+    }
+
+    /// Whether this outcome is settled and can never change.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Rejected | Self::Absent)
+    }
+
+    /// Parse the persisted discriminator.
+    ///
+    /// # Errors
+    /// Returns the unrecognised text if it is not a known status.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "Prepared" => Ok(Self::Prepared),
+            "Unknown" => Ok(Self::Unknown),
+            "Confirmed" => Ok(Self::Confirmed),
+            "Rejected" => Ok(Self::Rejected),
+            "Absent" => Ok(Self::Absent),
+            other => Err(other.to_owned()),
+        }
+    }
+}
+
+/// A durable record of one intended external consequence.
+///
+/// Persisted in the same transaction as the state transition that creates it,
+/// and always before the capability is called (ADR-014).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectIntent {
+    pub effect_intent_id: EffectIntentId,
+    pub booking_id: BookingId,
+    pub operation_kind: OperationKind,
+    /// The aggregate version this effect was derived from. Part of the
+    /// uniqueness key.
+    pub source_version: u64,
+    pub canonical_plan: BookingPlan,
+    pub status: EffectStatus,
+    /// ADR-016. Sent to the council on create and on lookup; absence is only
+    /// definitive once the council has tombstoned the intent past this.
+    pub expires_at_ms: i64,
+    pub provider_reference: Option<CouncilBookingRef>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct BookingContext {
     pub booking_id: BookingId,
@@ -187,7 +295,7 @@ pub struct BookingContext {
     pub fake_booking_ref: CouncilBookingRef,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BookingPlan {
     SelectVenue {
         venue_id: VenueId,

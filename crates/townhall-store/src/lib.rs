@@ -98,6 +98,14 @@ pub enum StoreError {
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
     #[error(
+        "effect identity disagrees: {where_} carries {found}, but this operation is {expected}"
+    )]
+    InconsistentEffectIdentity {
+        where_: &'static str,
+        found: EffectIntentId,
+        expected: EffectIntentId,
+    },
+    #[error(
         "an effect intent already exists for booking {booking_id} operation {operation_kind} \
          at version {source_version}, with a different canonical plan"
     )]
@@ -135,8 +143,15 @@ pub trait BookingRepository: Send + Sync {
     /// invoked while the transaction is open.
     ///
     /// Idempotent on `(booking_id, operation_kind, source_version)`: a retry
-    /// after a lost acknowledgement returns the intent and aggregate that were
-    /// already committed, with `replayed: true` and nothing written.
+    /// after a lost acknowledgement returns the committed intent with
+    /// `replayed: true` and nothing written.
+    ///
+    /// The aggregate returned on a replay is the **current** one, not a
+    /// snapshot of what was committed alongside the intent. That is deliberate:
+    /// by the time a retry arrives the booking may legitimately have advanced
+    /// or finalised, and handing back a stale snapshot would be more dangerous
+    /// than handing back the truth. A coordinator must therefore re-check both
+    /// the current state and the intent's status before executing anything.
     ///
     /// # Errors
     /// [`StoreError::ConflictingPlan`] if an intent already exists for that key
@@ -306,6 +321,8 @@ impl BookingRepository for SqliteBookingRepository {
             request.operation_kind,
             request.source_version,
         );
+        verify_effect_identity(&request, &effect_intent_id)?;
+
         let next = BookingWrite {
             active_effect: Some(effect_intent_id.clone()),
             ..request.next.clone()
@@ -334,27 +351,9 @@ impl BookingRepository for SqliteBookingRepository {
         .await?;
 
         if let Some(row) = existing {
-            let intent = decode_effect_row(&row)?;
-
-            // Same operation, different plan, is not a retry. It means two
-            // different consequences are competing for one identity, so fail
-            // closed rather than pick one.
-            let stored_plan: String = row.try_get("canonical_plan_json")?;
-            if stored_plan != plan_json {
-                return Err(StoreError::ConflictingPlan {
-                    booking_id: request.booking_id,
-                    operation_kind: request.operation_kind.name(),
-                    source_version: request.source_version,
-                });
-            }
-
-            let aggregate = load_booking_in_tx(&mut tx, &request.booking_id).await?;
+            let replayed = replay_existing(&mut tx, &request, &row, &plan_json).await?;
             tx.commit().await?;
-            return Ok(PreparedEffect {
-                aggregate,
-                intent,
-                replayed: true,
-            });
+            return Ok(replayed);
         }
 
         // No intent yet: commit the transition and record the effect together.
@@ -1172,7 +1171,81 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
     })
 }
 
+/// Resume an operation whose intent is already committed.
+///
+/// Reached when a retry arrives after a lost acknowledgement. Nothing is
+/// written: the CAS would fail anyway, because the version already advanced
+/// when the intent was first committed — and if this returned an error instead,
+/// the coordinator would hold one intent it could never resume.
+async fn replay_existing(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request: &PrepareEffect,
+    row: &sqlx::sqlite::SqliteRow,
+    plan_json: &str,
+) -> Result<PreparedEffect, StoreError> {
+    let intent = decode_effect_row(row)?;
+
+    // Same operation key, different plan, is not a retry: two different
+    // consequences are competing for one identity. Fail closed rather than
+    // pick one.
+    let stored_plan: String = row.try_get("canonical_plan_json")?;
+    if stored_plan != plan_json {
+        return Err(StoreError::ConflictingPlan {
+            booking_id: request.booking_id.clone(),
+            operation_kind: request.operation_kind.name(),
+            source_version: request.source_version,
+        });
+    }
+
+    let aggregate = load_booking_in_tx(tx, &request.booking_id).await?;
+    Ok(PreparedEffect {
+        aggregate,
+        intent,
+        replayed: true,
+    })
+}
+
+/// Every place that carries an effect id must carry *this* one.
+///
+/// The id is currently duplicated across the canonical plan, the in-flight
+/// state and the aggregate's `active_effect`; slice B removes that
+/// duplication. Until then:
+///
+/// - silently **rewriting** the caller's values would hide a coordinator bug;
+/// - silently **accepting** them would let the plan name one effect while the
+///   intent row names another — and fact binding later compares the plan's id
+///   against provider evidence, so the *real* provider result would be
+///   rejected as a mismatch.
+///
+/// So disagreement fails closed.
+fn verify_effect_identity(
+    request: &PrepareEffect,
+    expected: &EffectIntentId,
+) -> Result<(), StoreError> {
+    let sites = [
+        ("canonical plan", request.canonical_plan.effect_intent_id()),
+        ("in-flight state", request.next.state.effect_intent_id()),
+    ];
+    for (where_, found) in sites {
+        if let Some(found) = found
+            && found != expected
+        {
+            return Err(StoreError::InconsistentEffectIdentity {
+                where_,
+                found: found.clone(),
+                expected: expected.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Derive the identifier for one intended consequence.
+///
+/// **Public deliberately.** The coordinator must build its canonical plan and
+/// its in-flight state carrying the *same* id the repository will persist, and
+/// the only safe way to guarantee that is for both to call this one function.
+/// `prepare_effect` then verifies they agree and fails closed if they do not.
 ///
 /// Derived from the *operation identity* — resource, kind, source version —
 /// not from the plan's contents. That distinction matters: hashing plan
@@ -1183,7 +1256,8 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
 /// The value is written once and read back thereafter; the UNIQUE key on
 /// `(booking_id, operation_kind, source_version)` is what actually guarantees
 /// one intent per operation.
-fn derive_effect_intent_id(
+#[must_use]
+pub fn derive_effect_intent_id(
     booking_id: &BookingId,
     operation_kind: OperationKind,
     source_version: u64,
@@ -1228,18 +1302,18 @@ mod effect_identity {
         }
     }
 
-    fn plan_for(venue: &str, effect: &str) -> BookingPlan {
+    fn plan_for(venue: &str, effect: &EffectIntentId) -> BookingPlan {
         BookingPlan::Book {
-            effect_intent_id: EffectIntentId::new(effect),
+            effect_intent_id: effect.clone(),
             principal: PrincipalId::new("lucy"),
             facts: facts(venue),
         }
     }
 
-    fn in_progress_write(effect: &str) -> BookingWrite {
+    fn in_progress_write(effect: &EffectIntentId) -> BookingWrite {
         BookingWrite {
             state: BookingState::BookingInProgress(BookingInProgress {
-                effect_intent_id: EffectIntentId::new(effect),
+                effect_intent_id: effect.clone(),
             }),
             requirements: requirements(),
             selected_venue: Some(SelectedVenueRef {
@@ -1248,17 +1322,20 @@ mod effect_identity {
             }),
             availability: Some(facts("TH-A")),
             booking_ref: None,
-            active_effect: Some(EffectIntentId::new(effect)),
+            active_effect: Some(effect.clone()),
         }
     }
 
-    fn prepare_at(id: &BookingId, version: u64, venue: &str, effect: &str) -> PrepareEffect {
+    /// Build a prepare request the way a coordinator must: derive the id once
+    /// with the shared function, then use it everywhere.
+    fn prepare_at(id: &BookingId, version: u64, venue: &str) -> PrepareEffect {
+        let effect = derive_effect_intent_id(id, OperationKind::Book, version);
         PrepareEffect {
             booking_id: id.clone(),
             operation_kind: OperationKind::Book,
             source_version: version,
-            canonical_plan: plan_for(venue, effect),
-            next: in_progress_write(effect),
+            canonical_plan: plan_for(venue, &effect),
+            next: in_progress_write(&effect),
             audit: TransitionAudit::committed("Book", None),
         }
     }
@@ -1293,7 +1370,7 @@ mod effect_identity {
         let first = {
             let repo = repo_in(&temp).await;
             seeded(&repo, &id).await;
-            repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            repo.prepare_effect(prepare_at(&id, 0, "TH-A"))
                 .await
                 .expect("first prepare")
         };
@@ -1304,7 +1381,7 @@ mod effect_identity {
         // Restart, as if the acknowledgement was lost and the process died.
         let reopened = repo_in(&temp).await;
         let retry = reopened
-            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .prepare_effect(prepare_at(&id, 0, "TH-A"))
             .await
             .expect("retry must resume, not error");
 
@@ -1329,12 +1406,12 @@ mod effect_identity {
         let id = BookingId::new("BKG-CONFLICT");
         seeded(&repo, &id).await;
 
-        repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+        repo.prepare_effect(prepare_at(&id, 0, "TH-A"))
             .await
             .expect("first");
 
         let error = repo
-            .prepare_effect(prepare_at(&id, 0, "TH-B", "E-1"))
+            .prepare_effect(prepare_at(&id, 0, "TH-B"))
             .await
             .expect_err("a different plan under the same key must be refused");
 
@@ -1387,7 +1464,7 @@ mod effect_identity {
         .expect("advance to v1");
 
         let error = repo
-            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .prepare_effect(prepare_at(&id, 0, "TH-A"))
             .await
             .expect_err("a stale prepare must lose");
         assert!(
@@ -1413,14 +1490,11 @@ mod effect_identity {
         seeded(&repo, &id).await;
 
         let first = repo
-            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .prepare_effect(prepare_at(&id, 0, "TH-A"))
             .await
             .expect("v0");
         let second = repo
-            .prepare_effect(PrepareEffect {
-                source_version: 1,
-                ..prepare_at(&id, 1, "TH-A", "E-2")
-            })
+            .prepare_effect(prepare_at(&id, 1, "TH-A"))
             .await
             .expect("v1");
 
@@ -1431,40 +1505,69 @@ mod effect_identity {
         assert!(!second.replayed);
     }
 
-    /// The aggregate's `active_effect` and the intent row must name the **same**
-    /// effect, by construction.
+    /// Every place carrying an effect id must carry the same one, and a
+    /// disagreement is refused rather than silently rewritten.
     ///
-    /// The caller builds `next` and may put anything in `active_effect` — the
-    /// domain today still mints `BOOK-{booking}-{n}` plans. If the repository
-    /// honoured that, Phase A would commit an aggregate pointing at one id
-    /// while persisting an intent under another, and recovery — which reads
-    /// `active_effect` — would look up an intent that does not exist, or call
-    /// the council under the wrong identity. ADR-014's stable identity is only
-    /// stable if there is one value.
+    /// The id is currently duplicated across the canonical plan, the in-flight
+    /// state and the aggregate's `active_effect`. Rewriting the caller's values
+    /// would hide a coordinator bug; accepting them would let the plan name one
+    /// effect while the intent row names another, and fact binding later
+    /// compares the plan's id against provider evidence — so the *real*
+    /// provider result would be rejected. Fail closed.
     #[tokio::test]
-    async fn the_aggregate_and_the_intent_name_the_same_effect() {
+    async fn a_disagreeing_effect_identity_is_refused() {
         let temp = TempDir::new().expect("temp dir");
         let repo = repo_in(&temp).await;
         let id = BookingId::new("BKG-SAMEID");
         seeded(&repo, &id).await;
 
-        // Deliberately hostile: the caller names a completely different effect.
-        let mut request = prepare_at(&id, 0, "TH-A", "E-1");
-        request.next.active_effect = Some(EffectIntentId::new("WRONG-ID-FROM-CALLER"));
+        let mut request = prepare_at(&id, 0, "TH-A");
+        request.canonical_plan = BookingPlan::Book {
+            effect_intent_id: EffectIntentId::new("SOME-OTHER-EFFECT"),
+            principal: PrincipalId::new("lucy"),
+            facts: facts("TH-A"),
+        };
 
-        let prepared = repo.prepare_effect(request).await.expect("prepare");
-
-        assert_eq!(
-            prepared.aggregate.active_effect.as_ref(),
-            Some(&prepared.intent.effect_intent_id),
-            "the aggregate must point at the intent the repository actually wrote"
+        let error = repo
+            .prepare_effect(request)
+            .await
+            .expect_err("a plan naming a different effect must be refused");
+        assert!(
+            matches!(error, StoreError::InconsistentEffectIdentity { .. }),
+            "got {error:?}"
         );
-        // And recovery, which only has the aggregate, can find it.
+        assert_eq!(
+            repo.load(&id).await.expect("load").version,
+            0,
+            "nothing committed"
+        );
+    }
+
+    /// A consistent request commits, and recovery — which only has the
+    /// aggregate — can resolve the intent from `active_effect`.
+    #[tokio::test]
+    async fn recovery_can_resolve_the_intent_from_the_aggregate() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-RESOLVE");
+        seeded(&repo, &id).await;
+
+        let prepared = repo
+            .prepare_effect(prepare_at(&id, 0, "TH-A"))
+            .await
+            .expect("prepare");
         let active = prepared
             .aggregate
             .active_effect
             .clone()
             .expect("active effect");
+
+        assert_eq!(active, prepared.intent.effect_intent_id);
+        assert_eq!(
+            prepared.aggregate.state.effect_intent_id(),
+            Some(&prepared.intent.effect_intent_id),
+            "the in-flight state must name the same effect"
+        );
         let found = repo
             .load_effect(&active)
             .await
@@ -1486,7 +1589,7 @@ mod effect_identity {
 
         let before = now_ms().expect("clock");
         let prepared = repo
-            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .prepare_effect(prepare_at(&id, 0, "TH-A"))
             .await
             .expect("prepare");
         let after = now_ms().expect("clock");
@@ -1509,7 +1612,7 @@ mod effect_identity {
         let expected = {
             let repo = repo_in(&temp).await;
             seeded(&repo, &id).await;
-            repo.prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            repo.prepare_effect(prepare_at(&id, 0, "TH-A"))
                 .await
                 .expect("prepare")
                 .intent

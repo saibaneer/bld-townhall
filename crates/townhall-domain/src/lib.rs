@@ -120,6 +120,35 @@ pub enum BookingProposal {
     Reconcile,
 }
 
+impl BookingPlan {
+    /// The effect identity this plan intends, if it intends an external one.
+    ///
+    /// The store uses this to verify that every place carrying an effect id
+    /// agrees. Today the id is duplicated across the plan, the state and the
+    /// aggregate's `active_effect`; slice B removes that duplication. Until
+    /// then, disagreement must fail closed rather than be silently accepted.
+    #[must_use]
+    pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
+        match self {
+            Self::Book {
+                effect_intent_id, ..
+            } => Some(effect_intent_id),
+            _ => None,
+        }
+    }
+}
+
+impl BookingState {
+    /// The effect identity this state carries, if it is an in-flight state.
+    #[must_use]
+    pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
+        match self {
+            Self::BookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
+            _ => None,
+        }
+    }
+}
+
 impl BookingProposal {
     #[must_use]
     pub const fn name(&self) -> &'static str {

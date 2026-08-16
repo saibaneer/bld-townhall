@@ -154,6 +154,7 @@ pub trait BookingRepository: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct SqliteBookingRepository {
     pool: SqlitePool,
+    effect_ttl_ms: i64,
 }
 
 impl SqliteBookingRepository {
@@ -176,7 +177,24 @@ impl SqliteBookingRepository {
             .await?;
 
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            effect_ttl_ms: DEFAULT_EFFECT_TTL_MS,
+        })
+    }
+
+    /// Open with a non-default effect TTL. For tests that need a deadline they
+    /// can actually reach.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub async fn open_with_ttl(
+        path: impl AsRef<Path>,
+        effect_ttl_ms: i64,
+    ) -> Result<Self, StoreError> {
+        let mut repo = Self::open(path).await?;
+        repo.effect_ttl_ms = effect_ttl_ms;
+        Ok(repo)
     }
 
     #[must_use]
@@ -265,7 +283,33 @@ impl BookingRepository for SqliteBookingRepository {
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
         let plan_json = serde_json::to_string(&request.canonical_plan)?;
         let source_db = version_to_i64(request.source_version)?;
-        let now = now_ms()?;
+
+        // ADR-016: sampled once, immediately before the transaction opens. Not
+        // at commit - the commit instant is unknowable from inside the
+        // transaction that must persist the value. Sampling early is also the
+        // safe direction: the deadline lands marginally earlier than a
+        // commit-time reading would, never later, so the council can never act
+        // on an intent we already consider dead.
+        let prepared_at_ms = now_ms()?;
+        let expires_at_ms = prepared_at_ms
+            .checked_add(self.effect_ttl_ms)
+            .ok_or(StoreError::ClockOutOfRange)?;
+        let now = prepared_at_ms;
+
+        // The repository owns the effect identity. If the caller supplied
+        // `active_effect` on `next`, the aggregate and the intent row could
+        // name different effects - and recovery, which reads `active_effect`,
+        // would then look up an intent that does not exist. ADR-014's stable
+        // identity requires these to be the same value by construction.
+        let effect_intent_id = derive_effect_intent_id(
+            &request.booking_id,
+            request.operation_kind,
+            request.source_version,
+        );
+        let next = BookingWrite {
+            active_effect: Some(effect_intent_id.clone()),
+            ..request.next.clone()
+        };
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -318,7 +362,7 @@ impl BookingRepository for SqliteBookingRepository {
             &mut tx,
             &request.booking_id,
             request.source_version,
-            &request.next,
+            &next,
             &request.audit,
             now,
         )
@@ -345,7 +389,7 @@ impl BookingRepository for SqliteBookingRepository {
         .bind(source_db)
         .bind(&plan_json)
         .bind(EffectStatus::Prepared.name())
-        .bind(request.expires_at_ms)
+        .bind(expires_at_ms)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -362,7 +406,7 @@ impl BookingRepository for SqliteBookingRepository {
                 source_version: request.source_version,
                 canonical_plan: request.canonical_plan,
                 status: EffectStatus::Prepared,
-                expires_at_ms: request.expires_at_ms,
+                expires_at_ms,
                 provider_reference: None,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -1071,10 +1115,23 @@ pub struct PrepareEffect {
     /// expectation, and part of the uniqueness key.
     pub source_version: u64,
     pub canonical_plan: BookingPlan,
-    pub expires_at_ms: i64,
+    /// The state to commit alongside the intent.
+    ///
+    /// `active_effect` on this write is **ignored**: the repository owns the
+    /// effect identity and sets it, so the aggregate and the intent row cannot
+    /// disagree. See [`BookingRepository::prepare_effect`].
     pub next: BookingWrite,
     pub audit: TransitionAudit,
 }
+
+/// How long an effect intent may be acted on, from the instant Phase A is
+/// prepared.
+///
+/// ADR-016: the deadline is *derived*, never supplied by a caller. A caller
+/// that could choose it could set it in the past and have the council tombstone
+/// the effect immediately, or far in the future and extend the creation window
+/// past policy.
+pub const DEFAULT_EFFECT_TTL_MS: i64 = 30_000;
 
 /// The committed result of [`BookingRepository::prepare_effect`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1146,8 +1203,6 @@ mod effect_identity {
     use tempfile::TempDir;
     use townhall_domain::{BookingInProgress, BookingState, SelectedVenueRef, VenueFacts};
 
-    const TTL_MS: i64 = 30_000;
-
     fn requirements() -> BookingRequirements {
         BookingRequirements {
             purpose: "community meeting".to_owned(),
@@ -1203,7 +1258,6 @@ mod effect_identity {
             operation_kind: OperationKind::Book,
             source_version: version,
             canonical_plan: plan_for(venue, effect),
-            expires_at_ms: 1_787_230_800_000 + TTL_MS,
             next: in_progress_write(effect),
             audit: TransitionAudit::committed("Book", None),
         }
@@ -1375,6 +1429,74 @@ mod effect_identity {
             second.intent.effect_intent_id
         );
         assert!(!second.replayed);
+    }
+
+    /// The aggregate's `active_effect` and the intent row must name the **same**
+    /// effect, by construction.
+    ///
+    /// The caller builds `next` and may put anything in `active_effect` — the
+    /// domain today still mints `BOOK-{booking}-{n}` plans. If the repository
+    /// honoured that, Phase A would commit an aggregate pointing at one id
+    /// while persisting an intent under another, and recovery — which reads
+    /// `active_effect` — would look up an intent that does not exist, or call
+    /// the council under the wrong identity. ADR-014's stable identity is only
+    /// stable if there is one value.
+    #[tokio::test]
+    async fn the_aggregate_and_the_intent_name_the_same_effect() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-SAMEID");
+        seeded(&repo, &id).await;
+
+        // Deliberately hostile: the caller names a completely different effect.
+        let mut request = prepare_at(&id, 0, "TH-A", "E-1");
+        request.next.active_effect = Some(EffectIntentId::new("WRONG-ID-FROM-CALLER"));
+
+        let prepared = repo.prepare_effect(request).await.expect("prepare");
+
+        assert_eq!(
+            prepared.aggregate.active_effect.as_ref(),
+            Some(&prepared.intent.effect_intent_id),
+            "the aggregate must point at the intent the repository actually wrote"
+        );
+        // And recovery, which only has the aggregate, can find it.
+        let active = prepared
+            .aggregate
+            .active_effect
+            .clone()
+            .expect("active effect");
+        let found = repo
+            .load_effect(&active)
+            .await
+            .expect("recovery must resolve active_effect");
+        assert_eq!(found.effect_intent_id, prepared.intent.effect_intent_id);
+    }
+
+    /// The deadline is derived by the repository, never taken from the caller
+    /// (ADR-016) — a caller that could choose it could set it in the past and
+    /// have the council tombstone the effect immediately.
+    #[tokio::test]
+    async fn the_deadline_is_derived_not_supplied() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = SqliteBookingRepository::open_with_ttl(temp.path().join("t.sqlite"), 5_000)
+            .await
+            .expect("open");
+        let id = BookingId::new("BKG-TTL");
+        seeded(&repo, &id).await;
+
+        let before = now_ms().expect("clock");
+        let prepared = repo
+            .prepare_effect(prepare_at(&id, 0, "TH-A", "E-1"))
+            .await
+            .expect("prepare");
+        let after = now_ms().expect("clock");
+
+        let expiry = prepared.intent.expires_at_ms;
+        assert!(
+            expiry >= before + 5_000 && expiry <= after + 5_000,
+            "expiry {expiry} should be a sample taken during the call plus the 5s TTL, \
+             not anything the caller chose"
+        );
     }
 
     /// The stored expiry is read back verbatim, never recomputed — a restart or

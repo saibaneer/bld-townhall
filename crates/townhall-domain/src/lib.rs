@@ -1875,6 +1875,16 @@ mod characterization {
     // come out.
 
     /// Today `Book` fakes a synchronous confirmation and lands on `Booked`.
+    ///
+    /// # This test is the forcing function for its `#[ignore]`d counterpart
+    ///
+    /// An `#[ignore]`d test cannot be enforced by CI before the change it
+    /// describes exists — so on its own it is a TODO that B2 could forget.
+    /// What *is* enforced is this test: the moment B2 makes `Book` stop at
+    /// `BookingInProgress`, this fails. Whoever is standing here reading that
+    /// failure must delete this test and remove `#[ignore]` from
+    /// `book_after_b2_stops_at_booking_in_progress`. Green B2 without doing
+    /// both is impossible.
     #[tokio::test]
     async fn book_today_jumps_straight_to_booked() {
         let got = turn(
@@ -1907,6 +1917,10 @@ mod characterization {
 
     /// Today cancelling a confirmed booking fakes the council call and lands on
     /// `Cancelled` immediately.
+    ///
+    /// Forcing function for `booked_cancel_after_b2_stops_at_cancelling_booking`,
+    /// exactly as above: this fails the moment B2 lands, and the fix is to
+    /// delete it and unignore its counterpart.
     #[tokio::test]
     async fn booked_cancel_today_jumps_straight_to_cancelled() {
         let got = turn(

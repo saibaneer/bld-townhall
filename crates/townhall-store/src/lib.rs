@@ -98,6 +98,14 @@ pub enum StoreError {
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
     #[error(
+        "an effect prepare must commit a state that is waiting on it, but {state} carries no \
+         effect identity (expected {expected})"
+    )]
+    NotAnInFlightState {
+        state: &'static str,
+        expected: EffectIntentId,
+    },
+    #[error(
         "effect identity disagrees: {where_} carries {found}, but this operation is {expected}"
     )]
     InconsistentEffectIdentity {
@@ -1236,19 +1244,25 @@ fn verify_effect_identity(
     // `BookingPlan::Book` carried its own copy of the id — B2 removed that field,
     // so there is one fewer place for the value to drift. What remains is the
     // in-flight state, which legitimately records what it is waiting on.
-    let sites = [("in-flight state", request.next.state.effect_intent_id())];
-    for (where_, found) in sites {
-        if let Some(found) = found
-            && found != expected
-        {
-            return Err(StoreError::InconsistentEffectIdentity {
-                where_,
-                found: found.clone(),
-                expected: expected.clone(),
-            });
-        }
+    //
+    // Absence is a failure, not a pass. `prepare_effect` only ever commits an
+    // external effect, so the state it commits *must* be one that is waiting on
+    // that effect. Merely verifying the id when present would let a `Booked` or
+    // `Draft` through — and then `active_effect` would say an effect is running
+    // while the state says nothing is, which is precisely the inconsistency
+    // recovery has no way to resolve.
+    match request.next.state.effect_intent_id() {
+        Some(found) if found == expected => Ok(()),
+        Some(found) => Err(StoreError::InconsistentEffectIdentity {
+            where_: "in-flight state",
+            found: found.clone(),
+            expected: expected.clone(),
+        }),
+        None => Err(StoreError::NotAnInFlightState {
+            state: request.next.state.name(),
+            expected: expected.clone(),
+        }),
     }
-    Ok(())
 }
 
 /// Derive the identifier for one intended consequence.
@@ -1608,6 +1622,38 @@ mod effect_identity {
             expiry >= before + 5_000 && expiry <= after + 5_000,
             "expiry {expiry} should be a sample taken during the call plus the 5s TTL, \
              not anything the caller chose"
+        );
+    }
+
+    /// An effect prepare whose state is not waiting on that effect is refused.
+    ///
+    /// Otherwise the aggregate would persist `active_effect = Some(..)` beside a
+    /// state that records nothing in flight — recovery reads the state, finds no
+    /// effect to resume, and the intent is stranded.
+    #[tokio::test]
+    async fn a_prepare_whose_state_is_not_in_flight_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-NOTINFLIGHT");
+        seeded(&repo, &id).await;
+
+        let mut request = prepare_at(&id, 0, "TH-A");
+        request.next.state = BookingState::Booked(townhall_domain::Booked {
+            booking_ref: CouncilBookingRef::new("TH-92718"),
+        });
+
+        let error = repo
+            .prepare_effect(request)
+            .await
+            .expect_err("a Booked state carries no effect identity");
+        assert!(
+            matches!(error, StoreError::NotAnInFlightState { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            repo.load(&id).await.expect("load").version,
+            0,
+            "nothing committed"
         );
     }
 

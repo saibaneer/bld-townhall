@@ -1234,10 +1234,13 @@ mod characterization {
     /// `CancellingBooking` gained a required `effect_intent_id` in B2, which
     /// would break existing rows — except none can exist.
     ///
-    /// Verified against history rather than assumed: no commit before B2 ever
-    /// constructs `BookingState::CancellingBooking` anywhere, and the store
-    /// never wrote one. `validate` used to map a cancellation straight to
-    /// `Cancelled`, so the state was declared but unreachable.
+    /// Verified against history: **no production path ever constructed it**.
+    /// `townhall-store` has zero construction sites on `main`, and outside
+    /// `#[cfg(test)]` the domain has none either — `validate` mapped a
+    /// cancellation straight to `Cancelled`, so the state was declared but
+    /// never reached. Test fixtures did construct it, which is why the claim is
+    /// scoped to production paths rather than "anywhere"; an earlier draft said
+    /// "anywhere" and that was wrong.
     ///
     /// This pins the new shape. If a legacy row ever *did* turn up, it would
     /// fail loudly here rather than silently — which is the right direction.

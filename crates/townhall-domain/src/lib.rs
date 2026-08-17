@@ -1483,18 +1483,14 @@ mod characterization {
         );
     }
 
-    // --------------------------------------- cells slice B changes on purpose
+    // ------------------------------------------- the two external-effect cells
     //
-    // These two are the reason "tests unchanged" cannot be B's gate. They are
-    // pinned twice: what they do today, and what they must do after B2. The
-    // post-M4 assertions are `#[ignore]`d because they describe behaviour that
-    // does not exist yet — B2 removes the attribute, and a green run there is
-    // the evidence the change landed as designed rather than as it happened to
-    // come out.
-
-    // `book_today_jumps_straight_to_booked` lived here and was the tripwire for
-    // the B2 expectation above. B2 landed, it failed as designed, and both have
-    // been resolved: the expectation is now an ordinary passing test.
+    // These two changed deliberately in B2, which is why "tests unchanged" could
+    // not be its gate. B1 pinned each of them twice — the old behaviour as an
+    // ordinary test, and the intended new behaviour `#[ignore]`d — so that
+    // whoever made the change would be forced to confront both. That worked: the
+    // old assertions failed the moment B2 landed, and were deleted alongside
+    // unignoring these. What remains below is simply what the cells do now.
 
     /// `Book` stops at `BookingInProgress`: the effect intent is committed
     /// before the council is called (ADR-014).
@@ -1544,8 +1540,6 @@ mod characterization {
             "the same operation must derive the same effect identity"
         );
     }
-
-    // `booked_cancel_today_jumps_straight_to_cancelled` lived here, same story.
 
     /// `Booked + Cancel` stops at `CancellingBooking`. This is the *ordinary*
     /// cancellation path, not the in-flight one — had it stayed local, an

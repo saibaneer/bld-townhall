@@ -158,7 +158,6 @@ pub trait BookingRepository: Send + Sync {
     /// with a different canonical plan — that is a boundary violation, not a
     /// retry, and it fails closed.
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError>;
-
     /// Read one effect intent.
     ///
     /// # Errors
@@ -296,6 +295,9 @@ impl BookingRepository for SqliteBookingRepository {
     }
 
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
+        // Read off the plan, never supplied separately - see PrepareEffect.
+        let operation_kind = request.operation_kind();
+
         let plan_json = serde_json::to_string(&request.canonical_plan)?;
         let source_db = version_to_i64(request.source_version)?;
 
@@ -316,11 +318,8 @@ impl BookingRepository for SqliteBookingRepository {
         // name different effects - and recovery, which reads `active_effect`,
         // would then look up an intent that does not exist. ADR-014's stable
         // identity requires these to be the same value by construction.
-        let effect_intent_id = derive_effect_intent_id(
-            &request.booking_id,
-            request.operation_kind,
-            request.source_version,
-        );
+        let effect_intent_id =
+            derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
         verify_effect_identity(&request, &effect_intent_id)?;
 
         let next = BookingWrite {
@@ -345,7 +344,7 @@ impl BookingRepository for SqliteBookingRepository {
             ",
         )
         .bind(request.booking_id.as_str())
-        .bind(request.operation_kind.name())
+        .bind(operation_kind.name())
         .bind(source_db)
         .fetch_optional(&mut *tx)
         .await?;
@@ -367,11 +366,8 @@ impl BookingRepository for SqliteBookingRepository {
         )
         .await?;
 
-        let effect_intent_id = derive_effect_intent_id(
-            &request.booking_id,
-            request.operation_kind,
-            request.source_version,
-        );
+        let effect_intent_id =
+            derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
 
         sqlx::query(
             r"
@@ -384,7 +380,7 @@ impl BookingRepository for SqliteBookingRepository {
         )
         .bind(effect_intent_id.as_str())
         .bind(request.booking_id.as_str())
-        .bind(request.operation_kind.name())
+        .bind(operation_kind.name())
         .bind(source_db)
         .bind(&plan_json)
         .bind(EffectStatus::Prepared.name())
@@ -401,7 +397,7 @@ impl BookingRepository for SqliteBookingRepository {
             intent: EffectIntent {
                 effect_intent_id,
                 booking_id: request.booking_id,
-                operation_kind: request.operation_kind,
+                operation_kind,
                 source_version: request.source_version,
                 canonical_plan: request.canonical_plan,
                 status: EffectStatus::Prepared,
@@ -1109,7 +1105,6 @@ mod concurrency {
 #[derive(Clone, Debug)]
 pub struct PrepareEffect {
     pub booking_id: BookingId,
-    pub operation_kind: OperationKind,
     /// The aggregate version this effect is derived from. Also the CAS
     /// expectation, and part of the uniqueness key.
     pub source_version: u64,
@@ -1121,6 +1116,20 @@ pub struct PrepareEffect {
     /// disagree. See [`BookingRepository::prepare_effect`].
     pub next: BookingWrite,
     pub audit: TransitionAudit,
+}
+
+impl PrepareEffect {
+    /// Which kind of consequence this is — read off the plan, never supplied
+    /// separately.
+    ///
+    /// It used to be its own field, which meant a coordinator bug could persist
+    /// a `CancelBooking` plan under `OperationKind::Book`: wrong uniqueness key,
+    /// wrong persisted kind, and recovery later dispatching the effect as the
+    /// wrong class. Deriving it removes the possibility rather than guarding
+    /// against it.
+    fn operation_kind(&self) -> OperationKind {
+        self.canonical_plan.operation_kind()
+    }
 }
 
 /// How long an effect intent may be acted on, from the instant Phase A is
@@ -1183,6 +1192,7 @@ async fn replay_existing(
     row: &sqlx::sqlite::SqliteRow,
     plan_json: &str,
 ) -> Result<PreparedEffect, StoreError> {
+    let operation_kind = request.operation_kind();
     let intent = decode_effect_row(row)?;
 
     // Same operation key, different plan, is not a retry: two different
@@ -1192,7 +1202,7 @@ async fn replay_existing(
     if stored_plan != plan_json {
         return Err(StoreError::ConflictingPlan {
             booking_id: request.booking_id.clone(),
-            operation_kind: request.operation_kind.name(),
+            operation_kind: operation_kind.name(),
             source_version: request.source_version,
         });
     }
@@ -1332,7 +1342,6 @@ mod effect_identity {
         let effect = derive_effect_intent_id(id, OperationKind::Book, version);
         PrepareEffect {
             booking_id: id.clone(),
-            operation_kind: OperationKind::Book,
             source_version: version,
             canonical_plan: plan_for(venue),
             next: in_progress_write(&effect),

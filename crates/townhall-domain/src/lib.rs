@@ -67,6 +67,13 @@ pub struct Booked {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellingBooking {
     pub booking_ref: CouncilBookingRef,
+    /// The cancellation effect this state is waiting on.
+    ///
+    /// Symmetric with `BookingInProgress`. Without it the repository's
+    /// state-versus-intent verification covers the booking path and silently
+    /// skips the cancellation one, which is exactly the asymmetry that lets a
+    /// recovery bug live in the half nobody looked at.
+    pub effect_intent_id: EffectIntentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +136,7 @@ impl BookingState {
     pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
         match self {
             Self::BookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
+            Self::CancellingBooking(cancelling) => Some(&cancelling.effect_intent_id),
             _ => None,
         }
     }
@@ -491,11 +499,11 @@ impl TownHallDomain {
         let Some(effect_intent_id) = context.pending_effect.clone() else {
             return Resolution::Denied(BookingError::EffectIdentityMissing);
         };
-        let _ = effect_intent_id;
 
         Resolution::Ready(TransitionPlan::ExternalEffect {
             next_state: BookingState::CancellingBooking(CancellingBooking {
                 booking_ref: booked.booking_ref.clone(),
+                effect_intent_id,
             }),
             effect: BookingEffect::CancelBooking {
                 booking_ref: booked.booking_ref.clone(),
@@ -699,6 +707,7 @@ mod topology {
             }),
             BookingState::CancellingBooking(CancellingBooking {
                 booking_ref: CouncilBookingRef::new("TH-92718"),
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-CANCEL-0"),
             }),
             BookingState::Cancelled(Cancelled),
             BookingState::NeedsHuman(NeedsHuman),
@@ -1222,6 +1231,23 @@ mod characterization {
         assert_eq!(got, committed_local(needs_revalidation()));
     }
 
+    /// A row persisted before `NeedsRevalidation` carried a selection must still
+    /// decode, or M3's restart-survival gate breaks for every existing row.
+    ///
+    /// Carried over from the legacy `tests` module deleted in B2. Review caught
+    /// that I had dropped it — the one piece of coverage `characterization` did
+    /// not subsume, because it tests the wire format rather than a transition.
+    #[test]
+    fn legacy_null_state_payload_still_decodes() {
+        let legacy = r#"{"state":"NeedsRevalidation","data":null}"#;
+        let decoded: BookingState =
+            serde_json::from_str(legacy).expect("legacy NeedsRevalidation row must still load");
+        assert_eq!(
+            decoded,
+            BookingState::NeedsRevalidation(NeedsRevalidation { selected: None })
+        );
+    }
+
     // ------------------------------------------------ denials, one defect each
     //
     // Every fixture below starts from `good_facts()` and breaks exactly one
@@ -1510,6 +1536,7 @@ mod characterization {
             Resolution::Ready(TransitionPlan::ExternalEffect {
                 next_state: BookingState::CancellingBooking(CancellingBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
+                    effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
                 }),
                 effect: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),

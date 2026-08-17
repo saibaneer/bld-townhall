@@ -625,7 +625,7 @@ impl BoundaryDomain for TownHallDomain {
 ///
 /// Spec §7 draws arrows in two vocabularies, and only one of them is a
 /// `BookingProposal`. These are: `SelectVenue`, `VerifySlot`, `ChangeVenue`,
-/// `UpdateRequirements`, `RevalidateVenue`, `Book`, `Cancel`, `Reconcile`.
+/// `UpdateRequirements`, `RevalidateVenue`, `Book`, `Cancel`.
 /// These are **not** — they are evidence or read outcomes, and no agent can
 /// submit them: `booking_confirmed`, `booking_failed`, `no_booking_found`,
 /// `booking_found`, `reconciliation_failed`, `cancellation_confirmed`,
@@ -634,8 +634,11 @@ impl BoundaryDomain for TownHallDomain {
 /// Counting proposal arrows only, the spec defines 15 cells and this code
 /// implements 14. The single difference is recorded in [`PENDING`].
 ///
-/// `Reconcile` is listed in §7.1 but drawn on **no arrow anywhere**, so
-/// returning `Undefined` for it on every state matches the spec literally.
+/// The spec's §7.1 vocabulary also lists `Reconcile`, but draws it on **no
+/// arrow anywhere**. B2 removed the variant entirely rather than keep a
+/// proposal that is `Undefined` everywhere: recovery is runtime machinery and
+/// must run when the model is offline, hostile or absent (ADR-012). So the
+/// matrix is 10 states x 7 proposals = 70 cells, not 80.
 #[cfg(test)]
 mod topology {
     use super::*;

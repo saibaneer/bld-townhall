@@ -1223,19 +1223,21 @@ async fn replay_existing(
     })
 }
 
-/// Every place that carries an effect id must carry *this* one.
+/// The in-flight state must carry *this* effect id, and must carry one.
 ///
-/// The id is currently duplicated across the canonical plan, the in-flight
-/// state and the aggregate's `active_effect`; slice B removes that
-/// duplication. Until then:
+/// Slice A had to check two places, because `BookingPlan::Book` carried its own
+/// copy of the id. B2 removed that field, so the canonical plan no longer names
+/// an effect at all and only the state remains.
 ///
-/// - silently **rewriting** the caller's values would hide a coordinator bug;
-/// - silently **accepting** them would let the plan name one effect while the
-///   intent row names another — and fact binding later compares the plan's id
-///   against provider evidence, so the *real* provider result would be
-///   rejected as a mismatch.
+/// Two ways to get this wrong, both closed here:
 ///
-/// So disagreement fails closed.
+/// - a **different** id means the aggregate would point at one effect while the
+///   intent row records another, and recovery reads the aggregate;
+/// - **no** id means `active_effect` would say an effect is running beside a
+///   state recording nothing in flight, which recovery cannot resolve either way.
+///
+/// Rewriting the caller's value instead would hide a coordinator bug rather than
+/// surface it.
 fn verify_effect_identity(
     request: &PrepareEffect,
     expected: &EffectIntentId,
@@ -1528,15 +1530,12 @@ mod effect_identity {
         assert!(!second.replayed);
     }
 
-    /// Every place carrying an effect id must carry the same one, and a
-    /// disagreement is refused rather than silently rewritten.
+    /// The in-flight state must carry the same effect id the repository
+    /// derives, and a disagreement is refused rather than silently rewritten.
     ///
-    /// The id is currently duplicated across the canonical plan, the in-flight
-    /// state and the aggregate's `active_effect`. Rewriting the caller's values
-    /// would hide a coordinator bug; accepting them would let the plan name one
-    /// effect while the intent row names another, and fact binding later
-    /// compares the plan's id against provider evidence — so the *real*
-    /// provider result would be rejected. Fail closed.
+    /// Rewriting would hide a coordinator bug; accepting would leave the
+    /// aggregate pointing at one effect while the intent row records another,
+    /// and recovery reads the aggregate. Fail closed.
     #[tokio::test]
     async fn a_disagreeing_effect_identity_is_refused() {
         let temp = TempDir::new().expect("temp dir");

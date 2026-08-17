@@ -13,8 +13,8 @@ use std::{
 };
 use thiserror::Error;
 use townhall_domain::{
-    BookingAggregate, BookingPlan, BookingState, Draft, EffectIntent, EffectStatus, OperationKind,
-    SelectedVenueRef, VenueFacts,
+    BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
+    OperationKind, SelectedVenueRef, VenueFacts,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -1113,7 +1113,7 @@ pub struct PrepareEffect {
     /// The aggregate version this effect is derived from. Also the CAS
     /// expectation, and part of the uniqueness key.
     pub source_version: u64,
-    pub canonical_plan: BookingPlan,
+    pub canonical_plan: BookingEffect,
     /// The state to commit alongside the intent.
     ///
     /// `active_effect` on this write is **ignored**: the repository owns the
@@ -1222,10 +1222,11 @@ fn verify_effect_identity(
     request: &PrepareEffect,
     expected: &EffectIntentId,
 ) -> Result<(), StoreError> {
-    let sites = [
-        ("canonical plan", request.canonical_plan.effect_intent_id()),
-        ("in-flight state", request.next.state.effect_intent_id()),
-    ];
+    // Only the state, now. Slice A also had to check the canonical plan, because
+    // `BookingPlan::Book` carried its own copy of the id — B2 removed that field,
+    // so there is one fewer place for the value to drift. What remains is the
+    // in-flight state, which legitimately records what it is waiting on.
+    let sites = [("in-flight state", request.next.state.effect_intent_id())];
     for (where_, found) in sites {
         if let Some(found) = found
             && found != expected
@@ -1302,9 +1303,8 @@ mod effect_identity {
         }
     }
 
-    fn plan_for(venue: &str, effect: &EffectIntentId) -> BookingPlan {
-        BookingPlan::Book {
-            effect_intent_id: effect.clone(),
+    fn plan_for(venue: &str) -> BookingEffect {
+        BookingEffect::Book {
             principal: PrincipalId::new("lucy"),
             facts: facts(venue),
         }
@@ -1334,7 +1334,7 @@ mod effect_identity {
             booking_id: id.clone(),
             operation_kind: OperationKind::Book,
             source_version: version,
-            canonical_plan: plan_for(venue, &effect),
+            canonical_plan: plan_for(venue),
             next: in_progress_write(&effect),
             audit: TransitionAudit::committed("Book", None),
         }
@@ -1522,11 +1522,11 @@ mod effect_identity {
         seeded(&repo, &id).await;
 
         let mut request = prepare_at(&id, 0, "TH-A");
-        request.canonical_plan = BookingPlan::Book {
+        // The plan no longer carries an effect id at all (B2 removed the field),
+        // so a disagreement can only come from the in-flight state now.
+        request.next.state = BookingState::BookingInProgress(BookingInProgress {
             effect_intent_id: EffectIntentId::new("SOME-OTHER-EFFECT"),
-            principal: PrincipalId::new("lucy"),
-            facts: facts("TH-A"),
-        };
+        });
 
         let error = repo
             .prepare_effect(request)

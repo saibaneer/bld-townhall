@@ -951,29 +951,34 @@ mod topology {
     }
 }
 
-/// Characterization of the domain's behaviour **before** the M4 kernel change.
+/// The domain's behaviour, pinned cell by cell.
 ///
-/// Slice B rewrites the most load-bearing types in the repo: `Kernel::apply`
-/// stops owning `&mut State`, `execute` and `validate` leave `BoundaryDomain`
-/// for `Capability` and `Verifier`, and `Reconcile` leaves the proposal
-/// vocabulary. Behaviour-preserving refactors of that size are exactly where
-/// drift is silent, so this module pins what the domain does today.
+/// Written in B1 against the pre-B2 contract, and migrated here. What it pins
+/// is unchanged — the exact next state for every legal cell and the exact error
+/// for every denial. Only the wrapper moved, from
+/// `BoundaryOutcome::Committed(state)` to
+/// `Resolution::Ready(TransitionPlan::Local { next_state })`, because the kernel
+/// no longer commits: it classifies, and the coordinator commits (ADR-013).
 ///
-/// # Why these run a whole turn rather than calling `resolve`
-///
-/// Pinning `resolve` alone would capture only the intermediate `BookingPlan`.
-/// It would say nothing about what `execute` and `validate` contribute — the
-/// next state and its fields, evidence binding, and the rule that nothing
-/// commits unless validation succeeds. Those are precisely what slice B moves,
-/// so every test here drives `Kernel::apply` end to end and asserts the exact
-/// `BoundaryOutcome`.
+/// That migration is the point. A characterization suite whose value evaporates
+/// the moment the signature changes is not a safety net, and this one survived
+/// with its teeth: after B2, mutating `Book` back into a `Local` transition, or
+/// dropping the venue-selection carry-forward, still fails here.
 ///
 /// # One defect per fixture
 ///
-/// Denial tests use a fixture with exactly **one** thing wrong. A fixture with
-/// two defects would pin whichever guard the code happens to check first, and
-/// swapping two safety-neutral checks would then turn the test red for no
-/// reason. The expected error has to be forced by meaning.
+/// Denial fixtures start from `good_facts()` and break exactly **one** thing. A
+/// fixture with two defects pins whichever guard the code happens to check
+/// first, so a safety-neutral reorder would turn it red for no reason — verified
+/// by swapping the `may_book` and `selected_facts` checks and watching
+/// everything stay green.
+///
+/// # Two cells changed deliberately
+///
+/// `Book` now stops at `BookingInProgress` and `Booked + Cancel` at
+/// `CancellingBooking`, both as `ExternalEffect`. B1 pinned those as `#[ignore]`d
+/// expectations; B2 unignored them and deleted the tripwires that had asserted
+/// the old behaviour.
 #[cfg(test)]
 mod characterization {
     use super::*;

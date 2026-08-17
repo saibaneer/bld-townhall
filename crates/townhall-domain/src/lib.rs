@@ -1231,6 +1231,29 @@ mod characterization {
         assert_eq!(got, committed_local(needs_revalidation()));
     }
 
+    /// `CancellingBooking` gained a required `effect_intent_id` in B2, which
+    /// would break existing rows — except none can exist.
+    ///
+    /// Verified against history rather than assumed: no commit before B2 ever
+    /// constructs `BookingState::CancellingBooking` anywhere, and the store
+    /// never wrote one. `validate` used to map a cancellation straight to
+    /// `Cancelled`, so the state was declared but unreachable.
+    ///
+    /// This pins the new shape. If a legacy row ever *did* turn up, it would
+    /// fail loudly here rather than silently — which is the right direction.
+    #[test]
+    fn cancelling_booking_round_trips_in_its_new_shape() {
+        let state = BookingState::CancellingBooking(CancellingBooking {
+            booking_ref: CouncilBookingRef::new("TH-92718"),
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-CANCEL-1"),
+        });
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<BookingState>(&json).expect("round trip"),
+            state
+        );
+    }
+
     /// A row persisted before `NeedsRevalidation` carried a selection must still
     /// decode, or M3's restart-survival gate breaks for every existing row.
     ///
@@ -1519,13 +1542,19 @@ mod characterization {
     /// stayed live for every slice between the coordinator landing and F.
     #[tokio::test]
     async fn booked_cancel_stops_at_cancelling_booking_with_an_effect() {
+        // A cancellation is its own effect with its own identity — reusing the
+        // booking's id would make "has this effect completed?" unanswerable.
+        let ctx = BookingContext {
+            pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-CANCEL-1")),
+            ..context()
+        };
         let got = turn(
             booked(),
             BookingProposal::Cancel {
                 reason: "changed mind".to_owned(),
             },
             &authority(),
-            &context(),
+            &ctx,
         )
         .await;
         // Full equality, not just the variant. The reference must be carried
@@ -1536,7 +1565,7 @@ mod characterization {
             Resolution::Ready(TransitionPlan::ExternalEffect {
                 next_state: BookingState::CancellingBooking(CancellingBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
-                    effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
+                    effect_intent_id: EffectIntentId::new("EFF-BKG-1001-CANCEL-1"),
                 }),
                 effect: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),

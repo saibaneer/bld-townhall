@@ -1611,6 +1611,55 @@ mod effect_identity {
         );
     }
 
+    /// A cancellation is a different operation, and must get a different
+    /// identity and a different persisted kind.
+    ///
+    /// Review caught that every test here built a `Book` request, so the whole
+    /// cancellation path through `prepare_effect` was unexercised — the kind is
+    /// now derived from the plan, and nothing proved that derivation worked for
+    /// the other variant.
+    #[tokio::test]
+    async fn a_cancellation_gets_its_own_kind_and_identity() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-CANCELKIND");
+        seeded(&repo, &id).await;
+
+        let effect = derive_effect_intent_id(&id, OperationKind::Cancel, 0);
+        let prepared = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: 0,
+                canonical_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new("TH-92718"),
+                },
+                next: BookingWrite {
+                    state: BookingState::CancellingBooking(townhall_domain::CancellingBooking {
+                        booking_ref: CouncilBookingRef::new("TH-92718"),
+                        effect_intent_id: effect.clone(),
+                    }),
+                    requirements: requirements(),
+                    selected_venue: None,
+                    availability: None,
+                    booking_ref: Some(CouncilBookingRef::new("TH-92718")),
+                    active_effect: Some(effect.clone()),
+                },
+                audit: TransitionAudit::committed("Cancel", None),
+            })
+            .await
+            .expect("cancellation prepare");
+
+        assert_eq!(prepared.intent.operation_kind, OperationKind::Cancel);
+        assert_eq!(prepared.intent.effect_intent_id, effect);
+        assert!(
+            effect.as_str().contains("CANCEL"),
+            "a cancellation identity must be distinguishable from a booking one: {effect}"
+        );
+        // And a booking on the same resource at the same version is a DIFFERENT
+        // effect - two consequences, two identities.
+        assert_ne!(effect, derive_effect_intent_id(&id, OperationKind::Book, 0));
+    }
+
     /// The stored expiry is read back verbatim, never recomputed — a restart or
     /// clock change must not produce a different deadline for the same identity
     /// (ADR-016).

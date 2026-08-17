@@ -140,6 +140,20 @@ impl BookingState {
             _ => None,
         }
     }
+
+    /// Which kind of effect this state is waiting on, if it is in flight.
+    ///
+    /// An effect id does not encode its kind, so matching ids is not enough to
+    /// prove a state and an effect belong together: `BookingInProgress` waiting
+    /// on a cancellation is nonsense that an id comparison alone would accept.
+    #[must_use]
+    pub const fn in_flight_kind(&self) -> Option<OperationKind> {
+        match self {
+            Self::BookingInProgress(_) => Some(OperationKind::Book),
+            Self::CancellingBooking(_) => Some(OperationKind::Cancel),
+            _ => None,
+        }
+    }
 }
 
 impl BookingProposal {

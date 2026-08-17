@@ -97,6 +97,12 @@ pub enum StoreError {
     CorruptRow(String),
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
+    #[error("state {state} is waiting on a {state_kind} effect, but the plan is a {plan_kind}")]
+    EffectKindMismatch {
+        state: &'static str,
+        state_kind: &'static str,
+        plan_kind: &'static str,
+    },
     #[error(
         "an effect prepare must commit a state that is waiting on it, but {state} carries no \
          effect identity (expected {expected})"
@@ -328,7 +334,7 @@ impl BookingRepository for SqliteBookingRepository {
         // identity requires these to be the same value by construction.
         let effect_intent_id =
             derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
-        verify_effect_identity(&request, &effect_intent_id)?;
+        verify_effect_identity(&request, &effect_intent_id, operation_kind)?;
 
         let next = BookingWrite {
             active_effect: Some(effect_intent_id.clone()),
@@ -1241,7 +1247,24 @@ async fn replay_existing(
 fn verify_effect_identity(
     request: &PrepareEffect,
     expected: &EffectIntentId,
+    operation_kind: OperationKind,
 ) -> Result<(), StoreError> {
+    // Identity is not enough. An effect id does not encode its kind, so a `Book`
+    // plan committed alongside a `CancellingBooking` state would pass an id
+    // comparison while being nonsense — and recovery would then dispatch the
+    // effect as the wrong class.
+    match request.next.state.in_flight_kind() {
+        Some(kind) if kind == operation_kind => {}
+        Some(kind) => {
+            return Err(StoreError::EffectKindMismatch {
+                state: request.next.state.name(),
+                state_kind: kind.name(),
+                plan_kind: operation_kind.name(),
+            });
+        }
+        None => {}
+    }
+
     // Only the state, now. Slice A also had to check the canonical plan, because
     // `BookingPlan::Book` carried its own copy of the id — B2 removed that field,
     // so there is one fewer place for the value to drift. What remains is the
@@ -1647,6 +1670,37 @@ mod effect_identity {
             .expect_err("a Booked state carries no effect identity");
         assert!(
             matches!(error, StoreError::NotAnInFlightState { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            repo.load(&id).await.expect("load").version,
+            0,
+            "nothing committed"
+        );
+    }
+
+    /// A state waiting on one kind of effect cannot be committed with a plan of
+    /// the other kind, even when the identity lines up.
+    #[tokio::test]
+    async fn a_state_and_plan_of_different_kinds_are_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-KINDMIX");
+        seeded(&repo, &id).await;
+
+        // A cancellation plan, but committed alongside a state that is waiting
+        // for a booking. The id is not even consulted - the kinds disagree.
+        let mut request = prepare_at(&id, 0, "TH-A");
+        request.canonical_plan = BookingEffect::CancelBooking {
+            booking_ref: CouncilBookingRef::new("TH-92718"),
+        };
+
+        let error = repo
+            .prepare_effect(request)
+            .await
+            .expect_err("a Cancel plan cannot commit a BookingInProgress state");
+        assert!(
+            matches!(error, StoreError::EffectKindMismatch { .. }),
             "got {error:?}"
         );
         assert_eq!(

@@ -141,6 +141,37 @@ impl BookingState {
         }
     }
 
+    /// The venue selection this state names, if it names one.
+    ///
+    /// Some states record the selection inside themselves as well as the
+    /// aggregate recording it in `selected_venue`. This is the state's copy, so
+    /// the two can be compared — see [`Booking::coherent`].
+    #[must_use]
+    pub fn selection(&self) -> Option<SelectedVenueRef> {
+        match self {
+            Self::VenueSelected(selected) => Some(SelectedVenueRef {
+                venue_id: selected.venue_id.clone(),
+                slot_id: selected.slot_id.clone(),
+            }),
+            Self::AwaitingBooking(waiting) => Some(SelectedVenueRef {
+                venue_id: waiting.venue_id.clone(),
+                slot_id: waiting.slot_id.clone(),
+            }),
+            Self::NeedsRevalidation(pending) => pending.selected.clone(),
+            _ => None,
+        }
+    }
+
+    /// The council reference this state names, if it names one.
+    #[must_use]
+    pub const fn council_booking_ref(&self) -> Option<&CouncilBookingRef> {
+        match self {
+            Self::Booked(booked) => Some(&booked.booking_ref),
+            Self::CancellingBooking(cancelling) => Some(&cancelling.booking_ref),
+            _ => None,
+        }
+    }
+
     /// Which kind of effect this state is waiting on, if it is in flight.
     ///
     /// An effect id does not encode its kind, so matching ids is not enough to
@@ -244,6 +275,98 @@ pub struct Booking {
     pub availability: Option<VenueFacts>,
     pub booking_ref: Option<CouncilBookingRef>,
     pub active_effect: Option<EffectIntentId>,
+}
+
+/// A booking that contradicts itself.
+///
+/// Three facts are recorded twice: the effect an in-flight state waits on is
+/// also `active_effect`, the venue a state names is also `selected_venue`, and
+/// the council reference a state names is also `booking_ref`. The duplication is
+/// deliberate — the outer fields are what recovery and queries read without
+/// destructuring the state — but two copies of one fact can disagree.
+///
+/// A disagreement is **not** repaired. The transition that produced it was
+/// wrong, and silently reconciling the two copies would launder that away; the
+/// next reader would see a consistent booking and never learn one was written
+/// incorrectly.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum IncoherentBooking {
+    #[error("state {state} waits on {state_says:?}, but active_effect is {aggregate_says:?}")]
+    EffectIdentity {
+        state: &'static str,
+        state_says: Option<EffectIntentId>,
+        aggregate_says: Option<EffectIntentId>,
+    },
+    #[error("state {state} names venue {state_says:?}, but selected_venue is {aggregate_says:?}")]
+    Selection {
+        state: &'static str,
+        state_says: Box<SelectedVenueRef>,
+        aggregate_says: Option<Box<SelectedVenueRef>>,
+    },
+    #[error("state {state} names booking {state_says}, but booking_ref is {aggregate_says:?}")]
+    CouncilReference {
+        state: &'static str,
+        state_says: CouncilBookingRef,
+        aggregate_says: Option<CouncilBookingRef>,
+    },
+}
+
+impl Booking {
+    /// Whether the booking's two copies of each duplicated fact agree.
+    ///
+    /// The domain owns this because *which fields are copies of which* is domain
+    /// knowledge — the repository must not learn that `BookingInProgress`
+    /// carries the same identity as `active_effect` (ADR-013). The repository
+    /// asks; it does not know why.
+    ///
+    /// Checked on write and on read, so an incoherent booking can neither be
+    /// persisted nor loaded. That is what lets every transition arm carry these
+    /// fields through rather than defensively re-deriving them in each of eight
+    /// places — one enforced invariant beats a discipline eight arms must
+    /// remember.
+    ///
+    /// The effect pointer is checked in **both** directions: a state waiting on
+    /// nothing must not have an `active_effect` either, or recovery would chase
+    /// an effect no state is expecting. Selection and reference are checked only
+    /// where the state names one, because a terminal state legitimately retains
+    /// an outer value it no longer names — `Cancelled` keeps the reference of
+    /// the booking it cancelled.
+    ///
+    /// # Errors
+    /// One [`IncoherentBooking`] per disagreement, first found.
+    pub fn coherent(&self) -> Result<(), IncoherentBooking> {
+        let state = self.state.name();
+
+        if self.state.effect_intent_id() != self.active_effect.as_ref() {
+            return Err(IncoherentBooking::EffectIdentity {
+                state,
+                state_says: self.state.effect_intent_id().cloned(),
+                aggregate_says: self.active_effect.clone(),
+            });
+        }
+
+        if let Some(named) = self.state.selection()
+            && self.selected_venue.as_ref() != Some(&named)
+        {
+            return Err(IncoherentBooking::Selection {
+                state,
+                state_says: Box::new(named),
+                aggregate_says: self.selected_venue.clone().map(Box::new),
+            });
+        }
+
+        if let Some(named) = self.state.council_booking_ref()
+            && self.booking_ref.as_ref() != Some(named)
+        {
+            return Err(IncoherentBooking::CouncilReference {
+                state,
+                state_says: named.clone(),
+                aggregate_says: self.booking_ref.clone(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 impl From<&BookingAggregate> for Booking {
@@ -1505,6 +1628,108 @@ mod characterization {
         }
     }
 
+    /// Every plan the domain produces must be self-consistent, or the store
+    /// will refuse to persist it. Swept, because this is the property each new
+    /// transition arm has to uphold and none of them is reminded to.
+    #[tokio::test]
+    async fn every_transition_produces_a_coherent_booking() {
+        for source in [
+            draft(),
+            venue_selected(),
+            needs_revalidation(),
+            awaiting_booking(),
+            booked(),
+        ] {
+            source
+                .coherent()
+                .expect("the fixtures themselves must be coherent");
+
+            for proposal in [
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-B"),
+                    slot_id: SlotId::new("SLOT-B"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ] {
+                let cell = format!("{} + {}", source.state.name(), proposal.name());
+                if let Resolution::Ready(plan) =
+                    turn(source.clone(), proposal, &authority(), &context()).await
+                {
+                    plan.next_state().coherent().unwrap_or_else(|why| {
+                        panic!("{cell} produced an incoherent booking: {why}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// The effect pointer is checked in both directions. A state waiting on
+    /// nothing must not carry an `active_effect` either — recovery would chase
+    /// an effect no state expects, and nothing would ever resolve it.
+    #[test]
+    fn an_effect_pointer_with_no_state_waiting_on_it_is_incoherent() {
+        let orphaned = Booking {
+            active_effect: Some(EffectIntentId::new("EFF-ORPHAN")),
+            ..awaiting_booking()
+        };
+        assert!(matches!(
+            orphaned.coherent(),
+            Err(IncoherentBooking::EffectIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_naming_a_venue_the_aggregate_does_not_is_incoherent() {
+        let mismatched = Booking {
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-Z"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..venue_selected()
+        };
+        assert!(matches!(
+            mismatched.coherent(),
+            Err(IncoherentBooking::Selection { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_naming_a_council_reference_the_aggregate_does_not_is_incoherent() {
+        let mismatched = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-00000")),
+            ..booked()
+        };
+        assert!(matches!(
+            mismatched.coherent(),
+            Err(IncoherentBooking::CouncilReference { .. })
+        ));
+    }
+
+    /// Selection and reference are checked only where the state names one, so a
+    /// terminal state may keep an outer value it no longer mentions. B3b's fact
+    /// door relies on this: convergence at `Cancelled` compares the reference of
+    /// the booking that was cancelled, which only the aggregate still holds.
+    #[test]
+    fn a_terminal_state_may_retain_a_reference_it_no_longer_names() {
+        let cancelled = Booking {
+            state: BookingState::Cancelled(Cancelled),
+            ..booked()
+        };
+        assert!(
+            cancelled.coherent().is_ok(),
+            "Cancelled must be allowed to keep the reference it cancelled"
+        );
+    }
+
     /// A transition changes a booking; it never changes which booking.
     #[tokio::test]
     async fn no_transition_changes_the_identity() {
@@ -2069,13 +2294,21 @@ mod characterization {
         );
 
         // Matching the variant is not enough: B2 could produce the right state
-        // with the wrong effect identity and this would still pass. The id must
-        // be present, and it must be *deterministic* — the same operation
-        // proposed twice must derive the same identity, because that is what
-        // makes a retry idempotent rather than a second booking (ADR-014).
-        assert!(
-            !in_progress.effect_intent_id.as_str().is_empty(),
-            "BookingInProgress must carry an effect identity"
+        // with the wrong effect identity and this would still pass.
+        //
+        // What this pins is *adoption*: the domain takes the identity the
+        // coordinator supplied and does not invent, alter or drop one. It does
+        // not pin determinism — the domain cannot derive an effect identity,
+        // because the repository holds the uniqueness key. Repeating the turn
+        // with the same context proves the domain is a pure function of its
+        // inputs, not that those inputs are stable; that is
+        // `derive_effect_intent_id`'s contract and it is tested in
+        // `townhall-store`. An earlier version of this comment claimed the
+        // stronger property, which the assertion below cannot reach.
+        assert_eq!(
+            Some(&in_progress.effect_intent_id),
+            context().pending_effect.as_ref(),
+            "Book must adopt the supplied identity unchanged"
         );
         let again = turn(
             awaiting_booking(),
@@ -2084,10 +2317,7 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(
-            got, again,
-            "the same operation must derive the same effect identity"
-        );
+        assert_eq!(got, again, "classification must be a pure function");
     }
 
     /// `Booked + Cancel` stops at `CancellingBooking`. This is the *ordinary*

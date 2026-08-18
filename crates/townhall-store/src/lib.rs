@@ -13,8 +13,8 @@ use std::{
 };
 use thiserror::Error;
 use townhall_domain::{
-    BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
-    OperationKind, SelectedVenueRef, VenueFacts,
+    Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
+    IncoherentBooking, OperationKind,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -23,29 +23,6 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub struct NewBooking {
     pub id: BookingId,
     pub requirements: BookingRequirements,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BookingWrite {
-    pub state: BookingState,
-    pub requirements: BookingRequirements,
-    pub selected_venue: Option<SelectedVenueRef>,
-    pub availability: Option<VenueFacts>,
-    pub booking_ref: Option<CouncilBookingRef>,
-    pub active_effect: Option<EffectIntentId>,
-}
-
-impl From<&BookingAggregate> for BookingWrite {
-    fn from(value: &BookingAggregate) -> Self {
-        Self {
-            state: value.state.clone(),
-            requirements: value.requirements.clone(),
-            selected_venue: value.selected_venue.clone(),
-            availability: value.availability.clone(),
-            booking_ref: value.booking_ref.clone(),
-            active_effect: value.active_effect.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +72,16 @@ pub enum StoreError {
     ClockOutOfRange,
     #[error("persisted booking row is corrupt: {0}")]
     CorruptRow(String),
+    #[error("a transition tried to change booking identity from {expected} to {actual}")]
+    IdentityChanged {
+        expected: BookingId,
+        actual: BookingId,
+    },
+    #[error("{where_} booking contradicts itself: {reason}")]
+    IncoherentBooking {
+        where_: &'static str,
+        reason: IncoherentBooking,
+    },
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
     #[error("state {state} is waiting on a {state_kind} effect, but the plan is a {plan_kind}")]
@@ -146,7 +133,7 @@ pub trait BookingRepository: Send + Sync {
         &self,
         id: &BookingId,
         expected_version: u64,
-        next: BookingWrite,
+        next: Booking,
         audit: TransitionAudit,
     ) -> Result<BookingAggregate, StoreError>;
 
@@ -297,7 +284,7 @@ impl BookingRepository for SqliteBookingRepository {
         &self,
         id: &BookingId,
         expected_version: u64,
-        next: BookingWrite,
+        next: Booking,
         audit: TransitionAudit,
     ) -> Result<BookingAggregate, StoreError> {
         let now = now_ms()?;
@@ -309,6 +296,17 @@ impl BookingRepository for SqliteBookingRepository {
     }
 
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
+        // Before anything is read or written, and before the replay path can
+        // return early. `commit_in_tx` performs the same check, but a replay
+        // never reaches it — so without this a retry carrying another booking's
+        // value would be answered as though it were valid.
+        if request.next.id != request.booking_id {
+            return Err(StoreError::IdentityChanged {
+                expected: request.booking_id.clone(),
+                actual: request.next.id.clone(),
+            });
+        }
+
         // Read off the plan, never supplied separately - see PrepareEffect.
         let operation_kind = request.operation_kind();
 
@@ -336,7 +334,7 @@ impl BookingRepository for SqliteBookingRepository {
             derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
         verify_effect_identity(&request, &effect_intent_id, operation_kind)?;
 
-        let next = BookingWrite {
+        let next = Booking {
             active_effect: Some(effect_intent_id.clone()),
             ..request.next.clone()
         };
@@ -488,7 +486,7 @@ fn decode_booking_row(row: &sqlx::sqlite::SqliteRow) -> Result<BookingAggregate,
         )));
     }
 
-    Ok(BookingAggregate {
+    let aggregate = BookingAggregate {
         id: BookingId::new(id_string),
         version,
         state,
@@ -503,7 +501,20 @@ fn decode_booking_row(row: &sqlx::sqlite::SqliteRow) -> Result<BookingAggregate,
         active_effect: active_effect.map(EffectIntentId::new),
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
-    })
+    };
+
+    // A row written before this check existed, or edited outside the
+    // repository, must not be handed to the domain as if it were sound. Refusing
+    // on read is what makes the write-side check an invariant rather than a
+    // filter — otherwise every reader would have to re-check.
+    if let Err(reason) = Booking::from(&aggregate).coherent() {
+        return Err(StoreError::IncoherentBooking {
+            where_: "a persisted",
+            reason,
+        });
+    }
+
+    Ok(aggregate)
 }
 
 fn decode_audit_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, StoreError> {
@@ -540,14 +551,46 @@ fn decode_audit_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, StoreEr
 /// unrelated* bookings failed with "database is locked", and a genuine CAS
 /// loser got `SQLITE_BUSY` rather than `StaleVersion` ~99.7% of the time.
 /// See ADR-015.
+/// Everything a value must satisfy before any part of it is written.
+///
+/// Both checks are about the value itself rather than the transition, so they
+/// run before the transaction does any work — a refusal here has touched
+/// nothing.
+///
+/// A transition changes a booking; it never changes *which* booking. The domain
+/// carries `id` so evidence can be bound to a resource (ADR-012), and a carried
+/// field is one a future arm could rebuild wrongly, so the value that arrives is
+/// verified against the row being written rather than trusted.
+///
+/// Coherence is the domain's judgement, not this layer's: some facts live in two
+/// places — `active_effect` beside the in-flight state's own copy, and so on —
+/// and the domain says whether they agree. Refusing here is what lets every
+/// transition arm carry those fields through instead of defensively re-deriving
+/// them in each of eight places.
+fn admissible(id: &BookingId, next: &Booking) -> Result<(), StoreError> {
+    if next.id != *id {
+        return Err(StoreError::IdentityChanged {
+            expected: id.clone(),
+            actual: next.id.clone(),
+        });
+    }
+    next.coherent()
+        .map_err(|reason| StoreError::IncoherentBooking {
+            where_: "a committed",
+            reason,
+        })
+}
+
 async fn commit_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &BookingId,
     expected_version: u64,
-    next: &BookingWrite,
+    next: &Booking,
     audit: &TransitionAudit,
     now: i64,
 ) -> Result<BookingAggregate, StoreError> {
+    admissible(id, next)?;
+
     let expected_db = version_to_i64(expected_version)?;
     let next_version = expected_version
         .checked_add(1)
@@ -775,7 +818,8 @@ mod tests {
             .commit(
                 &id,
                 stale_copy_a.version,
-                BookingWrite {
+                Booking {
+                    id: id.clone(),
                     state: BookingState::VenueSelected(VenueSelected {
                         venue_id: selected.venue_id.clone(),
                         slot_id: selected.slot_id.clone(),
@@ -797,7 +841,7 @@ mod tests {
             .commit(
                 &id,
                 stale_copy_b.version,
-                BookingWrite::from(&stale_copy_b),
+                Booking::from(&stale_copy_b),
                 TransitionAudit::committed("Cancel", None),
             )
             .await
@@ -829,7 +873,8 @@ mod tests {
             .await
             .expect("create should succeed");
 
-        let next = BookingWrite {
+        let next = Booking {
+            id: id.clone(),
             state: BookingState::VenueSelected(VenueSelected {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A-1400-1700"),
@@ -860,6 +905,167 @@ mod tests {
         assert_eq!(audit[0].from_state, "Draft");
         assert_eq!(audit[0].to_state, "VenueSelected");
         assert_eq!(audit[0].proposal, "SelectVenue");
+    }
+
+    /// B3a put `id` on the domain's `Booking` so evidence can be bound to a
+    /// resource. A carried field is one a future transition could rebuild
+    /// wrongly, so the repository verifies it rather than trusting it — without
+    /// this check the field would be decorative, and a mis-assembled transition
+    /// could write one booking's state over another's row.
+    #[tokio::test]
+    async fn a_transition_may_not_change_which_booking_it_is() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-IDENTITY");
+        let created = repo
+            .create(NewBooking {
+                id: id.clone(),
+                requirements: requirements(),
+            })
+            .await
+            .expect("create should succeed");
+
+        // Coherent in every other respect, so the identity is the only thing
+        // that can refuse it. A fixture with two defects proves whichever check
+        // happens to run first, not the one it names.
+        let impostor = Booking {
+            id: BookingId::new("BKG-SOMEONE-ELSE"),
+            state: BookingState::VenueSelected(VenueSelected {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..Booking::from(&created)
+        };
+        impostor
+            .coherent()
+            .expect("the fixture must carry exactly one defect");
+
+        let error = repo
+            .commit(
+                &id,
+                0,
+                impostor,
+                TransitionAudit::committed("SelectVenue", None),
+            )
+            .await
+            .expect_err("a transition that changes identity must be refused");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::IdentityChanged {
+                    ref expected,
+                    ref actual,
+                } if expected == &id && actual == &BookingId::new("BKG-SOMEONE-ELSE")
+            ),
+            "expected IdentityChanged, got {error:?}"
+        );
+
+        let untouched = repo.load(&id).await.expect("the row must survive");
+        assert_eq!(untouched.version, 0, "nothing may have been written");
+        assert_eq!(untouched.state.name(), "Draft");
+    }
+
+    /// The aggregate records the in-flight effect twice: inside the state, and
+    /// in `active_effect`. B3a created that second copy, so B3a owes the
+    /// invariant that they cannot be persisted disagreeing — otherwise recovery
+    /// reads one value while the state means another.
+    #[tokio::test]
+    async fn a_booking_whose_two_effect_pointers_disagree_cannot_be_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-INCOHERENT");
+        let created = repo
+            .create(NewBooking {
+                id: id.clone(),
+                requirements: requirements(),
+            })
+            .await
+            .expect("create should succeed");
+
+        let contradictory = Booking {
+            state: BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                effect_intent_id: EffectIntentId::new("EFF-ONE"),
+            }),
+            active_effect: Some(EffectIntentId::new("EFF-TWO")),
+            ..Booking::from(&created)
+        };
+
+        let error = repo
+            .commit(
+                &id,
+                0,
+                contradictory,
+                TransitionAudit::committed("Book", None),
+            )
+            .await
+            .expect_err("a self-contradictory booking must not be persisted");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::IncoherentBooking {
+                    reason: IncoherentBooking::EffectIdentity { .. },
+                    ..
+                }
+            ),
+            "expected an effect-identity disagreement, got {error:?}"
+        );
+
+        let untouched = repo.load(&id).await.expect("the row must survive");
+        assert_eq!(untouched.version, 0, "nothing may have been written");
+    }
+
+    /// Refusing on write is only half of it. A row edited outside the repository
+    /// — or written before the check existed — must not be handed to the domain
+    /// as though it were sound, or every reader would have to re-check.
+    #[tokio::test]
+    async fn a_persisted_booking_that_contradicts_itself_fails_to_load() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-CORRUPT");
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create should succeed");
+
+        // Straight past the repository's own API, which is the only way such a
+        // row can come into being now.
+        let state = BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+            effect_intent_id: EffectIntentId::new("EFF-ONE"),
+        });
+        sqlx::query(
+            "UPDATE bookings SET state_name = ?, state_json = ?, active_effect = ? WHERE id = ?",
+        )
+        .bind(state.name())
+        .bind(serde_json::to_string(&state).expect("state should serialise"))
+        .bind("EFF-TWO")
+        .bind(id.as_str())
+        .execute(repo.pool())
+        .await
+        .expect("the corrupt row should be written");
+
+        let error = repo
+            .load(&id)
+            .await
+            .expect_err("a self-contradictory row must not load");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::IncoherentBooking {
+                    reason: IncoherentBooking::EffectIdentity { .. },
+                    ..
+                }
+            ),
+            "expected an effect-identity disagreement, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -914,8 +1120,14 @@ mod concurrency {
         }
     }
 
-    fn write_for(venue: &str, slot: &str, requirements: BookingRequirements) -> BookingWrite {
-        BookingWrite {
+    fn write_for(
+        id: &BookingId,
+        venue: &str,
+        slot: &str,
+        requirements: BookingRequirements,
+    ) -> Booking {
+        Booking {
+            id: id.clone(),
             state: BookingState::VenueSelected(VenueSelected {
                 venue_id: VenueId::new(venue),
                 slot_id: SlotId::new(slot),
@@ -964,7 +1176,7 @@ mod concurrency {
                 let repo = repo.clone();
                 let id = id.clone();
                 let barrier = Arc::clone(&barrier);
-                let write = write_for(venue, "SLOT-1", created.requirements.clone());
+                let write = write_for(&id, venue, "SLOT-1", created.requirements.clone());
                 let expected = created.version;
 
                 handles.push(tokio::spawn(async move {
@@ -1074,7 +1286,7 @@ mod concurrency {
         for id in ids {
             let repo = repo.clone();
             let barrier = Arc::clone(&barrier);
-            let write = write_for("TH-A", "SLOT-1", requirements());
+            let write = write_for(&id, "TH-A", "SLOT-1", requirements());
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 repo.commit(
@@ -1128,7 +1340,7 @@ pub struct PrepareEffect {
     /// `active_effect` on this write is **ignored**: the repository owns the
     /// effect identity and sets it, so the aggregate and the intent row cannot
     /// disagree. See [`BookingRepository::prepare_effect`].
-    pub next: BookingWrite,
+    pub next: Booking,
     pub audit: TransitionAudit,
 }
 
@@ -1233,7 +1445,12 @@ async fn replay_existing(
 ///
 /// Slice A had to check two places, because `BookingPlan::Book` carried its own
 /// copy of the id. B2 removed that field, so the canonical plan no longer names
-/// an effect at all and only the state remains.
+/// an effect at all.
+///
+/// What this checks is the *state's* copy against the identity being prepared.
+/// The aggregate's `active_effect` is the third copy, and it is not checked here
+/// because [`Booking::coherent`] already refuses any booking whose state and
+/// `active_effect` disagree, on write and on read alike.
 ///
 /// Two ways to get this wrong, both closed here:
 ///
@@ -1265,10 +1482,10 @@ fn verify_effect_identity(
         None => {}
     }
 
-    // Only the state, now. Slice A also had to check the canonical plan, because
-    // `BookingPlan::Book` carried its own copy of the id — B2 removed that field,
-    // so there is one fewer place for the value to drift. What remains is the
-    // in-flight state, which legitimately records what it is waiting on.
+    // The state's own copy. Slice A also had to check the canonical plan, because
+    // `BookingPlan::Book` carried its own copy of the id — B2 removed that field.
+    // `active_effect` is covered separately and unconditionally by
+    // `Booking::coherent`, so it needs no check here.
     //
     // Absence is a failure, not a pass. `prepare_effect` only ever commits an
     // external effect, so the state it commits *must* be one that is waiting on
@@ -1325,7 +1542,7 @@ mod effect_identity {
     use super::*;
     use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
-    use townhall_domain::{BookingInProgress, BookingState, SelectedVenueRef, VenueFacts};
+    use townhall_domain::{BookingState, SelectedVenueRef, VenueFacts};
 
     fn requirements() -> BookingRequirements {
         BookingRequirements {
@@ -1359,9 +1576,10 @@ mod effect_identity {
         }
     }
 
-    fn in_progress_write(effect: &EffectIntentId) -> BookingWrite {
-        BookingWrite {
-            state: BookingState::BookingInProgress(BookingInProgress {
+    fn in_progress_write(id: &BookingId, effect: &EffectIntentId) -> Booking {
+        Booking {
+            id: id.clone(),
+            state: BookingState::BookingInProgress(townhall_domain::BookingInProgress {
                 effect_intent_id: effect.clone(),
             }),
             requirements: requirements(),
@@ -1383,7 +1601,7 @@ mod effect_identity {
             booking_id: id.clone(),
             source_version: version,
             canonical_plan: plan_for(venue),
-            next: in_progress_write(&effect),
+            next: in_progress_write(id, &effect),
             audit: TransitionAudit::committed("Book", None),
         }
     }
@@ -1487,6 +1705,34 @@ mod effect_identity {
     /// signature. A deterministic failure point between the CAS and the intent
     /// write is what would test it properly, and that needs an injectable
     /// interruption the coordinator provides — slice C.
+    /// The replay path returns before `commit_in_tx`, so it needs its own gate.
+    /// Without one, a retry that named a different booking in its write value
+    /// would be answered as a successful replay.
+    #[tokio::test]
+    async fn a_retry_naming_a_different_booking_is_refused_on_the_replay_path() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-REPLAYID");
+        seeded(&repo, &id).await;
+
+        repo.prepare_effect(prepare_at(&id, 0, "TH-A"))
+            .await
+            .expect("the first prepare should succeed");
+
+        let mut retry = prepare_at(&id, 0, "TH-A");
+        retry.next.id = BookingId::new("BKG-ELSEWHERE");
+
+        let error = repo
+            .prepare_effect(retry)
+            .await
+            .expect_err("a retry naming another booking must be refused");
+
+        assert!(
+            matches!(error, StoreError::IdentityChanged { .. }),
+            "expected IdentityChanged on the replay path, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_stale_prepare_writes_nothing() {
         let temp = TempDir::new().expect("temp dir");
@@ -1498,7 +1744,8 @@ mod effect_identity {
         repo.commit(
             &id,
             0,
-            BookingWrite {
+            Booking {
+                id: id.clone(),
                 state: BookingState::Draft(townhall_domain::Draft),
                 requirements: requirements(),
                 selected_venue: None,
@@ -1569,7 +1816,7 @@ mod effect_identity {
         let mut request = prepare_at(&id, 0, "TH-A");
         // The plan no longer carries an effect id at all (B2 removed the field),
         // so a disagreement can only come from the in-flight state now.
-        request.next.state = BookingState::BookingInProgress(BookingInProgress {
+        request.next.state = BookingState::BookingInProgress(townhall_domain::BookingInProgress {
             effect_intent_id: EffectIntentId::new("SOME-OTHER-EFFECT"),
         });
 
@@ -1732,7 +1979,8 @@ mod effect_identity {
                 canonical_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
                 },
-                next: BookingWrite {
+                next: Booking {
+                    id: id.clone(),
                     state: BookingState::CancellingBooking(townhall_domain::CancellingBooking {
                         booking_ref: CouncilBookingRef::new("TH-92718"),
                         effect_intent_id: effect.clone(),

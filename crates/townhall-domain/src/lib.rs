@@ -56,8 +56,26 @@ pub struct BookingInProgress {
     pub effect_intent_id: EffectIntentId,
 }
 
+/// A cancellation has been asked for while the *booking* is still in flight.
+///
+/// The effect it names is therefore the **booking** intent, not a cancellation
+/// one — nothing has been sent to the council about cancelling yet, and the
+/// booking's own outcome is still unknown. Until that resolves there is nothing
+/// to cancel and no second identity to mint. The completeness matrix in
+/// `docs/state-machine.md` says the same thing: this state's active intent is a
+/// booking, and `BookingExists` is what moves it on to `CancellingBooking`.
+///
+/// Losing that pointer would be the real cost of leaving this a unit struct: a
+/// crash here would find a booking whose council request is outstanding and no
+/// record of which effect to reconcile.
+///
+/// The state is not yet reachable — `BookingInProgress + Cancel` lands in slice
+/// F with its compensation protocol — but [`Booking::coherent`] must permit it,
+/// so the field lands with the invariant rather than after it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CancellationRequested;
+pub struct CancellationRequested {
+    pub effect_intent_id: EffectIntentId,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Booked {
@@ -136,7 +154,39 @@ impl BookingState {
     pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
         match self {
             Self::BookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
+            Self::CancellationRequested(requested) => Some(&requested.effect_intent_id),
             Self::CancellingBooking(cancelling) => Some(&cancelling.effect_intent_id),
+            _ => None,
+        }
+    }
+
+    /// The venue selection this state names, if it names one.
+    ///
+    /// Some states record the selection inside themselves as well as the
+    /// aggregate recording it in `selected_venue`. This is the state's copy, so
+    /// the two can be compared — see [`Booking::coherent`].
+    #[must_use]
+    pub fn selection(&self) -> Option<SelectedVenueRef> {
+        match self {
+            Self::VenueSelected(selected) => Some(SelectedVenueRef {
+                venue_id: selected.venue_id.clone(),
+                slot_id: selected.slot_id.clone(),
+            }),
+            Self::AwaitingBooking(waiting) => Some(SelectedVenueRef {
+                venue_id: waiting.venue_id.clone(),
+                slot_id: waiting.slot_id.clone(),
+            }),
+            Self::NeedsRevalidation(pending) => pending.selected.clone(),
+            _ => None,
+        }
+    }
+
+    /// The council reference this state names, if it names one.
+    #[must_use]
+    pub const fn council_booking_ref(&self) -> Option<&CouncilBookingRef> {
+        match self {
+            Self::Booked(booked) => Some(&booked.booking_ref),
+            Self::CancellingBooking(cancelling) => Some(&cancelling.booking_ref),
             _ => None,
         }
     }
@@ -146,10 +196,24 @@ impl BookingState {
     /// An effect id does not encode its kind, so matching ids is not enough to
     /// prove a state and an effect belong together: `BookingInProgress` waiting
     /// on a cancellation is nonsense that an id comparison alone would accept.
+    // `BookingInProgress` and `CancellationRequested` both answer `Book`, and
+    // clippy wants them merged into one arm. Kept separate deliberately: they
+    // answer the same way for entirely different reasons, and
+    // `CancellationRequested => Book` is the surprising one. Folded into
+    // `(A | B) => Book` it reads as an obvious pair, which is exactly the wrong
+    // impression — a reader would stop asking why a state named for a
+    // cancellation waits on a booking.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub const fn in_flight_kind(&self) -> Option<OperationKind> {
         match self {
             Self::BookingInProgress(_) => Some(OperationKind::Book),
+            // Deliberately `Book`. `CancellationRequested` means "cancel the
+            // booking we are still waiting on", so the effect in flight is the
+            // booking's — see [`CancellationRequested`]. Reading the name and
+            // answering `Cancel` here would let a cancellation outcome resolve a
+            // booking request.
+            Self::CancellationRequested(_) => Some(OperationKind::Book),
             Self::CancellingBooking(_) => Some(OperationKind::Cancel),
             _ => None,
         }
@@ -208,6 +272,148 @@ pub struct BookingAggregate {
     pub active_effect: Option<EffectIntentId>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Every business field of a booking, as decided by the domain.
+///
+/// This is `BoundaryDomain::State`, and it is deliberately the whole thing
+/// rather than the state discriminator alone (ADR-013). The repository owns
+/// `version`, `created_at_ms` and `updated_at_ms`; the domain owns everything
+/// here.
+///
+/// # Why not just `BookingState`
+///
+/// B2 used `BookingState`, which left `requirements`, `selected_venue`,
+/// `availability`, `booking_ref` and `active_effect` to whoever assembled the
+/// repository's write value. That is domain mutation semantics living outside
+/// the domain, and it had already produced a real defect:
+/// `UpdateRequirements { attendees }` could not apply its own patch, because a
+/// plan carrying only a state has nowhere to put changed requirements. The
+/// headcount was silently dropped and the next capacity check validated against
+/// the old one.
+///
+/// So the fix is not "remember to set the fields" — it is making the complete
+/// value the only thing a transition can produce.
+///
+/// `id` is here for a second reason. Evidence must be bound to *this resource*
+/// (ADR-012), and only the authoritatively loaded aggregate can establish which
+/// resource that is. Binding against a caller-supplied id would compare two
+/// values from the same source and prove nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Booking {
+    pub id: BookingId,
+    pub state: BookingState,
+    pub requirements: BookingRequirements,
+    pub selected_venue: Option<SelectedVenueRef>,
+    pub availability: Option<VenueFacts>,
+    pub booking_ref: Option<CouncilBookingRef>,
+    pub active_effect: Option<EffectIntentId>,
+}
+
+/// A booking that contradicts itself.
+///
+/// Three facts are recorded twice: the effect an in-flight state waits on is
+/// also `active_effect`, the venue a state names is also `selected_venue`, and
+/// the council reference a state names is also `booking_ref`. The duplication is
+/// deliberate — the outer fields are what recovery and queries read without
+/// destructuring the state — but two copies of one fact can disagree.
+///
+/// A disagreement is **not** repaired. The transition that produced it was
+/// wrong, and silently reconciling the two copies would launder that away; the
+/// next reader would see a consistent booking and never learn one was written
+/// incorrectly.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum IncoherentBooking {
+    #[error("state {state} waits on {state_says:?}, but active_effect is {aggregate_says:?}")]
+    EffectIdentity {
+        state: &'static str,
+        state_says: Option<EffectIntentId>,
+        aggregate_says: Option<EffectIntentId>,
+    },
+    #[error("state {state} names venue {state_says:?}, but selected_venue is {aggregate_says:?}")]
+    Selection {
+        state: &'static str,
+        state_says: Box<SelectedVenueRef>,
+        aggregate_says: Option<Box<SelectedVenueRef>>,
+    },
+    #[error("state {state} names booking {state_says}, but booking_ref is {aggregate_says:?}")]
+    CouncilReference {
+        state: &'static str,
+        state_says: CouncilBookingRef,
+        aggregate_says: Option<CouncilBookingRef>,
+    },
+}
+
+impl Booking {
+    /// Whether the booking's two copies of each duplicated fact agree.
+    ///
+    /// The domain owns this because *which fields are copies of which* is domain
+    /// knowledge — the repository must not learn that `BookingInProgress`
+    /// carries the same identity as `active_effect` (ADR-013). The repository
+    /// asks; it does not know why.
+    ///
+    /// Checked on write and on read, so an incoherent booking can neither be
+    /// persisted nor loaded. That is what lets every transition arm carry these
+    /// fields through rather than defensively re-deriving them in each of eight
+    /// places — one enforced invariant beats a discipline eight arms must
+    /// remember.
+    ///
+    /// The effect pointer is checked in **both** directions: a state waiting on
+    /// nothing must not have an `active_effect` either, or recovery would chase
+    /// an effect no state is expecting. Selection and reference are checked only
+    /// where the state names one, because a terminal state legitimately retains
+    /// an outer value it no longer names — `Cancelled` keeps the reference of
+    /// the booking it cancelled.
+    ///
+    /// # Errors
+    /// One [`IncoherentBooking`] per disagreement, first found.
+    pub fn coherent(&self) -> Result<(), IncoherentBooking> {
+        let state = self.state.name();
+
+        if self.state.effect_intent_id() != self.active_effect.as_ref() {
+            return Err(IncoherentBooking::EffectIdentity {
+                state,
+                state_says: self.state.effect_intent_id().cloned(),
+                aggregate_says: self.active_effect.clone(),
+            });
+        }
+
+        if let Some(named) = self.state.selection()
+            && self.selected_venue.as_ref() != Some(&named)
+        {
+            return Err(IncoherentBooking::Selection {
+                state,
+                state_says: Box::new(named),
+                aggregate_says: self.selected_venue.clone().map(Box::new),
+            });
+        }
+
+        if let Some(named) = self.state.council_booking_ref()
+            && self.booking_ref.as_ref() != Some(named)
+        {
+            return Err(IncoherentBooking::CouncilReference {
+                state,
+                state_says: named.clone(),
+                aggregate_says: self.booking_ref.clone(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl From<&BookingAggregate> for Booking {
+    fn from(value: &BookingAggregate) -> Self {
+        Self {
+            id: value.id.clone(),
+            state: value.state.clone(),
+            requirements: value.requirements.clone(),
+            selected_venue: value.selected_venue.clone(),
+            availability: value.availability.clone(),
+            booking_ref: value.booking_ref.clone(),
+            active_effect: value.active_effect.clone(),
+        }
+    }
 }
 
 /// Which external consequence an effect intent represents.
@@ -318,13 +524,19 @@ pub struct EffectIntent {
     pub updated_at_ms: i64,
 }
 
+/// What the coordinator must supply that the booking itself cannot know.
+///
+/// Deliberately small. It carried `booking_id` and `requirements` until B3a,
+/// and both were removed rather than tidied: they duplicated authoritative
+/// fields on [`Booking`], and a duplicated field is one a guard can read the
+/// stale copy of. `bind_facts` did exactly that — it validated against
+/// `context.requirements`, so patching the aggregate's requirements would have
+/// fixed the `UpdateRequirements` bug in one place and left it live in another.
 #[derive(Clone, Debug)]
 pub struct BookingContext {
-    pub booking_id: BookingId,
-    pub requirements: BookingRequirements,
     /// Facts loaded by a capability. Never authoritative on their own: every
     /// behaviour that consumes them must first bind them to what the user
-    /// actually chose, which lives in the *state*, not here.
+    /// actually chose, which lives in the *booking*, not here.
     pub selected_facts: Option<VenueFacts>,
     /// The effect identity the coordinator derived for this turn.
     ///
@@ -428,10 +640,8 @@ impl TownHallDomain {
 }
 
 /// Shorthand for a transition that reaches nothing external.
-fn local(
-    next_state: BookingState,
-) -> Resolution<TransitionPlan<BookingState, BookingEffect>, BookingError> {
-    Resolution::Ready(TransitionPlan::Local { next_state })
+fn local(next: Booking) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+    Resolution::Ready(TransitionPlan::Local { next_state: next })
 }
 
 impl TownHallDomain {
@@ -441,7 +651,13 @@ impl TownHallDomain {
     /// The binding is the point. Loaded facts are never authoritative on their
     /// own — every per-venue guard passes for a venue the user never selected,
     /// so only comparing against the selection catches a substitution.
+    ///
+    /// Requirements come from `booking`, never from `context`. That is the whole
+    /// reason `BookingContext` no longer carries a copy: reading the context's
+    /// would validate against whatever the coordinator happened to assemble
+    /// rather than against what was committed.
     fn bind_facts<'a>(
+        booking: &Booking,
         context: &'a BookingContext,
         venue_id: &VenueId,
         slot_id: &SlotId,
@@ -454,8 +670,36 @@ impl TownHallDomain {
         if facts.venue_id != *venue_id || facts.slot_id != *slot_id {
             return Err(BookingError::VenueFactsMissing);
         }
-        Self::validate_facts(facts, &context.requirements, authority)?;
+        Self::validate_facts(facts, &booking.requirements, authority)?;
         Ok(facts)
+    }
+
+    /// Apply an `UpdateRequirements` patch. `None` means "leave unchanged".
+    ///
+    /// Before B3a this did not exist and the patch was discarded — see
+    /// [`Booking`].
+    fn patch_requirements(
+        current: &BookingRequirements,
+        attendees: Option<u16>,
+    ) -> BookingRequirements {
+        BookingRequirements {
+            attendees: attendees.unwrap_or(current.attendees),
+            ..current.clone()
+        }
+    }
+
+    /// A booking whose selection changed, so any loaded availability is stale.
+    ///
+    /// Loaded facts describe a venue-slot pair *under a set of requirements*.
+    /// Change either and the facts no longer describe anything current. Leaving
+    /// them is how an under-capacity or substituted venue survives a
+    /// revalidation.
+    fn resettled(booking: &Booking, state: BookingState) -> Booking {
+        Booking {
+            state,
+            availability: None,
+            ..booking.clone()
+        }
     }
 
     /// `Book` no longer books. It commits the intent to book.
@@ -466,15 +710,21 @@ impl TownHallDomain {
     /// fake, and the reason a lost response could leave no record that an
     /// external consequence might exist.
     fn resolve_book(
+        booking: &Booking,
         waiting: &AwaitingBooking,
         authority: &VerifiedAuthority,
         context: &BookingContext,
-    ) -> Resolution<TransitionPlan<BookingState, BookingEffect>, BookingError> {
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         if !authority.may_book {
             return Resolution::Denied(BookingError::BookingAuthorityRequired);
         }
-        let facts = match Self::bind_facts(context, &waiting.venue_id, &waiting.slot_id, authority)
-        {
+        let facts = match Self::bind_facts(
+            booking,
+            context,
+            &waiting.venue_id,
+            &waiting.slot_id,
+            authority,
+        ) {
             Ok(facts) => facts,
             Err(error) => return Resolution::Denied(error),
         };
@@ -488,7 +738,13 @@ impl TownHallDomain {
         };
 
         Resolution::Ready(TransitionPlan::ExternalEffect {
-            next_state: BookingState::BookingInProgress(BookingInProgress { effect_intent_id }),
+            next_state: Booking {
+                state: BookingState::BookingInProgress(BookingInProgress {
+                    effect_intent_id: effect_intent_id.clone(),
+                }),
+                active_effect: Some(effect_intent_id),
+                ..booking.clone()
+            },
             effect: BookingEffect::Book {
                 principal: authority.principal.clone(),
                 facts: facts.clone(),
@@ -503,10 +759,11 @@ impl TownHallDomain {
     /// would commit `Cancelled` while the council booking stayed live for every
     /// slice between the coordinator landing and in-flight cancellation.
     fn resolve_cancel_booked(
+        booking: &Booking,
         booked: &Booked,
         authority: &VerifiedAuthority,
         context: &BookingContext,
-    ) -> Resolution<TransitionPlan<BookingState, BookingEffect>, BookingError> {
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         if !authority.may_cancel {
             return Resolution::Denied(BookingError::CancellationAuthorityRequired);
         }
@@ -515,10 +772,14 @@ impl TownHallDomain {
         };
 
         Resolution::Ready(TransitionPlan::ExternalEffect {
-            next_state: BookingState::CancellingBooking(CancellingBooking {
-                booking_ref: booked.booking_ref.clone(),
-                effect_intent_id,
-            }),
+            next_state: Booking {
+                state: BookingState::CancellingBooking(CancellingBooking {
+                    booking_ref: booked.booking_ref.clone(),
+                    effect_intent_id: effect_intent_id.clone(),
+                }),
+                active_effect: Some(effect_intent_id),
+                ..booking.clone()
+            },
             effect: BookingEffect::CancelBooking {
                 booking_ref: booked.booking_ref.clone(),
             },
@@ -528,7 +789,7 @@ impl TownHallDomain {
 
 #[async_trait]
 impl BoundaryDomain for TownHallDomain {
-    type State = BookingState;
+    type State = Booking;
     type Proposal = BookingProposal;
     type Effect = BookingEffect;
     type Authority = VerifiedAuthority;
@@ -548,45 +809,62 @@ impl BoundaryDomain for TownHallDomain {
     #[allow(clippy::match_same_arms)]
     async fn resolve_proposal(
         &self,
-        state: &Self::State,
+        booking: &Self::State,
         proposal: Self::Proposal,
         authority: &Self::Authority,
         context: &Self::Context,
     ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
-        match (state, proposal) {
+        // Every arm produces a complete `Booking` via struct-update syntax, so
+        // what each transition *changes* is what you read, and a field nobody
+        // mentions is carried rather than quietly defaulted.
+        match (&booking.state, proposal) {
             (BookingState::Draft(_), BookingProposal::SelectVenue { venue_id, slot_id }) => {
-                local(BookingState::VenueSelected(VenueSelected {
-                    venue_id,
-                    slot_id,
-                }))
+                let selection = SelectedVenueRef {
+                    venue_id: venue_id.clone(),
+                    slot_id: slot_id.clone(),
+                };
+                local(Booking {
+                    selected_venue: Some(selection),
+                    ..Self::resettled(
+                        booking,
+                        BookingState::VenueSelected(VenueSelected { venue_id, slot_id }),
+                    )
+                })
             }
-            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => {
-                local(BookingState::Cancelled(Cancelled))
-            }
+            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
             (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
-                match Self::bind_facts(context, &selected.venue_id, &selected.slot_id, authority) {
-                    Ok(facts) => local(BookingState::AwaitingBooking(AwaitingBooking {
-                        venue_id: facts.venue_id.clone(),
-                        slot_id: facts.slot_id.clone(),
-                        verified_fee: facts.fee,
-                    })),
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::AwaitingBooking(AwaitingBooking {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                            verified_fee: facts.fee,
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
                     Err(error) => Resolution::Denied(error),
                 }
             }
-            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => {
-                local(BookingState::Draft(Draft))
-            }
-            (BookingState::VenueSelected(selected), BookingProposal::UpdateRequirements { .. }) => {
-                local(BookingState::NeedsRevalidation(NeedsRevalidation {
-                    selected: Some(SelectedVenueRef {
-                        venue_id: selected.venue_id.clone(),
-                        slot_id: selected.slot_id.clone(),
-                    }),
-                }))
-            }
-            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => {
-                local(BookingState::Cancelled(Cancelled))
-            }
+            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
+            (
+                BookingState::VenueSelected(selected),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
+                    venue_id: selected.venue_id.clone(),
+                    slot_id: selected.slot_id.clone(),
+                },
+                attendees,
+            ),
+            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
             (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
                 // The binding target is state data, not context, so this holds
                 // without trusting whoever assembled the context. Without it, an
@@ -595,44 +873,93 @@ impl BoundaryDomain for TownHallDomain {
                 let Some(selected) = pending.selected.as_ref() else {
                     return Resolution::Denied(BookingError::VenueFactsMissing);
                 };
-                match Self::bind_facts(context, &selected.venue_id, &selected.slot_id, authority) {
-                    Ok(facts) => local(BookingState::VenueSelected(VenueSelected {
-                        venue_id: facts.venue_id.clone(),
-                        slot_id: facts.slot_id.clone(),
-                    })),
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::VenueSelected(VenueSelected {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
                     Err(error) => Resolution::Denied(error),
                 }
             }
             (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
-                local(BookingState::Draft(Draft))
+                change_venue(booking)
             }
-            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => {
-                local(BookingState::Cancelled(Cancelled))
-            }
+            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => cancel(booking),
             (BookingState::AwaitingBooking(waiting), BookingProposal::Book) => {
-                Self::resolve_book(waiting, authority, context)
+                Self::resolve_book(booking, waiting, authority, context)
             }
             (BookingState::AwaitingBooking(_), BookingProposal::ChangeVenue) => {
-                local(BookingState::Draft(Draft))
+                change_venue(booking)
             }
             (
                 BookingState::AwaitingBooking(waiting),
-                BookingProposal::UpdateRequirements { .. },
-            ) => local(BookingState::NeedsRevalidation(NeedsRevalidation {
-                selected: Some(SelectedVenueRef {
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
                     venue_id: waiting.venue_id.clone(),
                     slot_id: waiting.slot_id.clone(),
-                }),
-            })),
-            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => {
-                local(BookingState::Cancelled(Cancelled))
-            }
+                },
+                attendees,
+            ),
+            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
             (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
-                Self::resolve_cancel_booked(booked, authority, context)
+                Self::resolve_cancel_booked(booking, booked, authority, context)
             }
             _ => Resolution::Undefined,
         }
     }
+}
+
+/// Abandon the booking. Selection and availability are kept deliberately: they
+/// record what was being attempted, and `Cancelled` has no outbound behaviour
+/// that could consume them, so retaining them costs nothing and keeps the audit
+/// trail intact.
+fn cancel(booking: &Booking) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+    local(Booking {
+        state: BookingState::Cancelled(Cancelled),
+        ..booking.clone()
+    })
+}
+
+/// Start over. The selection is abandoned, so loaded facts describe nothing.
+fn change_venue(
+    booking: &Booking,
+) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+    local(Booking {
+        selected_venue: None,
+        ..TownHallDomain::resettled(booking, BookingState::Draft(Draft))
+    })
+}
+
+/// Change what is being asked for, carrying the selection so it can be
+/// revalidated against the new requirements.
+///
+/// The patch is applied here. Before B3a it was destructured away and lost.
+fn update_requirements(
+    booking: &Booking,
+    selected: SelectedVenueRef,
+    attendees: Option<u16>,
+) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+    local(Booking {
+        requirements: TownHallDomain::patch_requirements(&booking.requirements, attendees),
+        ..TownHallDomain::resettled(
+            booking,
+            BookingState::NeedsRevalidation(NeedsRevalidation {
+                selected: Some(selected),
+            }),
+        )
+    })
 }
 
 /// The state × proposal topology, pinned.
@@ -718,7 +1045,9 @@ mod topology {
             BookingState::BookingInProgress(BookingInProgress {
                 effect_intent_id: EffectIntentId::new("BOOK-BKG-1001-1"),
             }),
-            BookingState::CancellationRequested(CancellationRequested),
+            BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
+            }),
             BookingState::Booked(Booked {
                 booking_ref: CouncilBookingRef::new("TH-92718"),
             }),
@@ -821,20 +1150,38 @@ mod topology {
         }
     }
 
+    fn permissive_requirements() -> BookingRequirements {
+        BookingRequirements {
+            purpose: "meeting".to_owned(),
+            requested_date: "2026-08-20".to_owned(),
+            time_window: TimeWindow {
+                from: "13:00".to_owned(),
+                to: "17:00".to_owned(),
+            },
+            attendees: 20,
+            wheelchair_accessible: true,
+            max_fee: Money::from_pence(5_000),
+        }
+    }
+
+    /// Wrap a state in a complete booking so the sweep can classify it.
+    ///
+    /// The other fields are deliberately uniform: this suite asks only whether a
+    /// behaviour *exists*, and existence must not depend on any of them.
+    fn booking_of(state: BookingState, requirements: BookingRequirements) -> Booking {
+        Booking {
+            id: BookingId::new("BKG-1001"),
+            state,
+            requirements,
+            selected_venue: Some(selection()),
+            availability: None,
+            booking_ref: None,
+            active_effect: None,
+        }
+    }
+
     fn permissive_context() -> BookingContext {
         BookingContext {
-            booking_id: BookingId::new("BKG-1001"),
-            requirements: BookingRequirements {
-                purpose: "meeting".to_owned(),
-                requested_date: "2026-08-20".to_owned(),
-                time_window: TimeWindow {
-                    from: "13:00".to_owned(),
-                    to: "17:00".to_owned(),
-                },
-                attendees: 20,
-                wheelchair_accessible: true,
-                max_fee: Money::from_pence(5_000),
-            },
             selected_facts: Some(VenueFacts {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
@@ -872,7 +1219,12 @@ mod topology {
         )
     }
 
-    async fn sweep(label: &str, authority: &VerifiedAuthority, context: &BookingContext) {
+    async fn sweep(
+        label: &str,
+        authority: &VerifiedAuthority,
+        context: &BookingContext,
+        requirements: &BookingRequirements,
+    ) {
         let domain = TownHallDomain;
         let mut checked = 0_usize;
 
@@ -881,9 +1233,10 @@ mod topology {
                 let state_name = state.name();
                 let proposal_name = proposal.name();
                 let want_defined = expected_defined(state_name, proposal_name);
+                let booking = booking_of(state.clone(), requirements.clone());
 
                 let got = domain
-                    .resolve_proposal(&state, proposal.clone(), authority, context)
+                    .resolve_proposal(&booking, proposal.clone(), authority, context)
                     .await;
                 let is_undefined = matches!(got, Resolution::Undefined);
 
@@ -912,7 +1265,13 @@ mod topology {
     /// The whole matrix, under a fixture where every guard passes.
     #[tokio::test]
     async fn topology_matches_the_pinned_matrix() {
-        sweep("permissive", &permissive_authority(), &permissive_context()).await;
+        sweep(
+            "permissive",
+            &permissive_authority(),
+            &permissive_context(),
+            &permissive_requirements(),
+        )
+        .await;
     }
 
     /// The same matrix under a fixture where every guard fails. A behaviour
@@ -922,7 +1281,35 @@ mod topology {
     /// `Denied` would light up all 66 impossible cells at once.
     #[tokio::test]
     async fn topology_does_not_depend_on_authority_or_context() {
-        sweep("hostile", &hostile_authority(), &hostile_context()).await;
+        sweep(
+            "hostile",
+            &hostile_authority(),
+            &hostile_context(),
+            &permissive_requirements(),
+        )
+        .await;
+    }
+
+    /// And it must not depend on the booking's own requirements either.
+    ///
+    /// B3a moved `requirements` out of the context and into the state, so the
+    /// sweep above no longer varies them — a guard reading them is now reading
+    /// *state*. Requirements decide whether an existing behaviour is permitted,
+    /// never whether it exists, so an unsatisfiable set must change nothing here.
+    #[tokio::test]
+    async fn topology_does_not_depend_on_requirements() {
+        let unsatisfiable = BookingRequirements {
+            attendees: 9_999,
+            max_fee: Money::from_pence(0),
+            ..permissive_requirements()
+        };
+        sweep(
+            "unsatisfiable-requirements",
+            &permissive_authority(),
+            &permissive_context(),
+            &unsatisfiable,
+        )
+        .await;
     }
 
     /// Under the permissive fixture a legal cell must actually reach `Ready`.
@@ -940,8 +1327,9 @@ mod topology {
                 if !expected_defined(state.name(), proposal.name()) {
                     continue;
                 }
+                let booking = booking_of(state.clone(), permissive_requirements());
                 let got = domain
-                    .resolve_proposal(&state, proposal.clone(), &authority, &context)
+                    .resolve_proposal(&booking, proposal.clone(), &authority, &context)
                     .await;
                 assert!(
                     matches!(got, Resolution::Ready(_)),
@@ -1038,67 +1426,433 @@ mod characterization {
 
     fn context() -> BookingContext {
         BookingContext {
-            booking_id: BookingId::new("BKG-1001"),
-            requirements: requirements(),
             selected_facts: Some(good_facts()),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
         }
     }
 
-    fn venue_selected() -> BookingState {
-        BookingState::VenueSelected(VenueSelected {
+    fn selection() -> SelectedVenueRef {
+        SelectedVenueRef {
             venue_id: VenueId::new("TH-A"),
             slot_id: SlotId::new("SLOT-A"),
-        })
+        }
     }
 
-    fn needs_revalidation() -> BookingState {
-        BookingState::NeedsRevalidation(NeedsRevalidation {
-            selected: Some(SelectedVenueRef {
+    // --------------------------------------------------------------- fixtures
+    //
+    // Each returns a complete, *realistic* `Booking`: a state paired with the
+    // other business fields as they would actually be at that point in the
+    // lifecycle. Realism matters here in a way it does not in the topology
+    // sweep, because these tests assert the complete next value — so a fixture
+    // that carried, say, `availability: None` at `AwaitingBooking` would let a
+    // transition that wrongly cleared it pass unnoticed.
+
+    fn draft() -> Booking {
+        Booking {
+            id: BookingId::new("BKG-1001"),
+            state: BookingState::Draft(Draft),
+            requirements: requirements(),
+            selected_venue: None,
+            availability: None,
+            booking_ref: None,
+            active_effect: None,
+        }
+    }
+
+    fn venue_selected() -> Booking {
+        Booking {
+            state: BookingState::VenueSelected(VenueSelected {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
             }),
-        })
+            selected_venue: Some(selection()),
+            ..draft()
+        }
     }
 
-    fn awaiting_booking() -> BookingState {
-        BookingState::AwaitingBooking(AwaitingBooking {
-            venue_id: VenueId::new("TH-A"),
-            slot_id: SlotId::new("SLOT-A"),
-            verified_fee: Money::from_pence(4_500),
-        })
+    fn needs_revalidation() -> Booking {
+        Booking {
+            state: BookingState::NeedsRevalidation(NeedsRevalidation {
+                selected: Some(selection()),
+            }),
+            ..venue_selected()
+        }
     }
 
-    fn booked() -> BookingState {
-        BookingState::Booked(Booked {
-            booking_ref: CouncilBookingRef::new("TH-92718"),
-        })
+    fn awaiting_booking() -> Booking {
+        Booking {
+            state: BookingState::AwaitingBooking(AwaitingBooking {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                verified_fee: Money::from_pence(4_500),
+            }),
+            availability: Some(good_facts()),
+            ..venue_selected()
+        }
+    }
+
+    fn booked() -> Booking {
+        Booking {
+            state: BookingState::Booked(Booked {
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+            }),
+            booking_ref: Some(CouncilBookingRef::new("TH-92718")),
+            ..awaiting_booking()
+        }
     }
 
     /// Classify one proposal and return the resolution.
     ///
     /// B2 changed what a turn *is*: the kernel classifies and the coordinator
     /// commits, so there is no longer a single call that both decides and
-    /// mutates. What these tests pin is unchanged — the exact next state for
-    /// every legal cell, and the exact error for every denial. Only the
-    /// wrapper moved from `BoundaryOutcome::Committed` to
-    /// `Resolution::Ready(TransitionPlan::…)`.
+    /// mutates. B3a changed what a turn *produces*: the complete next booking
+    /// rather than the state discriminator, which is what lets these tests pin
+    /// every business field instead of one enum tag.
     async fn turn(
-        state: BookingState,
+        booking: Booking,
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
         context: &BookingContext,
-    ) -> Resolution<TransitionPlan<BookingState, BookingEffect>, BookingError> {
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         TownHallDomain
-            .resolve_proposal(&state, proposal, authority, context)
+            .resolve_proposal(&booking, proposal, authority, context)
             .await
     }
 
     /// A local transition to `next`, which is what most cells produce.
     fn committed_local(
-        next: BookingState,
-    ) -> Resolution<TransitionPlan<BookingState, BookingEffect>, BookingError> {
+        next: Booking,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         Resolution::Ready(TransitionPlan::Local { next_state: next })
+    }
+
+    /// The bug B3a fixes, end to end.
+    ///
+    /// Lucy raises her party from 20 to 25, then the venue is revalidated
+    /// against a room that holds 22. That must be refused.
+    ///
+    /// Before B3a it was accepted. `UpdateRequirements` could not carry its own
+    /// patch — a plan holding only a state discriminator had nowhere to put
+    /// changed requirements — so `RevalidateVenue` validated 22 against the
+    /// stale 20 and passed. The two steps are threaded here exactly as a
+    /// coordinator would thread them: the second turn starts from what the
+    /// first one produced, which is the only way the patch can be observed at
+    /// all.
+    #[tokio::test]
+    async fn a_raised_headcount_is_revalidated_against_the_new_number() {
+        let Resolution::Ready(first) = turn(
+            awaiting_booking(),
+            BookingProposal::UpdateRequirements {
+                attendees: Some(25),
+            },
+            &authority(),
+            &context(),
+        )
+        .await
+        else {
+            panic!("UpdateRequirements must be legal at AwaitingBooking");
+        };
+        let after_patch = first.next_state().clone();
+        assert_eq!(
+            after_patch.requirements.attendees, 25,
+            "the patch must reach the committed booking, or nothing downstream can honour it"
+        );
+
+        let too_small = VenueFacts {
+            capacity: 22,
+            ..good_facts()
+        };
+        let got = turn(
+            after_patch,
+            BookingProposal::RevalidateVenue,
+            &authority(),
+            &BookingContext {
+                selected_facts: Some(too_small),
+                ..context()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::CapacityInsufficient {
+                capacity: 22,
+                required: 25,
+            }),
+            "a room holding 22 must be refused for 25 people"
+        );
+    }
+
+    /// `None` means "leave it alone", not "reset it".
+    #[tokio::test]
+    async fn an_empty_requirements_patch_changes_nothing() {
+        let got = turn(
+            venue_selected(),
+            BookingProposal::UpdateRequirements { attendees: None },
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert_eq!(got, committed_local(needs_revalidation()));
+    }
+
+    /// `active_effect` is a pointer to work in flight. Only the two external
+    /// transitions may set it, and every other legal cell must pass it through
+    /// untouched.
+    ///
+    /// Swept rather than sampled: this is the field a future arm is most likely
+    /// to clobber by rebuilding a `Booking` from scratch instead of carrying it.
+    #[tokio::test]
+    async fn only_external_transitions_touch_the_effect_pointer() {
+        let external = [("AwaitingBooking", "Book"), ("Booked", "Cancel")];
+
+        for source in [
+            draft(),
+            venue_selected(),
+            needs_revalidation(),
+            awaiting_booking(),
+            booked(),
+        ] {
+            for proposal in [
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ] {
+                let cell = (source.state.name(), proposal.name());
+                let Resolution::Ready(plan) =
+                    turn(source.clone(), proposal, &authority(), &context()).await
+                else {
+                    continue;
+                };
+                let next = plan.next_state();
+
+                if external.contains(&cell) {
+                    assert_eq!(
+                        next.active_effect.as_ref(),
+                        context().pending_effect.as_ref(),
+                        "{} + {} is external and must adopt the pending identity",
+                        cell.0,
+                        cell.1
+                    );
+                    assert_eq!(
+                        next.active_effect.as_ref(),
+                        next.state.effect_intent_id(),
+                        "{} + {}: the two copies of the effect identity disagree",
+                        cell.0,
+                        cell.1
+                    );
+                } else {
+                    assert_eq!(
+                        next.active_effect, source.active_effect,
+                        "{} + {} is local and must carry active_effect through unchanged",
+                        cell.0, cell.1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every plan the domain produces must be self-consistent, or the store
+    /// will refuse to persist it. Swept, because this is the property each new
+    /// transition arm has to uphold and none of them is reminded to.
+    #[tokio::test]
+    async fn every_transition_produces_a_coherent_booking() {
+        for source in [
+            draft(),
+            venue_selected(),
+            needs_revalidation(),
+            awaiting_booking(),
+            booked(),
+        ] {
+            source
+                .coherent()
+                .expect("the fixtures themselves must be coherent");
+
+            for proposal in [
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-B"),
+                    slot_id: SlotId::new("SLOT-B"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ] {
+                let cell = format!("{} + {}", source.state.name(), proposal.name());
+                if let Resolution::Ready(plan) =
+                    turn(source.clone(), proposal, &authority(), &context()).await
+                {
+                    plan.next_state().coherent().unwrap_or_else(|why| {
+                        panic!("{cell} produced an incoherent booking: {why}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// The effect pointer is checked in both directions. A state waiting on
+    /// nothing must not carry an `active_effect` either — recovery would chase
+    /// an effect no state expects, and nothing would ever resolve it.
+    #[test]
+    fn an_effect_pointer_with_no_state_waiting_on_it_is_incoherent() {
+        let orphaned = Booking {
+            active_effect: Some(EffectIntentId::new("EFF-ORPHAN")),
+            ..awaiting_booking()
+        };
+        assert!(matches!(
+            orphaned.coherent(),
+            Err(IncoherentBooking::EffectIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_naming_a_venue_the_aggregate_does_not_is_incoherent() {
+        let mismatched = Booking {
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-Z"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..venue_selected()
+        };
+        assert!(matches!(
+            mismatched.coherent(),
+            Err(IncoherentBooking::Selection { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_naming_a_council_reference_the_aggregate_does_not_is_incoherent() {
+        let mismatched = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-00000")),
+            ..booked()
+        };
+        assert!(matches!(
+            mismatched.coherent(),
+            Err(IncoherentBooking::CouncilReference { .. })
+        ));
+    }
+
+    /// The state B3b's completeness matrix requires must be representable: a
+    /// cancellation asked for while the booking is still in flight, still
+    /// pointing at the booking effect it is waiting on.
+    ///
+    /// The both-directions effect rule would have forbidden this while
+    /// `CancellationRequested` was a unit struct — an aggregate could not name
+    /// the effect it was waiting for, so `active_effect` had to be `None` and
+    /// recovery would have had nothing to reconcile. Caught in review of this
+    /// slice rather than after the invariant shipped.
+    #[test]
+    fn a_cancellation_requested_while_the_booking_is_in_flight_is_coherent() {
+        let effect = EffectIntentId::new("EFF-BKG-1001-BOOK-0");
+        let awaiting_the_council = Booking {
+            state: BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: effect.clone(),
+            }),
+            active_effect: Some(effect),
+            ..awaiting_booking()
+        };
+        awaiting_the_council
+            .coherent()
+            .expect("a cancellation requested mid-booking must be representable");
+        assert_eq!(
+            awaiting_the_council.state.in_flight_kind(),
+            Some(OperationKind::Book),
+            "the effect in flight is the booking's, not a cancellation's"
+        );
+    }
+
+    /// The old unit payload is refused rather than defaulted.
+    ///
+    /// `CancellationRequested` is unreachable today — `BookingInProgress` has no
+    /// outbound behaviours — so no known row carries it, and the only
+    /// construction sites in the tree are fixtures. A defaulting deserializer
+    /// would invent a legacy that does not exist, and would have to invent an
+    /// effect identity out of nothing to do it. Failing loudly is the right
+    /// direction; this pins that it does.
+    ///
+    /// Contrast `legacy_null_state_payload_still_decodes`, which pins a shape
+    /// that *is* deliberately supported. Both are wire-format assertions and
+    /// neither is subsumed by a transition test.
+    #[test]
+    fn the_old_cancellation_requested_payload_is_deliberately_rejected() {
+        let legacy = r#"{"state":"CancellationRequested","data":null}"#;
+        let decoded = serde_json::from_str::<BookingState>(legacy);
+        assert!(
+            decoded.is_err(),
+            "the old unit payload must fail closed, not default an effect identity"
+        );
+    }
+
+    /// Selection and reference are checked only where the state names one, so a
+    /// terminal state may keep an outer value it no longer mentions. B3b's fact
+    /// door relies on this: convergence at `Cancelled` compares the reference of
+    /// the booking that was cancelled, which only the aggregate still holds.
+    #[test]
+    fn a_terminal_state_may_retain_a_reference_it_no_longer_names() {
+        let cancelled = Booking {
+            state: BookingState::Cancelled(Cancelled),
+            ..booked()
+        };
+        assert!(
+            cancelled.coherent().is_ok(),
+            "Cancelled must be allowed to keep the reference it cancelled"
+        );
+    }
+
+    /// A transition changes a booking; it never changes which booking.
+    #[tokio::test]
+    async fn no_transition_changes_the_identity() {
+        for source in [
+            draft(),
+            venue_selected(),
+            needs_revalidation(),
+            awaiting_booking(),
+            booked(),
+        ] {
+            for proposal in [
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements { attendees: None },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ] {
+                let name = proposal.name();
+                let state_name = source.state.name();
+                if let Resolution::Ready(plan) =
+                    turn(source.clone(), proposal, &authority(), &context()).await
+                {
+                    assert_eq!(
+                        plan.next_state().id,
+                        source.id,
+                        "{state_name} + {name} changed the booking identity"
+                    );
+                }
+            }
+        }
     }
 
     // ------------------------------------------------ preserved local cells
@@ -1109,7 +1863,7 @@ mod characterization {
     #[tokio::test]
     async fn draft_select_venue() {
         let got = turn(
-            BookingState::Draft(Draft),
+            draft(),
             BookingProposal::SelectVenue {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
@@ -1124,7 +1878,7 @@ mod characterization {
     #[tokio::test]
     async fn draft_cancel() {
         let got = turn(
-            BookingState::Draft(Draft),
+            draft(),
             BookingProposal::Cancel {
                 reason: "changed mind".to_owned(),
             },
@@ -1132,7 +1886,13 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Cancelled(Cancelled)));
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                ..draft()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1144,6 +1904,8 @@ mod characterization {
             &context(),
         )
         .await;
+        // Verifying a slot records the facts it verified. Without that, the
+        // aggregate would claim a verified fee with nothing behind it.
         assert_eq!(got, committed_local(awaiting_booking()));
     }
 
@@ -1156,13 +1918,28 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Draft(Draft)));
+        // Starting over abandons the selection, so the loaded facts describe a
+        // venue nobody has chosen. Both must go, or a later revalidation could
+        // bind to them.
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Draft(Draft),
+                selected_venue: None,
+                availability: None,
+                ..venue_selected()
+            })
+        );
     }
 
     /// The selection must be carried forward — this is the field that closed
     /// the venue-substitution bug, so the refactor must not drop it.
+    ///
+    /// B3a adds the other half: the *patch* must be carried forward too. Before
+    /// B3a the 25 was destructured away, so the next capacity check validated
+    /// against the old headcount.
     #[tokio::test]
-    async fn venue_selected_update_requirements_carries_the_selection() {
+    async fn venue_selected_update_requirements_carries_the_selection_and_the_patch() {
         let got = turn(
             venue_selected(),
             BookingProposal::UpdateRequirements {
@@ -1172,7 +1949,16 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(needs_revalidation()));
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                requirements: BookingRequirements {
+                    attendees: 25,
+                    ..requirements()
+                },
+                ..needs_revalidation()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1186,7 +1972,15 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Cancelled(Cancelled)));
+        // Abandoning keeps the selection: it records what was being attempted,
+        // and `Cancelled` has no behaviour that could act on it.
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                ..venue_selected()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1198,7 +1992,15 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(venue_selected()));
+        // Revalidation records the facts it just checked, exactly as
+        // `VerifySlot` does.
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                availability: Some(good_facts()),
+                ..venue_selected()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1210,7 +2012,15 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Draft(Draft)));
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Draft(Draft),
+                selected_venue: None,
+                availability: None,
+                ..needs_revalidation()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1224,7 +2034,13 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Cancelled(Cancelled)));
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                ..needs_revalidation()
+            })
+        );
     }
 
     #[tokio::test]
@@ -1236,11 +2052,22 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Draft(Draft)));
+        // Starting over abandons the selection, so the loaded facts describe a
+        // venue nobody has chosen. Both must go, or a later revalidation could
+        // bind to them.
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Draft(Draft),
+                selected_venue: None,
+                availability: None,
+                ..awaiting_booking()
+            })
+        );
     }
 
     #[tokio::test]
-    async fn awaiting_booking_update_requirements_carries_the_selection() {
+    async fn awaiting_booking_update_requirements_carries_the_selection_and_the_patch() {
         let got = turn(
             awaiting_booking(),
             BookingProposal::UpdateRequirements {
@@ -1250,7 +2077,18 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(needs_revalidation()));
+        // `availability` was verified against 20 people; it says nothing about
+        // 25, so it must not survive the change.
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                requirements: BookingRequirements {
+                    attendees: 25,
+                    ..requirements()
+                },
+                ..needs_revalidation()
+            })
+        );
     }
 
     /// `CancellingBooking` gained a required `effect_intent_id` in B2, which
@@ -1413,9 +2251,12 @@ mod characterization {
     /// rather than trust whatever the context happens to carry.
     #[tokio::test]
     async fn revalidate_denies_when_the_state_carries_no_selection() {
-        let state = BookingState::NeedsRevalidation(NeedsRevalidation { selected: None });
+        let legacy = Booking {
+            state: BookingState::NeedsRevalidation(NeedsRevalidation { selected: None }),
+            ..needs_revalidation()
+        };
         let got = turn(
-            state,
+            legacy,
             BookingProposal::RevalidateVenue,
             &authority(),
             &context(),
@@ -1520,12 +2361,17 @@ mod characterization {
         let Resolution::Ready(plan) = &got else {
             panic!("Book must resolve to a plan, got {got:?}");
         };
-        let BookingState::BookingInProgress(in_progress) = plan.next_state() else {
-            panic!(
-                "Book must stop at BookingInProgress, got {:?}",
-                plan.next_state()
-            );
+        let next = plan.next_state();
+        let BookingState::BookingInProgress(in_progress) = &next.state else {
+            panic!("Book must stop at BookingInProgress, got {:?}", next.state);
         };
+        // The aggregate's own pointer must agree with the state's. They are two
+        // copies of one fact, and B3a is what created the second one.
+        assert_eq!(
+            next.active_effect.as_ref(),
+            Some(&in_progress.effect_intent_id),
+            "active_effect must name the same effect the state is waiting on"
+        );
         // And it must be an ExternalEffect, not a Local one — that distinction is
         // what forces the intent to be persisted before the council is called.
         assert!(
@@ -1534,13 +2380,21 @@ mod characterization {
         );
 
         // Matching the variant is not enough: B2 could produce the right state
-        // with the wrong effect identity and this would still pass. The id must
-        // be present, and it must be *deterministic* — the same operation
-        // proposed twice must derive the same identity, because that is what
-        // makes a retry idempotent rather than a second booking (ADR-014).
-        assert!(
-            !in_progress.effect_intent_id.as_str().is_empty(),
-            "BookingInProgress must carry an effect identity"
+        // with the wrong effect identity and this would still pass.
+        //
+        // What this pins is *adoption*: the domain takes the identity the
+        // coordinator supplied and does not invent, alter or drop one. It does
+        // not pin determinism — the domain cannot derive an effect identity,
+        // because the repository holds the uniqueness key. Repeating the turn
+        // with the same context proves the domain is a pure function of its
+        // inputs, not that those inputs are stable; that is
+        // `derive_effect_intent_id`'s contract and it is tested in
+        // `townhall-store`. An earlier version of this comment claimed the
+        // stronger property, which the assertion below cannot reach.
+        assert_eq!(
+            Some(&in_progress.effect_intent_id),
+            context().pending_effect.as_ref(),
+            "Book must adopt the supplied identity unchanged"
         );
         let again = turn(
             awaiting_booking(),
@@ -1549,10 +2403,7 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(
-            got, again,
-            "the same operation must derive the same effect identity"
-        );
+        assert_eq!(got, again, "classification must be a pure function");
     }
 
     /// `Booked + Cancel` stops at `CancellingBooking`. This is the *ordinary*
@@ -1582,10 +2433,14 @@ mod characterization {
         assert_eq!(
             got,
             Resolution::Ready(TransitionPlan::ExternalEffect {
-                next_state: BookingState::CancellingBooking(CancellingBooking {
-                    booking_ref: CouncilBookingRef::new("TH-92718"),
-                    effect_intent_id: EffectIntentId::new("EFF-BKG-1001-CANCEL-1"),
-                }),
+                next_state: Booking {
+                    state: BookingState::CancellingBooking(CancellingBooking {
+                        booking_ref: CouncilBookingRef::new("TH-92718"),
+                        effect_intent_id: EffectIntentId::new("EFF-BKG-1001-CANCEL-1"),
+                    }),
+                    active_effect: Some(EffectIntentId::new("EFF-BKG-1001-CANCEL-1")),
+                    ..booked()
+                },
                 effect: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
                 },
@@ -1611,6 +2466,12 @@ mod characterization {
             &context(),
         )
         .await;
-        assert_eq!(got, committed_local(BookingState::Cancelled(Cancelled)));
+        assert_eq!(
+            got,
+            committed_local(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                ..awaiting_booking()
+            })
+        );
     }
 }

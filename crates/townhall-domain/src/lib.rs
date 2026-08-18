@@ -1324,6 +1324,129 @@ impl TownHallDomain {
             _ => FactResolution::Denied(BookingError::EffectKindMismatch),
         }
     }
+
+    // `clippy::pedantic` flags the ChangeVenue/UpdateRequirements/Cancel arms as
+    // having identical bodies and wants them merged into `(A, X) | (B, X) => ..`.
+    // We deliberately keep one arm per (state, proposal) pair, grouped by state.
+    //
+    // This match IS the state x proposal topology, and the topology is the
+    // security surface (implementation guide sections 5 and 19, step 4). Reading it
+    // state-by-state answers "which behaviours does VenueSelected have?" directly
+    // and mirrors docs/state-machine.md. Merging by body would scatter each
+    // state's behaviour set across the match and make an accidentally-added or
+    // accidentally-removed pair harder to spot in review.
+    #[allow(clippy::match_same_arms)]
+    fn resolve_proposal_cell(
+        booking: &Booking,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+        context: &BookingContext,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        // Every arm produces a complete `Booking` via struct-update syntax, so
+        // what each transition *changes* is what you read, and a field nobody
+        // mentions is carried rather than quietly defaulted.
+        match (&booking.state, proposal) {
+            (BookingState::Draft(_), BookingProposal::SelectVenue { venue_id, slot_id }) => {
+                let selection = SelectedVenueRef {
+                    venue_id: venue_id.clone(),
+                    slot_id: slot_id.clone(),
+                };
+                local(Booking {
+                    selected_venue: Some(selection),
+                    ..Self::resettled(
+                        booking,
+                        BookingState::VenueSelected(VenueSelected { venue_id, slot_id }),
+                    )
+                })
+            }
+            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::AwaitingBooking(AwaitingBooking {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                            verified_fee: facts.fee,
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
+                    Err(error) => Resolution::Denied(error),
+                }
+            }
+            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
+            (
+                BookingState::VenueSelected(selected),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
+                    venue_id: selected.venue_id.clone(),
+                    slot_id: selected.slot_id.clone(),
+                },
+                attendees,
+            ),
+            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
+                // The binding target is state data, not context, so this holds
+                // without trusting whoever assembled the context. Without it, an
+                // ordinary `UpdateRequirements` is enough to launder any venue
+                // into the booking.
+                let Some(selected) = pending.selected.as_ref() else {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                };
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::VenueSelected(VenueSelected {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
+                    Err(error) => Resolution::Denied(error),
+                }
+            }
+            (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
+                change_venue(booking)
+            }
+            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::AwaitingBooking(waiting), BookingProposal::Book) => {
+                Self::resolve_book(booking, waiting, authority, context)
+            }
+            (BookingState::AwaitingBooking(_), BookingProposal::ChangeVenue) => {
+                change_venue(booking)
+            }
+            (
+                BookingState::AwaitingBooking(waiting),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
+                    venue_id: waiting.venue_id.clone(),
+                    slot_id: waiting.slot_id.clone(),
+                },
+                attendees,
+            ),
+            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
+                Self::resolve_cancel_booked(booking, booked, authority, context)
+            }
+            _ => Resolution::Undefined,
+        }
+    }
 }
 
 /// Shorthand for a transition that reaches nothing external.
@@ -1487,17 +1610,6 @@ impl BoundaryDomain for TownHallDomain {
     type FactContext = FactContext;
     type Error = BookingError;
 
-    // `clippy::pedantic` flags the ChangeVenue/UpdateRequirements/Cancel arms as
-    // having identical bodies and wants them merged into `(A, X) | (B, X) => ..`.
-    // We deliberately keep one arm per (state, proposal) pair, grouped by state.
-    //
-    // This match IS the state x proposal topology, and the topology is the
-    // security surface (implementation guide sections 5 and 19, step 4). Reading it
-    // state-by-state answers "which behaviours does VenueSelected have?" directly
-    // and mirrors docs/state-machine.md. Merging by body would scatter each
-    // state's behaviour set across the match and make an accidentally-added or
-    // accidentally-removed pair harder to spot in review.
-    #[allow(clippy::match_same_arms)]
     async fn resolve_proposal(
         &self,
         booking: &Self::State,
@@ -1505,110 +1617,32 @@ impl BoundaryDomain for TownHallDomain {
         authority: &Self::Authority,
         context: &Self::Context,
     ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
-        // Every arm produces a complete `Booking` via struct-update syntax, so
-        // what each transition *changes* is what you read, and a field nobody
-        // mentions is carried rather than quietly defaulted.
-        match (&booking.state, proposal) {
-            (BookingState::Draft(_), BookingProposal::SelectVenue { venue_id, slot_id }) => {
-                let selection = SelectedVenueRef {
-                    venue_id: venue_id.clone(),
-                    slot_id: slot_id.clone(),
-                };
-                local(Booking {
-                    selected_venue: Some(selection),
-                    ..Self::resettled(
-                        booking,
-                        BookingState::VenueSelected(VenueSelected { venue_id, slot_id }),
-                    )
-                })
-            }
-            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
-                match Self::bind_facts(
-                    booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
-                    authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::AwaitingBooking(AwaitingBooking {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                            verified_fee: facts.fee,
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
-            }
-            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
-            (
-                BookingState::VenueSelected(selected),
-                BookingProposal::UpdateRequirements { attendees },
-            ) => update_requirements(
-                booking,
-                SelectedVenueRef {
-                    venue_id: selected.venue_id.clone(),
-                    slot_id: selected.slot_id.clone(),
-                },
-                attendees,
-            ),
-            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
-                // The binding target is state data, not context, so this holds
-                // without trusting whoever assembled the context. Without it, an
-                // ordinary `UpdateRequirements` is enough to launder any venue
-                // into the booking.
-                let Some(selected) = pending.selected.as_ref() else {
-                    return Resolution::Denied(BookingError::VenueFactsMissing);
-                };
-                match Self::bind_facts(
-                    booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
-                    authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::VenueSelected(VenueSelected {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
-            }
-            (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
-                change_venue(booking)
-            }
-            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::AwaitingBooking(waiting), BookingProposal::Book) => {
-                Self::resolve_book(booking, waiting, authority, context)
-            }
-            (BookingState::AwaitingBooking(_), BookingProposal::ChangeVenue) => {
-                change_venue(booking)
-            }
-            (
-                BookingState::AwaitingBooking(waiting),
-                BookingProposal::UpdateRequirements { attendees },
-            ) => update_requirements(
-                booking,
-                SelectedVenueRef {
-                    venue_id: waiting.venue_id.clone(),
-                    slot_id: waiting.slot_id.clone(),
-                },
-                attendees,
-            ),
-            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
-                Self::resolve_cancel_booked(booking, booked, authority, context)
-            }
-            _ => Resolution::Undefined,
+        let resolution = Self::resolve_proposal_cell(booking, proposal, authority, context);
+
+        // Whether a behaviour EXISTS depends on (state, proposal) alone, so an
+        // Undefined cell stays Undefined no matter what the aggregate carries.
+        if matches!(resolution, Resolution::Undefined) {
+            return Resolution::Undefined;
         }
+
+        // For a cell that does exist: the same self-consistency step as the
+        // other two doors, and for the same reason. Review found this gap after
+        // it was closed on the fact door — an incoherent VenueSelected carrying
+        // a phantom reference could take Cancel into Cancelled, whose reference
+        // is legitimately unconstrained, and the phantom became terminal
+        // history indistinguishable from a real cancellation. The cell's own
+        // result is computed first and discarded: classification is pure, so
+        // evaluating it costs nothing and launders nothing.
+        if let Err(why) = booking.coherent() {
+            return Resolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
+        }
+
+        resolution
     }
 
     /// The fact door. Four outcomes; see `docs/state-machine.md` for the full
@@ -1970,14 +2004,18 @@ mod topology {
     /// The other fields are deliberately uniform: this suite asks only whether a
     /// behaviour *exists*, and existence must not depend on any of them.
     fn booking_of(state: BookingState, requirements: BookingRequirements) -> Booking {
+        // The outer copies are derived from the state, so the wrapper is
+        // coherent for every variant — the sweep asks whether behaviours
+        // exist, and an incoherent wrapper would be refused before the
+        // topology was even consulted.
         Booking {
             id: BookingId::new("BKG-1001"),
+            booking_ref: state.council_booking_ref().cloned(),
+            active_effect: state.effect_intent_id().cloned(),
             state,
             requirements,
             selected_venue: Some(selection()),
             availability: None,
-            booking_ref: None,
-            active_effect: None,
         }
     }
 
@@ -2646,6 +2684,100 @@ mod characterization {
         assert!(
             cancelled.coherent().is_ok(),
             "Cancelled must be allowed to keep the reference it cancelled"
+        );
+    }
+
+    /// Round two of the laundering hunt: the PROPOSAL door was the third door
+    /// without the self-consistency step. An incoherent `VenueSelected` carrying
+    /// a phantom reference could take Cancel into Cancelled — whose reference
+    /// is legitimately unconstrained — and the phantom became terminal history
+    /// indistinguishable from a real cancellation.
+    #[tokio::test]
+    async fn the_proposal_door_refuses_an_incoherent_booking_too() {
+        // A phantom reference laundered through Cancel.
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..venue_selected()
+        };
+        let got = turn(
+            phantom,
+            BookingProposal::Cancel {
+                reason: "changed mind".to_owned(),
+            },
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Resolution::Denied(BookingError::IncoherentAggregate(
+                    IncoherentBooking::PhantomReference { .. }
+                ))
+            ),
+            "a phantom reference must not become terminal history, got {got:?}"
+        );
+
+        // A selection disagreement laundered through ChangeVenue, which clears
+        // both copies and would erase the evidence.
+        let mismatched = Booking {
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-Z"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..venue_selected()
+        };
+        let got = turn(
+            mismatched,
+            BookingProposal::ChangeVenue,
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Resolution::Denied(BookingError::IncoherentAggregate(
+                    IncoherentBooking::Selection { .. }
+                ))
+            ),
+            "a selection disagreement must not be cleared away, got {got:?}"
+        );
+
+        // An effect-pointer disagreement keeps its own, older name.
+        let contradictory = Booking {
+            active_effect: Some(EffectIntentId::new("EFF-SOMETHING-ELSE")),
+            ..booked()
+        };
+        let got = turn(
+            contradictory,
+            BookingProposal::Cancel {
+                reason: "changed mind".to_owned(),
+            },
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::InconsistentEffectIdentity)
+        );
+    }
+
+    /// The ordering half of the same rule: whether a behaviour EXISTS depends
+    /// on (state, proposal) alone, so an Undefined cell stays Undefined no
+    /// matter how broken the aggregate is. Coherence turns Ready into Denied;
+    /// it must never turn Undefined into anything.
+    #[tokio::test]
+    async fn incoherence_cannot_make_an_undefined_cell_exist() {
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..draft()
+        };
+        let got = turn(phantom, BookingProposal::Book, &authority(), &context()).await;
+        assert!(
+            matches!(got, Resolution::Undefined),
+            "Draft has no book; a phantom reference must not conjure one, got {got:?}"
         );
     }
 

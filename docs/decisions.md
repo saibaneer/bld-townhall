@@ -286,14 +286,41 @@ transition (`AwaitingBooking -> BookingInProgress`) yields a durable effect plan
 be persisted before execution. This avoids forcing every transition through an effect
 workflow.
 
-`S` is the **complete next aggregate value** the domain has decided on — state plus
-`booking_ref`, `active_effect` and `availability` — not the state discriminator alone.
+`S` is the **complete next aggregate value** the domain has decided on, not the state
+discriminator alone. For the town hall that is `townhall_domain::Booking`, and the list is
+exhaustive rather than illustrative:
 
-Having the repository derive those from a state-only plan would put domain mutation
+```text
+id  state  requirements  selected_venue  availability  booking_ref  active_effect
+```
+
+The repository owns exactly the complement: `version`, `created_at_ms`, `updated_at_ms`.
+
+Having the repository derive any of those from a state-only plan would put domain mutation
 semantics in the persistence layer, which ADR-001 and the guide's dependency direction both
 forbid: the repository would have to know that confirming a booking sets `booking_ref` and
 clears `active_effect`. It must not know that. The domain decides every business field; the
 repository owns only the version increment, timestamps and atomicity.
+
+### Why the list is exhaustive, and not a sketch
+
+This paragraph originally named only `booking_ref`, `active_effect` and `availability`. B2
+then shipped `type State = BookingState`, and the partial list is part of why eight review
+passes did not catch it: a reader checking the implementation against a three-field example
+has nothing to notice is missing.
+
+The omission of `requirements` was not cosmetic. `UpdateRequirements { attendees }` could not
+apply its own patch, because a plan carrying only a state has nowhere to put changed
+requirements — so the headcount was silently discarded and the next capacity guard validated
+against the old one. Lucy raising a booking from 20 people to 25 would be revalidated against
+20, and a room holding 22 would pass. Fixed in M4 slice B3a, along with the contract that
+allowed it.
+
+`id` is on the list for a different reason: evidence must be bound to *this resource*
+(ADR-012), and only the authoritatively loaded aggregate can establish which resource that
+is. Binding against a caller-supplied identifier would compare two values from the same
+source and prove nothing. The repository verifies that a transition does not change it —
+a carried field is one a future arm could rebuild wrongly.
 
 The repository then writes that value **atomically with** the audit row, the effect-intent
 row and any reconciliation job. One transaction, or the guarantees are worthless.

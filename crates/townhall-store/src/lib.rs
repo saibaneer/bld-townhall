@@ -13,8 +13,8 @@ use std::{
 };
 use thiserror::Error;
 use townhall_domain::{
-    BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
-    OperationKind, SelectedVenueRef, VenueFacts,
+    Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
+    OperationKind,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -23,29 +23,6 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub struct NewBooking {
     pub id: BookingId,
     pub requirements: BookingRequirements,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BookingWrite {
-    pub state: BookingState,
-    pub requirements: BookingRequirements,
-    pub selected_venue: Option<SelectedVenueRef>,
-    pub availability: Option<VenueFacts>,
-    pub booking_ref: Option<CouncilBookingRef>,
-    pub active_effect: Option<EffectIntentId>,
-}
-
-impl From<&BookingAggregate> for BookingWrite {
-    fn from(value: &BookingAggregate) -> Self {
-        Self {
-            state: value.state.clone(),
-            requirements: value.requirements.clone(),
-            selected_venue: value.selected_venue.clone(),
-            availability: value.availability.clone(),
-            booking_ref: value.booking_ref.clone(),
-            active_effect: value.active_effect.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +72,11 @@ pub enum StoreError {
     ClockOutOfRange,
     #[error("persisted booking row is corrupt: {0}")]
     CorruptRow(String),
+    #[error("a transition tried to change booking identity from {expected} to {actual}")]
+    IdentityChanged {
+        expected: BookingId,
+        actual: BookingId,
+    },
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
     #[error("state {state} is waiting on a {state_kind} effect, but the plan is a {plan_kind}")]
@@ -146,7 +128,7 @@ pub trait BookingRepository: Send + Sync {
         &self,
         id: &BookingId,
         expected_version: u64,
-        next: BookingWrite,
+        next: Booking,
         audit: TransitionAudit,
     ) -> Result<BookingAggregate, StoreError>;
 
@@ -297,7 +279,7 @@ impl BookingRepository for SqliteBookingRepository {
         &self,
         id: &BookingId,
         expected_version: u64,
-        next: BookingWrite,
+        next: Booking,
         audit: TransitionAudit,
     ) -> Result<BookingAggregate, StoreError> {
         let now = now_ms()?;
@@ -336,7 +318,7 @@ impl BookingRepository for SqliteBookingRepository {
             derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
         verify_effect_identity(&request, &effect_intent_id, operation_kind)?;
 
-        let next = BookingWrite {
+        let next = Booking {
             active_effect: Some(effect_intent_id.clone()),
             ..request.next.clone()
         };
@@ -544,10 +526,22 @@ async fn commit_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &BookingId,
     expected_version: u64,
-    next: &BookingWrite,
+    next: &Booking,
     audit: &TransitionAudit,
     now: i64,
 ) -> Result<BookingAggregate, StoreError> {
+    // A transition changes a booking; it never changes *which* booking. The
+    // domain now carries `id` so that evidence can be bound to a resource
+    // (ADR-012), and a carried field is one a future arm could rebuild wrongly —
+    // so the value that arrives is verified against the row being written rather
+    // than trusted. Without this the id would be decorative.
+    if next.id != *id {
+        return Err(StoreError::IdentityChanged {
+            expected: id.clone(),
+            actual: next.id.clone(),
+        });
+    }
+
     let expected_db = version_to_i64(expected_version)?;
     let next_version = expected_version
         .checked_add(1)
@@ -775,7 +769,8 @@ mod tests {
             .commit(
                 &id,
                 stale_copy_a.version,
-                BookingWrite {
+                Booking {
+                    id: id.clone(),
                     state: BookingState::VenueSelected(VenueSelected {
                         venue_id: selected.venue_id.clone(),
                         slot_id: selected.slot_id.clone(),
@@ -797,7 +792,7 @@ mod tests {
             .commit(
                 &id,
                 stale_copy_b.version,
-                BookingWrite::from(&stale_copy_b),
+                Booking::from(&stale_copy_b),
                 TransitionAudit::committed("Cancel", None),
             )
             .await
@@ -829,7 +824,8 @@ mod tests {
             .await
             .expect("create should succeed");
 
-        let next = BookingWrite {
+        let next = Booking {
+            id: id.clone(),
             state: BookingState::VenueSelected(VenueSelected {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A-1400-1700"),
@@ -860,6 +856,59 @@ mod tests {
         assert_eq!(audit[0].from_state, "Draft");
         assert_eq!(audit[0].to_state, "VenueSelected");
         assert_eq!(audit[0].proposal, "SelectVenue");
+    }
+
+    /// B3a put `id` on the domain's `Booking` so evidence can be bound to a
+    /// resource. A carried field is one a future transition could rebuild
+    /// wrongly, so the repository verifies it rather than trusting it — without
+    /// this check the field would be decorative, and a mis-assembled transition
+    /// could write one booking's state over another's row.
+    #[tokio::test]
+    async fn a_transition_may_not_change_which_booking_it_is() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-IDENTITY");
+        let created = repo
+            .create(NewBooking {
+                id: id.clone(),
+                requirements: requirements(),
+            })
+            .await
+            .expect("create should succeed");
+
+        let impostor = Booking {
+            id: BookingId::new("BKG-SOMEONE-ELSE"),
+            state: BookingState::VenueSelected(VenueSelected {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..Booking::from(&created)
+        };
+
+        let error = repo
+            .commit(
+                &id,
+                0,
+                impostor,
+                TransitionAudit::committed("SelectVenue", None),
+            )
+            .await
+            .expect_err("a transition that changes identity must be refused");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::IdentityChanged {
+                    ref expected,
+                    ref actual,
+                } if expected == &id && actual == &BookingId::new("BKG-SOMEONE-ELSE")
+            ),
+            "expected IdentityChanged, got {error:?}"
+        );
+
+        let untouched = repo.load(&id).await.expect("the row must survive");
+        assert_eq!(untouched.version, 0, "nothing may have been written");
+        assert_eq!(untouched.state.name(), "Draft");
     }
 
     #[tokio::test]
@@ -914,8 +963,14 @@ mod concurrency {
         }
     }
 
-    fn write_for(venue: &str, slot: &str, requirements: BookingRequirements) -> BookingWrite {
-        BookingWrite {
+    fn write_for(
+        id: &BookingId,
+        venue: &str,
+        slot: &str,
+        requirements: BookingRequirements,
+    ) -> Booking {
+        Booking {
+            id: id.clone(),
             state: BookingState::VenueSelected(VenueSelected {
                 venue_id: VenueId::new(venue),
                 slot_id: SlotId::new(slot),
@@ -964,7 +1019,7 @@ mod concurrency {
                 let repo = repo.clone();
                 let id = id.clone();
                 let barrier = Arc::clone(&barrier);
-                let write = write_for(venue, "SLOT-1", created.requirements.clone());
+                let write = write_for(&id, venue, "SLOT-1", created.requirements.clone());
                 let expected = created.version;
 
                 handles.push(tokio::spawn(async move {
@@ -1074,7 +1129,7 @@ mod concurrency {
         for id in ids {
             let repo = repo.clone();
             let barrier = Arc::clone(&barrier);
-            let write = write_for("TH-A", "SLOT-1", requirements());
+            let write = write_for(&id, "TH-A", "SLOT-1", requirements());
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 repo.commit(
@@ -1128,7 +1183,7 @@ pub struct PrepareEffect {
     /// `active_effect` on this write is **ignored**: the repository owns the
     /// effect identity and sets it, so the aggregate and the intent row cannot
     /// disagree. See [`BookingRepository::prepare_effect`].
-    pub next: BookingWrite,
+    pub next: Booking,
     pub audit: TransitionAudit,
 }
 
@@ -1359,8 +1414,9 @@ mod effect_identity {
         }
     }
 
-    fn in_progress_write(effect: &EffectIntentId) -> BookingWrite {
-        BookingWrite {
+    fn in_progress_write(id: &BookingId, effect: &EffectIntentId) -> Booking {
+        Booking {
+            id: id.clone(),
             state: BookingState::BookingInProgress(BookingInProgress {
                 effect_intent_id: effect.clone(),
             }),
@@ -1383,7 +1439,7 @@ mod effect_identity {
             booking_id: id.clone(),
             source_version: version,
             canonical_plan: plan_for(venue),
-            next: in_progress_write(&effect),
+            next: in_progress_write(id, &effect),
             audit: TransitionAudit::committed("Book", None),
         }
     }
@@ -1498,7 +1554,8 @@ mod effect_identity {
         repo.commit(
             &id,
             0,
-            BookingWrite {
+            Booking {
+                id: id.clone(),
                 state: BookingState::Draft(townhall_domain::Draft),
                 requirements: requirements(),
                 selected_venue: None,
@@ -1732,7 +1789,8 @@ mod effect_identity {
                 canonical_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
                 },
-                next: BookingWrite {
+                next: Booking {
+                    id: id.clone(),
                     state: BookingState::CancellingBooking(townhall_domain::CancellingBooking {
                         booking_ref: CouncilBookingRef::new("TH-92718"),
                         effect_intent_id: effect.clone(),

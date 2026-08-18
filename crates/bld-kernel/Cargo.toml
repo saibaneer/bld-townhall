@@ -10,6 +10,11 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# Dev-only, and load-bearing that way: serde must NEVER be a real dependency of
+# this crate, or Verified<T> gaining an impl stops being unthinkable. It exists
+# here purely so the provenance test can assert the impls are absent.
+serde.workspace = true
+static_assertions.workspace = true
 
 [lints]
 workspace = true

@@ -104,6 +104,29 @@ re-evaluated against the new state rather than discarded.
 > that, a "not found" is `Unknown` and drives nothing — the council may still act on an
 > in-flight request.
 
+### The executable classification
+
+The fact door implements the matrix through a three-way category, decided by the state
+alone before any guard runs or any context is read:
+
+| Category | States | Meaning |
+|---|---|---|
+| **Waiting** | `BookingInProgress`, `CancellationRequested`, `CancellingBooking` | an effect is in flight; a fact may answer it |
+| **Settled** | `AwaitingBooking`, `Booked`, `Cancelled` | a fact-driven edge lands here; an arriving fact must already be reflected |
+| **Absent** | `Draft`, `VenueSelected`, `NeedsRevalidation`, `NeedsHuman` | neither in flight nor fact-reachable; `Undefined` immediately |
+
+`Absent` returning before anything is consulted is what preserves the `Undefined`/`Denied`
+distinction on this door: irrelevant context must not manufacture behaviour in a state that
+has none. The Settled category is what keeps ADR-016's race closed — a `BookingExists`
+arriving after its intent was tombstoned lands in a Settled state and is refused loudly,
+never silently dropped. `Converged` requires the state, the persisted canonical plan and
+the intent's durable outcome to agree; where the fact carries no reference to compare
+(`EffectAbsent`, `ProviderRejected`), the state is compared against the plan instead.
+
+The full 40-cell matrix (10 states × 4 facts) is pinned by the `fact_topology` test module
+in `crates/townhall-domain`; `LOCKED_FACTS` there is the executable form of this section,
+and a diff to it needs an ADR.
+
 ## System-event edges — deterministic runtime facts
 
 Reachable only through `SystemEvent` via `resolve_system_event`. Neither intent nor

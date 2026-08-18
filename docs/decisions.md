@@ -213,6 +213,15 @@ greppable and auditable. Separate enums give vocabulary separation; provenance c
 the crate graph plus that audit discipline. Claiming more than that would be the
 overclaiming this project exists to avoid.
 
+Two notes recorded when B3 made the canonical block executable. `BookingEffect::Book`
+carries `attendees` precisely because this section requires headcount bound against the
+plan — `VenueFacts.capacity` is the room's limit, not the party's size, so without the
+field the one number the capacity guard checks would be unbindable. And
+`CancellationRequested` carries the **booking** intent's identity: it means "cancel the
+booking we are still waiting on", so the effect in flight is the booking's — a state named
+for a cancellation waiting on a `Book`, which is why `in_flight_kind()` must not be read
+off the state's name.
+
 ### The fact door needs a fourth outcome
 
 Recovery loops re-apply the same fact by design, so a repeat is normal rather than a

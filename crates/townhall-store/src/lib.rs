@@ -362,7 +362,7 @@ impl BookingRepository for SqliteBookingRepository {
         .await?;
 
         if let Some(row) = existing {
-            let replayed = replay_existing(&mut tx, &request, &row, &plan_json).await?;
+            let replayed = replay_existing(&mut tx, &request, &row).await?;
             tx.commit().await?;
             return Ok(replayed);
         }
@@ -742,9 +742,9 @@ fn now_ms() -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bld_types::{Money, SlotId, TimeWindow, VenueId};
+    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
-    use townhall_domain::{BookingState, SelectedVenueRef, VenueSelected};
+    use townhall_domain::{BookingState, SelectedVenueRef, VenueFacts, VenueSelected};
 
     fn requirements() -> BookingRequirements {
         BookingRequirements {
@@ -1065,6 +1065,42 @@ mod tests {
                 }
             ),
             "expected an effect-identity disagreement, got {error:?}"
+        );
+    }
+
+    /// `BookingEffect::Book` gained `attendees` in B3b (ADR-012: fee and
+    /// headcount are not optional in the evidence binding). Old rows in
+    /// `effect_intents.canonical_plan_json` lack the field and must FAIL to
+    /// decode — a `#[serde(default)]` would hide the change behind an
+    /// `attendees: 0` that binds against nothing. Any dev database written
+    /// before this commit must be recreated; the failure mode is a loud decode
+    /// error at load, not a silent mis-bind.
+    #[test]
+    fn a_book_plan_without_attendees_is_deliberately_rejected() {
+        let legacy = r#"{"Book":{"principal":"lucy","facts":{"venue_id":"TH-A","slot_id":"SLOT-1","capacity":30,"wheelchair_accessible":true,"fee":{"pence":4500},"available":true}}}"#;
+        assert!(
+            serde_json::from_str::<BookingEffect>(legacy).is_err(),
+            "the pre-attendees wire shape must fail closed"
+        );
+
+        // And the current shape round-trips, so this test cannot rot into
+        // rejecting everything.
+        let current = BookingEffect::Book {
+            principal: PrincipalId::new("lucy"),
+            attendees: 20,
+            facts: VenueFacts {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-1"),
+                capacity: 30,
+                wheelchair_accessible: true,
+                fee: Money::from_pence(4_500),
+                available: true,
+            },
+        };
+        let json = serde_json::to_string(&current).expect("serialise");
+        assert_eq!(
+            serde_json::from_str::<BookingEffect>(&json).expect("decode"),
+            current
         );
     }
 
@@ -1416,7 +1452,6 @@ async fn replay_existing(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     request: &PrepareEffect,
     row: &sqlx::sqlite::SqliteRow,
-    plan_json: &str,
 ) -> Result<PreparedEffect, StoreError> {
     let operation_kind = request.operation_kind();
     let intent = decode_effect_row(row)?;
@@ -1424,8 +1459,13 @@ async fn replay_existing(
     // Same operation key, different plan, is not a retry: two different
     // consequences are competing for one identity. Fail closed rather than
     // pick one.
-    let stored_plan: String = row.try_get("canonical_plan_json")?;
-    if stored_plan != plan_json {
+    //
+    // Compared as values, not as JSON strings. String equality only ever
+    // worked because serde's field order happens to be stable, and it would
+    // report ConflictingPlan for a semantically identical plan the moment the
+    // shape evolves — decode_effect_row has already parsed the stored plan, so
+    // the honest comparison is free.
+    if intent.canonical_plan != request.canonical_plan {
         return Err(StoreError::ConflictingPlan {
             booking_id: request.booking_id.clone(),
             operation_kind: operation_kind.name(),
@@ -1572,6 +1612,7 @@ mod effect_identity {
     fn plan_for(venue: &str) -> BookingEffect {
         BookingEffect::Book {
             principal: PrincipalId::new("lucy"),
+            attendees: 20,
             facts: facts(venue),
         }
     }

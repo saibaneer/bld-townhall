@@ -56,8 +56,26 @@ pub struct BookingInProgress {
     pub effect_intent_id: EffectIntentId,
 }
 
+/// A cancellation has been asked for while the *booking* is still in flight.
+///
+/// The effect it names is therefore the **booking** intent, not a cancellation
+/// one — nothing has been sent to the council about cancelling yet, and the
+/// booking's own outcome is still unknown. Until that resolves there is nothing
+/// to cancel and no second identity to mint. The completeness matrix in
+/// `docs/state-machine.md` says the same thing: this state's active intent is a
+/// booking, and `BookingExists` is what moves it on to `CancellingBooking`.
+///
+/// Losing that pointer would be the real cost of leaving this a unit struct: a
+/// crash here would find a booking whose council request is outstanding and no
+/// record of which effect to reconcile.
+///
+/// The state is not yet reachable — `BookingInProgress + Cancel` lands in slice
+/// F with its compensation protocol — but [`Booking::coherent`] must permit it,
+/// so the field lands with the invariant rather than after it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CancellationRequested;
+pub struct CancellationRequested {
+    pub effect_intent_id: EffectIntentId,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Booked {
@@ -136,6 +154,7 @@ impl BookingState {
     pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
         match self {
             Self::BookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
+            Self::CancellationRequested(requested) => Some(&requested.effect_intent_id),
             Self::CancellingBooking(cancelling) => Some(&cancelling.effect_intent_id),
             _ => None,
         }
@@ -177,10 +196,24 @@ impl BookingState {
     /// An effect id does not encode its kind, so matching ids is not enough to
     /// prove a state and an effect belong together: `BookingInProgress` waiting
     /// on a cancellation is nonsense that an id comparison alone would accept.
+    // `BookingInProgress` and `CancellationRequested` both answer `Book`, and
+    // clippy wants them merged into one arm. Kept separate deliberately: they
+    // answer the same way for entirely different reasons, and
+    // `CancellationRequested => Book` is the surprising one. Folded into
+    // `(A | B) => Book` it reads as an obvious pair, which is exactly the wrong
+    // impression — a reader would stop asking why a state named for a
+    // cancellation waits on a booking.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub const fn in_flight_kind(&self) -> Option<OperationKind> {
         match self {
             Self::BookingInProgress(_) => Some(OperationKind::Book),
+            // Deliberately `Book`. `CancellationRequested` means "cancel the
+            // booking we are still waiting on", so the effect in flight is the
+            // booking's — see [`CancellationRequested`]. Reading the name and
+            // answering `Cancel` here would let a cancellation outcome resolve a
+            // booking request.
+            Self::CancellationRequested(_) => Some(OperationKind::Book),
             Self::CancellingBooking(_) => Some(OperationKind::Cancel),
             _ => None,
         }
@@ -1012,7 +1045,9 @@ mod topology {
             BookingState::BookingInProgress(BookingInProgress {
                 effect_intent_id: EffectIntentId::new("BOOK-BKG-1001-1"),
             }),
-            BookingState::CancellationRequested(CancellationRequested),
+            BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
+            }),
             BookingState::Booked(Booked {
                 booking_ref: CouncilBookingRef::new("TH-92718"),
             }),
@@ -1712,6 +1747,57 @@ mod characterization {
             mismatched.coherent(),
             Err(IncoherentBooking::CouncilReference { .. })
         ));
+    }
+
+    /// The state B3b's completeness matrix requires must be representable: a
+    /// cancellation asked for while the booking is still in flight, still
+    /// pointing at the booking effect it is waiting on.
+    ///
+    /// The both-directions effect rule would have forbidden this while
+    /// `CancellationRequested` was a unit struct — an aggregate could not name
+    /// the effect it was waiting for, so `active_effect` had to be `None` and
+    /// recovery would have had nothing to reconcile. Caught in review of this
+    /// slice rather than after the invariant shipped.
+    #[test]
+    fn a_cancellation_requested_while_the_booking_is_in_flight_is_coherent() {
+        let effect = EffectIntentId::new("EFF-BKG-1001-BOOK-0");
+        let awaiting_the_council = Booking {
+            state: BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: effect.clone(),
+            }),
+            active_effect: Some(effect),
+            ..awaiting_booking()
+        };
+        awaiting_the_council
+            .coherent()
+            .expect("a cancellation requested mid-booking must be representable");
+        assert_eq!(
+            awaiting_the_council.state.in_flight_kind(),
+            Some(OperationKind::Book),
+            "the effect in flight is the booking's, not a cancellation's"
+        );
+    }
+
+    /// The old unit payload is refused rather than defaulted.
+    ///
+    /// `CancellationRequested` is unreachable today — `BookingInProgress` has no
+    /// outbound behaviours — so no known row carries it, and the only
+    /// construction sites in the tree are fixtures. A defaulting deserializer
+    /// would invent a legacy that does not exist, and would have to invent an
+    /// effect identity out of nothing to do it. Failing loudly is the right
+    /// direction; this pins that it does.
+    ///
+    /// Contrast `legacy_null_state_payload_still_decodes`, which pins a shape
+    /// that *is* deliberately supported. Both are wire-format assertions and
+    /// neither is subsumed by a transition test.
+    #[test]
+    fn the_old_cancellation_requested_payload_is_deliberately_rejected() {
+        let legacy = r#"{"state":"CancellationRequested","data":null}"#;
+        let decoded = serde_json::from_str::<BookingState>(legacy);
+        assert!(
+            decoded.is_err(),
+            "the old unit payload must fail closed, not default an effect identity"
+        );
     }
 
     /// Selection and reference are checked only where the state names one, so a

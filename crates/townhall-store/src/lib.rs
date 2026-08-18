@@ -13,8 +13,8 @@ use std::{
 };
 use thiserror::Error;
 use townhall_domain::{
-    BookingAggregate, BookingPlan, BookingState, Draft, EffectIntent, EffectStatus, OperationKind,
-    SelectedVenueRef, VenueFacts,
+    BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
+    OperationKind, SelectedVenueRef, VenueFacts,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -97,6 +97,20 @@ pub enum StoreError {
     CorruptRow(String),
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
+    #[error("state {state} is waiting on a {state_kind} effect, but the plan is a {plan_kind}")]
+    EffectKindMismatch {
+        state: &'static str,
+        state_kind: &'static str,
+        plan_kind: &'static str,
+    },
+    #[error(
+        "an effect prepare must commit a state that is waiting on it, but {state} carries no \
+         effect identity (expected {expected})"
+    )]
+    NotAnInFlightState {
+        state: &'static str,
+        expected: EffectIntentId,
+    },
     #[error(
         "effect identity disagrees: {where_} carries {found}, but this operation is {expected}"
     )]
@@ -158,7 +172,6 @@ pub trait BookingRepository: Send + Sync {
     /// with a different canonical plan — that is a boundary violation, not a
     /// retry, and it fails closed.
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError>;
-
     /// Read one effect intent.
     ///
     /// # Errors
@@ -296,6 +309,9 @@ impl BookingRepository for SqliteBookingRepository {
     }
 
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
+        // Read off the plan, never supplied separately - see PrepareEffect.
+        let operation_kind = request.operation_kind();
+
         let plan_json = serde_json::to_string(&request.canonical_plan)?;
         let source_db = version_to_i64(request.source_version)?;
 
@@ -316,12 +332,9 @@ impl BookingRepository for SqliteBookingRepository {
         // name different effects - and recovery, which reads `active_effect`,
         // would then look up an intent that does not exist. ADR-014's stable
         // identity requires these to be the same value by construction.
-        let effect_intent_id = derive_effect_intent_id(
-            &request.booking_id,
-            request.operation_kind,
-            request.source_version,
-        );
-        verify_effect_identity(&request, &effect_intent_id)?;
+        let effect_intent_id =
+            derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
+        verify_effect_identity(&request, &effect_intent_id, operation_kind)?;
 
         let next = BookingWrite {
             active_effect: Some(effect_intent_id.clone()),
@@ -345,7 +358,7 @@ impl BookingRepository for SqliteBookingRepository {
             ",
         )
         .bind(request.booking_id.as_str())
-        .bind(request.operation_kind.name())
+        .bind(operation_kind.name())
         .bind(source_db)
         .fetch_optional(&mut *tx)
         .await?;
@@ -367,11 +380,8 @@ impl BookingRepository for SqliteBookingRepository {
         )
         .await?;
 
-        let effect_intent_id = derive_effect_intent_id(
-            &request.booking_id,
-            request.operation_kind,
-            request.source_version,
-        );
+        let effect_intent_id =
+            derive_effect_intent_id(&request.booking_id, operation_kind, request.source_version);
 
         sqlx::query(
             r"
@@ -384,7 +394,7 @@ impl BookingRepository for SqliteBookingRepository {
         )
         .bind(effect_intent_id.as_str())
         .bind(request.booking_id.as_str())
-        .bind(request.operation_kind.name())
+        .bind(operation_kind.name())
         .bind(source_db)
         .bind(&plan_json)
         .bind(EffectStatus::Prepared.name())
@@ -401,7 +411,7 @@ impl BookingRepository for SqliteBookingRepository {
             intent: EffectIntent {
                 effect_intent_id,
                 booking_id: request.booking_id,
-                operation_kind: request.operation_kind,
+                operation_kind,
                 source_version: request.source_version,
                 canonical_plan: request.canonical_plan,
                 status: EffectStatus::Prepared,
@@ -1109,11 +1119,10 @@ mod concurrency {
 #[derive(Clone, Debug)]
 pub struct PrepareEffect {
     pub booking_id: BookingId,
-    pub operation_kind: OperationKind,
     /// The aggregate version this effect is derived from. Also the CAS
     /// expectation, and part of the uniqueness key.
     pub source_version: u64,
-    pub canonical_plan: BookingPlan,
+    pub canonical_plan: BookingEffect,
     /// The state to commit alongside the intent.
     ///
     /// `active_effect` on this write is **ignored**: the repository owns the
@@ -1121,6 +1130,20 @@ pub struct PrepareEffect {
     /// disagree. See [`BookingRepository::prepare_effect`].
     pub next: BookingWrite,
     pub audit: TransitionAudit,
+}
+
+impl PrepareEffect {
+    /// Which kind of consequence this is — read off the plan, never supplied
+    /// separately.
+    ///
+    /// It used to be its own field, which meant a coordinator bug could persist
+    /// a `CancelBooking` plan under `OperationKind::Book`: wrong uniqueness key,
+    /// wrong persisted kind, and recovery later dispatching the effect as the
+    /// wrong class. Deriving it removes the possibility rather than guarding
+    /// against it.
+    fn operation_kind(&self) -> OperationKind {
+        self.canonical_plan.operation_kind()
+    }
 }
 
 /// How long an effect intent may be acted on, from the instant Phase A is
@@ -1183,6 +1206,7 @@ async fn replay_existing(
     row: &sqlx::sqlite::SqliteRow,
     plan_json: &str,
 ) -> Result<PreparedEffect, StoreError> {
+    let operation_kind = request.operation_kind();
     let intent = decode_effect_row(row)?;
 
     // Same operation key, different plan, is not a retry: two different
@@ -1192,7 +1216,7 @@ async fn replay_existing(
     if stored_plan != plan_json {
         return Err(StoreError::ConflictingPlan {
             booking_id: request.booking_id.clone(),
-            operation_kind: request.operation_kind.name(),
+            operation_kind: operation_kind.name(),
             source_version: request.source_version,
         });
     }
@@ -1205,39 +1229,65 @@ async fn replay_existing(
     })
 }
 
-/// Every place that carries an effect id must carry *this* one.
+/// The in-flight state must carry *this* effect id, and must carry one.
 ///
-/// The id is currently duplicated across the canonical plan, the in-flight
-/// state and the aggregate's `active_effect`; slice B removes that
-/// duplication. Until then:
+/// Slice A had to check two places, because `BookingPlan::Book` carried its own
+/// copy of the id. B2 removed that field, so the canonical plan no longer names
+/// an effect at all and only the state remains.
 ///
-/// - silently **rewriting** the caller's values would hide a coordinator bug;
-/// - silently **accepting** them would let the plan name one effect while the
-///   intent row names another — and fact binding later compares the plan's id
-///   against provider evidence, so the *real* provider result would be
-///   rejected as a mismatch.
+/// Two ways to get this wrong, both closed here:
 ///
-/// So disagreement fails closed.
+/// - a **different** id means the aggregate would point at one effect while the
+///   intent row records another, and recovery reads the aggregate;
+/// - **no** id means `active_effect` would say an effect is running beside a
+///   state recording nothing in flight, which recovery cannot resolve either way.
+///
+/// Rewriting the caller's value instead would hide a coordinator bug rather than
+/// surface it.
 fn verify_effect_identity(
     request: &PrepareEffect,
     expected: &EffectIntentId,
+    operation_kind: OperationKind,
 ) -> Result<(), StoreError> {
-    let sites = [
-        ("canonical plan", request.canonical_plan.effect_intent_id()),
-        ("in-flight state", request.next.state.effect_intent_id()),
-    ];
-    for (where_, found) in sites {
-        if let Some(found) = found
-            && found != expected
-        {
-            return Err(StoreError::InconsistentEffectIdentity {
-                where_,
-                found: found.clone(),
-                expected: expected.clone(),
+    // Identity is not enough. An effect id does not encode its kind, so a `Book`
+    // plan committed alongside a `CancellingBooking` state would pass an id
+    // comparison while being nonsense — and recovery would then dispatch the
+    // effect as the wrong class.
+    match request.next.state.in_flight_kind() {
+        Some(kind) if kind == operation_kind => {}
+        Some(kind) => {
+            return Err(StoreError::EffectKindMismatch {
+                state: request.next.state.name(),
+                state_kind: kind.name(),
+                plan_kind: operation_kind.name(),
             });
         }
+        None => {}
     }
-    Ok(())
+
+    // Only the state, now. Slice A also had to check the canonical plan, because
+    // `BookingPlan::Book` carried its own copy of the id — B2 removed that field,
+    // so there is one fewer place for the value to drift. What remains is the
+    // in-flight state, which legitimately records what it is waiting on.
+    //
+    // Absence is a failure, not a pass. `prepare_effect` only ever commits an
+    // external effect, so the state it commits *must* be one that is waiting on
+    // that effect. Merely verifying the id when present would let a `Booked` or
+    // `Draft` through — and then `active_effect` would say an effect is running
+    // while the state says nothing is, which is precisely the inconsistency
+    // recovery has no way to resolve.
+    match request.next.state.effect_intent_id() {
+        Some(found) if found == expected => Ok(()),
+        Some(found) => Err(StoreError::InconsistentEffectIdentity {
+            where_: "in-flight state",
+            found: found.clone(),
+            expected: expected.clone(),
+        }),
+        None => Err(StoreError::NotAnInFlightState {
+            state: request.next.state.name(),
+            expected: expected.clone(),
+        }),
+    }
 }
 
 /// Derive the identifier for one intended consequence.
@@ -1302,9 +1352,8 @@ mod effect_identity {
         }
     }
 
-    fn plan_for(venue: &str, effect: &EffectIntentId) -> BookingPlan {
-        BookingPlan::Book {
-            effect_intent_id: effect.clone(),
+    fn plan_for(venue: &str) -> BookingEffect {
+        BookingEffect::Book {
             principal: PrincipalId::new("lucy"),
             facts: facts(venue),
         }
@@ -1332,9 +1381,8 @@ mod effect_identity {
         let effect = derive_effect_intent_id(id, OperationKind::Book, version);
         PrepareEffect {
             booking_id: id.clone(),
-            operation_kind: OperationKind::Book,
             source_version: version,
-            canonical_plan: plan_for(venue, &effect),
+            canonical_plan: plan_for(venue),
             next: in_progress_write(&effect),
             audit: TransitionAudit::committed("Book", None),
         }
@@ -1505,15 +1553,12 @@ mod effect_identity {
         assert!(!second.replayed);
     }
 
-    /// Every place carrying an effect id must carry the same one, and a
-    /// disagreement is refused rather than silently rewritten.
+    /// The in-flight state must carry the same effect id the repository
+    /// derives, and a disagreement is refused rather than silently rewritten.
     ///
-    /// The id is currently duplicated across the canonical plan, the in-flight
-    /// state and the aggregate's `active_effect`. Rewriting the caller's values
-    /// would hide a coordinator bug; accepting them would let the plan name one
-    /// effect while the intent row names another, and fact binding later
-    /// compares the plan's id against provider evidence — so the *real*
-    /// provider result would be rejected. Fail closed.
+    /// Rewriting would hide a coordinator bug; accepting would leave the
+    /// aggregate pointing at one effect while the intent row records another,
+    /// and recovery reads the aggregate. Fail closed.
     #[tokio::test]
     async fn a_disagreeing_effect_identity_is_refused() {
         let temp = TempDir::new().expect("temp dir");
@@ -1522,11 +1567,11 @@ mod effect_identity {
         seeded(&repo, &id).await;
 
         let mut request = prepare_at(&id, 0, "TH-A");
-        request.canonical_plan = BookingPlan::Book {
+        // The plan no longer carries an effect id at all (B2 removed the field),
+        // so a disagreement can only come from the in-flight state now.
+        request.next.state = BookingState::BookingInProgress(BookingInProgress {
             effect_intent_id: EffectIntentId::new("SOME-OTHER-EFFECT"),
-            principal: PrincipalId::new("lucy"),
-            facts: facts("TH-A"),
-        };
+        });
 
         let error = repo
             .prepare_effect(request)
@@ -1600,6 +1645,118 @@ mod effect_identity {
             "expiry {expiry} should be a sample taken during the call plus the 5s TTL, \
              not anything the caller chose"
         );
+    }
+
+    /// An effect prepare whose state is not waiting on that effect is refused.
+    ///
+    /// Otherwise the aggregate would persist `active_effect = Some(..)` beside a
+    /// state that records nothing in flight — recovery reads the state, finds no
+    /// effect to resume, and the intent is stranded.
+    #[tokio::test]
+    async fn a_prepare_whose_state_is_not_in_flight_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-NOTINFLIGHT");
+        seeded(&repo, &id).await;
+
+        let mut request = prepare_at(&id, 0, "TH-A");
+        request.next.state = BookingState::Booked(townhall_domain::Booked {
+            booking_ref: CouncilBookingRef::new("TH-92718"),
+        });
+
+        let error = repo
+            .prepare_effect(request)
+            .await
+            .expect_err("a Booked state carries no effect identity");
+        assert!(
+            matches!(error, StoreError::NotAnInFlightState { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            repo.load(&id).await.expect("load").version,
+            0,
+            "nothing committed"
+        );
+    }
+
+    /// A state waiting on one kind of effect cannot be committed with a plan of
+    /// the other kind, even when the identity lines up.
+    #[tokio::test]
+    async fn a_state_and_plan_of_different_kinds_are_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-KINDMIX");
+        seeded(&repo, &id).await;
+
+        // A cancellation plan, but committed alongside a state that is waiting
+        // for a booking. The id is not even consulted - the kinds disagree.
+        let mut request = prepare_at(&id, 0, "TH-A");
+        request.canonical_plan = BookingEffect::CancelBooking {
+            booking_ref: CouncilBookingRef::new("TH-92718"),
+        };
+
+        let error = repo
+            .prepare_effect(request)
+            .await
+            .expect_err("a Cancel plan cannot commit a BookingInProgress state");
+        assert!(
+            matches!(error, StoreError::EffectKindMismatch { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            repo.load(&id).await.expect("load").version,
+            0,
+            "nothing committed"
+        );
+    }
+
+    /// A cancellation is a different operation, and must get a different
+    /// identity and a different persisted kind.
+    ///
+    /// Review caught that every test here built a `Book` request, so the whole
+    /// cancellation path through `prepare_effect` was unexercised — the kind is
+    /// now derived from the plan, and nothing proved that derivation worked for
+    /// the other variant.
+    #[tokio::test]
+    async fn a_cancellation_gets_its_own_kind_and_identity() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-CANCELKIND");
+        seeded(&repo, &id).await;
+
+        let effect = derive_effect_intent_id(&id, OperationKind::Cancel, 0);
+        let prepared = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: 0,
+                canonical_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new("TH-92718"),
+                },
+                next: BookingWrite {
+                    state: BookingState::CancellingBooking(townhall_domain::CancellingBooking {
+                        booking_ref: CouncilBookingRef::new("TH-92718"),
+                        effect_intent_id: effect.clone(),
+                    }),
+                    requirements: requirements(),
+                    selected_venue: None,
+                    availability: None,
+                    booking_ref: Some(CouncilBookingRef::new("TH-92718")),
+                    active_effect: Some(effect.clone()),
+                },
+                audit: TransitionAudit::committed("Cancel", None),
+            })
+            .await
+            .expect("cancellation prepare");
+
+        assert_eq!(prepared.intent.operation_kind, OperationKind::Cancel);
+        assert_eq!(prepared.intent.effect_intent_id, effect);
+        assert!(
+            effect.as_str().contains("CANCEL"),
+            "a cancellation identity must be distinguishable from a booking one: {effect}"
+        );
+        // And a booking on the same resource at the same version is a DIFFERENT
+        // effect - two consequences, two identities.
+        assert_ne!(effect, derive_effect_intent_id(&id, OperationKind::Book, 0));
     }
 
     /// The stored expiry is read back verbatim, never recomputed — a restart or

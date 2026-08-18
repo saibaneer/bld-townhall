@@ -69,9 +69,11 @@ pub struct BookingInProgress {
 /// crash here would find a booking whose council request is outstanding and no
 /// record of which effect to reconcile.
 ///
-/// The state is not yet reachable — `BookingInProgress + Cancel` lands in slice
-/// F with its compensation protocol — but [`Booking::coherent`] must permit it,
-/// so the field lands with the invariant rather than after it.
+/// Not yet *enterable* — `BookingInProgress + Cancel` lands in slice F with its
+/// compensation protocol — but as of B3b its outbound fact edges are live:
+/// `BookingExists` moves it to `CancellingBooking`, and absence or rejection of
+/// the booking resolves it to `Cancelled`, because there was never anything to
+/// cancel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellationRequested {
     pub effect_intent_id: EffectIntentId,
@@ -342,6 +344,11 @@ pub enum IncoherentBooking {
         state_says: CouncilBookingRef,
         aggregate_says: Option<CouncilBookingRef>,
     },
+    #[error("state {state} cannot know a council reference, but booking_ref is {aggregate_says}")]
+    PhantomReference {
+        state: &'static str,
+        aggregate_says: CouncilBookingRef,
+    },
 }
 
 impl Booking {
@@ -395,6 +402,35 @@ impl Booking {
                 state,
                 state_says: named.clone(),
                 aggregate_says: self.booking_ref.clone(),
+            });
+        }
+
+        // The reference rule is per-state, not merely forward-only. B3b's
+        // review found the gap: a forward-only rule let `BookingInProgress`
+        // carry a phantom `booking_ref`, which the fact door then silently
+        // cleared — a bad write laundered into a clean transition. A state
+        // whose booking has never been confirmed cannot honestly know a
+        // council reference, so carrying one is a contradiction:
+        //
+        //   must be None      Draft, VenueSelected, NeedsRevalidation,
+        //                     AwaitingBooking, BookingInProgress,
+        //                     CancellationRequested
+        //   must match state  Booked, CancellingBooking (checked above)
+        //   unconstrained     Cancelled (kept, or never existed) and
+        //                     NeedsHuman (frozen with whatever was known)
+        let cannot_know_a_reference = matches!(
+            self.state,
+            BookingState::Draft(_)
+                | BookingState::VenueSelected(_)
+                | BookingState::NeedsRevalidation(_)
+                | BookingState::AwaitingBooking(_)
+                | BookingState::BookingInProgress(_)
+                | BookingState::CancellationRequested(_)
+        );
+        if cannot_know_a_reference && let Some(phantom) = self.booking_ref.as_ref() {
+            return Err(IncoherentBooking::PhantomReference {
+                state,
+                aggregate_says: phantom.clone(),
             });
         }
 
@@ -622,6 +658,8 @@ pub enum BookingError {
     ContradictoryProviderFact,
     #[error("the aggregate's state and its active_effect disagree about what is in flight")]
     InconsistentEffectIdentity,
+    #[error("the aggregate contradicts itself: {0}")]
+    IncoherentAggregate(IncoherentBooking),
 }
 
 /// Externally verified reality. State-neutral: the verifier establishes *what
@@ -1613,11 +1651,19 @@ impl BoundaryDomain for TownHallDomain {
             Err(error) => return FactResolution::Denied(error),
         };
 
-        // C. Two copies of one in-flight pointer must agree before either is
-        // used. The store refuses to persist or load a disagreement, but this
-        // door must not assume its caller went through the store.
-        if booking.state.effect_intent_id() != booking.active_effect.as_ref() {
-            return FactResolution::Denied(BookingError::InconsistentEffectIdentity);
+        // C. The aggregate must not contradict itself — the WHOLE invariant,
+        // not just the effect pointer. The store refuses to persist or load a
+        // disagreement, but this door must not assume its caller went through
+        // the store; review of this slice found that checking only the effect
+        // ids let a phantom booking_ref at BookingInProgress be silently
+        // cleared by the very transitions below.
+        if let Err(why) = booking.coherent() {
+            return FactResolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
         }
 
         // D.
@@ -1644,9 +1690,18 @@ impl BoundaryDomain for TownHallDomain {
             return Resolution::Undefined;
         };
 
-        // The same self-consistency check as the fact door.
-        if booking.state.effect_intent_id() != booking.active_effect.as_ref() {
-            return Resolution::Denied(BookingError::InconsistentEffectIdentity);
+        // The same self-consistency check as the fact door. Note the freeze
+        // itself would also be refused by the store — `admissible` runs
+        // `coherent()` on every write — so refusing here with a precise reason
+        // beats an opaque refusal later; either way an aggregate this broken
+        // needs an operator below the domain, not automation above it.
+        if let Err(why) = booking.coherent() {
+            return Resolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
         }
 
         // Exhaustion of some OTHER effect says nothing about this state.
@@ -2543,6 +2598,38 @@ mod characterization {
         assert!(
             decoded.is_err(),
             "the old unit payload must fail closed, not default an effect identity"
+        );
+    }
+
+    /// A state whose booking has never been confirmed cannot know a council
+    /// reference. Forward-only checking left this open, and B3b's review found
+    /// the consequence: the fact door silently cleared a phantom reference on
+    /// its way through a transition.
+    #[test]
+    fn a_state_that_cannot_know_a_reference_must_not_carry_one() {
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..awaiting_booking()
+        };
+        assert!(matches!(
+            phantom.coherent(),
+            Err(IncoherentBooking::PhantomReference { .. })
+        ));
+    }
+
+    /// The freeze state keeps whatever was known when automation gave up —
+    /// a `NeedsHuman` reached from `CancellingBooking` legitimately carries the
+    /// reference of the booking it was trying to cancel.
+    #[test]
+    fn needs_human_may_retain_the_reference_it_froze_with() {
+        let frozen = Booking {
+            state: BookingState::NeedsHuman(NeedsHuman),
+            active_effect: None,
+            ..booked()
+        };
+        assert!(
+            frozen.coherent().is_ok(),
+            "NeedsHuman must be allowed to keep the reference it froze with"
         );
     }
 
@@ -3474,6 +3561,7 @@ mod fact_topology {
             BookingError::DuplicateProviderEffect => "DuplicateProviderEffect",
             BookingError::ContradictoryProviderFact => "ContradictoryProviderFact",
             BookingError::InconsistentEffectIdentity => "InconsistentEffectIdentity",
+            BookingError::IncoherentAggregate(_) => "IncoherentAggregate",
         }
     }
 
@@ -4378,15 +4466,21 @@ mod fact_topology {
             );
         }
         // The aggregate's outer copy disagrees with everything else. The store
-        // would never load this shape, but the door must not assume the store.
+        // would never load this shape, and the door's C-step catches it before
+        // any fact comparison runs: the aggregate contradicts ITSELF, which is
+        // a more honest refusal than blaming the fact for it.
         {
             let (mut booking, fact, context) = bound_cell("Booked", 0);
             booking.booking_ref = Some(CouncilBookingRef::new("TH-99999"));
             let got = classify(&booking, fact, &context).await;
-            assert_eq!(
-                got,
-                FactResolution::Denied(BookingError::DuplicateProviderEffect),
-                "aggregate's reference vs fact's"
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(BookingError::IncoherentAggregate(
+                        IncoherentBooking::CouncilReference { .. }
+                    ))
+                ),
+                "a self-contradictory aggregate must be refused as such, got {got:?}"
             );
         }
     }
@@ -4547,6 +4641,41 @@ mod fact_topology {
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
                 "a tombstoned booking cannot have left a reference behind"
+            );
+        }
+    }
+
+    /// The review's finding, pinned: a phantom reference — a state whose
+    /// booking has never been confirmed carrying a `booking_ref` — must be
+    /// refused, never silently cleared or overwritten by a transition. A bad
+    /// write laundered into a clean state is how the next reader never learns
+    /// anything was wrong.
+    #[tokio::test]
+    async fn a_phantom_reference_is_refused_not_laundered() {
+        // Each of these transitions would have cleared or overwritten the
+        // phantom: absence clears it, confirmation overwrites it, the found
+        // booking under cancellation overwrites it, and the AwaitingBooking
+        // convergence would have blessed it.
+        let cells: &[(&str, usize)] = &[
+            ("BookingInProgress", 2),     // would clear via EffectAbsent
+            ("BookingInProgress", 0),     // would overwrite via BookingExists
+            ("CancellationRequested", 2), // would clear via EffectAbsent
+            ("CancellationRequested", 0), // would overwrite via BookingExists
+            ("AwaitingBooking", 2),       // would converge over it
+        ];
+        for (state_name, fact_ix) in cells {
+            let (mut booking, fact, context) = bound_cell(state_name, *fact_ix);
+            let fact_name = fact.name();
+            booking.booking_ref = Some(CouncilBookingRef::new("TH-PHANTOM"));
+            let got = classify(&booking, fact, &context).await;
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(BookingError::IncoherentAggregate(
+                        IncoherentBooking::PhantomReference { .. }
+                    ))
+                ),
+                "{state_name} + {fact_name} with a phantom reference must refuse, got {got:?}"
             );
         }
     }

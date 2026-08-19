@@ -86,6 +86,94 @@ impl<P, E> Resolution<P, E> {
     }
 }
 
+/// Evidence whose provenance a verifier has established.
+///
+/// `Verified<T>` answers exactly one question: did this claim pass its
+/// provenance verifier — did it genuinely come from where it says it did,
+/// intact? It does **not** say the claim is consistent with any resource. The
+/// domain still binds every consequential field against the persisted canonical
+/// plan (ADR-012); a field-perfect claim with the wrong provenance never gets
+/// this far, and a well-provenanced claim about the wrong effect is refused by
+/// the binding.
+///
+/// # What the type actually guarantees
+///
+/// - **No `Serialize`, no `Deserialize`.** Deserialising verified evidence from
+///   a wire format is precisely the forgery the type exists to prevent.
+/// - The untrusted half cannot *name* it: `agent-runtime` and `bld-client` may
+///   not depend on this crate, so no proposer-facing transport can carry one.
+///
+/// # What it does not guarantee
+///
+/// Unforgeability. Any code inside the trusted half can construct one. The
+/// constructor is named [`Verified::assert_verified`] so every call site greps
+/// as an audit point — the guarantee is vocabulary separation plus the crate
+/// graph, and claiming more would be an overclaim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verified<T> {
+    inner: T,
+}
+
+impl<T> Verified<T> {
+    /// Assert that `inner` passed its provenance verifier.
+    ///
+    /// Every call to this is a claim someone can audit. Grep for it.
+    #[must_use]
+    pub fn assert_verified(inner: T) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub fn get(&self) -> &T {
+        &self.inner
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+/// The fact door's four outcomes.
+///
+/// Three are [`Resolution`]'s. The fourth exists because recovery re-applies
+/// the same fact **by design**: a reconciler that lost a compare-and-set
+/// reloads and asks again, and "authoritative state already reflects this
+/// fact" is success, not breakage. Without `Converged`, healthy convergence is
+/// indistinguishable from a refused transition and a reconciler reads its own
+/// success as an error.
+///
+/// `Converged` is deliberately **not** added to the proposal door: for intent,
+/// a silent no-op hides mistakes — `Book` when already booked is `Undefined`,
+/// never "quietly fine" (ADR-012).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FactResolution<P, E> {
+    Undefined,
+    Denied(E),
+    Ready(P),
+    Converged,
+}
+
+impl<P, E> FactResolution<P, E> {
+    /// Whether this resolution would produce a transition.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    /// Whether the behaviour exists in this state at all.
+    #[must_use]
+    pub const fn is_undefined(&self) -> bool {
+        matches!(self, Self::Undefined)
+    }
+
+    /// Whether authoritative state already reflects the fact.
+    #[must_use]
+    pub const fn is_converged(&self) -> bool {
+        matches!(self, Self::Converged)
+    }
+}
+
 /// What a legal transition will do.
 ///
 /// The distinction is load-bearing, not descriptive. A `Local` transition can
@@ -132,6 +220,17 @@ pub trait BoundaryDomain: Send + Sync {
     type Effect: Send + Sync;
     type Authority: Send + Sync;
     type Context: Send + Sync;
+    /// Externally verified reality, as domain vocabulary. Lives in the domain
+    /// crate, not here — the kernel must not know what a booking is (ADR-001).
+    type ProviderFact: Send;
+    /// A deterministic runtime fact. Neither intent nor external truth: the
+    /// provider cannot tell us our own retry budget is exhausted.
+    type SystemEvent: Send;
+    /// What the coordinator must supply for fact binding — canonically, the
+    /// persisted effect intent. Deliberately a different type from `Context`:
+    /// the fact door must bind against the persisted plan, and a context that
+    /// cannot even name capability-loaded facts makes that structural.
+    type FactContext: Send + Sync;
     type Error: Send;
 
     /// Classify a proposal against the current state.
@@ -146,26 +245,53 @@ pub trait BoundaryDomain: Send + Sync {
         authority: &Self::Authority,
         context: &Self::Context,
     ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error>;
+
+    /// Classify a verified provider fact against the current state.
+    ///
+    /// No authority parameter, deliberately: a fact is admitted by its
+    /// verifier, not authorised by a principal, and recovery must run with a
+    /// helpful model, a hostile model, or no model at all (ADR-012). The
+    /// `principal` a fact must match comes from the persisted canonical plan —
+    /// which is why the plan is persisted.
+    async fn resolve_fact(
+        &self,
+        state: &Self::State,
+        fact: Verified<Self::ProviderFact>,
+        context: &Self::FactContext,
+    ) -> FactResolution<TransitionPlan<Self::State, Self::Effect>, Self::Error>;
+
+    /// Classify a deterministic runtime fact against the current state.
+    ///
+    /// No context at all: the only binding a system event needs is "is this
+    /// the effect this state is waiting on", and the state carries that
+    /// identity. Nothing but state and event is what lets this door run with
+    /// no provider reachable and no model present.
+    async fn resolve_system_event(
+        &self,
+        state: &Self::State,
+        event: Self::SystemEvent,
+    ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error>;
 }
 
-/// Deterministic transition resolution.
-///
-/// # Honestly: at B2 this is a passthrough
-///
-/// With one door and `execute`/`validate` gone, there is no sequencing left for
-/// the kernel to enforce — it forwards to the domain and nothing more. It is
-/// kept rather than deleted because B3 adds two more doors, and *then* it
-/// becomes the typed dispatch point where "which provenance class is this
-/// transition being driven by" lives:
+/// Deterministic transition resolution — the three provenance doors, in one
+/// named place.
 ///
 /// ```text
-/// resolve_proposal      what someone WANTS
-/// resolve_fact          what is externally TRUE      (B3)
-/// resolve_system_event  what the runtime KNOWS       (B3)
+/// resolve_proposal      what someone WANTS       (intent)
+/// resolve_fact          what is externally TRUE  (verified provider fact)
+/// resolve_system_event  what the runtime KNOWS   (deterministic runtime fact)
 /// ```
 ///
-/// Deleting it now and reintroducing it in B3 would churn the public API twice
-/// for no gain. Saying it earns its keep today would be an overclaim.
+/// # Honestly: each method still forwards to the domain
+///
+/// B2's version of this comment promised the kernel would "stop being a
+/// passthrough" at B3. The accurate statement is narrower: it stops being a
+/// *single-door* passthrough. No method here adds logic — the value is that
+/// every way state can legally change is visible in this one type, which makes
+/// "these are the only three doors" auditable rather than asserted. The
+/// forbidden move — a proposer driving a fact-shaped transition — is absent
+/// from the *type system*: `resolve_fact` demands `Verified<ProviderFact>`,
+/// which proposer-facing transport cannot construct or even name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Kernel;
 
@@ -183,6 +309,28 @@ impl Kernel {
         domain
             .resolve_proposal(state, proposal, authority, context)
             .await
+    }
+
+    /// Classify a verified provider fact. Returns a plan or `Converged` — the
+    /// kernel neither mutates state nor persists anything.
+    pub async fn resolve_fact<D: BoundaryDomain>(
+        &self,
+        domain: &D,
+        state: &D::State,
+        fact: Verified<D::ProviderFact>,
+        context: &D::FactContext,
+    ) -> FactResolution<TransitionPlan<D::State, D::Effect>, D::Error> {
+        domain.resolve_fact(state, fact, context).await
+    }
+
+    /// Classify a deterministic runtime fact.
+    pub async fn resolve_system_event<D: BoundaryDomain>(
+        &self,
+        domain: &D,
+        state: &D::State,
+        event: D::SystemEvent,
+    ) -> Resolution<TransitionPlan<D::State, D::Effect>, D::Error> {
+        domain.resolve_system_event(state, event).await
     }
 }
 
@@ -215,9 +363,26 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Effect;
 
+    /// One fact, carrying the identity it claims to answer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Arrived {
+        effect_id: u8,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Event {
+        GaveUp,
+    }
+
+    /// What the coordinator supplies for binding: which effect is in flight.
+    struct FactContext {
+        in_flight: Option<u8>,
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Error {
         Denied,
+        WrongEffect,
     }
 
     struct Domain;
@@ -229,6 +394,9 @@ mod tests {
         type Effect = Effect;
         type Authority = Authority;
         type Context = Context;
+        type ProviderFact = Arrived;
+        type SystemEvent = Event;
+        type FactContext = FactContext;
         type Error = Error;
 
         // One arm per (state, proposal) pair, deliberately - see the same note
@@ -255,6 +423,43 @@ mod tests {
                     })
                 }
                 (State::Start, Proposal::Reach) => Resolution::Denied(Error::Denied),
+                _ => Resolution::Undefined,
+            }
+        }
+
+        // The four outcomes, minimally: a fact answers `Reaching` if it names
+        // the in-flight effect; `Done` already reflects any arrival; `Start`
+        // has no fact-shaped behaviour at all.
+        async fn resolve_fact(
+            &self,
+            state: &Self::State,
+            fact: Verified<Self::ProviderFact>,
+            context: &Self::FactContext,
+        ) -> FactResolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+            match state {
+                State::Start => FactResolution::Undefined,
+                State::Done => FactResolution::Converged,
+                State::Reaching => match context.in_flight {
+                    Some(id) if id == fact.get().effect_id => {
+                        FactResolution::Ready(TransitionPlan::Local {
+                            next_state: State::Done,
+                        })
+                    }
+                    _ => FactResolution::Denied(Error::WrongEffect),
+                },
+            }
+        }
+
+        async fn resolve_system_event(
+            &self,
+            state: &Self::State,
+            event: Self::SystemEvent,
+        ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+            let Event::GaveUp = event;
+            match state {
+                State::Reaching => Resolution::Ready(TransitionPlan::Local {
+                    next_state: State::Start,
+                }),
                 _ => Resolution::Undefined,
             }
         }
@@ -321,5 +526,116 @@ mod tests {
         let second = classify(state.clone(), Proposal::Go, true).await;
         assert_eq!(first, second);
         assert_eq!(state, State::Start, "the caller's state is untouched");
+    }
+
+    /// The fact door has a fourth outcome the proposal door must not have:
+    /// a state that already reflects the fact is convergence, not breakage.
+    /// This is what lets a reconciler re-apply a fact after losing a CAS.
+    #[tokio::test]
+    async fn a_fact_the_state_already_reflects_converges() {
+        let got = Kernel
+            .resolve_fact(
+                &Domain,
+                &State::Done,
+                Verified::assert_verified(Arrived { effect_id: 7 }),
+                &FactContext { in_flight: None },
+            )
+            .await;
+        assert!(got.is_converged());
+        assert!(!got.is_ready(), "Converged must never carry a plan");
+    }
+
+    /// A fact where no fact-shaped behaviour exists is Undefined — exactly the
+    /// proposal door's distinction, preserved across doors.
+    #[tokio::test]
+    async fn a_fact_with_no_edge_here_is_undefined() {
+        let got = Kernel
+            .resolve_fact(
+                &Domain,
+                &State::Start,
+                Verified::assert_verified(Arrived { effect_id: 7 }),
+                &FactContext { in_flight: None },
+            )
+            .await;
+        assert!(got.is_undefined());
+    }
+
+    /// A fact that fails its binding is Denied with a typed reason — the
+    /// behaviour exists, the evidence does not fit.
+    #[tokio::test]
+    async fn a_fact_naming_the_wrong_effect_is_denied() {
+        let got = Kernel
+            .resolve_fact(
+                &Domain,
+                &State::Reaching,
+                Verified::assert_verified(Arrived { effect_id: 9 }),
+                &FactContext { in_flight: Some(7) },
+            )
+            .await;
+        assert_eq!(got, FactResolution::Denied(Error::WrongEffect));
+    }
+
+    /// A bound fact at the waiting state yields the transition.
+    #[tokio::test]
+    async fn a_bound_fact_at_the_waiting_state_yields_a_plan() {
+        let got = Kernel
+            .resolve_fact(
+                &Domain,
+                &State::Reaching,
+                Verified::assert_verified(Arrived { effect_id: 7 }),
+                &FactContext { in_flight: Some(7) },
+            )
+            .await;
+        let FactResolution::Ready(plan) = got else {
+            panic!("expected Ready");
+        };
+        assert_eq!(*plan.next_state(), State::Done);
+    }
+
+    /// The system-event door: reachable only where something is in flight.
+    #[tokio::test]
+    async fn a_system_event_moves_only_an_in_flight_state() {
+        let moved = Kernel
+            .resolve_system_event(&Domain, &State::Reaching, Event::GaveUp)
+            .await;
+        assert!(moved.is_ready());
+
+        let nowhere = Kernel
+            .resolve_system_event(&Domain, &State::Done, Event::GaveUp)
+            .await;
+        assert!(nowhere.is_undefined());
+    }
+
+    /// The load-bearing negative: `Verified<T>` implements neither `Serialize`
+    /// nor `Deserialize`, and this fails to COMPILE if either impl ever appears.
+    ///
+    /// The plan called for a `trybuild` compile-fail test here. This is the
+    /// same assertion with a cheaper mechanism: `assert_not_impl_any!` errors
+    /// at compile time on the exact property (the impl exists), where trybuild
+    /// pins a full stderr transcript that drifts with compiler versions and can
+    /// silently start passing for an unrelated compilation error.
+    /// `DeserializeOwned` sidesteps the lifetime parameter that makes
+    /// `Deserialize<'de>` awkward to name in a static assertion.
+    ///
+    /// A `Serialize` impl would let verified evidence leak outward through any
+    /// generic sink; a `Deserialize` impl would let it be minted from JSON,
+    /// which is the forgery ADR-012 exists to prevent.
+    #[test]
+    fn verified_evidence_cannot_cross_a_wire() {
+        static_assertions::assert_not_impl_any!(
+            Verified<Arrived>: serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            Verified<String>: serde::Serialize, serde::de::DeserializeOwned
+        );
+    }
+
+    /// `Verified<T>` hands its inner value out but never absorbs one from a
+    /// wire format — construction is `assert_verified`, greppably, or nothing.
+    #[test]
+    fn verified_exposes_but_never_absorbs() {
+        let fact = Verified::assert_verified(Arrived { effect_id: 7 });
+        assert_eq!(fact.get().effect_id, 7);
+        assert_eq!(fact.into_inner().effect_id, 7);
     }
 }

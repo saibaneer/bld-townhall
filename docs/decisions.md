@@ -213,6 +213,15 @@ greppable and auditable. Separate enums give vocabulary separation; provenance c
 the crate graph plus that audit discipline. Claiming more than that would be the
 overclaiming this project exists to avoid.
 
+Two notes recorded when B3 made the canonical block executable. `BookingEffect::Book`
+carries `attendees` precisely because this section requires headcount bound against the
+plan — `VenueFacts.capacity` is the room's limit, not the party's size, so without the
+field the one number the capacity guard checks would be unbindable. And
+`CancellationRequested` carries the **booking** intent's identity: it means "cancel the
+booking we are still waiting on", so the effect in flight is the booking's — a state named
+for a cancellation waiting on a `Book`, which is why `in_flight_kind()` must not be read
+off the state's name.
+
 ### The fact door needs a fourth outcome
 
 Recovery loops re-apply the same fact by design, so a repeat is normal rather than a
@@ -601,3 +610,87 @@ a counter, and it still needs a serialization point.
 currently visible" does not help, because the council cannot tell "never sent" from "sent and
 still in flight". The ambiguous case never resolves and cancellation could never complete.
 Expiry is what makes the first answer reachable at all.
+
+## ADR-017 — Audit provenance is typed and derived; denials are recorded tiered
+
+Decided 2026-08-18 with the project owner. Implementation lands in **slice C** with the
+coordinator, which is the first component that sees both the resolution and the commit.
+
+### Context: the audit trail asserts, and can only say one thing
+
+`TransitionAudit` is three caller-supplied strings — `proposal`, `outcome`,
+`evidence_summary` — passed through `commit_in_tx` unexamined. Its only constructor
+hardcodes `outcome: "Committed"`, and a denial never reaches `commit` at all, so the
+`outcome` column has exactly one possible value in the whole system. For a project whose
+central claim is *"the boundary refuses correctly"*, not a single refusal is provable from
+the database.
+
+Worse once the fact door exists: three provenance classes (ADR-012), one `proposal` column.
+When the council confirms a booking, the transition is driven by a verified provider fact,
+but the row can only say something proposal-shaped — it must imply an intent caused the
+confirmation. Ask that trail "did the model ever cause a booking to be confirmed?" and it
+answers yes, wrongly. That is the asserted-not-derived defect class B3a removed from the
+aggregate, alive in the audit trail.
+
+### Decision
+
+1. **Audit fields become typed and derived from the resolution, not asserted by the
+   caller.** `proposal: String` is replaced by a `driver` carrying the door —
+   `Proposal(name)` / `Fact(name)` / `SystemEvent(name)` — and `outcome` becomes the typed
+   boundary outcome. `evidence_summary` is dropped; the driver carries it.
+2. **Denials are recorded, tiered by outcome.**
+   - `Undefined` — constructible from pure garbage, unbounded — is **counted, never
+     rowed**: in-memory counters per `(state, proposal)`, flushed periodically,
+     crash-lossy by design.
+   - `Denied` — requires a real booking in a real state — gets **durable rows**,
+     deduplicated per `(booking_id, principal, reason)` per window: the first N are
+     recorded, further identical refusals increment a suppressed-count. Identical retries
+     are compressible precisely because they are identical: the rows carry the *what*, the
+     counter carries the *how many*. Nothing forensic is lost.
+   - Denial writes may be **asynchronous and off the request path**. A lost denial record
+     strands nothing — no state changed, no recovery waits on it — so it does not need the
+     commit-grade durability that effect intents need. This is deliberate tiering of
+     durability by consequence, not corner-cutting.
+3. **The boundary's answer is never rate-limited.** Classification is a pure function;
+   request 501 receives the same deterministic `Denied` as request 1, at match-arm cost.
+   Only the audit trail's appetite for identical rows saturates. A boundary whose answers
+   depended on history would no longer be deterministic.
+4. **The returned-value form ("verdict") is deferred to M5**, where the agent-facing
+   consumer exists. If built, it revives the dormant `BoundaryOutcome` shape in
+   `bld-kernel` rather than adding a peer type, and takes the same anti-forgery treatment
+   as `Verified<T>`: private fields, no `Deserialize`.
+
+### Why tiered, not one of the simpler shapes
+
+The decision space was walked explicitly (eight options, from "keep not recording" to
+"record everything"), replayed against one night of traffic: a real refusal at 23:00, a
+stuck agent flooding ~5M `Undefined` events overnight, and a legitimate booking needing the
+single `BEGIN IMMEDIATE` writer lock at 02:00.
+
+- **Record everything, same store** puts attacker-priced writes on the lock this project
+  measured failing at 52/60 under contention (ADR-015), and queueing there burns real
+  bookings' council TTL. Vetoed.
+- **Counters only** answers "are we under attack" but cannot prove any individual refusal.
+- **Sampling** keeps statistics, not evidence: the one refusal an auditor asks for is
+  probably not there.
+- **A bounded buffer** hands the adversary control of retention — flood cheap denials to
+  evict the refusal that mattered.
+- **Telemetry-only** makes refusals as ephemeral as the model's chatter; a provable
+  refusal you can pull from the database is part of this project's demonstration.
+
+The tier survives all of those failure modes at near-constant cost: the flood is one
+counter, the refusal that matters is a full durable row.
+
+### The design-basis adversary
+
+Not an internet attacker — there is no public endpoint until M5. BLD's adversary is the
+probabilistic component we already distrust, and it does not need to be hostile: an agent
+whose loop does not understand denials retries at machine speed, and denials are the one
+output it can generate unboundedly, because they are what it produces by being wrong, and
+being wrong is free. We hope agents relay typed denial reasons to their principals; we
+design for the ones that retry.
+
+The symmetry with ADR-012, stated once: **denial reasons are the vocabulary the untrusted
+half is meant to see** — the outbound feedback channel. **Evidence types are the vocabulary
+it must not be able to name.** Information flows out as typed refusals; it never flows in
+as claimed facts.

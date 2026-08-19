@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use bld_kernel::{BoundaryDomain, Resolution, TransitionPlan};
+use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId, Money, PrincipalId,
-    SlotId, VenueId,
+    ActorId, BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId,
+    Money, PrincipalId, SlotId, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -69,9 +69,11 @@ pub struct BookingInProgress {
 /// crash here would find a booking whose council request is outstanding and no
 /// record of which effect to reconcile.
 ///
-/// The state is not yet reachable — `BookingInProgress + Cancel` lands in slice
-/// F with its compensation protocol — but [`Booking::coherent`] must permit it,
-/// so the field lands with the invariant rather than after it.
+/// Not yet *enterable* — `BookingInProgress + Cancel` lands in slice F with its
+/// compensation protocol — but as of B3b its outbound fact edges are live:
+/// `BookingExists` moves it to `CancellingBooking`, and absence or rejection of
+/// the booking resolves it to `Cancelled`, because there was never anything to
+/// cancel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellationRequested {
     pub effect_intent_id: EffectIntentId,
@@ -342,6 +344,11 @@ pub enum IncoherentBooking {
         state_says: CouncilBookingRef,
         aggregate_says: Option<CouncilBookingRef>,
     },
+    #[error("state {state} cannot know a council reference, but booking_ref is {aggregate_says}")]
+    PhantomReference {
+        state: &'static str,
+        aggregate_says: CouncilBookingRef,
+    },
 }
 
 impl Booking {
@@ -395,6 +402,35 @@ impl Booking {
                 state,
                 state_says: named.clone(),
                 aggregate_says: self.booking_ref.clone(),
+            });
+        }
+
+        // The reference rule is per-state, not merely forward-only. B3b's
+        // review found the gap: a forward-only rule let `BookingInProgress`
+        // carry a phantom `booking_ref`, which the fact door then silently
+        // cleared — a bad write laundered into a clean transition. A state
+        // whose booking has never been confirmed cannot honestly know a
+        // council reference, so carrying one is a contradiction:
+        //
+        //   must be None      Draft, VenueSelected, NeedsRevalidation,
+        //                     AwaitingBooking, BookingInProgress,
+        //                     CancellationRequested
+        //   must match state  Booked, CancellingBooking (checked above)
+        //   unconstrained     Cancelled (kept, or never existed) and
+        //                     NeedsHuman (frozen with whatever was known)
+        let cannot_know_a_reference = matches!(
+            self.state,
+            BookingState::Draft(_)
+                | BookingState::VenueSelected(_)
+                | BookingState::NeedsRevalidation(_)
+                | BookingState::AwaitingBooking(_)
+                | BookingState::BookingInProgress(_)
+                | BookingState::CancellationRequested(_)
+        );
+        if cannot_know_a_reference && let Some(phantom) = self.booking_ref.as_ref() {
+            return Err(IncoherentBooking::PhantomReference {
+                state,
+                aggregate_says: phantom.clone(),
             });
         }
 
@@ -566,6 +602,12 @@ pub enum BookingEffect {
     /// Book the verified venue for the verified fee.
     Book {
         principal: PrincipalId,
+        /// The headcount this booking was authorised for. `facts.capacity` is
+        /// the *room's* limit, not the party's size — without this field the
+        /// one number the capacity guard actually checked would be unbindable
+        /// when provider evidence comes back, exactly where ADR-012 says fee
+        /// and headcount are not optional.
+        attendees: u16,
         facts: VenueFacts,
     },
     /// Cancel a council booking that is known to exist.
@@ -602,6 +644,192 @@ pub enum BookingError {
     FeeExceeded,
     #[error("no effect identity was supplied for a transition that needs one")]
     EffectIdentityMissing,
+    #[error("a state that participates in the fact door was given no intent to bind against")]
+    EffectPlanMissing,
+    #[error("the evidence does not concern the effect this booking is running")]
+    EffectMismatch,
+    #[error("the evidence's kind and the effect's kind disagree")]
+    EffectKindMismatch,
+    #[error("the evidence's {field} disagrees with the persisted canonical plan")]
+    EffectPlanMismatch { field: &'static str },
+    #[error("one effect identity has resolved to two different provider references")]
+    DuplicateProviderEffect,
+    #[error("the evidence contradicts a durable determination already recorded")]
+    ContradictoryProviderFact,
+    #[error("the aggregate's state and its active_effect disagree about what is in flight")]
+    InconsistentEffectIdentity,
+    #[error("the aggregate contradicts itself: {0}")]
+    IncoherentAggregate(IncoherentBooking),
+}
+
+/// Externally verified reality. State-neutral: the verifier establishes *what
+/// is true*, the domain decides *what it means here* — one `EffectAbsent` fact
+/// means three different things at three different states (ADR-012).
+///
+/// Canonical definition lives in ADR-012; this is its executable form. Every
+/// consequential field is bound against the persisted canonical plan before any
+/// meaning is derived.
+///
+/// **No `Serialize`, no `Deserialize`** — a fact enters the system through a
+/// verifier or not at all. Rust cannot make enum variant fields private, so
+/// unlike [`bld_kernel::Verified`] the protection here is the missing serde
+/// impls plus the crate graph: the untrusted half cannot name this type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifiedProviderFact {
+    /// A booking exists at the council for this intent.
+    BookingExists {
+        effect_intent_id: EffectIntentId,
+        booking_ref: CouncilBookingRef,
+        venue_id: VenueId,
+        slot_id: SlotId,
+        attendees: u16,
+        fee: Money,
+        principal: PrincipalId,
+    },
+    /// Nothing was created for this intent, and nothing ever can be.
+    ///
+    /// Deliberately kind-agnostic: absence carries only the identity, so one
+    /// variant covers a booking intent and a cancellation intent alike. Which
+    /// it means comes from the persisted intent and the current state.
+    ///
+    /// Admissible only from the council's definitive-absence response, which
+    /// tombstones the intent (ADR-016). Anything weaker is `Unknown` and
+    /// drives nothing.
+    EffectAbsent { effect_intent_id: EffectIntentId },
+    /// A cancellation exists at the council for this intent.
+    CancellationExists {
+        effect_intent_id: EffectIntentId,
+        booking_ref: CouncilBookingRef,
+    },
+    /// The provider authoritatively and durably refused this intent.
+    ProviderRejected {
+        effect_intent_id: EffectIntentId,
+        reason: BoundedString,
+    },
+}
+
+impl VerifiedProviderFact {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::BookingExists { .. } => "BookingExists",
+            Self::EffectAbsent { .. } => "EffectAbsent",
+            Self::CancellationExists { .. } => "CancellationExists",
+            Self::ProviderRejected { .. } => "ProviderRejected",
+        }
+    }
+
+    /// The effect identity this fact claims to be about.
+    #[must_use]
+    pub const fn effect_intent_id(&self) -> &EffectIntentId {
+        match self {
+            Self::BookingExists {
+                effect_intent_id, ..
+            }
+            | Self::EffectAbsent {
+                effect_intent_id, ..
+            }
+            | Self::CancellationExists {
+                effect_intent_id, ..
+            }
+            | Self::ProviderRejected {
+                effect_intent_id, ..
+            } => effect_intent_id,
+        }
+    }
+
+    /// The operation kind this fact implies, where it implies one.
+    ///
+    /// `EffectAbsent` and `ProviderRejected` are deliberately `None`: absence
+    /// and refusal carry no kind of their own and take it from the persisted
+    /// intent — which is exactly why the state-vs-intent kind check must run
+    /// separately, or a cancellation intent could answer a booking state.
+    #[must_use]
+    pub const fn implied_kind(&self) -> Option<OperationKind> {
+        match self {
+            Self::BookingExists { .. } => Some(OperationKind::Book),
+            Self::CancellationExists { .. } => Some(OperationKind::Cancel),
+            Self::EffectAbsent { .. } | Self::ProviderRejected { .. } => None,
+        }
+    }
+
+    /// The provider reference this fact carries, if it names one.
+    #[must_use]
+    pub const fn provider_reference(&self) -> Option<&CouncilBookingRef> {
+        match self {
+            Self::BookingExists { booking_ref, .. }
+            | Self::CancellationExists { booking_ref, .. } => Some(booking_ref),
+            Self::EffectAbsent { .. } | Self::ProviderRejected { .. } => None,
+        }
+    }
+
+    /// Whether this fact asserts the effect happened, as opposed to asserting
+    /// it did not and never will.
+    #[must_use]
+    pub const fn asserts_existence(&self) -> bool {
+        matches!(
+            self,
+            Self::BookingExists { .. } | Self::CancellationExists { .. }
+        )
+    }
+}
+
+/// A deterministic runtime fact. Neither intent nor external truth: the
+/// council cannot tell us our own retry budget is exhausted (ADR-012).
+///
+/// Exactly one variant in M4. Deriving it from durable retry accounting is
+/// slice E's work; this door exists so `NeedsHuman` is reachable at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemEvent {
+    ReconciliationExhausted { effect_intent_id: EffectIntentId },
+}
+
+/// What the coordinator supplies for fact binding.
+///
+/// Deliberately not [`BookingContext`]: that carries `selected_facts`, loaded
+/// by a capability, and the fact door must never bind against those — it binds
+/// against the *persisted* canonical plan. A context that cannot even name
+/// capability-loaded facts makes that structural rather than a discipline.
+#[derive(Clone, Debug)]
+pub struct FactContext {
+    /// The persisted effect intent this fact is about, loaded by the fact's
+    /// identity. The binding source of truth. `None` is refused, never guessed.
+    pub intent: Option<EffectIntent>,
+    /// A fresh identity for the one fact-driven transition that starts a NEW
+    /// external effect: `CancellationRequested + BookingExists` mints the
+    /// cancellation. `None` on any turn that cannot start one.
+    pub pending_effect: Option<EffectIntentId>,
+}
+
+/// Which of the fact door's three categories a state falls into.
+///
+/// Decided by the state alone, before any guard runs or any context is read —
+/// `Absent` must return `Undefined` without consulting anything, or irrelevant
+/// context could manufacture behaviour in a state that has none (ADR-012's
+/// `BookingExists + Draft -> Undefined`).
+enum FactCategory {
+    /// An effect is in flight; a fact may answer it.
+    Waiting,
+    /// A fact-driven edge lands here; an arriving fact must already be
+    /// reflected, or it contradicts how we got here.
+    Settled,
+    /// Neither in flight nor fact-reachable. No fact behaviour exists.
+    Absent,
+}
+
+const fn fact_category(state: &BookingState) -> FactCategory {
+    match state {
+        BookingState::BookingInProgress(_)
+        | BookingState::CancellationRequested(_)
+        | BookingState::CancellingBooking(_) => FactCategory::Waiting,
+        BookingState::AwaitingBooking(_) | BookingState::Booked(_) | BookingState::Cancelled(_) => {
+            FactCategory::Settled
+        }
+        BookingState::Draft(_)
+        | BookingState::VenueSelected(_)
+        | BookingState::NeedsRevalidation(_)
+        | BookingState::NeedsHuman(_) => FactCategory::Absent,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -636,6 +864,588 @@ impl TownHallDomain {
             return Err(BookingError::FeeExceeded);
         }
         Ok(())
+    }
+}
+
+/// Where a fact arrived from, for the one judgement that differs by origin.
+///
+/// A fact that binds cleanly but fits no edge means different things at the two
+/// categories: at a Waiting state it is evidence about the wrong effect
+/// (`EffectMismatch`); at a Settled state it contradicts how the state was
+/// reached (`ContradictoryProviderFact`). Same fallthrough, different honest
+/// reason.
+#[derive(Clone, Copy)]
+enum FactOrigin {
+    Waiting,
+    Settled,
+}
+
+impl TownHallDomain {
+    /// Steps I and B: everything checkable without asking what the state means.
+    ///
+    /// Runs after the category test (a state with no fact behaviour must return
+    /// `Undefined` before any of this is consulted) and before any
+    /// state-relative meaning is derived, so a contradiction is caught no
+    /// matter which state the fact lands in — the ADR-016 hazard is a
+    /// `BookingExists` arriving *after* its intent was tombstoned, and the
+    /// state it lands in is unpredictable by construction.
+    fn bind_fact<'a>(
+        booking: &Booking,
+        fact: &VerifiedProviderFact,
+        context: &'a FactContext,
+    ) -> Result<&'a EffectIntent, BookingError> {
+        // I. Waiting and Settled states both require the persisted intent.
+        let Some(intent) = context.intent.as_ref() else {
+            return Err(BookingError::EffectPlanMissing);
+        };
+
+        // B1. The supplied intent is the fact's.
+        if intent.effect_intent_id != *fact.effect_intent_id() {
+            return Err(BookingError::EffectMismatch);
+        }
+        // B2. And this booking's — against the authoritative loaded aggregate,
+        // not a caller-supplied id, which is why `Booking` carries `id`.
+        if intent.booking_id != booking.id {
+            return Err(BookingError::EffectMismatch);
+        }
+        // B3. A kind-specific fact must agree with the intent's kind. Vacuous
+        // for the two kind-agnostic facts — the state-vs-intent check in the
+        // dispatch covers those.
+        if let Some(kind) = fact.implied_kind()
+            && kind != intent.operation_kind
+        {
+            return Err(BookingError::EffectKindMismatch);
+        }
+        // B4. The intent's status/reference shape must be valid before it is
+        // compared against anything — a malformed record is not a wildcard.
+        // `Confirmed` without its reference is corruption; a reference on any
+        // other status names an effect that officially does not exist.
+        let shape_valid = match intent.status {
+            EffectStatus::Confirmed => intent.provider_reference.is_some(),
+            EffectStatus::Prepared
+            | EffectStatus::Unknown
+            | EffectStatus::Absent
+            | EffectStatus::Rejected => intent.provider_reference.is_none(),
+        };
+        if !shape_valid {
+            return Err(BookingError::ContradictoryProviderFact);
+        }
+        // B5. The intent's durable outcome must not contradict the fact.
+        // `Prepared`/`Unknown` contradict nothing — that is the ordinary happy
+        // path, where the fact arrives before anything recorded the outcome.
+        let contradiction = match intent.status {
+            EffectStatus::Absent | EffectStatus::Rejected => fact.asserts_existence(),
+            EffectStatus::Confirmed => !fact.asserts_existence(),
+            EffectStatus::Prepared | EffectStatus::Unknown => false,
+        };
+        if contradiction {
+            return Err(BookingError::ContradictoryProviderFact);
+        }
+        if let (Some(stored), Some(claimed)) = (
+            intent.provider_reference.as_ref(),
+            fact.provider_reference(),
+        ) && stored != claimed
+        {
+            // One identity, two provider references: duplication, corruption
+            // or broken idempotency. Never silent convergence.
+            return Err(BookingError::DuplicateProviderEffect);
+        }
+        // B6. Every consequential field the fact carries must match the
+        // persisted canonical plan. Fee and headcount are not optional in this
+        // list: a council booking at a different price or party size is what
+        // the fee ceiling and capacity guards exist to prevent, and this
+        // binding is the only place it is detectable (ADR-012).
+        match (fact, &intent.canonical_plan) {
+            (
+                VerifiedProviderFact::BookingExists {
+                    venue_id,
+                    slot_id,
+                    attendees,
+                    fee,
+                    principal,
+                    ..
+                },
+                BookingEffect::Book {
+                    principal: plan_principal,
+                    attendees: plan_attendees,
+                    facts,
+                },
+            ) => {
+                if *venue_id != facts.venue_id {
+                    return Err(BookingError::EffectPlanMismatch { field: "venue_id" });
+                }
+                if *slot_id != facts.slot_id {
+                    return Err(BookingError::EffectPlanMismatch { field: "slot_id" });
+                }
+                if *attendees != *plan_attendees {
+                    return Err(BookingError::EffectPlanMismatch { field: "attendees" });
+                }
+                if *fee != facts.fee {
+                    return Err(BookingError::EffectPlanMismatch { field: "fee" });
+                }
+                if *principal != *plan_principal {
+                    return Err(BookingError::EffectPlanMismatch { field: "principal" });
+                }
+            }
+            (
+                VerifiedProviderFact::CancellationExists { booking_ref, .. },
+                BookingEffect::CancelBooking {
+                    booking_ref: plan_ref,
+                },
+            ) => {
+                if booking_ref != plan_ref {
+                    return Err(BookingError::EffectPlanMismatch {
+                        field: "booking_ref",
+                    });
+                }
+            }
+            // B3 checked the intent's *column*; this catches a row whose
+            // column and plan disagree with each other. Corrupt, refused.
+            (VerifiedProviderFact::BookingExists { .. }, BookingEffect::CancelBooking { .. })
+            | (VerifiedProviderFact::CancellationExists { .. }, BookingEffect::Book { .. }) => {
+                return Err(BookingError::EffectPlanMismatch {
+                    field: "operation_kind",
+                });
+            }
+            (
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+                _,
+            ) => {}
+        }
+
+        Ok(intent)
+    }
+
+    /// Step D's convergence half: is this state the destination of this fact's
+    /// edge, and does everything on record agree?
+    ///
+    /// `Converged` requires the *state*, the *plan*, and the intent's *durable
+    /// outcome* to line up — state alone was revision 1's unsoundness (one
+    /// identity, two council bookings, reported healthy), status alone would
+    /// trust a repository that wrote a status without its state. Where the fact
+    /// carries no reference to compare (`EffectAbsent`, `ProviderRejected`),
+    /// the state is compared against the plan instead: that is what the
+    /// state's own data leaves available.
+    ///
+    /// Error vocabulary: a reference disagreement involving what the provider
+    /// said → `DuplicateProviderEffect` (one identity, two bookings); a
+    /// disagreement among our own records, or a live intent at a state that
+    /// claims the outcome already happened → `ContradictoryProviderFact`.
+    // One arm per reflection-table row, deliberately over the line budget:
+    // this match IS the convergence table in `docs/state-machine.md`, and
+    // splitting rows into helpers would scatter the one place the table can be
+    // reviewed against the doc.
+    #[allow(clippy::too_many_lines)]
+    fn converge(
+        booking: &Booking,
+        fact: &VerifiedProviderFact,
+        intent: &EffectIntent,
+        origin: FactOrigin,
+    ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        let fallthrough = match origin {
+            FactOrigin::Waiting => BookingError::EffectMismatch,
+            FactOrigin::Settled => BookingError::ContradictoryProviderFact,
+        };
+
+        // The intent's status must be terminal and in the fact's direction. A
+        // live (`Prepared`/`Unknown`) intent at a destination state is not
+        // convergence — the repository commits state and status in one
+        // transaction, so this shape is inconsistent partial finalisation, and
+        // calling it converged would launder a broken atomicity guarantee into
+        // an idempotent repair path.
+        let terminal_in_direction = if fact.asserts_existence() {
+            intent.status == EffectStatus::Confirmed
+        } else {
+            matches!(intent.status, EffectStatus::Absent | EffectStatus::Rejected)
+        };
+
+        match (&booking.state, fact, &intent.canonical_plan) {
+            // The booking intent failed; AwaitingBooking is where that lands.
+            // No reference exists anywhere, so the state's own venue, slot and
+            // verified fee are compared against the plan.
+            (
+                BookingState::AwaitingBooking(waiting),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+                BookingEffect::Book { facts, .. },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if facts.venue_id == waiting.venue_id
+                    && facts.slot_id == waiting.slot_id
+                    && facts.fee == waiting.verified_fee
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            // The booking succeeded; Booked is where that lands. Four copies of
+            // the reference must agree: the fact's, the state's, the outer
+            // aggregate's — and B5 already matched the intent's against the
+            // fact's.
+            (
+                BookingState::Booked(booked),
+                VerifiedProviderFact::BookingExists { booking_ref, .. },
+                BookingEffect::Book { .. },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if booked.booking_ref == *booking_ref
+                    && booking.booking_ref.as_ref() == Some(booking_ref)
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::DuplicateProviderEffect)
+                }
+            }
+            // The cancellation failed; still Booked. The fact carries nothing,
+            // so the state's reference is compared against the cancel plan's.
+            (
+                BookingState::Booked(booked),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+                BookingEffect::CancelBooking {
+                    booking_ref: plan_ref,
+                },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if booked.booking_ref == *plan_ref && booking.booking_ref.as_ref() == Some(plan_ref)
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            // The cancellation succeeded; Cancelled. The state is a unit
+            // struct, so the aggregate's retained reference stands in for it.
+            (
+                BookingState::Cancelled(_),
+                VerifiedProviderFact::CancellationExists { booking_ref, .. },
+                BookingEffect::CancelBooking { .. },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if booking.booking_ref.as_ref() == Some(booking_ref) {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::DuplicateProviderEffect)
+                }
+            }
+            // The booking intent failed while a cancellation was wanted;
+            // Cancelled with nothing to show for it. The booking never
+            // happened, so no reference can exist anywhere.
+            (
+                BookingState::Cancelled(_),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+                BookingEffect::Book { .. },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if booking.booking_ref.is_none() {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            // The one Waiting state that is also a destination: the old book
+            // intent's confirmation re-arriving at CancellingBooking, which is
+            // how this state was reached in the first place.
+            (
+                BookingState::CancellingBooking(cancelling),
+                VerifiedProviderFact::BookingExists { booking_ref, .. },
+                BookingEffect::Book { .. },
+            ) => {
+                if !terminal_in_direction {
+                    return FactResolution::Denied(BookingError::ContradictoryProviderFact);
+                }
+                if cancelling.booking_ref == *booking_ref
+                    && booking.booking_ref.as_ref() == Some(booking_ref)
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::DuplicateProviderEffect)
+                }
+            }
+            // Not this fact's destination at all.
+            _ => FactResolution::Denied(fallthrough),
+        }
+    }
+
+    /// Step D's waiting half: the fact answers the effect this state has in
+    /// flight, and its state-relative meaning is derived.
+    fn resolve_fact_waiting(
+        booking: &Booking,
+        fact: &VerifiedProviderFact,
+        intent: &EffectIntent,
+        context: &FactContext,
+    ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        // Not the identity this state waits on. The fact may still be the OLD
+        // intent's outcome re-arriving at its destination (CancellingBooking is
+        // both waiting and a destination), so it gets the convergence reading —
+        // with `EffectMismatch` as the honest fallthrough here.
+        if booking.active_effect.as_ref() != Some(fact.effect_intent_id()) {
+            return Self::converge(booking, fact, intent, FactOrigin::Waiting);
+        }
+
+        // The intent's kind must be the kind this state is waiting on — for
+        // EVERY fact, kind-agnostic ones included. B3 is vacuous for
+        // `EffectAbsent`/`ProviderRejected`, and without this check a
+        // cancellation intent could answer a booking state: "the cancellation
+        // never happened" read as "the booking never happened".
+        if Some(intent.operation_kind) != booking.state.in_flight_kind() {
+            return FactResolution::Denied(BookingError::EffectKindMismatch);
+        }
+
+        let ready =
+            |next: Booking| FactResolution::Ready(TransitionPlan::Local { next_state: next });
+
+        match (&booking.state, fact) {
+            // Booking confirmed.
+            (
+                BookingState::BookingInProgress(_),
+                VerifiedProviderFact::BookingExists { booking_ref, .. },
+            ) => ready(Booking {
+                state: BookingState::Booked(Booked {
+                    booking_ref: booking_ref.clone(),
+                }),
+                booking_ref: Some(booking_ref.clone()),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            // The booking never happened, or was refused: back to the state
+            // that can try again. Venue, slot and fee come from the persisted
+            // plan — the binding source of truth — never reconstructed from
+            // anywhere else.
+            (
+                BookingState::BookingInProgress(_),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => {
+                let BookingEffect::Book { facts, .. } = &intent.canonical_plan else {
+                    // Kind said Book; the plan says otherwise. Corrupt row.
+                    return FactResolution::Denied(BookingError::EffectPlanMismatch {
+                        field: "operation_kind",
+                    });
+                };
+                ready(Booking {
+                    state: BookingState::AwaitingBooking(AwaitingBooking {
+                        venue_id: facts.venue_id.clone(),
+                        slot_id: facts.slot_id.clone(),
+                        verified_fee: facts.fee,
+                    }),
+                    // The tombstone says nothing exists, so nothing may claim
+                    // a reference.
+                    booking_ref: None,
+                    active_effect: None,
+                    ..booking.clone()
+                })
+            }
+            // The booking we wanted to cancel turns out to exist: NOW there is
+            // something to cancel. The one fact-driven external effect — it
+            // targets an in-flight state, so ADR-014 applies and it consumes a
+            // FRESH identity from the coordinator.
+            (
+                BookingState::CancellationRequested(_),
+                VerifiedProviderFact::BookingExists { booking_ref, .. },
+            ) => {
+                let Some(cancel_id) = context.pending_effect.clone() else {
+                    return FactResolution::Denied(BookingError::EffectIdentityMissing);
+                };
+                // A plan whose old and new effects share one identity is
+                // structurally invalid; the boundary must not emit it even
+                // though the store would refuse it later.
+                if cancel_id == *fact.effect_intent_id() {
+                    return FactResolution::Denied(BookingError::EffectMismatch);
+                }
+                FactResolution::Ready(TransitionPlan::ExternalEffect {
+                    next_state: Booking {
+                        state: BookingState::CancellingBooking(CancellingBooking {
+                            booking_ref: booking_ref.clone(),
+                            effect_intent_id: cancel_id.clone(),
+                        }),
+                        booking_ref: Some(booking_ref.clone()),
+                        active_effect: Some(cancel_id),
+                        ..booking.clone()
+                    },
+                    effect: BookingEffect::CancelBooking {
+                        booking_ref: booking_ref.clone(),
+                    },
+                })
+            }
+            // The booking never happened: there is nothing to cancel, which is
+            // everything the cancellation wanted.
+            (
+                BookingState::CancellationRequested(_),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                booking_ref: None,
+                active_effect: None,
+                ..booking.clone()
+            }),
+            // Cancellation confirmed. The reference is kept: it records what
+            // was cancelled, and the convergence reading of this very state
+            // depends on it.
+            (
+                BookingState::CancellingBooking(_),
+                VerifiedProviderFact::CancellationExists { .. },
+            ) => ready(Booking {
+                state: BookingState::Cancelled(Cancelled),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            // The cancellation never happened, or was refused: still booked.
+            (
+                BookingState::CancellingBooking(cancelling),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::Booked(Booked {
+                    booking_ref: cancelling.booking_ref.clone(),
+                }),
+                booking_ref: Some(cancelling.booking_ref.clone()),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            // Kind-specific facts whose kind disagrees with the state were
+            // refused above (B3 against the intent, then intent against the
+            // state), so these arms are unreachable — but a boundary refuses
+            // rather than panics, in case a future edit breaks that chain.
+            _ => FactResolution::Denied(BookingError::EffectKindMismatch),
+        }
+    }
+
+    // `clippy::pedantic` flags the ChangeVenue/UpdateRequirements/Cancel arms as
+    // having identical bodies and wants them merged into `(A, X) | (B, X) => ..`.
+    // We deliberately keep one arm per (state, proposal) pair, grouped by state.
+    //
+    // This match IS the state x proposal topology, and the topology is the
+    // security surface (implementation guide sections 5 and 19, step 4). Reading it
+    // state-by-state answers "which behaviours does VenueSelected have?" directly
+    // and mirrors docs/state-machine.md. Merging by body would scatter each
+    // state's behaviour set across the match and make an accidentally-added or
+    // accidentally-removed pair harder to spot in review.
+    #[allow(clippy::match_same_arms)]
+    fn resolve_proposal_cell(
+        booking: &Booking,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+        context: &BookingContext,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        // Every arm produces a complete `Booking` via struct-update syntax, so
+        // what each transition *changes* is what you read, and a field nobody
+        // mentions is carried rather than quietly defaulted.
+        match (&booking.state, proposal) {
+            (BookingState::Draft(_), BookingProposal::SelectVenue { venue_id, slot_id }) => {
+                let selection = SelectedVenueRef {
+                    venue_id: venue_id.clone(),
+                    slot_id: slot_id.clone(),
+                };
+                local(Booking {
+                    selected_venue: Some(selection),
+                    ..Self::resettled(
+                        booking,
+                        BookingState::VenueSelected(VenueSelected { venue_id, slot_id }),
+                    )
+                })
+            }
+            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::AwaitingBooking(AwaitingBooking {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                            verified_fee: facts.fee,
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
+                    Err(error) => Resolution::Denied(error),
+                }
+            }
+            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
+            (
+                BookingState::VenueSelected(selected),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
+                    venue_id: selected.venue_id.clone(),
+                    slot_id: selected.slot_id.clone(),
+                },
+                attendees,
+            ),
+            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
+                // The binding target is state data, not context, so this holds
+                // without trusting whoever assembled the context. Without it, an
+                // ordinary `UpdateRequirements` is enough to launder any venue
+                // into the booking.
+                let Some(selected) = pending.selected.as_ref() else {
+                    return Resolution::Denied(BookingError::VenueFactsMissing);
+                };
+                match Self::bind_facts(
+                    booking,
+                    context,
+                    &selected.venue_id,
+                    &selected.slot_id,
+                    authority,
+                ) {
+                    Ok(facts) => local(Booking {
+                        state: BookingState::VenueSelected(VenueSelected {
+                            venue_id: facts.venue_id.clone(),
+                            slot_id: facts.slot_id.clone(),
+                        }),
+                        availability: Some(facts.clone()),
+                        ..booking.clone()
+                    }),
+                    Err(error) => Resolution::Denied(error),
+                }
+            }
+            (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
+                change_venue(booking)
+            }
+            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::AwaitingBooking(waiting), BookingProposal::Book) => {
+                Self::resolve_book(booking, waiting, authority, context)
+            }
+            (BookingState::AwaitingBooking(_), BookingProposal::ChangeVenue) => {
+                change_venue(booking)
+            }
+            (
+                BookingState::AwaitingBooking(waiting),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(
+                booking,
+                SelectedVenueRef {
+                    venue_id: waiting.venue_id.clone(),
+                    slot_id: waiting.slot_id.clone(),
+                },
+                attendees,
+            ),
+            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
+                Self::resolve_cancel_booked(booking, booked, authority, context)
+            }
+            _ => Resolution::Undefined,
+        }
     }
 }
 
@@ -747,6 +1557,7 @@ impl TownHallDomain {
             },
             effect: BookingEffect::Book {
                 principal: authority.principal.clone(),
+                attendees: booking.requirements.attendees,
                 facts: facts.clone(),
             },
         })
@@ -794,19 +1605,11 @@ impl BoundaryDomain for TownHallDomain {
     type Effect = BookingEffect;
     type Authority = VerifiedAuthority;
     type Context = BookingContext;
+    type ProviderFact = VerifiedProviderFact;
+    type SystemEvent = SystemEvent;
+    type FactContext = FactContext;
     type Error = BookingError;
 
-    // `clippy::pedantic` flags the ChangeVenue/UpdateRequirements/Cancel arms as
-    // having identical bodies and wants them merged into `(A, X) | (B, X) => ..`.
-    // We deliberately keep one arm per (state, proposal) pair, grouped by state.
-    //
-    // This match IS the state x proposal topology, and the topology is the
-    // security surface (implementation guide sections 5 and 19, step 4). Reading it
-    // state-by-state answers "which behaviours does VenueSelected have?" directly
-    // and mirrors docs/state-machine.md. Merging by body would scatter each
-    // state's behaviour set across the match and make an accidentally-added or
-    // accidentally-removed pair harder to spot in review.
-    #[allow(clippy::match_same_arms)]
     async fn resolve_proposal(
         &self,
         booking: &Self::State,
@@ -814,110 +1617,142 @@ impl BoundaryDomain for TownHallDomain {
         authority: &Self::Authority,
         context: &Self::Context,
     ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
-        // Every arm produces a complete `Booking` via struct-update syntax, so
-        // what each transition *changes* is what you read, and a field nobody
-        // mentions is carried rather than quietly defaulted.
-        match (&booking.state, proposal) {
-            (BookingState::Draft(_), BookingProposal::SelectVenue { venue_id, slot_id }) => {
-                let selection = SelectedVenueRef {
-                    venue_id: venue_id.clone(),
-                    slot_id: slot_id.clone(),
-                };
-                local(Booking {
-                    selected_venue: Some(selection),
-                    ..Self::resettled(
-                        booking,
-                        BookingState::VenueSelected(VenueSelected { venue_id, slot_id }),
-                    )
-                })
-            }
-            (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
-                match Self::bind_facts(
-                    booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
-                    authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::AwaitingBooking(AwaitingBooking {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                            verified_fee: facts.fee,
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
-            }
-            (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
-            (
-                BookingState::VenueSelected(selected),
-                BookingProposal::UpdateRequirements { attendees },
-            ) => update_requirements(
-                booking,
-                SelectedVenueRef {
-                    venue_id: selected.venue_id.clone(),
-                    slot_id: selected.slot_id.clone(),
-                },
-                attendees,
-            ),
-            (BookingState::VenueSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::NeedsRevalidation(pending), BookingProposal::RevalidateVenue) => {
-                // The binding target is state data, not context, so this holds
-                // without trusting whoever assembled the context. Without it, an
-                // ordinary `UpdateRequirements` is enough to launder any venue
-                // into the booking.
-                let Some(selected) = pending.selected.as_ref() else {
-                    return Resolution::Denied(BookingError::VenueFactsMissing);
-                };
-                match Self::bind_facts(
-                    booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
-                    authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::VenueSelected(VenueSelected {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
-            }
-            (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
-                change_venue(booking)
-            }
-            (BookingState::NeedsRevalidation(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::AwaitingBooking(waiting), BookingProposal::Book) => {
-                Self::resolve_book(booking, waiting, authority, context)
-            }
-            (BookingState::AwaitingBooking(_), BookingProposal::ChangeVenue) => {
-                change_venue(booking)
-            }
-            (
-                BookingState::AwaitingBooking(waiting),
-                BookingProposal::UpdateRequirements { attendees },
-            ) => update_requirements(
-                booking,
-                SelectedVenueRef {
-                    venue_id: waiting.venue_id.clone(),
-                    slot_id: waiting.slot_id.clone(),
-                },
-                attendees,
-            ),
-            (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
-            (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
-                Self::resolve_cancel_booked(booking, booked, authority, context)
-            }
-            _ => Resolution::Undefined,
+        let resolution = Self::resolve_proposal_cell(booking, proposal, authority, context);
+
+        // Whether a behaviour EXISTS depends on (state, proposal) alone, so an
+        // Undefined cell stays Undefined no matter what the aggregate carries.
+        if matches!(resolution, Resolution::Undefined) {
+            return Resolution::Undefined;
         }
+
+        // For a cell that does exist: the same self-consistency step as the
+        // other two doors, and for the same reason. Review found this gap after
+        // it was closed on the fact door — an incoherent VenueSelected carrying
+        // a phantom reference could take Cancel into Cancelled, whose reference
+        // is legitimately unconstrained, and the phantom became terminal
+        // history indistinguishable from a real cancellation. The cell's own
+        // result is computed first and discarded: classification is pure, so
+        // evaluating it costs nothing and launders nothing.
+        if let Err(why) = booking.coherent() {
+            return Resolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
+        }
+
+        resolution
+    }
+
+    /// The fact door. Four outcomes; see `docs/state-machine.md` for the full
+    /// 40-cell matrix this implements.
+    ///
+    /// The decision procedure, in order:
+    ///
+    /// ```text
+    /// S. Category of the state. Absent -> Undefined, before anything else is
+    ///    consulted — no guard runs, no context is read.
+    /// I. Waiting and Settled require the persisted intent.
+    /// B. Intent binding — everything checkable without asking what the state
+    ///    means: identity, resource, kind, status/reference shape, durable
+    ///    contradiction, canonical-plan fields.
+    /// C. Aggregate self-consistency: the state's own effect id and
+    ///    active_effect must agree.
+    /// D. Dispatch: Waiting derives the state-relative meaning; Settled asks
+    ///    whether the state already reflects the fact.
+    /// ```
+    async fn resolve_fact(
+        &self,
+        booking: &Self::State,
+        fact: Verified<Self::ProviderFact>,
+        context: &Self::FactContext,
+    ) -> FactResolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+        // S. Nothing else is consulted for an Absent state: irrelevant context
+        // must not manufacture behaviour where none exists.
+        let category = fact_category(&booking.state);
+        if matches!(category, FactCategory::Absent) {
+            return FactResolution::Undefined;
+        }
+
+        // The provenance wrapper has done its job by existing: only a verifier
+        // (or trusted-half test code, greppably) could have produced it.
+        let fact = fact.into_inner();
+
+        // I + B.
+        let intent = match Self::bind_fact(booking, &fact, context) {
+            Ok(intent) => intent,
+            Err(error) => return FactResolution::Denied(error),
+        };
+
+        // C. The aggregate must not contradict itself — the WHOLE invariant,
+        // not just the effect pointer. The store refuses to persist or load a
+        // disagreement, but this door must not assume its caller went through
+        // the store; review of this slice found that checking only the effect
+        // ids let a phantom booking_ref at BookingInProgress be silently
+        // cleared by the very transitions below.
+        if let Err(why) = booking.coherent() {
+            return FactResolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
+        }
+
+        // D.
+        match category {
+            FactCategory::Waiting => Self::resolve_fact_waiting(booking, &fact, intent, context),
+            FactCategory::Settled => Self::converge(booking, &fact, intent, FactOrigin::Settled),
+            FactCategory::Absent => FactResolution::Undefined,
+        }
+    }
+
+    /// The system-event door. One variant, three edges, no context.
+    ///
+    /// `NeedsHuman` is reachable only through here — neither a proposer nor a
+    /// provider fact can conclude that *our own* retry budget is exhausted.
+    async fn resolve_system_event(
+        &self,
+        booking: &Self::State,
+        event: Self::SystemEvent,
+    ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+        let SystemEvent::ReconciliationExhausted { effect_intent_id } = event;
+
+        // Only a state with an effect in flight has a retry budget to exhaust.
+        let Some(waiting_on) = booking.state.effect_intent_id() else {
+            return Resolution::Undefined;
+        };
+
+        // The same self-consistency check as the fact door. Note the freeze
+        // itself would also be refused by the store — `admissible` runs
+        // `coherent()` on every write — so refusing here with a precise reason
+        // beats an opaque refusal later; either way an aggregate this broken
+        // needs an operator below the domain, not automation above it.
+        if let Err(why) = booking.coherent() {
+            return Resolution::Denied(match why {
+                IncoherentBooking::EffectIdentity { .. } => {
+                    BookingError::InconsistentEffectIdentity
+                }
+                other => BookingError::IncoherentAggregate(other),
+            });
+        }
+
+        // Exhaustion of some OTHER effect says nothing about this state.
+        if *waiting_on != effect_intent_id {
+            return Resolution::Denied(BookingError::EffectMismatch);
+        }
+
+        // Give up: no automation will act on this effect again, so the pointer
+        // is cleared — a NeedsHuman still carrying an active_effect would
+        // invite a reconciler to keep chasing what it just abandoned.
+        Resolution::Ready(TransitionPlan::Local {
+            next_state: Booking {
+                state: BookingState::NeedsHuman(NeedsHuman),
+                active_effect: None,
+                ..booking.clone()
+            },
+        })
     }
 }
 
@@ -1169,14 +2004,18 @@ mod topology {
     /// The other fields are deliberately uniform: this suite asks only whether a
     /// behaviour *exists*, and existence must not depend on any of them.
     fn booking_of(state: BookingState, requirements: BookingRequirements) -> Booking {
+        // The outer copies are derived from the state, so the wrapper is
+        // coherent for every variant — the sweep asks whether behaviours
+        // exist, and an incoherent wrapper would be refused before the
+        // topology was even consulted.
         Booking {
             id: BookingId::new("BKG-1001"),
+            booking_ref: state.council_booking_ref().cloned(),
+            active_effect: state.effect_intent_id().cloned(),
             state,
             requirements,
             selected_venue: Some(selection()),
             availability: None,
-            booking_ref: None,
-            active_effect: None,
         }
     }
 
@@ -1800,6 +2639,38 @@ mod characterization {
         );
     }
 
+    /// A state whose booking has never been confirmed cannot know a council
+    /// reference. Forward-only checking left this open, and B3b's review found
+    /// the consequence: the fact door silently cleared a phantom reference on
+    /// its way through a transition.
+    #[test]
+    fn a_state_that_cannot_know_a_reference_must_not_carry_one() {
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..awaiting_booking()
+        };
+        assert!(matches!(
+            phantom.coherent(),
+            Err(IncoherentBooking::PhantomReference { .. })
+        ));
+    }
+
+    /// The freeze state keeps whatever was known when automation gave up —
+    /// a `NeedsHuman` reached from `CancellingBooking` legitimately carries the
+    /// reference of the booking it was trying to cancel.
+    #[test]
+    fn needs_human_may_retain_the_reference_it_froze_with() {
+        let frozen = Booking {
+            state: BookingState::NeedsHuman(NeedsHuman),
+            active_effect: None,
+            ..booked()
+        };
+        assert!(
+            frozen.coherent().is_ok(),
+            "NeedsHuman must be allowed to keep the reference it froze with"
+        );
+    }
+
     /// Selection and reference are checked only where the state names one, so a
     /// terminal state may keep an outer value it no longer mentions. B3b's fact
     /// door relies on this: convergence at `Cancelled` compares the reference of
@@ -1813,6 +2684,100 @@ mod characterization {
         assert!(
             cancelled.coherent().is_ok(),
             "Cancelled must be allowed to keep the reference it cancelled"
+        );
+    }
+
+    /// Round two of the laundering hunt: the PROPOSAL door was the third door
+    /// without the self-consistency step. An incoherent `VenueSelected` carrying
+    /// a phantom reference could take Cancel into Cancelled — whose reference
+    /// is legitimately unconstrained — and the phantom became terminal history
+    /// indistinguishable from a real cancellation.
+    #[tokio::test]
+    async fn the_proposal_door_refuses_an_incoherent_booking_too() {
+        // A phantom reference laundered through Cancel.
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..venue_selected()
+        };
+        let got = turn(
+            phantom,
+            BookingProposal::Cancel {
+                reason: "changed mind".to_owned(),
+            },
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Resolution::Denied(BookingError::IncoherentAggregate(
+                    IncoherentBooking::PhantomReference { .. }
+                ))
+            ),
+            "a phantom reference must not become terminal history, got {got:?}"
+        );
+
+        // A selection disagreement laundered through ChangeVenue, which clears
+        // both copies and would erase the evidence.
+        let mismatched = Booking {
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-Z"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            ..venue_selected()
+        };
+        let got = turn(
+            mismatched,
+            BookingProposal::ChangeVenue,
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Resolution::Denied(BookingError::IncoherentAggregate(
+                    IncoherentBooking::Selection { .. }
+                ))
+            ),
+            "a selection disagreement must not be cleared away, got {got:?}"
+        );
+
+        // An effect-pointer disagreement keeps its own, older name.
+        let contradictory = Booking {
+            active_effect: Some(EffectIntentId::new("EFF-SOMETHING-ELSE")),
+            ..booked()
+        };
+        let got = turn(
+            contradictory,
+            BookingProposal::Cancel {
+                reason: "changed mind".to_owned(),
+            },
+            &authority(),
+            &context(),
+        )
+        .await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::InconsistentEffectIdentity)
+        );
+    }
+
+    /// The ordering half of the same rule: whether a behaviour EXISTS depends
+    /// on (state, proposal) alone, so an Undefined cell stays Undefined no
+    /// matter how broken the aggregate is. Coherence turns Ready into Denied;
+    /// it must never turn Undefined into anything.
+    #[tokio::test]
+    async fn incoherence_cannot_make_an_undefined_cell_exist() {
+        let phantom = Booking {
+            booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
+            ..draft()
+        };
+        let got = turn(phantom, BookingProposal::Book, &authority(), &context()).await;
+        assert!(
+            matches!(got, Resolution::Undefined),
+            "Draft has no book; a phantom reference must not conjure one, got {got:?}"
         );
     }
 
@@ -2472,6 +3437,1746 @@ mod characterization {
                 state: BookingState::Cancelled(Cancelled),
                 ..awaiting_booking()
             })
+        );
+    }
+}
+
+/// The state × fact topology, pinned — 10 states × 4 facts = 40 cells.
+///
+/// Mirrors `docs/state-machine.md`'s completeness matrix and its three
+/// meanings of absence. The three Waiting rows are that document's rows
+/// verbatim; the Settled rows encode "a fact landing at its own destination
+/// must already be reflected"; the Absent rows are `Undefined` before any
+/// guard runs.
+///
+/// Fixture convention ("fully bound"): the fact's identity is the one the
+/// state waits on where it waits on something, else the edge intent that lands
+/// at that state; the intent's kind is the one the fact implies where the fact
+/// is kind-specific, else the state's in-flight or edge kind; status and
+/// reference are shape-valid and consistent — `(Unknown, None)` at Waiting
+/// states, `(Confirmed, Some)` / `(Absent, None)` at Settled ones.
+#[cfg(test)]
+mod fact_topology {
+    use super::*;
+    use bld_types::{BookingRequirements, Money, TimeWindow};
+
+    const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
+    const CANCEL_ID: &str = "EFF-BKG-1001-CANCEL-5";
+    /// A fresh identity the coordinator would mint for the fact-driven
+    /// cancellation. Deliberately distinct from both in-flight ids.
+    const FRESH_CANCEL_ID: &str = "EFF-BKG-1001-CANCEL-9";
+    const REF: &str = "TH-92718";
+
+    fn requirements() -> BookingRequirements {
+        BookingRequirements {
+            purpose: "meeting".to_owned(),
+            requested_date: "2026-08-20".to_owned(),
+            time_window: TimeWindow {
+                from: "13:00".to_owned(),
+                to: "17:00".to_owned(),
+            },
+            attendees: 20,
+            wheelchair_accessible: true,
+            max_fee: Money::from_pence(5_000),
+        }
+    }
+
+    fn good_facts() -> VenueFacts {
+        VenueFacts {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        }
+    }
+
+    fn book_plan() -> BookingEffect {
+        BookingEffect::Book {
+            principal: PrincipalId::new("lucy"),
+            attendees: 20,
+            facts: good_facts(),
+        }
+    }
+
+    fn cancel_plan() -> BookingEffect {
+        BookingEffect::CancelBooking {
+            booking_ref: CouncilBookingRef::new(REF),
+        }
+    }
+
+    fn intent(
+        id: &str,
+        kind: OperationKind,
+        status: EffectStatus,
+        provider_reference: Option<&str>,
+    ) -> EffectIntent {
+        EffectIntent {
+            effect_intent_id: EffectIntentId::new(id),
+            booking_id: BookingId::new("BKG-1001"),
+            operation_kind: kind,
+            source_version: 2,
+            canonical_plan: match kind {
+                OperationKind::Book => book_plan(),
+                OperationKind::Cancel => cancel_plan(),
+            },
+            status,
+            expires_at_ms: 1_000_030_000,
+            provider_reference: provider_reference.map(CouncilBookingRef::new),
+            created_at_ms: 1_000_000_000,
+            updated_at_ms: 1_000_000_000,
+        }
+    }
+
+    /// A complete, coherent booking around `state`. `booking_ref` and
+    /// `active_effect` are the two fields whose right value depends on the
+    /// state, so they are explicit.
+    fn booking_at(
+        state: BookingState,
+        booking_ref: Option<&str>,
+        active_effect: Option<&str>,
+    ) -> Booking {
+        let booking = Booking {
+            id: BookingId::new("BKG-1001"),
+            state,
+            requirements: requirements(),
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            availability: Some(good_facts()),
+            booking_ref: booking_ref.map(CouncilBookingRef::new),
+            active_effect: active_effect.map(EffectIntentId::new),
+        };
+        booking
+            .coherent()
+            .expect("every fixture must be coherent, or the sweep tests nothing");
+        booking
+    }
+
+    fn booking_in_progress() -> Booking {
+        booking_at(
+            BookingState::BookingInProgress(BookingInProgress {
+                effect_intent_id: EffectIntentId::new(BOOK_ID),
+            }),
+            None,
+            Some(BOOK_ID),
+        )
+    }
+
+    fn cancellation_requested() -> Booking {
+        booking_at(
+            BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: EffectIntentId::new(BOOK_ID),
+            }),
+            None,
+            Some(BOOK_ID),
+        )
+    }
+
+    fn cancelling_booking() -> Booking {
+        booking_at(
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+                effect_intent_id: EffectIntentId::new(CANCEL_ID),
+            }),
+            Some(REF),
+            Some(CANCEL_ID),
+        )
+    }
+
+    fn awaiting_booking() -> Booking {
+        booking_at(
+            BookingState::AwaitingBooking(AwaitingBooking {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                verified_fee: Money::from_pence(4_500),
+            }),
+            None,
+            None,
+        )
+    }
+
+    fn booked() -> Booking {
+        booking_at(
+            BookingState::Booked(Booked {
+                booking_ref: CouncilBookingRef::new(REF),
+            }),
+            Some(REF),
+            None,
+        )
+    }
+
+    /// `Cancelled` has two legitimate histories with different references: a
+    /// cancellation that completed (keeps the reference of what it cancelled)
+    /// and a booking that never happened (no reference can exist).
+    fn cancelled_after_cancellation() -> Booking {
+        booking_at(BookingState::Cancelled(Cancelled), Some(REF), None)
+    }
+
+    fn cancelled_never_booked() -> Booking {
+        booking_at(BookingState::Cancelled(Cancelled), None, None)
+    }
+
+    const FACT_COUNT: usize = 4;
+
+    fn fact_index(fact: &VerifiedProviderFact) -> usize {
+        match fact {
+            VerifiedProviderFact::BookingExists { .. } => 0,
+            VerifiedProviderFact::CancellationExists { .. } => 1,
+            VerifiedProviderFact::EffectAbsent { .. } => 2,
+            VerifiedProviderFact::ProviderRejected { .. } => 3,
+        }
+    }
+
+    fn fact_of(index: usize, id: &str) -> VerifiedProviderFact {
+        match index {
+            0 => VerifiedProviderFact::BookingExists {
+                effect_intent_id: EffectIntentId::new(id),
+                booking_ref: CouncilBookingRef::new(REF),
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                attendees: 20,
+                fee: Money::from_pence(4_500),
+                principal: PrincipalId::new("lucy"),
+            },
+            1 => VerifiedProviderFact::CancellationExists {
+                effect_intent_id: EffectIntentId::new(id),
+                booking_ref: CouncilBookingRef::new(REF),
+            },
+            2 => VerifiedProviderFact::EffectAbsent {
+                effect_intent_id: EffectIntentId::new(id),
+            },
+            3 => VerifiedProviderFact::ProviderRejected {
+                effect_intent_id: EffectIntentId::new(id),
+                reason: BoundedString::truncating("hall closed for maintenance"),
+            },
+            _ => panic!("no fact at index {index}"),
+        }
+    }
+
+    #[test]
+    fn every_fact_variant_has_a_representative() {
+        let mut seen = [false; FACT_COUNT];
+        for index in 0..FACT_COUNT {
+            seen[fact_index(&fact_of(index, BOOK_ID))] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "fact_of() is missing a VerifiedProviderFact variant; the sweep would skip it"
+        );
+    }
+
+    /// The expected outcome of one cell, by shape.
+    enum Cell {
+        U,
+        C,
+        R(&'static str),
+        D(&'static str),
+    }
+
+    fn error_name(error: &BookingError) -> &'static str {
+        match error {
+            BookingError::BookingAuthorityRequired => "BookingAuthorityRequired",
+            BookingError::CancellationAuthorityRequired => "CancellationAuthorityRequired",
+            BookingError::VenueFactsMissing => "VenueFactsMissing",
+            BookingError::SlotUnavailable => "SlotUnavailable",
+            BookingError::CapacityInsufficient { .. } => "CapacityInsufficient",
+            BookingError::AccessibilityRequired => "AccessibilityRequired",
+            BookingError::FeeExceeded => "FeeExceeded",
+            BookingError::EffectIdentityMissing => "EffectIdentityMissing",
+            BookingError::EffectPlanMissing => "EffectPlanMissing",
+            BookingError::EffectMismatch => "EffectMismatch",
+            BookingError::EffectKindMismatch => "EffectKindMismatch",
+            BookingError::EffectPlanMismatch { .. } => "EffectPlanMismatch",
+            BookingError::DuplicateProviderEffect => "DuplicateProviderEffect",
+            BookingError::ContradictoryProviderFact => "ContradictoryProviderFact",
+            BookingError::InconsistentEffectIdentity => "InconsistentEffectIdentity",
+            BookingError::IncoherentAggregate(_) => "IncoherentAggregate",
+        }
+    }
+
+    /// Spec-grounded. **A diff to this table means the fact-driven transition
+    /// graph changed and needs an ADR** — the same review stop-sign as the
+    /// proposal door's `LOCKED`.
+    ///
+    /// Columns: `BookingExists`, `CancellationExists`, `EffectAbsent`,
+    /// `ProviderRejected`.
+    const LOCKED_FACTS: &[(&str, [Cell; FACT_COUNT])] = &[
+        ("Draft", [Cell::U, Cell::U, Cell::U, Cell::U]),
+        ("VenueSelected", [Cell::U, Cell::U, Cell::U, Cell::U]),
+        ("NeedsRevalidation", [Cell::U, Cell::U, Cell::U, Cell::U]),
+        ("NeedsHuman", [Cell::U, Cell::U, Cell::U, Cell::U]),
+        (
+            "AwaitingBooking",
+            [
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::C,
+                Cell::C,
+            ],
+        ),
+        (
+            "Booked",
+            [
+                Cell::C,
+                Cell::D("ContradictoryProviderFact"),
+                Cell::C,
+                Cell::C,
+            ],
+        ),
+        (
+            "Cancelled",
+            [
+                Cell::D("ContradictoryProviderFact"),
+                Cell::C,
+                Cell::C,
+                Cell::C,
+            ],
+        ),
+        (
+            "BookingInProgress",
+            [
+                Cell::R("Booked"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("AwaitingBooking"),
+                Cell::R("AwaitingBooking"),
+            ],
+        ),
+        (
+            "CancellationRequested",
+            [
+                Cell::R("CancellingBooking"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("Cancelled"),
+                Cell::R("Cancelled"),
+            ],
+        ),
+        (
+            "CancellingBooking",
+            [
+                Cell::D("EffectKindMismatch"),
+                Cell::R("Cancelled"),
+                Cell::R("Booked"),
+                Cell::R("Booked"),
+            ],
+        ),
+    ];
+
+    /// Build the fully-bound fixture for one cell: the booking, the fact, and
+    /// the context whose intent follows the convention in the module docs.
+    // One arm per state, mirroring the matrix rows; length is the fixture
+    // convention written out, not incidental complexity.
+    #[allow(clippy::too_many_lines)]
+    fn bound_cell(
+        state_name: &str,
+        fact_ix: usize,
+    ) -> (Booking, VerifiedProviderFact, FactContext) {
+        // Which intent id, kind, and status this cell binds.
+        let (booking, id, kind) = match state_name {
+            "Draft" => (
+                booking_at(BookingState::Draft(Draft), None, None),
+                BOOK_ID,
+                OperationKind::Book,
+            ),
+            "VenueSelected" => (
+                booking_at(
+                    BookingState::VenueSelected(VenueSelected {
+                        venue_id: VenueId::new("TH-A"),
+                        slot_id: SlotId::new("SLOT-A"),
+                    }),
+                    None,
+                    None,
+                ),
+                BOOK_ID,
+                OperationKind::Book,
+            ),
+            "NeedsRevalidation" => (
+                booking_at(
+                    BookingState::NeedsRevalidation(NeedsRevalidation {
+                        selected: Some(SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        }),
+                    }),
+                    None,
+                    None,
+                ),
+                BOOK_ID,
+                OperationKind::Book,
+            ),
+            "NeedsHuman" => (
+                booking_at(BookingState::NeedsHuman(NeedsHuman), None, None),
+                BOOK_ID,
+                OperationKind::Book,
+            ),
+            // Waiting rows: the fact names the id the state waits on; the
+            // intent's kind follows the fact where kind-specific.
+            "BookingInProgress" => (
+                booking_in_progress(),
+                BOOK_ID,
+                match fact_ix {
+                    1 => OperationKind::Cancel, // CancellationExists implies it
+                    _ => OperationKind::Book,
+                },
+            ),
+            "CancellationRequested" => (
+                cancellation_requested(),
+                BOOK_ID,
+                match fact_ix {
+                    1 => OperationKind::Cancel,
+                    _ => OperationKind::Book,
+                },
+            ),
+            "CancellingBooking" => (
+                cancelling_booking(),
+                CANCEL_ID,
+                match fact_ix {
+                    0 => OperationKind::Book, // BookingExists implies it
+                    _ => OperationKind::Cancel,
+                },
+            ),
+            // Settled rows: the intent is the edge that lands here for the
+            // fact's direction.
+            "AwaitingBooking" => (
+                awaiting_booking(),
+                match fact_ix {
+                    1 => CANCEL_ID,
+                    _ => BOOK_ID,
+                },
+                match fact_ix {
+                    1 => OperationKind::Cancel,
+                    _ => OperationKind::Book,
+                },
+            ),
+            "Booked" => (
+                booked(),
+                match fact_ix {
+                    0 => BOOK_ID,
+                    _ => CANCEL_ID,
+                },
+                match fact_ix {
+                    0 => OperationKind::Book,
+                    _ => OperationKind::Cancel,
+                },
+            ),
+            "Cancelled" => (
+                match fact_ix {
+                    1 => cancelled_after_cancellation(),
+                    _ => cancelled_never_booked(),
+                },
+                match fact_ix {
+                    1 => CANCEL_ID,
+                    _ => BOOK_ID,
+                },
+                match fact_ix {
+                    1 => OperationKind::Cancel,
+                    _ => OperationKind::Book,
+                },
+            ),
+            other => panic!("no fixture for state {other}"),
+        };
+
+        let waiting = matches!(fact_category(&booking.state), super::FactCategory::Waiting);
+        let (status, reference) = if waiting {
+            (EffectStatus::Unknown, None)
+        } else if fact_ix <= 1 {
+            (EffectStatus::Confirmed, Some(REF))
+        } else {
+            (EffectStatus::Absent, None)
+        };
+
+        let context = FactContext {
+            intent: Some(intent(id, kind, status, reference)),
+            pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+        };
+        (booking, fact_of(fact_ix, id), context)
+    }
+
+    async fn classify(
+        booking: &Booking,
+        fact: VerifiedProviderFact,
+        context: &FactContext,
+    ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        TownHallDomain
+            .resolve_fact(booking, Verified::assert_verified(fact), context)
+            .await
+    }
+
+    /// The whole matrix under the fully-bound fixture. Every `Ready` output is
+    /// also checked coherent — an incoherent plan could never be committed, so
+    /// producing one would make the cell a lie.
+    #[tokio::test]
+    async fn fact_topology_matches_the_pinned_matrix() {
+        let mut checked = 0_usize;
+        for (state_name, row) in LOCKED_FACTS {
+            for (fact_ix, expected) in row.iter().enumerate() {
+                let (booking, fact, context) = bound_cell(state_name, fact_ix);
+                let fact_name = fact.name();
+                let got = classify(&booking, fact, &context).await;
+
+                // U and C arms are identical bodies by design: one row per
+                // outcome pairing keeps the table readable.
+                #[allow(clippy::match_same_arms)]
+                let ok = match (expected, &got) {
+                    (Cell::U, FactResolution::Undefined) => true,
+                    (Cell::C, FactResolution::Converged) => true,
+                    (Cell::R(next), FactResolution::Ready(plan)) => {
+                        plan.next_state().coherent().unwrap_or_else(|why| {
+                            panic!(
+                                "{state_name} + {fact_name} produced an incoherent booking: {why}"
+                            )
+                        });
+                        plan.next_state().state.name() == *next
+                    }
+                    (Cell::D(reason), FactResolution::Denied(error)) => {
+                        error_name(error) == *reason
+                    }
+                    _ => false,
+                };
+                assert!(
+                    ok,
+                    "{state_name} + {fact_name}: expected {}, got {got:?}",
+                    match expected {
+                        Cell::U => "Undefined".to_owned(),
+                        Cell::C => "Converged".to_owned(),
+                        Cell::R(next) => format!("Ready({next})"),
+                        Cell::D(reason) => format!("Denied({reason})"),
+                    }
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, LOCKED_FACTS.len() * FACT_COUNT);
+        assert_eq!(checked, 40, "the matrix must cover every cell");
+    }
+
+    /// `LOCKED_FACTS` must name every state exactly once, or the sweep silently
+    /// shrinks. Guarded the same way the proposal matrix is: through the
+    /// compile-checked state index.
+    #[test]
+    fn every_state_has_exactly_one_matrix_row() {
+        let mut seen = [false; 10];
+        for (state_name, _) in LOCKED_FACTS {
+            let (booking, _, _) = bound_cell(state_name, 0);
+            let index = match booking.state {
+                BookingState::Draft(_) => 0,
+                BookingState::VenueSelected(_) => 1,
+                BookingState::NeedsRevalidation(_) => 2,
+                BookingState::AwaitingBooking(_) => 3,
+                BookingState::BookingInProgress(_) => 4,
+                BookingState::CancellationRequested(_) => 5,
+                BookingState::Booked(_) => 6,
+                BookingState::CancellingBooking(_) => 7,
+                BookingState::Cancelled(_) => 8,
+                BookingState::NeedsHuman(_) => 9,
+            };
+            assert!(!seen[index], "duplicate row for {state_name}");
+            seen[index] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "a BookingState variant is missing from LOCKED_FACTS"
+        );
+    }
+
+    // ------------------------------------------------- the nine Ready cells,
+    // asserted as complete bookings
+    //
+    // The sweep proves the state discriminator; these prove every business
+    // field — which is the entire point of B3a's contract, and what revision 1
+    // of the plan could not even express.
+
+    fn ready_of(
+        got: FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError>,
+    ) -> TransitionPlan<Booking, BookingEffect> {
+        let FactResolution::Ready(plan) = got else {
+            panic!("expected Ready, got {got:?}");
+        };
+        plan
+    }
+
+    /// Booking confirmed: `Booked` carries the council's reference in both
+    /// copies, the effect pointer clears, and nothing else moves.
+    #[tokio::test]
+    async fn a_confirmed_booking_commits_the_reference_and_clears_the_pointer() {
+        let (booking, fact, context) = bound_cell("BookingInProgress", 0);
+        let plan = ready_of(classify(&booking, fact, &context).await);
+        assert_eq!(
+            plan,
+            TransitionPlan::Local {
+                next_state: Booking {
+                    state: BookingState::Booked(Booked {
+                        booking_ref: CouncilBookingRef::new(REF),
+                    }),
+                    booking_ref: Some(CouncilBookingRef::new(REF)),
+                    active_effect: None,
+                    ..booking
+                },
+            }
+        );
+    }
+
+    /// The booking never happened: back to `AwaitingBooking`, rebuilt from the
+    /// persisted plan — and the reference slot is empty, because a tombstoned
+    /// intent has nothing to refer to.
+    #[tokio::test]
+    async fn an_absent_booking_returns_to_awaiting_from_the_persisted_plan() {
+        for fact_ix in [2, 3] {
+            let (booking, fact, context) = bound_cell("BookingInProgress", fact_ix);
+            let fact_name = fact.name();
+            let plan = ready_of(classify(&booking, fact, &context).await);
+            assert_eq!(
+                plan,
+                TransitionPlan::Local {
+                    next_state: Booking {
+                        state: BookingState::AwaitingBooking(AwaitingBooking {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                            verified_fee: Money::from_pence(4_500),
+                        }),
+                        booking_ref: None,
+                        active_effect: None,
+                        ..booking
+                    },
+                },
+                "under {fact_name}"
+            );
+        }
+    }
+
+    /// The one fact-driven external effect: the booking we wanted rid of turns
+    /// out to exist, so a cancellation is planned against it — carrying the
+    /// council reference into both copies, adopting the FRESH identity in both
+    /// copies, and shipping a `CancelBooking` bound to the fact's reference.
+    #[tokio::test]
+    async fn a_found_booking_under_cancellation_plans_the_cancel_effect() {
+        let (booking, fact, context) = bound_cell("CancellationRequested", 0);
+        let plan = ready_of(classify(&booking, fact, &context).await);
+        assert_eq!(
+            plan,
+            TransitionPlan::ExternalEffect {
+                next_state: Booking {
+                    state: BookingState::CancellingBooking(CancellingBooking {
+                        booking_ref: CouncilBookingRef::new(REF),
+                        effect_intent_id: EffectIntentId::new(FRESH_CANCEL_ID),
+                    }),
+                    booking_ref: Some(CouncilBookingRef::new(REF)),
+                    active_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+                    ..booking
+                },
+                effect: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new(REF),
+                },
+            }
+        );
+    }
+
+    /// The booking never happened while a cancellation was wanted: `Cancelled`
+    /// with nothing to show for it — no reference anywhere, pointer cleared.
+    #[tokio::test]
+    async fn an_absent_booking_under_cancellation_is_simply_cancelled() {
+        for fact_ix in [2, 3] {
+            let (booking, fact, context) = bound_cell("CancellationRequested", fact_ix);
+            let fact_name = fact.name();
+            let plan = ready_of(classify(&booking, fact, &context).await);
+            assert_eq!(
+                plan,
+                TransitionPlan::Local {
+                    next_state: Booking {
+                        state: BookingState::Cancelled(Cancelled),
+                        booking_ref: None,
+                        active_effect: None,
+                        ..booking
+                    },
+                },
+                "under {fact_name}"
+            );
+        }
+    }
+
+    /// Cancellation confirmed: `Cancelled`, keeping the reference of what was
+    /// cancelled — the convergence reading of this very state depends on it.
+    #[tokio::test]
+    async fn a_confirmed_cancellation_keeps_the_reference_it_cancelled() {
+        let (booking, fact, context) = bound_cell("CancellingBooking", 1);
+        let plan = ready_of(classify(&booking, fact, &context).await);
+        assert_eq!(
+            plan,
+            TransitionPlan::Local {
+                next_state: Booking {
+                    state: BookingState::Cancelled(Cancelled),
+                    active_effect: None,
+                    ..booking
+                },
+            }
+        );
+    }
+
+    /// The cancellation never happened: still booked, both reference copies
+    /// intact, pointer cleared.
+    #[tokio::test]
+    async fn an_absent_cancellation_returns_to_booked() {
+        for fact_ix in [2, 3] {
+            let (booking, fact, context) = bound_cell("CancellingBooking", fact_ix);
+            let fact_name = fact.name();
+            let plan = ready_of(classify(&booking, fact, &context).await);
+            assert_eq!(
+                plan,
+                TransitionPlan::Local {
+                    next_state: Booking {
+                        state: BookingState::Booked(Booked {
+                            booking_ref: CouncilBookingRef::new(REF),
+                        }),
+                        booking_ref: Some(CouncilBookingRef::new(REF)),
+                        active_effect: None,
+                        ..booking
+                    },
+                },
+                "under {fact_name}"
+            );
+        }
+    }
+
+    // ---------------------------------------------- identity and binding
+
+    /// The four identities varied independently: the state's, the aggregate's
+    /// `active_effect`, the fact's, and the supplied intent's. Lockstep
+    /// fixtures cannot tell which comparison actually fired.
+    #[tokio::test]
+    async fn a_fact_about_some_other_effect_is_refused() {
+        // Fact and intent agree with each other (bind cleanly) but name an
+        // effect this state is not waiting on.
+        for state_name in ["BookingInProgress", "CancellationRequested"] {
+            let (booking, _, _) = bound_cell(state_name, 0);
+            let stranger = "EFF-BKG-1001-BOOK-7";
+            let context = FactContext {
+                intent: Some(intent(
+                    stranger,
+                    OperationKind::Book,
+                    EffectStatus::Unknown,
+                    None,
+                )),
+                pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+            };
+            let got = classify(&booking, fact_of(0, stranger), &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::EffectMismatch),
+                "at {state_name}"
+            );
+        }
+        // And at CancellingBooking, via a kind-consistent cancellation fact.
+        let (booking, _, _) = bound_cell("CancellingBooking", 1);
+        let stranger = "EFF-BKG-1001-CANCEL-7";
+        let context = FactContext {
+            intent: Some(intent(
+                stranger,
+                OperationKind::Cancel,
+                EffectStatus::Unknown,
+                None,
+            )),
+            pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+        };
+        let got = classify(&booking, fact_of(1, stranger), &context).await;
+        assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
+    }
+
+    /// The supplied intent is not the fact's — caught before anything else is
+    /// trusted about it.
+    #[tokio::test]
+    async fn an_intent_that_is_not_the_facts_is_refused() {
+        let (booking, fact, _) = bound_cell("BookingInProgress", 0);
+        let context = FactContext {
+            intent: Some(intent(
+                CANCEL_ID, // a real intent, the wrong one
+                OperationKind::Book,
+                EffectStatus::Unknown,
+                None,
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
+    }
+
+    /// The intent belongs to a different booking. The comparison target is the
+    /// authoritative loaded aggregate's id — which is why `Booking` carries it.
+    #[tokio::test]
+    async fn an_intent_for_another_booking_is_refused() {
+        let (booking, fact, mut context) = bound_cell("BookingInProgress", 0);
+        if let Some(intent) = context.intent.as_mut() {
+            intent.booking_id = BookingId::new("BKG-9999");
+        }
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
+    }
+
+    /// C1 on the fact door: the state's copy and `active_effect` disagreeing is
+    /// refused before any meaning is derived. The store cannot produce this
+    /// shape, but this door must not assume its caller went through the store.
+    #[tokio::test]
+    async fn a_self_contradictory_aggregate_is_refused_by_the_fact_door() {
+        let (mut booking, fact, context) = bound_cell("BookingInProgress", 0);
+        booking.active_effect = Some(EffectIntentId::new("EFF-SOMETHING-ELSE"));
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::InconsistentEffectIdentity)
+        );
+    }
+
+    /// The check the kind-agnostic facts cannot get from B3: an intent of the
+    /// WRONG KIND carrying the right identity. "The cancellation never
+    /// happened" must never be read as "the booking never happened".
+    #[tokio::test]
+    async fn an_absence_of_the_wrong_kind_cannot_answer_a_waiting_state() {
+        // BookingInProgress waits on a Book; hand it a Cancel intent under the
+        // same id, with an EffectAbsent fact (which implies no kind at all).
+        let (booking, _, _) = bound_cell("BookingInProgress", 2);
+        let context = FactContext {
+            intent: Some(intent(
+                BOOK_ID,
+                OperationKind::Cancel,
+                EffectStatus::Unknown,
+                None,
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact_of(2, BOOK_ID), &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectKindMismatch),
+            "an EffectAbsent must take its kind from the intent, and the intent's kind \
+             must match the state's"
+        );
+
+        // The mirror: CancellingBooking waits on a Cancel; a Book intent under
+        // its id must not answer it.
+        let (booking, _, _) = bound_cell("CancellingBooking", 2);
+        let context = FactContext {
+            intent: Some(intent(
+                CANCEL_ID,
+                OperationKind::Book,
+                EffectStatus::Unknown,
+                None,
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact_of(2, CANCEL_ID), &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectKindMismatch)
+        );
+    }
+
+    /// B6, one defect per fixture: each consequential field of `BookingExists`
+    /// flipped in turn, asserting the SPECIFIC field named in the refusal.
+    #[tokio::test]
+    async fn every_consequential_field_is_bound_against_the_plan() {
+        let (booking, _, context) = bound_cell("BookingInProgress", 0);
+        let base = |mutate: &dyn Fn(&mut VerifiedProviderFact)| {
+            let mut fact = fact_of(0, BOOK_ID);
+            mutate(&mut fact);
+            fact
+        };
+
+        let cases: Vec<(&str, VerifiedProviderFact)> = vec![
+            (
+                "venue_id",
+                base(&|f| {
+                    if let VerifiedProviderFact::BookingExists { venue_id, .. } = f {
+                        *venue_id = VenueId::new("TH-B");
+                    }
+                }),
+            ),
+            (
+                "slot_id",
+                base(&|f| {
+                    if let VerifiedProviderFact::BookingExists { slot_id, .. } = f {
+                        *slot_id = SlotId::new("SLOT-B");
+                    }
+                }),
+            ),
+            (
+                "attendees",
+                base(&|f| {
+                    if let VerifiedProviderFact::BookingExists { attendees, .. } = f {
+                        *attendees = 25;
+                    }
+                }),
+            ),
+            (
+                "fee",
+                base(&|f| {
+                    if let VerifiedProviderFact::BookingExists { fee, .. } = f {
+                        *fee = Money::from_pence(5_200);
+                    }
+                }),
+            ),
+            (
+                "principal",
+                base(&|f| {
+                    if let VerifiedProviderFact::BookingExists { principal, .. } = f {
+                        *principal = PrincipalId::new("mallory");
+                    }
+                }),
+            ),
+        ];
+
+        for (field, fact) in cases {
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::EffectPlanMismatch { field }),
+                "a flipped {field} must be refused by name"
+            );
+        }
+    }
+
+    /// The cancellation half of the binding, which revision 1 left untested:
+    /// `CancellationExists.booking_ref` against the persisted cancel plan.
+    #[tokio::test]
+    async fn a_cancellation_for_a_different_reference_is_refused() {
+        let (booking, _, context) = bound_cell("CancellingBooking", 1);
+        let fact = VerifiedProviderFact::CancellationExists {
+            effect_intent_id: EffectIntentId::new(CANCEL_ID),
+            booking_ref: CouncilBookingRef::new("TH-00000"),
+        };
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectPlanMismatch {
+                field: "booking_ref"
+            })
+        );
+    }
+
+    /// The other corner of the kind triangle: the intent's COLUMN disagrees
+    /// with both the fact and its own plan. At a settled state nothing after
+    /// B3 would notice — the convergence table dispatches on the plan, so
+    /// without the column check a corrupt row would happily converge.
+    #[tokio::test]
+    async fn a_corrupt_intent_column_cannot_converge() {
+        let (booking, fact, mut context) = bound_cell("Cancelled", 1);
+        if let Some(stored) = context.intent.as_mut() {
+            // Plan and fact still agree (CancelBooking, TH-92718); only the
+            // column lies.
+            stored.operation_kind = OperationKind::Book;
+        }
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectKindMismatch),
+            "a column claiming Book must not converge a cancellation"
+        );
+    }
+
+    /// An intent whose column and plan disagree with each other is a corrupt
+    /// row, refused rather than guessed about.
+    #[tokio::test]
+    async fn an_intent_whose_kind_and_plan_disagree_is_refused() {
+        let (booking, fact, mut context) = bound_cell("BookingInProgress", 0);
+        if let Some(intent) = context.intent.as_mut() {
+            intent.canonical_plan = cancel_plan(); // column says Book
+        }
+        let got = classify(&booking, fact, &context).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectPlanMismatch {
+                field: "operation_kind"
+            })
+        );
+    }
+
+    /// Every participating cell with no intent supplied: refused, never
+    /// guessed. Swept, not sampled.
+    #[tokio::test]
+    async fn no_participating_cell_proceeds_without_the_persisted_intent() {
+        for (state_name, _) in LOCKED_FACTS {
+            for fact_ix in 0..FACT_COUNT {
+                let (booking, fact, _) = bound_cell(state_name, fact_ix);
+                if matches!(fact_category(&booking.state), super::FactCategory::Absent) {
+                    continue;
+                }
+                let fact_name = fact.name();
+                let context = FactContext {
+                    intent: None,
+                    pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+                };
+                let got = classify(&booking, fact, &context).await;
+                assert_eq!(
+                    got,
+                    FactResolution::Denied(BookingError::EffectPlanMissing),
+                    "{state_name} + {fact_name} must refuse without an intent"
+                );
+            }
+        }
+    }
+
+    /// The regression test for revision 2's over-correction: an Absent state
+    /// stays `Undefined` even when the context carries a deliberately
+    /// mismatched intent. Irrelevant context must not manufacture behaviour.
+    #[tokio::test]
+    async fn garbage_context_cannot_manufacture_behaviour_in_an_absent_state() {
+        for state_name in ["Draft", "VenueSelected", "NeedsRevalidation", "NeedsHuman"] {
+            for fact_ix in 0..FACT_COUNT {
+                let (booking, fact, _) = bound_cell(state_name, fact_ix);
+                let fact_name = fact.name();
+                let garbage = FactContext {
+                    // Wrong id, wrong booking, invalid shape — all irrelevant.
+                    intent: Some({
+                        let mut bad = intent(
+                            "EFF-WRONG-EVERYTHING",
+                            OperationKind::Cancel,
+                            EffectStatus::Confirmed,
+                            None, // Confirmed with no reference: invalid shape
+                        );
+                        bad.booking_id = BookingId::new("BKG-9999");
+                        bad
+                    }),
+                    pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+                };
+                let got = classify(&booking, fact, &garbage).await;
+                assert!(
+                    got.is_undefined(),
+                    "{state_name} + {fact_name} must be Undefined regardless of context, got {got:?}"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------- contradiction and convergence
+
+    /// B4's shape table, every row: a malformed status/reference pair is
+    /// refused before it can be used as a wildcard. `Confirmed` without its
+    /// reference is the dangerous one — it would converge against anything.
+    #[tokio::test]
+    async fn a_malformed_intent_record_is_never_a_wildcard() {
+        let rows: &[(EffectStatus, Option<&str>)] = &[
+            (EffectStatus::Confirmed, None),
+            (EffectStatus::Prepared, Some(REF)),
+            (EffectStatus::Unknown, Some(REF)),
+            (EffectStatus::Absent, Some(REF)),
+            (EffectStatus::Rejected, Some(REF)),
+        ];
+        for (status, reference) in rows {
+            let (booking, fact, _) = bound_cell("BookingInProgress", 0);
+            let context = FactContext {
+                intent: Some(intent(BOOK_ID, OperationKind::Book, *status, *reference)),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "status {status:?} with reference {reference:?} must be refused as malformed"
+            );
+        }
+    }
+
+    /// B5's contradiction table: a fact that contradicts the intent's durable
+    /// outcome is refused loudly no matter which state it lands in — checked at
+    /// a Waiting state and at a Settled one, because the dangerous arrival
+    /// order (ADR-016's race) does not get to choose its landing state.
+    #[tokio::test]
+    async fn a_fact_contradicting_the_durable_outcome_is_refused_everywhere() {
+        // Tombstoned, then "it exists": the catastrophic case.
+        for (state_name, fact_ix, id, kind) in [
+            ("BookingInProgress", 0, BOOK_ID, OperationKind::Book),
+            ("AwaitingBooking", 0, BOOK_ID, OperationKind::Book),
+            ("CancellingBooking", 1, CANCEL_ID, OperationKind::Cancel),
+            ("Cancelled", 1, CANCEL_ID, OperationKind::Cancel),
+        ] {
+            let (booking, fact, _) = bound_cell(state_name, fact_ix);
+            let fact_name = fact.name();
+            let context = FactContext {
+                intent: Some(intent(id, kind, EffectStatus::Absent, None)),
+                pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "{fact_name} after a tombstone at {state_name}"
+            );
+        }
+        // Rejected, then "it exists".
+        {
+            let (booking, fact, _) = bound_cell("BookingInProgress", 0);
+            let context = FactContext {
+                intent: Some(intent(
+                    BOOK_ID,
+                    OperationKind::Book,
+                    EffectStatus::Rejected,
+                    None,
+                )),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact)
+            );
+        }
+        // Confirmed, then "it never happened".
+        for fact_ix in [2, 3] {
+            let (booking, fact, _) = bound_cell("BookingInProgress", fact_ix);
+            let fact_name = fact.name();
+            let context = FactContext {
+                intent: Some(intent(
+                    BOOK_ID,
+                    OperationKind::Book,
+                    EffectStatus::Confirmed,
+                    Some(REF),
+                )),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "{fact_name} after a confirmation"
+            );
+        }
+    }
+
+    /// One identity resolving to two provider references, in each of the three
+    /// places a reference lives: the intent's record, the state's copy, and the
+    /// aggregate's copy. Varied independently — a lockstep fixture proves only
+    /// whichever comparison runs first.
+    #[tokio::test]
+    async fn one_identity_two_references_is_duplication_wherever_it_shows() {
+        // Intent recorded TH-00000; the fact claims TH-92718. Caught at B5,
+        // so it holds at Waiting and Settled states alike.
+        {
+            let (booking, fact, _) = bound_cell("Booked", 0);
+            let context = FactContext {
+                intent: Some(intent(
+                    BOOK_ID,
+                    OperationKind::Book,
+                    EffectStatus::Confirmed,
+                    Some("TH-00000"),
+                )),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::DuplicateProviderEffect),
+                "intent's reference vs fact's"
+            );
+        }
+        // The state says TH-92718; the fact (and its intent) say TH-99999.
+        // The plan's fixture for test 13, verbatim.
+        {
+            let (booking, _, _) = bound_cell("Booked", 0);
+            let fact = VerifiedProviderFact::BookingExists {
+                effect_intent_id: EffectIntentId::new(BOOK_ID),
+                booking_ref: CouncilBookingRef::new("TH-99999"),
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                attendees: 20,
+                fee: Money::from_pence(4_500),
+                principal: PrincipalId::new("lucy"),
+            };
+            let context = FactContext {
+                intent: Some(intent(
+                    BOOK_ID,
+                    OperationKind::Book,
+                    EffectStatus::Confirmed,
+                    Some("TH-99999"),
+                )),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::DuplicateProviderEffect),
+                "state's reference vs fact's"
+            );
+        }
+        // The aggregate's outer copy disagrees with everything else. The store
+        // would never load this shape, and the door's C-step catches it before
+        // any fact comparison runs: the aggregate contradicts ITSELF, which is
+        // a more honest refusal than blaming the fact for it.
+        {
+            let (mut booking, fact, context) = bound_cell("Booked", 0);
+            booking.booking_ref = Some(CouncilBookingRef::new("TH-99999"));
+            let got = classify(&booking, fact, &context).await;
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(BookingError::IncoherentAggregate(
+                        IncoherentBooking::CouncilReference { .. }
+                    ))
+                ),
+                "a self-contradictory aggregate must be refused as such, got {got:?}"
+            );
+        }
+    }
+
+    /// Every convergence cell with the intent kind flipped: what would have
+    /// converged is a contradiction once the history it claims is the wrong
+    /// operation. This is what makes `Converged` mean "already applied" rather
+    /// than "close enough".
+    #[tokio::test]
+    async fn a_flipped_intent_kind_turns_convergence_into_contradiction() {
+        // (state, fact_ix, flipped kind, id under the flipped kind)
+        let cells: &[(&str, usize, OperationKind, &str)] = &[
+            ("AwaitingBooking", 2, OperationKind::Cancel, CANCEL_ID),
+            ("AwaitingBooking", 3, OperationKind::Cancel, CANCEL_ID),
+            ("Booked", 0, OperationKind::Cancel, CANCEL_ID),
+            ("Booked", 2, OperationKind::Book, BOOK_ID),
+            ("Booked", 3, OperationKind::Book, BOOK_ID),
+            ("Cancelled", 1, OperationKind::Book, BOOK_ID),
+            ("Cancelled", 2, OperationKind::Cancel, CANCEL_ID),
+            ("Cancelled", 3, OperationKind::Cancel, CANCEL_ID),
+        ];
+        for (state_name, fact_ix, kind, id) in cells {
+            let (booking, _, _) = bound_cell(state_name, *fact_ix);
+            let fact = fact_of(*fact_ix, id);
+            let fact_name = fact.name();
+            // Keep status/reference shape-valid and non-contradictory so the
+            // kind flip is the ONLY defect: existence facts pair with
+            // Confirmed, absence with Absent.
+            let (status, reference) = if fact.asserts_existence() {
+                (EffectStatus::Confirmed, Some(REF))
+            } else {
+                (EffectStatus::Absent, None)
+            };
+            let context = FactContext {
+                intent: Some(intent(id, *kind, status, reference)),
+                pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(
+                        BookingError::ContradictoryProviderFact | BookingError::EffectKindMismatch
+                    )
+                ),
+                "{state_name} + {fact_name} with a {} intent must not converge, got {got:?}",
+                kind.name()
+            );
+        }
+    }
+
+    /// A live intent at a Settled state is inconsistent partial finalisation,
+    /// not convergence: the repository commits state and status in one
+    /// transaction, so this shape cannot arise honestly. Calling it converged
+    /// would launder a broken atomicity guarantee into a repair path.
+    #[tokio::test]
+    async fn a_live_intent_at_a_settled_state_is_not_convergence() {
+        for status in [EffectStatus::Prepared, EffectStatus::Unknown] {
+            let (booking, fact, _) = bound_cell("Booked", 0);
+            let context = FactContext {
+                intent: Some(intent(BOOK_ID, OperationKind::Book, status, None)),
+                pending_effect: None,
+            };
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "a {status:?} intent must not converge at Booked"
+            );
+        }
+    }
+
+    /// The reflection table, one mutated comparison per fixture — where the
+    /// fact carries nothing, the STATE is compared against the PLAN, and each
+    /// leg of that comparison must be able to fail alone.
+    #[tokio::test]
+    async fn reflection_compares_real_data_in_every_row() {
+        // AwaitingBooking vs the Book plan: venue, slot, fee — each alone.
+        {
+            let (_, fact, context) = bound_cell("AwaitingBooking", 2);
+            // The booking is internally coherent — state and selection both
+            // say TH-B — so the PLAN is the only thing that disagrees, which
+            // is exactly the comparison this row exists to make.
+            let mismatched = Booking {
+                state: BookingState::AwaitingBooking(AwaitingBooking {
+                    venue_id: VenueId::new("TH-B"), // plan says TH-A
+                    slot_id: SlotId::new("SLOT-A"),
+                    verified_fee: Money::from_pence(4_500),
+                }),
+                selected_venue: Some(SelectedVenueRef {
+                    venue_id: VenueId::new("TH-B"),
+                    slot_id: SlotId::new("SLOT-A"),
+                }),
+                ..awaiting_booking()
+            };
+            mismatched
+                .coherent()
+                .expect("one defect per fixture: the plan is the mismatch, not the booking");
+            let got = classify(&mismatched, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "an absent Book plan for TH-A cannot converge at an AwaitingBooking for TH-B"
+            );
+        }
+        {
+            let (_, fact, context) = bound_cell("AwaitingBooking", 2);
+            let mismatched = booking_at(
+                BookingState::AwaitingBooking(AwaitingBooking {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                    verified_fee: Money::from_pence(9_999), // plan says 4500
+                }),
+                None,
+                None,
+            );
+            let got = classify(&mismatched, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact)
+            );
+        }
+        // Booked vs an absent CANCEL plan naming a different booking: the
+        // review's own example — EffectAbsent carries no reference, so only
+        // the state-vs-plan comparison can catch it.
+        {
+            let (booking, fact, mut context) = bound_cell("Booked", 2);
+            if let Some(stored) = context.intent.as_mut() {
+                stored.canonical_plan = BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new("TH-00000"),
+                };
+            }
+            let got = classify(&booking, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "an absent cancellation of TH-00000 says nothing about a booking of TH-92718"
+            );
+        }
+        // Cancelled + CancellationExists, aggregate reference disagreeing.
+        {
+            let (_, fact, context) = bound_cell("Cancelled", 1);
+            let mismatched = booking_at(BookingState::Cancelled(Cancelled), Some("TH-00000"), None);
+            let got = classify(&mismatched, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::DuplicateProviderEffect),
+                "the fact's reference disagrees with what this booking cancelled"
+            );
+        }
+        // Cancelled + absent Book intent, but the aggregate CLAIMS a reference:
+        // the booking supposedly never happened, yet something referenced it.
+        {
+            let (_, fact, context) = bound_cell("Cancelled", 2);
+            let contradictory = booking_at(BookingState::Cancelled(Cancelled), Some(REF), None);
+            let got = classify(&contradictory, fact, &context).await;
+            assert_eq!(
+                got,
+                FactResolution::Denied(BookingError::ContradictoryProviderFact),
+                "a tombstoned booking cannot have left a reference behind"
+            );
+        }
+    }
+
+    /// The review's finding, pinned: a phantom reference — a state whose
+    /// booking has never been confirmed carrying a `booking_ref` — must be
+    /// refused, never silently cleared or overwritten by a transition. A bad
+    /// write laundered into a clean state is how the next reader never learns
+    /// anything was wrong.
+    #[tokio::test]
+    async fn a_phantom_reference_is_refused_not_laundered() {
+        // Each of these transitions would have cleared or overwritten the
+        // phantom: absence clears it, confirmation overwrites it, the found
+        // booking under cancellation overwrites it, and the AwaitingBooking
+        // convergence would have blessed it.
+        let cells: &[(&str, usize)] = &[
+            ("BookingInProgress", 2),     // would clear via EffectAbsent
+            ("BookingInProgress", 0),     // would overwrite via BookingExists
+            ("CancellationRequested", 2), // would clear via EffectAbsent
+            ("CancellationRequested", 0), // would overwrite via BookingExists
+            ("AwaitingBooking", 2),       // would converge over it
+        ];
+        for (state_name, fact_ix) in cells {
+            let (mut booking, fact, context) = bound_cell(state_name, *fact_ix);
+            let fact_name = fact.name();
+            booking.booking_ref = Some(CouncilBookingRef::new("TH-PHANTOM"));
+            let got = classify(&booking, fact, &context).await;
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(BookingError::IncoherentAggregate(
+                        IncoherentBooking::PhantomReference { .. }
+                    ))
+                ),
+                "{state_name} + {fact_name} with a phantom reference must refuse, got {got:?}"
+            );
+        }
+    }
+
+    /// The ‡ cell's other reading: the OLD booking intent's confirmation
+    /// re-arriving at `CancellingBooking` — which is how this state was reached —
+    /// is convergence, not an answer to the cancellation in flight.
+    #[tokio::test]
+    async fn the_old_bookings_confirmation_converges_at_cancelling_booking() {
+        let (booking, _, _) = bound_cell("CancellingBooking", 0);
+        let fact = fact_of(0, BOOK_ID); // the BOOK intent's id, not the cancel's
+        let context = FactContext {
+            intent: Some(intent(
+                BOOK_ID,
+                OperationKind::Book,
+                EffectStatus::Confirmed,
+                Some(REF),
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact, &context).await;
+        assert!(
+            got.is_converged(),
+            "the fact that created this state must read as already applied, got {got:?}"
+        );
+    }
+
+    /// The commonest transition in the system, pinned so no future
+    /// contradiction or convergence machinery can break it: the fact arrives
+    /// while the intent still says Unknown, because nothing has recorded the
+    /// outcome yet. That is the ordinary happy path, not an edge case.
+    #[tokio::test]
+    async fn the_ordinary_happy_path_never_touches_the_contradiction_machinery() {
+        let (booking, fact, _) = bound_cell("BookingInProgress", 0);
+        let context = FactContext {
+            intent: Some(intent(
+                BOOK_ID,
+                OperationKind::Book,
+                EffectStatus::Unknown,
+                None,
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(plan) = got else {
+            panic!("the happy path must be Ready, got {got:?}");
+        };
+        assert_eq!(plan.next_state().state.name(), "Booked");
+    }
+
+    // ------------------------------------------- the external-effect cell
+
+    /// The fact-driven cancellation needs a fresh identity from the
+    /// coordinator: absent is refused, and the old identity reused is refused —
+    /// a plan whose old and new effects share one identity is structurally
+    /// invalid, and the boundary must not emit it even though the store would
+    /// catch it later.
+    #[tokio::test]
+    async fn the_fact_driven_cancellation_demands_a_fresh_identity() {
+        let (booking, fact, context) = bound_cell("CancellationRequested", 0);
+        let no_identity = FactContext {
+            pending_effect: None,
+            ..context.clone()
+        };
+        let got = classify(&booking, fact.clone(), &no_identity).await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectIdentityMissing)
+        );
+
+        let reused = FactContext {
+            pending_effect: Some(EffectIntentId::new(BOOK_ID)),
+            ..context
+        };
+        let got = classify(&booking, fact, &reused).await;
+        assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
+    }
+
+    // ---------------------------------------------- cross-door and structure
+
+    /// ADR-012's central claim, asserted rather than argued: no proposal in any
+    /// state reaches `Booked` or `NeedsHuman` — the model cannot announce its
+    /// own success — and no provider fact reaches `NeedsHuman`, because the
+    /// council cannot conclude our retry budget is exhausted.
+    #[tokio::test]
+    async fn no_door_reaches_a_state_that_is_not_its_to_reach() {
+        let authority = VerifiedAuthority {
+            principal: PrincipalId::new("lucy"),
+            actor: ActorId::new("townhall-agent"),
+            max_fee: Money::from_pence(5_000),
+            may_book: true,
+            may_cancel: true,
+        };
+        let proposal_context = BookingContext {
+            selected_facts: Some(good_facts()),
+            pending_effect: Some(EffectIntentId::new(BOOK_ID)),
+        };
+        let proposals = || {
+            vec![
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements {
+                    attendees: Some(25),
+                },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ]
+        };
+
+        for (state_name, _) in LOCKED_FACTS {
+            let (booking, _, _) = bound_cell(state_name, 0);
+            for proposal in proposals() {
+                let name = proposal.name();
+                if let Resolution::Ready(plan) = TownHallDomain
+                    .resolve_proposal(&booking, proposal, &authority, &proposal_context)
+                    .await
+                {
+                    let next = plan.next_state().state.name();
+                    assert!(
+                        next != "Booked" && next != "NeedsHuman",
+                        "{state_name} + proposal {name} reached {next}: a proposer announced \
+                         an outcome only evidence or the runtime may conclude"
+                    );
+                }
+            }
+
+            for fact_ix in 0..FACT_COUNT {
+                let (booking, fact, context) = bound_cell(state_name, fact_ix);
+                let fact_name = fact.name();
+                if let FactResolution::Ready(plan) = classify(&booking, fact, &context).await {
+                    assert_ne!(
+                        plan.next_state().state.name(),
+                        "NeedsHuman",
+                        "{state_name} + fact {fact_name} reached NeedsHuman: a provider \
+                         concluded our own retry budget"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both new doors classify; they never mutate, and asking twice gives the
+    /// same answer — which is what lets a coordinator reload and re-classify
+    /// after losing a compare-and-set.
+    #[tokio::test]
+    async fn both_doors_are_pure_and_repeatable() {
+        let (booking, fact, context) = bound_cell("BookingInProgress", 0);
+        let before = booking.clone();
+        let first = classify(&booking, fact.clone(), &context).await;
+        let second = classify(&booking, fact, &context).await;
+        assert_eq!(first, second);
+        assert_eq!(booking, before, "the caller's booking is untouched");
+
+        let event = || SystemEvent::ReconciliationExhausted {
+            effect_intent_id: EffectIntentId::new(BOOK_ID),
+        };
+        let first = TownHallDomain.resolve_system_event(&booking, event()).await;
+        let second = TownHallDomain.resolve_system_event(&booking, event()).await;
+        assert_eq!(first, second);
+        assert_eq!(booking, before);
+    }
+}
+
+/// The state × system-event topology — 10 states × 1 event.
+///
+/// `NeedsHuman` is reachable only through this door: neither a proposer nor a
+/// provider fact can conclude that our own retry budget is exhausted.
+#[cfg(test)]
+mod system_event_topology {
+    use super::*;
+    use bld_types::{BookingRequirements, Money, TimeWindow};
+
+    const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
+    const CANCEL_ID: &str = "EFF-BKG-1001-CANCEL-5";
+    const REF: &str = "TH-92718";
+
+    fn booking_of(state: BookingState, booking_ref: Option<&str>, active: Option<&str>) -> Booking {
+        let booking = Booking {
+            id: BookingId::new("BKG-1001"),
+            state,
+            requirements: BookingRequirements {
+                purpose: "meeting".to_owned(),
+                requested_date: "2026-08-20".to_owned(),
+                time_window: TimeWindow {
+                    from: "13:00".to_owned(),
+                    to: "17:00".to_owned(),
+                },
+                attendees: 20,
+                wheelchair_accessible: true,
+                max_fee: Money::from_pence(5_000),
+            },
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            availability: None,
+            booking_ref: booking_ref.map(CouncilBookingRef::new),
+            active_effect: active.map(EffectIntentId::new),
+        };
+        booking.coherent().expect("fixtures must be coherent");
+        booking
+    }
+
+    /// Every state, with the effect id its in-flight variant carries (if any).
+    /// Exhaustive by construction: a new `BookingState` variant fails to
+    /// compile here.
+    fn all_states() -> Vec<Booking> {
+        [
+            booking_of(BookingState::Draft(Draft), None, None),
+            booking_of(
+                BookingState::VenueSelected(VenueSelected {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                }),
+                None,
+                None,
+            ),
+            booking_of(
+                BookingState::NeedsRevalidation(NeedsRevalidation {
+                    selected: Some(SelectedVenueRef {
+                        venue_id: VenueId::new("TH-A"),
+                        slot_id: SlotId::new("SLOT-A"),
+                    }),
+                }),
+                None,
+                None,
+            ),
+            booking_of(
+                BookingState::AwaitingBooking(AwaitingBooking {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                    verified_fee: Money::from_pence(4_500),
+                }),
+                None,
+                None,
+            ),
+            booking_of(
+                BookingState::BookingInProgress(BookingInProgress {
+                    effect_intent_id: EffectIntentId::new(BOOK_ID),
+                }),
+                None,
+                Some(BOOK_ID),
+            ),
+            booking_of(
+                BookingState::CancellationRequested(CancellationRequested {
+                    effect_intent_id: EffectIntentId::new(BOOK_ID),
+                }),
+                None,
+                Some(BOOK_ID),
+            ),
+            booking_of(
+                BookingState::Booked(Booked {
+                    booking_ref: CouncilBookingRef::new(REF),
+                }),
+                Some(REF),
+                None,
+            ),
+            booking_of(
+                BookingState::CancellingBooking(CancellingBooking {
+                    booking_ref: CouncilBookingRef::new(REF),
+                    effect_intent_id: EffectIntentId::new(CANCEL_ID),
+                }),
+                Some(REF),
+                Some(CANCEL_ID),
+            ),
+            booking_of(BookingState::Cancelled(Cancelled), None, None),
+            booking_of(BookingState::NeedsHuman(NeedsHuman), None, None),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn exhausted(id: &str) -> SystemEvent {
+        SystemEvent::ReconciliationExhausted {
+            effect_intent_id: EffectIntentId::new(id),
+        }
+    }
+
+    /// The whole matrix: exactly the three in-flight states move to
+    /// `NeedsHuman`; everywhere else the behaviour does not exist.
+    #[tokio::test]
+    async fn exhaustion_moves_exactly_the_in_flight_states() {
+        let mut checked = 0_usize;
+        for booking in all_states() {
+            let state_name = booking.state.name();
+            let in_flight = booking.state.effect_intent_id().cloned();
+            let event = exhausted(in_flight.as_ref().map_or(BOOK_ID, EffectIntentId::as_str));
+            let got = TownHallDomain.resolve_system_event(&booking, event).await;
+
+            if in_flight.is_some() {
+                let Resolution::Ready(plan) = &got else {
+                    panic!(
+                        "{state_name} has an effect in flight and must reach NeedsHuman, got {got:?}"
+                    );
+                };
+                let next = plan.next_state();
+                next.coherent()
+                    .unwrap_or_else(|why| panic!("{state_name} produced incoherence: {why}"));
+                // The complete booking, not the discriminator: giving up
+                // clears the pointer — no automation acts on this effect again
+                // — and touches nothing else.
+                assert_eq!(
+                    plan,
+                    &TransitionPlan::Local {
+                        next_state: Booking {
+                            state: BookingState::NeedsHuman(NeedsHuman),
+                            active_effect: None,
+                            ..booking.clone()
+                        },
+                    },
+                    "at {state_name}"
+                );
+            } else {
+                assert!(
+                    matches!(got, Resolution::Undefined),
+                    "{state_name} has no retry budget to exhaust; expected Undefined, got {got:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "the sweep must cover every state");
+    }
+
+    /// Exhaustion of some OTHER effect says nothing about this state: refused
+    /// with a reason, never a silent gap — and never a giving-up on the wrong
+    /// effect's behalf.
+    #[tokio::test]
+    async fn exhaustion_of_a_different_effect_is_refused() {
+        for booking in all_states() {
+            if booking.state.effect_intent_id().is_none() {
+                continue;
+            }
+            let got = TownHallDomain
+                .resolve_system_event(&booking, exhausted("EFF-SOMEBODY-ELSE"))
+                .await;
+            assert_eq!(
+                got,
+                Resolution::Denied(BookingError::EffectMismatch),
+                "at {}",
+                booking.state.name()
+            );
+        }
+    }
+
+    /// C1 holds on this door too: a state whose two effect pointers disagree
+    /// is refused before the event is interpreted.
+    #[tokio::test]
+    async fn a_self_contradictory_aggregate_is_refused_by_the_event_door() {
+        let mut booking = booking_of(
+            BookingState::BookingInProgress(BookingInProgress {
+                effect_intent_id: EffectIntentId::new(BOOK_ID),
+            }),
+            None,
+            Some(BOOK_ID),
+        );
+        booking.active_effect = Some(EffectIntentId::new("EFF-SOMETHING-ELSE"));
+        let got = TownHallDomain
+            .resolve_system_event(&booking, exhausted(BOOK_ID))
+            .await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::InconsistentEffectIdentity)
         );
     }
 }

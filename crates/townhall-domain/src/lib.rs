@@ -633,6 +633,24 @@ pub enum BookingEffect {
 }
 
 impl BookingEffect {
+    /// The provider reference this plan operates on, where it operates on one.
+    ///
+    /// `Book` creates something that does not exist yet, so it names nothing.
+    /// `CancelBooking` acts on a booking the council already made.
+    ///
+    /// This is what lets the repository check a handoff without knowing what a
+    /// booking is: a successor effect exists *because* its predecessor succeeded,
+    /// so the successor must act on the reference the predecessor produced. The
+    /// domain decides what "acts on" means per variant; the repository only
+    /// compares.
+    #[must_use]
+    pub const fn acts_on(&self) -> Option<&CouncilBookingRef> {
+        match self {
+            Self::Book { .. } => None,
+            Self::CancelBooking { booking_ref } => Some(booking_ref),
+        }
+    }
+
     /// Which kind of consequence this is. Part of the effect uniqueness key: a
     /// booking and its cancellation are two effects with two identities.
     #[must_use]

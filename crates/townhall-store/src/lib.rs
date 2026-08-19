@@ -146,6 +146,8 @@ pub enum StoreError {
         expected: EffectIntentId,
         actual: Option<EffectIntentId>,
     },
+    #[error("this is not a coherent handoff: {reason}")]
+    IncoherentHandoff { reason: &'static str },
     #[error("{0} is not a terminal outcome; an effect can only be finalised to one that is")]
     NotATerminalStatus(&'static str),
     #[error(
@@ -627,6 +629,36 @@ impl BookingRepository for SqliteBookingRepository {
             });
         }
 
+        // A handoff is only coherent in one direction, and nothing so far checked
+        // it. Review found that a caller could record "the booking never happened"
+        // — `Absent`/`Rejected` with no reference — and in the same transaction
+        // create a cancellation for some booking reference. Two contradictory
+        // facts, committed atomically.
+        //
+        // The rule, stated without knowing what a booking is: a successor exists
+        // *because* its predecessor succeeded, and it acts on what the predecessor
+        // produced. So the predecessor must be `Confirmed` (which the shape rule
+        // then requires to carry a reference), and the successor's plan must act
+        // on exactly that reference — `BookingEffect::acts_on` is the domain's
+        // answer to "which reference does this plan operate on".
+        if request.finalising_status != EffectStatus::Confirmed {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "a successor effect exists only because its predecessor succeeded",
+            });
+        }
+        if request.successor_plan.acts_on() != request.finalising_reference.as_ref() {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "the successor must act on the reference its predecessor produced",
+            });
+        }
+        // And the aggregate must record that reference too, or the booking would
+        // point at one thing while its in-flight effect acts on another.
+        if request.next.booking_ref != request.finalising_reference {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "the next booking must record the reference its predecessor produced",
+            });
+        }
+
         let successor_kind = request.successor_plan.operation_kind();
         let successor_id =
             derive_effect_intent_id(&request.booking_id, successor_kind, request.source_version);
@@ -695,6 +727,20 @@ impl BookingRepository for SqliteBookingRepository {
                 });
             }
             let finalised = load_effect_in_tx(&mut tx, &request.finalising).await?;
+            // The successor matching is not enough on its own: a replay must agree
+            // about the *predecessor's outcome* too, or a request claiming a
+            // different finalisation would be answered as though it had been
+            // accepted.
+            if finalised.status != request.finalising_status
+                || finalised.provider_reference != request.finalising_reference
+                || finalised.outcome_detail != request.finalising_detail
+            {
+                return Err(StoreError::ContradictoryFinalisation {
+                    effect_intent_id: request.finalising.clone(),
+                    recorded: finalised.status.name(),
+                    attempted: request.finalising_status.name(),
+                });
+            }
             let aggregate = load_booking_in_tx(&mut tx, &request.booking_id).await?;
             tx.commit().await?;
             return Ok(HandedOffEffect {
@@ -3402,6 +3448,237 @@ mod phase_c {
         let last = audit.last().expect("a row");
         assert_eq!(last.driver_kind, Provenance::Fact);
         assert_eq!(last.driver_detail, "BookingExists");
+    }
+
+    /// A handoff is only coherent in one direction, and this is the test for it.
+    ///
+    /// Without the rule a caller could record "the booking never happened" —
+    /// `Absent` or `Rejected`, no reference — and in the same transaction create a
+    /// cancellation for some booking reference. Two contradictory facts committed
+    /// atomically, which is worse than either alone: the trail would say the
+    /// booking failed while a cancellation intent went to the council for it.
+    // Three fixtures inline, each isolating one contradiction, plus the positive
+    // control that proves the rule is not simply refusing everything. Splitting
+    // them into separate tests would duplicate the twelve-line setup four times.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_handoff_that_contradicts_itself_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-INCOHERENT");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+        let cancel_effect = derive_effect_intent_id(&id, OperationKind::Cancel, requested.version);
+
+        let coherent_next = booking_at(
+            &id,
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+                effect_intent_id: cancel_effect.clone(),
+            }),
+            Some(REF),
+            Some(&cancel_effect),
+        );
+        let base = || HandoffEffect {
+            booking_id: id.clone(),
+            source_version: requested.version,
+            finalising: book_effect.clone(),
+            finalising_status: EffectStatus::Confirmed,
+            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_detail: None,
+            successor_plan: BookingEffect::CancelBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+            },
+            next: coherent_next.clone(),
+            audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
+        };
+
+        // One defect per fixture, three ways to contradict.
+
+        // (a) The predecessor failed, so there is nothing for a successor to
+        //     continue. Isolated to that one defect: an `Absent` outcome carries no
+        //     reference, so the successor plan here is one that acts on nothing
+        //     either — every reference comparison agrees on `None`, and only the
+        //     status is wrong.
+        let book_successor = derive_effect_intent_id(&id, OperationKind::Book, requested.version);
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_status: EffectStatus::Absent,
+                finalising_reference: None,
+                successor_plan: book_plan(),
+                next: booking_at(
+                    &id,
+                    BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                        effect_intent_id: book_successor.clone(),
+                    }),
+                    None,
+                    Some(&book_successor),
+                ),
+                ..base()
+            })
+            .await
+            .expect_err("a failed predecessor cannot hand off");
+        assert!(
+            matches!(error, StoreError::IncoherentHandoff { .. }),
+            "expected IncoherentHandoff, got {error:?}"
+        );
+
+        // (b) The successor acts on a different booking than the one confirmed.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                successor_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new("TH-00000"),
+                },
+                ..base()
+            })
+            .await
+            .expect_err("a successor acting on another reference must be refused");
+        assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
+
+        // (c) The aggregate records a different reference than was confirmed.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                next: booking_at(
+                    &id,
+                    BookingState::CancellingBooking(CancellingBooking {
+                        booking_ref: CouncilBookingRef::new("TH-00000"),
+                        effect_intent_id: cancel_effect.clone(),
+                    }),
+                    Some("TH-00000"),
+                    Some(&cancel_effect),
+                ),
+                ..base()
+            })
+            .await
+            .expect_err("an aggregate recording another reference must be refused");
+        assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
+
+        // Nothing moved, and no cancellation intent exists.
+        let current = repo.load(&id).await.expect("load");
+        assert_eq!(current.version, requested.version);
+        assert_eq!(current.active_effect, Some(book_effect.clone()));
+        assert!(
+            repo.load_effect(&cancel_effect).await.is_err(),
+            "no successor may have been created"
+        );
+
+        // And the coherent request still works, so the rule is not simply refusing
+        // everything.
+        repo.handoff_effect(base())
+            .await
+            .expect("the coherent handoff must still succeed");
+    }
+
+    /// A replay must agree about the predecessor's outcome, not just the
+    /// successor. Otherwise a request claiming a different finalisation would be
+    /// answered as though it had been accepted.
+    #[tokio::test]
+    async fn a_replay_claiming_a_different_predecessor_outcome_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-REPLAYOUT");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+        let cancel_effect = derive_effect_intent_id(&id, OperationKind::Cancel, requested.version);
+        let next = booking_at(
+            &id,
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+                effect_intent_id: cancel_effect.clone(),
+            }),
+            Some(REF),
+            Some(&cancel_effect),
+        );
+        let request = HandoffEffect {
+            booking_id: id.clone(),
+            source_version: requested.version,
+            finalising: book_effect.clone(),
+            finalising_status: EffectStatus::Confirmed,
+            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_detail: None,
+            successor_plan: BookingEffect::CancelBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+            },
+            next,
+            audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
+        };
+
+        repo.handoff_effect(request.clone())
+            .await
+            .expect("first handoff");
+        // The genuine retry is idempotent.
+        let replay = repo
+            .handoff_effect(request.clone())
+            .await
+            .expect("an identical retry must replay");
+        assert!(replay.replayed);
+
+        // A retry claiming the predecessor was rejected instead must not be
+        // answered as a replay. It is refused before the coherence rule, since a
+        // rejected predecessor cannot hand off at all.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_status: EffectStatus::Rejected,
+                finalising_reference: None,
+                ..request.clone()
+            })
+            .await
+            .expect_err("a contradictory retry must be refused");
+        assert!(
+            matches!(error, StoreError::IncoherentHandoff { .. }),
+            "expected refusal, got {error:?}"
+        );
+
+        // And a retry that is coherent, names the same successor, but disagrees
+        // about *why* the predecessor ended. `outcome_detail` is the one dimension
+        // the coherence rule leaves free, which is what makes this the fixture that
+        // isolates the replay path's outcome check — everything else matches, so
+        // only that comparison can refuse it.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_detail: Some(BoundedString::truncating("a different story")),
+                ..request
+            })
+            .await
+            .expect_err("a replay disagreeing about the outcome must be refused");
+        assert!(
+            matches!(error, StoreError::ContradictoryFinalisation { .. }),
+            "expected ContradictoryFinalisation, got {error:?}"
+        );
     }
 
     /// The aggregate must name the successor, not merely stop naming the

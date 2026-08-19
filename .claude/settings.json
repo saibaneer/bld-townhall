@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(codex exec --model gpt-5.6-sol --sandbox read-only --skip-git-repo-check 'Re-review. You reviewed revision 1 of this plan and raised one critical, one high, three medium findings plus answers to four risks. Revision 2 claims to accept all of them. *)",
-      "Bash(codex exec --model gpt-5.6-sol --sandbox read-only --skip-git-repo-check 'Third review round. Read __TRACKED_VAR__/PLAN-C.md \\(revision 3\\) plus docs/decisions.md \\(ADR-012 through ADR-017\\), docs/m4-effects-guidance.md, crates/townhall-store/src/lib.rs, crates/townhall-domain/src/lib.rs, crates/bld-kernel/src/lib.rs. *)"
+      "Bash(codex exec --model gpt-5.6-sol --sandbox read-only --skip-git-repo-check 'Third review round. Read __TRACKED_VAR__/PLAN-C.md \\(revision 3\\) plus docs/decisions.md \\(ADR-012 through ADR-017\\), docs/m4-effects-guidance.md, crates/townhall-store/src/lib.rs, crates/townhall-domain/src/lib.rs, crates/bld-kernel/src/lib.rs. *)",
+      "Bash(timeout 580 codex exec --model gpt-5.5 --sandbox read-only --skip-git-repo-check 'Review PR #12 on this Rust repository \\(BLD reference implementation\\). Adversarial code review, not a summary. Be concise: at most four findings, ranked, each with file:line and a concrete fix. *)",
+      "Bash(codex exec --model gpt-5.5 --sandbox read-only --skip-git-repo-check 'Review PR #12 on this Rust repository \\(BLD reference implementation\\). Adversarial code review, not a summary. Be concise: at most four findings, ranked, each with file:line and a concrete fix. *)"
     ]
   }
 }

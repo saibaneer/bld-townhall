@@ -864,6 +864,45 @@ impl TransitionDriver for SystemEvent {
 /// by a capability, and the fact door must never bind against those — it binds
 /// against the *persisted* canonical plan. A context that cannot even name
 /// capability-loaded facts makes that structural rather than a discipline.
+/// What a verified fact establishes about the effect it concerns.
+///
+/// The three fields travel together so they cannot be mismatched. Deriving them
+/// from the fact — rather than letting a coordinator assemble them — means the
+/// status and its reference always agree, so a shape
+/// [`EffectIntent::coherent`] would refuse cannot be constructed on this path at
+/// all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EstablishedOutcome {
+    pub status: EffectStatus,
+    pub provider_reference: Option<CouncilBookingRef>,
+    pub detail: Option<BoundedString>,
+}
+
+impl VerifiedProviderFact {
+    /// The terminal outcome this fact establishes for its effect.
+    #[must_use]
+    pub fn establishes(&self) -> EstablishedOutcome {
+        match self {
+            Self::BookingExists { booking_ref, .. }
+            | Self::CancellationExists { booking_ref, .. } => EstablishedOutcome {
+                status: EffectStatus::Confirmed,
+                provider_reference: Some(booking_ref.clone()),
+                detail: None,
+            },
+            Self::EffectAbsent { .. } => EstablishedOutcome {
+                status: EffectStatus::Absent,
+                provider_reference: None,
+                detail: None,
+            },
+            Self::ProviderRejected { reason, .. } => EstablishedOutcome {
+                status: EffectStatus::Rejected,
+                provider_reference: None,
+                detail: Some(reason.clone()),
+            },
+        }
+    }
+}
+
 /// An effect intent that contradicts itself.
 ///
 /// The same treatment [`IncoherentBooking`] gets, for the same reason. Slice C1
@@ -991,6 +1030,49 @@ const fn fact_category(state: &BookingState) -> FactCategory {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TownHallDomain;
+
+impl TownHallDomain {
+    /// Which kind of effect a proposal would set in motion here, if any.
+    ///
+    /// A coordinator needs this *before* classifying, because the effect identity
+    /// is an input to classification and the identity's derivation includes the
+    /// operation kind. So the question has to be answerable one step early.
+    ///
+    /// It restates two facts the transition graph already knows, which is exactly
+    /// the duplication this project keeps finding bugs in — so it is pinned by a
+    /// sweep over all seventy cells asserting it agrees with `resolve_proposal`
+    /// about which cells are external and what kind they carry. Stating a fact
+    /// twice is survivable when the agreement is proved; it is the unproved kind
+    /// that rots.
+    #[must_use]
+    pub const fn intended_effect_kind(
+        state: &BookingState,
+        proposal: &BookingProposal,
+    ) -> Option<OperationKind> {
+        match (state, proposal) {
+            (BookingState::AwaitingBooking(_), BookingProposal::Book) => Some(OperationKind::Book),
+            (BookingState::Booked(_), BookingProposal::Cancel { .. }) => {
+                Some(OperationKind::Cancel)
+            }
+            _ => None,
+        }
+    }
+
+    /// The same question for the fact door, which has exactly one external edge.
+    #[must_use]
+    pub const fn fact_intended_effect_kind(
+        state: &BookingState,
+        fact: &VerifiedProviderFact,
+    ) -> Option<OperationKind> {
+        match (state, fact) {
+            (
+                BookingState::CancellationRequested(_),
+                VerifiedProviderFact::BookingExists { .. },
+            ) => Some(OperationKind::Cancel),
+            _ => None,
+        }
+    }
+}
 
 impl TownHallDomain {
     fn effective_max_fee(
@@ -3069,6 +3151,114 @@ mod characterization {
             matches!(got, Resolution::Undefined),
             "Draft has no book; a phantom reference must not conjure one, got {got:?}"
         );
+    }
+
+    /// `intended_effect_kind` restates what the transition graph already knows, so
+    /// the agreement is proved rather than assumed: across every legal cell it must
+    /// be `Some` exactly where the plan is an `ExternalEffect`, and must name the
+    /// same kind the effect carries.
+    ///
+    /// This is the discipline that makes the duplication survivable. Without it,
+    /// adding a third external edge would leave the coordinator deriving a
+    /// `Book` identity for a `Cancel` effect — and the store would refuse it,
+    /// correctly but confusingly, one layer away from the mistake.
+    #[tokio::test]
+    async fn the_intended_effect_kind_agrees_with_the_topology() {
+        let mut external_cells = 0_usize;
+        for source in [
+            draft(),
+            venue_selected(),
+            needs_revalidation(),
+            awaiting_booking(),
+            booked(),
+        ] {
+            for proposal in [
+                BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                },
+                BookingProposal::VerifySlot,
+                BookingProposal::ChangeVenue,
+                BookingProposal::UpdateRequirements { attendees: None },
+                BookingProposal::RevalidateVenue,
+                BookingProposal::Book,
+                BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                },
+            ] {
+                let cell = format!("{} + {}", source.state.name(), proposal.name());
+                let predicted = TownHallDomain::intended_effect_kind(&source.state, &proposal);
+                let got = turn(source.clone(), proposal, &authority(), &context()).await;
+
+                match got {
+                    Resolution::Ready(TransitionPlan::ExternalEffect { effect, .. }) => {
+                        external_cells += 1;
+                        assert_eq!(
+                            predicted,
+                            Some(effect.operation_kind()),
+                            "{cell} is external; the prediction must name its kind"
+                        );
+                    }
+                    _ => assert_eq!(
+                        predicted, None,
+                        "{cell} is not external; the prediction must say so"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            external_cells, 2,
+            "the proposal door has exactly two external edges; a change needs an ADR"
+        );
+    }
+
+    /// `establishes` keeps the status and its reference together, so the shape
+    /// `EffectIntent::coherent` requires holds by construction rather than by the
+    /// caller assembling it correctly.
+    #[test]
+    fn what_a_fact_establishes_is_always_a_coherent_shape() {
+        let effect = EffectIntentId::new("EFF-BKG-1001-BOOK-0");
+        let facts = [
+            VerifiedProviderFact::BookingExists {
+                effect_intent_id: effect.clone(),
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                attendees: 20,
+                fee: Money::from_pence(4_500),
+                principal: PrincipalId::new("lucy"),
+            },
+            VerifiedProviderFact::CancellationExists {
+                effect_intent_id: effect.clone(),
+                booking_ref: CouncilBookingRef::new("TH-92718"),
+            },
+            VerifiedProviderFact::EffectAbsent {
+                effect_intent_id: effect.clone(),
+            },
+            VerifiedProviderFact::ProviderRejected {
+                effect_intent_id: effect.clone(),
+                reason: BoundedString::truncating("hall closed"),
+            },
+        ];
+
+        for fact in facts {
+            let name = fact.name();
+            let outcome = fact.establishes();
+            assert!(
+                outcome.status.is_terminal(),
+                "{name} must establish a terminal outcome"
+            );
+            // Project it onto an intent and check the shared definition accepts it.
+            let projected = EffectIntent {
+                status: outcome.status,
+                provider_reference: outcome.provider_reference.clone(),
+                outcome_detail: outcome.detail.clone(),
+                ..sound_intent()
+            };
+            projected.coherent().unwrap_or_else(|why| {
+                panic!("{name} establishes a shape the read gate would refuse: {why}")
+            });
+        }
     }
 
     /// A transition changes a booking; it never changes which booking.

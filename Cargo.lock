@@ -1438,6 +1438,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "townhall-service"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bld-kernel",
+ "bld-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "townhall-domain",
+ "townhall-store",
+]
+
+[[package]]
 name = "townhall-store"
 version = "0.1.0"
 dependencies = [

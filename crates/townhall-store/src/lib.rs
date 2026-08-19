@@ -17,7 +17,7 @@ use std::{
 use thiserror::Error;
 use townhall_domain::{
     Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
-    IncoherentBooking, OperationKind,
+    IncoherentBooking, IncoherentIntent, OperationKind,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -120,6 +120,11 @@ pub enum StoreError {
         where_: &'static str,
         reason: IncoherentBooking,
     },
+    #[error("{where_} effect intent contradicts itself: {reason}")]
+    IncoherentIntent {
+        where_: &'static str,
+        reason: IncoherentIntent,
+    },
     #[error(
         "effect {effect_intent_id} belongs to booking {actual_booking}, not {expected_booking}"
     )]
@@ -150,14 +155,6 @@ pub enum StoreError {
     IncoherentHandoff { reason: &'static str },
     #[error("{0} is not a terminal outcome; an effect can only be finalised to one that is")]
     NotATerminalStatus(&'static str),
-    #[error(
-        "effect outcome {status} may not carry {}a provider reference",
-        if *.has_reference { "" } else { "no " }
-    )]
-    InvalidEffectOutcome {
-        status: &'static str,
-        has_reference: bool,
-    },
     #[error(
         "effect {effect_intent_id} is already {recorded}; refusing to record {attempted} — one          identity cannot have two outcomes"
     )]
@@ -251,8 +248,8 @@ pub trait BookingRepository: Send + Sync {
     ///
     /// # Errors
     /// [`StoreError::NotATerminalStatus`] for a non-outcome;
-    /// [`StoreError::InvalidEffectOutcome`] for a status/reference shape the fact
-    /// door would refuse to read; [`StoreError::ContradictoryFinalisation`] when a
+    /// [`StoreError::IncoherentIntent`] when the row the write would produce is one
+    /// the read gate would refuse; [`StoreError::ContradictoryFinalisation`] when a
     /// different outcome is already recorded — one identity cannot have two;
     /// [`StoreError::NotAnInFlightState`] when the aggregate is not waiting on
     /// this identity, which is what stops a stale intent being finalised while
@@ -575,21 +572,24 @@ impl BookingRepository for SqliteBookingRepository {
         )
         .await?;
 
-        if let FinalisationState::AlreadyRecorded(intent) = classified {
-            // The version already advanced when the outcome was first recorded, so
-            // the CAS would fail; returning the truth is what lets a coordinator
-            // retry safely after a lost acknowledgement.
-            tx.commit().await?;
-            return Ok(FinalizedEffect {
-                aggregate: current,
-                intent: *intent,
-                replayed: true,
-            });
-        }
+        let loaded = match classified {
+            FinalisationState::AlreadyRecorded(intent) => {
+                // The version already advanced when the outcome was first
+                // recorded, so the CAS would fail; returning the truth is what
+                // lets a coordinator retry safely after a lost acknowledgement.
+                tx.commit().await?;
+                return Ok(FinalizedEffect {
+                    aggregate: current,
+                    intent: *intent,
+                    replayed: true,
+                });
+            }
+            FinalisationState::Fresh(intent) => intent,
+        };
 
         record_outcome(
             &mut tx,
-            &request.effect_intent_id,
+            &loaded,
             request.status,
             request.provider_reference.as_ref(),
             request.outcome_detail.as_ref(),
@@ -768,16 +768,19 @@ impl BookingRepository for SqliteBookingRepository {
         // aggregate stayed pointed at it — which this operation and
         // `finalize_effect` both commit atomically, so it cannot happen honestly.
         // Refuse with a reason rather than proceed on a broken premise.
-        if let FinalisationState::AlreadyRecorded(intent) = classified {
-            return Err(StoreError::HandoffPredecessorAlreadyFinal {
-                effect_intent_id: request.finalising.clone(),
-                recorded: intent.status.name(),
-            });
-        }
+        let loaded = match classified {
+            FinalisationState::AlreadyRecorded(intent) => {
+                return Err(StoreError::HandoffPredecessorAlreadyFinal {
+                    effect_intent_id: request.finalising.clone(),
+                    recorded: intent.status.name(),
+                });
+            }
+            FinalisationState::Fresh(intent) => intent,
+        };
 
         record_outcome(
             &mut tx,
-            &request.finalising,
+            &loaded,
             request.finalising_status,
             request.finalising_reference.as_ref(),
             request.finalising_detail.as_ref(),
@@ -1940,42 +1943,29 @@ async fn load_effect_in_tx(
     decode_effect_row(&row)
 }
 
-/// A terminal outcome's status and reference must be a shape the fact door would
-/// accept when it reads the row back (`resolve_fact`'s B4).
+/// Is this a valid *outcome* to record?
 ///
-/// Checking it on the write path means a malformed record can never exist to be
-/// read: a `Confirmed` intent with no reference would otherwise converge against
-/// *any* provider reference, and a referenceless outcome carrying one would name
-/// an effect that officially does not exist.
-fn validate_outcome_shape(
-    status: EffectStatus,
-    provider_reference: Option<&CouncilBookingRef>,
-) -> Result<(), StoreError> {
-    if !status.is_terminal() {
-        return Err(StoreError::NotATerminalStatus(status.name()));
-    }
-    let has_reference = provider_reference.is_some();
-    let valid = match status {
-        EffectStatus::Confirmed => has_reference,
-        EffectStatus::Absent | EffectStatus::Rejected => !has_reference,
-        // Unreachable: is_terminal() already refused these.
-        EffectStatus::Prepared | EffectStatus::Unknown => false,
-    };
-    if valid {
+/// A narrower question than "is this intent coherent", and deliberately separate
+/// from it. `Prepared` is a perfectly good status for an intent to hold — it is
+/// just not something an effect can be finalised *to*. Conflating the two, as an
+/// earlier version of this function did, meant one name answering two questions
+/// and a rule about intent shape living here as well as in the domain.
+///
+/// The shape rule itself is [`EffectIntent::coherent`]'s, checked when the row is
+/// written and again when it is read.
+fn validate_outcome_status(status: EffectStatus) -> Result<(), StoreError> {
+    if status.is_terminal() {
         Ok(())
     } else {
-        Err(StoreError::InvalidEffectOutcome {
-            status: status.name(),
-            has_reference,
-        })
+        Err(StoreError::NotATerminalStatus(status.name()))
     }
 }
 
 /// The outcome of asking whether a finalisation has already happened.
 enum FinalisationState {
-    /// Not yet recorded; proceed. The intent is re-read after the write, so there
-    /// is nothing to carry forward from here.
-    Fresh,
+    /// Not yet recorded; proceed. Carries the loaded intent so the write path can
+    /// project what the row will become and check it before writing.
+    Fresh(Box<EffectIntent>),
     /// This exact outcome is already recorded; write nothing.
     AlreadyRecorded(Box<EffectIntent>),
 }
@@ -1996,7 +1986,7 @@ async fn classify_finalisation(
     provider_reference: Option<&CouncilBookingRef>,
     outcome_detail: Option<&BoundedString>,
 ) -> Result<FinalisationState, StoreError> {
-    validate_outcome_shape(status, provider_reference)?;
+    validate_outcome_status(status)?;
 
     let row = sqlx::query(
         r"
@@ -2070,18 +2060,39 @@ async fn classify_finalisation(
         });
     }
 
-    Ok(FinalisationState::Fresh)
+    Ok(FinalisationState::Fresh(Box::new(intent)))
 }
 
 /// Write an effect's terminal outcome.
+///
+/// `projected` is the intent as it will be once written, and it is checked before
+/// anything is: the same definition the read gate applies, so a row that could not
+/// be loaded can never be stored either.
 async fn record_outcome(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    effect_intent_id: &EffectIntentId,
+    current: &EffectIntent,
     status: EffectStatus,
     provider_reference: Option<&CouncilBookingRef>,
     outcome_detail: Option<&BoundedString>,
     now: i64,
 ) -> Result<(), StoreError> {
+    let effect_intent_id = &current.effect_intent_id;
+
+    // The row as it will be. Checked against the same definition the read gate
+    // applies, so a row that could not be loaded can never be stored either.
+    let projected = EffectIntent {
+        status,
+        provider_reference: provider_reference.cloned(),
+        outcome_detail: outcome_detail.cloned(),
+        ..current.clone()
+    };
+    if let Err(reason) = projected.coherent() {
+        return Err(StoreError::IncoherentIntent {
+            where_: "a recorded",
+            reason,
+        });
+    }
+
     sqlx::query(
         r"
         UPDATE effect_intents
@@ -2107,7 +2118,7 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
     let outcome_detail: Option<String> = row.try_get("outcome_detail")?;
     let supersedes: Option<String> = row.try_get("supersedes")?;
 
-    Ok(EffectIntent {
+    let intent = EffectIntent {
         effect_intent_id: EffectIntentId::new(row.try_get::<String, _>("effect_intent_id")?),
         booking_id: BookingId::new(row.try_get::<String, _>("booking_id")?),
         operation_kind: OperationKind::parse(&kind_text)
@@ -2124,7 +2135,20 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
         supersedes: supersedes.map(EffectIntentId::new),
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
-    })
+    };
+
+    // The gate C1 gave bookings and skipped for intents. Its absence was visible
+    // as a symptom: the fact door hand-rolled the shape rule and the
+    // kind-versus-plan comparison in three places, because nothing guaranteed a
+    // loaded row was sound. Refusing here is what let those become one call.
+    if let Err(reason) = intent.coherent() {
+        return Err(StoreError::IncoherentIntent {
+            where_: "a persisted",
+            reason,
+        });
+    }
+
+    Ok(intent)
 }
 
 /// Resume an operation whose intent is already committed.
@@ -3115,6 +3139,11 @@ mod phase_c {
     /// The status/reference shape must be one the fact door would accept on the
     /// way back in. A `Confirmed` intent with no reference would otherwise
     /// converge against *any* provider reference.
+    ///
+    /// C2 folded the rule into `EffectIntent::coherent`, so the refusal now names
+    /// the intent contradicting itself rather than a store-local "invalid
+    /// outcome" — one definition, applied on write here and on read in
+    /// `decode_effect_row`.
     #[tokio::test]
     async fn a_malformed_outcome_shape_cannot_be_persisted() {
         let temp = TempDir::new().expect("temp dir");
@@ -3140,9 +3169,21 @@ mod phase_c {
                 ))
                 .await
                 .expect_err("a malformed outcome shape must be refused");
+            // `where_` is asserted, not ignored: without the write-path check the
+            // malformed row is written and then refused by the read-back inside
+            // the same transaction — same rollback, but the diagnosis becomes
+            // "this was already in the database" when the truth is "you tried to
+            // write this". Mutation testing found the write gate untested for
+            // exactly that reason.
             assert!(
-                matches!(error, StoreError::InvalidEffectOutcome { .. }),
-                "expected InvalidEffectOutcome for {status:?}/{reference:?}, got {error:?}"
+                matches!(
+                    error,
+                    StoreError::IncoherentIntent {
+                        where_: "a recorded",
+                        reason: IncoherentIntent::OutcomeShape { .. },
+                    }
+                ),
+                "expected the WRITE path to refuse {status:?}/{reference:?}, got {error:?}"
             );
         }
     }
@@ -3363,6 +3404,85 @@ mod phase_c {
             Some("principal is barred")
         );
         assert_ne!(recorded[0], recorded[1]);
+    }
+
+    /// The gate the audit found missing. C1 refused an incoherent *booking* on
+    /// read and on write; the intent got only the write half, and the absence was
+    /// visible as a symptom — the fact door hand-rolled the same rules in three
+    /// places because nothing guaranteed a loaded row was sound.
+    ///
+    /// Written past the repository's own API, which is the only way such a row can
+    /// come into being now.
+    #[tokio::test]
+    async fn a_persisted_intent_that_contradicts_itself_fails_to_load() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-BADINTENT");
+        let (_, effect) = in_flight(&repo, &id).await;
+
+        // Prepared, yet carrying a provider reference: an effect that officially
+        // has not been attempted, naming something the council supposedly made.
+        sqlx::query("UPDATE effect_intents SET provider_reference = ? WHERE effect_intent_id = ?")
+            .bind("TH-92718")
+            .bind(effect.as_str())
+            .execute(repo.pool())
+            .await
+            .expect("the corrupt row should be written");
+
+        let error = repo
+            .load_effect(&effect)
+            .await
+            .expect_err("a self-contradictory intent must not load");
+        assert!(
+            matches!(
+                error,
+                StoreError::IncoherentIntent {
+                    reason: IncoherentIntent::OutcomeShape { .. },
+                    ..
+                }
+            ),
+            "expected an outcome-shape refusal, got {error:?}"
+        );
+    }
+
+    /// And the same row cannot be reached through a *booking* load either, since
+    /// Phase C reads the intent on its way to a decision.
+    #[tokio::test]
+    async fn a_corrupt_intent_blocks_the_operations_that_read_it() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-BADINTENT2");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        sqlx::query("UPDATE effect_intents SET operation_kind = ? WHERE effect_intent_id = ?")
+            .bind(OperationKind::Cancel.name())
+            .bind(effect.as_str())
+            .execute(repo.pool())
+            .await
+            .expect("the corrupt row should be written");
+
+        let error = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &confirmed_fact(&effect),
+            ))
+            .await
+            .expect_err("a corrupt intent must not be finalisable");
+        assert!(
+            matches!(
+                error,
+                StoreError::IncoherentIntent {
+                    reason: IncoherentIntent::KindDisagreesWithPlan { .. },
+                    ..
+                }
+            ),
+            "expected a kind-versus-plan refusal, got {error:?}"
+        );
     }
 
     // ---------------------------------------------------- handoff_effect

@@ -696,6 +696,8 @@ pub enum BookingError {
     InconsistentEffectIdentity,
     #[error("the aggregate contradicts itself: {0}")]
     IncoherentAggregate(IncoherentBooking),
+    #[error("the effect intent contradicts itself: {0}")]
+    IncoherentIntent(IncoherentIntent),
 }
 
 /// Externally verified reality. State-neutral: the verifier establishes *what
@@ -862,6 +864,89 @@ impl TransitionDriver for SystemEvent {
 /// by a capability, and the fact door must never bind against those — it binds
 /// against the *persisted* canonical plan. A context that cannot even name
 /// capability-loaded facts makes that structural rather than a discipline.
+/// An effect intent that contradicts itself.
+///
+/// The same treatment [`IncoherentBooking`] gets, for the same reason. Slice C1
+/// gave the booking one definition of self-consistency and gated it on read and
+/// write; the intent was skipped, and the gap showed up as a symptom — the fact
+/// door hand-rolled the shape rule and the kind-versus-plan comparison, in three
+/// places, precisely because nothing guaranteed a loaded row was sound.
+///
+/// One definition, called from wherever a row arrives, is the fix. Multiple call
+/// sites of one function is the pattern; two implementations of one rule is the
+/// defect.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum IncoherentIntent {
+    #[error("status {status} may not carry {}a provider reference", if *.has_reference { "" } else { "no " })]
+    OutcomeShape {
+        status: &'static str,
+        has_reference: bool,
+    },
+    #[error("a Prepared effect has attempted nothing, so it can have nothing to explain")]
+    PrematureDetail,
+    #[error("the intent is recorded as {column} but its plan is a {plan}")]
+    KindDisagreesWithPlan {
+        column: &'static str,
+        plan: &'static str,
+    },
+    #[error("effect {0} supersedes itself")]
+    SupersedesItself(EffectIntentId),
+}
+
+impl EffectIntent {
+    /// Whether this intent's own fields agree with each other.
+    ///
+    /// # Errors
+    /// One [`IncoherentIntent`] per disagreement, first found.
+    pub fn coherent(&self) -> Result<(), IncoherentIntent> {
+        // A confirmed effect exists, so the provider named it. Nothing else does
+        // — a reference on any other status names an effect that officially never
+        // happened, and a `Confirmed` without one would converge against *any*
+        // reference the fact door was shown.
+        let has_reference = self.provider_reference.is_some();
+        let shape_ok = match self.status {
+            EffectStatus::Confirmed => has_reference,
+            EffectStatus::Prepared
+            | EffectStatus::Unknown
+            | EffectStatus::Absent
+            | EffectStatus::Rejected => !has_reference,
+        };
+        if !shape_ok {
+            return Err(IncoherentIntent::OutcomeShape {
+                status: self.status.name(),
+                has_reference,
+            });
+        }
+
+        // `Prepared` means the capability has not been called. `Unknown` means it
+        // has and the answer was ambiguous — there a detail is genuinely useful,
+        // so only the first is constrained.
+        if self.status == EffectStatus::Prepared && self.outcome_detail.is_some() {
+            return Err(IncoherentIntent::PrematureDetail);
+        }
+
+        // Two copies of one fact: the persisted discriminator and the plan it
+        // describes. `PrepareEffect` derives the column *from* the plan, so they
+        // agree by construction on the way in — this is what catches a row where
+        // they no longer do.
+        let plan_kind = self.canonical_plan.operation_kind();
+        if self.operation_kind != plan_kind {
+            return Err(IncoherentIntent::KindDisagreesWithPlan {
+                column: self.operation_kind.name(),
+                plan: plan_kind.name(),
+            });
+        }
+
+        if self.supersedes.as_ref() == Some(&self.effect_intent_id) {
+            return Err(IncoherentIntent::SupersedesItself(
+                self.effect_intent_id.clone(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FactContext {
     /// The persisted effect intent this fact is about, loaded by the fact's
@@ -988,19 +1073,15 @@ impl TownHallDomain {
         {
             return Err(BookingError::EffectKindMismatch);
         }
-        // B4. The intent's status/reference shape must be valid before it is
-        // compared against anything — a malformed record is not a wildcard.
-        // `Confirmed` without its reference is corruption; a reference on any
-        // other status names an effect that officially does not exist.
-        let shape_valid = match intent.status {
-            EffectStatus::Confirmed => intent.provider_reference.is_some(),
-            EffectStatus::Prepared
-            | EffectStatus::Unknown
-            | EffectStatus::Absent
-            | EffectStatus::Rejected => intent.provider_reference.is_none(),
-        };
-        if !shape_valid {
-            return Err(BookingError::ContradictoryProviderFact);
+        // B4. The intent must not contradict itself before it is compared against
+        // anything — a malformed record is not a wildcard. This used to be a
+        // hand-rolled shape check here, and the kind-versus-plan comparison was
+        // hand-rolled twice more below; all three were compensating for the
+        // absence of a read gate on the intent. One definition now, called here
+        // as well as by the repository, because this door must not assume its
+        // caller went through the repository.
+        if let Err(why) = intent.coherent() {
+            return Err(BookingError::IncoherentIntent(why));
         }
         // B5. The intent's durable outcome must not contradict the fact.
         // `Prepared`/`Unknown` contradict nothing — that is the ordinary happy
@@ -1071,8 +1152,11 @@ impl TownHallDomain {
                     });
                 }
             }
-            // B3 checked the intent's *column*; this catches a row whose
-            // column and plan disagree with each other. Corrupt, refused.
+            // Unreachable: B4 proved the column matches the plan and B3 proved
+            // the fact's kind matches the column, so a kind-specific fact and a
+            // mismatched plan cannot both survive to here. Refused rather than
+            // unreachable!() because a boundary that is wrong should say no, not
+            // abort the process.
             (VerifiedProviderFact::BookingExists { .. }, BookingEffect::CancelBooking { .. })
             | (VerifiedProviderFact::CancellationExists { .. }, BookingEffect::Book { .. }) => {
                 return Err(BookingError::EffectPlanMismatch {
@@ -2711,6 +2795,140 @@ mod characterization {
         );
     }
 
+    // ---------------------------------------------------- effect coherence
+    //
+    // C1 gave the booking one definition of self-consistency and gated it on read
+    // and write. The intent was skipped, and the gap showed as a symptom: the
+    // fact door hand-rolled the same rules in three places. These pin the single
+    // definition that replaced them.
+
+    fn sound_intent() -> EffectIntent {
+        EffectIntent {
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
+            booking_id: BookingId::new("BKG-1001"),
+            operation_kind: OperationKind::Book,
+            source_version: 0,
+            canonical_plan: BookingEffect::Book {
+                principal: PrincipalId::new("lucy"),
+                attendees: 20,
+                facts: good_facts(),
+            },
+            status: EffectStatus::Prepared,
+            expires_at_ms: 1_000_030_000,
+            provider_reference: None,
+            outcome_detail: None,
+            supersedes: None,
+            created_at_ms: 1_000_000_000,
+            updated_at_ms: 1_000_000_000,
+        }
+    }
+
+    #[test]
+    fn a_sound_intent_is_coherent() {
+        sound_intent()
+            .coherent()
+            .expect("the fixture must be sound, or every test below proves nothing");
+    }
+
+    /// A `Confirmed` effect without its reference would converge against *any*
+    /// reference the fact door was shown. Every other status carrying one names an
+    /// effect that officially never happened.
+    #[test]
+    fn only_a_confirmed_effect_may_name_a_provider_reference() {
+        let confirmed_without = EffectIntent {
+            status: EffectStatus::Confirmed,
+            provider_reference: None,
+            ..sound_intent()
+        };
+        assert!(matches!(
+            confirmed_without.coherent(),
+            Err(IncoherentIntent::OutcomeShape { .. })
+        ));
+
+        for status in [
+            EffectStatus::Prepared,
+            EffectStatus::Unknown,
+            EffectStatus::Absent,
+            EffectStatus::Rejected,
+        ] {
+            let carrying = EffectIntent {
+                status,
+                provider_reference: Some(CouncilBookingRef::new("TH-92718")),
+                ..sound_intent()
+            };
+            assert!(
+                matches!(
+                    carrying.coherent(),
+                    Err(IncoherentIntent::OutcomeShape { .. })
+                ),
+                "{status:?} must not carry a reference"
+            );
+        }
+
+        let confirmed_with = EffectIntent {
+            status: EffectStatus::Confirmed,
+            provider_reference: Some(CouncilBookingRef::new("TH-92718")),
+            ..sound_intent()
+        };
+        confirmed_with
+            .coherent()
+            .expect("Confirmed with its reference is the sound shape");
+    }
+
+    /// `Prepared` means the capability has not been called, so there is nothing
+    /// to explain. `Unknown` means it has and the answer was ambiguous — a detail
+    /// is genuinely useful there, so only the first is constrained.
+    #[test]
+    fn a_prepared_effect_has_nothing_to_explain_yet() {
+        let premature = EffectIntent {
+            outcome_detail: Some(BoundedString::truncating("hall closed")),
+            ..sound_intent()
+        };
+        assert!(matches!(
+            premature.coherent(),
+            Err(IncoherentIntent::PrematureDetail)
+        ));
+
+        let ambiguous = EffectIntent {
+            status: EffectStatus::Unknown,
+            outcome_detail: Some(BoundedString::truncating("timed out after 30s")),
+            ..sound_intent()
+        };
+        ambiguous
+            .coherent()
+            .expect("an Unknown outcome may record why it is unknown");
+    }
+
+    /// The persisted discriminator and the plan it describes are two copies of one
+    /// fact. `PrepareEffect` derives the column from the plan, so they agree by
+    /// construction on the way in; this catches a row where they no longer do.
+    #[test]
+    fn the_recorded_kind_must_match_the_plan_it_describes() {
+        let disagreeing = EffectIntent {
+            operation_kind: OperationKind::Cancel,
+            ..sound_intent()
+        };
+        assert!(matches!(
+            disagreeing.coherent(),
+            Err(IncoherentIntent::KindDisagreesWithPlan {
+                column: "Cancel",
+                plan: "Book"
+            })
+        ));
+    }
+
+    #[test]
+    fn an_effect_cannot_supersede_itself() {
+        let ouroboros = EffectIntent {
+            supersedes: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
+            ..sound_intent()
+        };
+        assert!(matches!(
+            ouroboros.coherent(),
+            Err(IncoherentIntent::SupersedesItself(_))
+        ));
+    }
+
     /// A state whose booking has never been confirmed cannot know a council
     /// reference. Forward-only checking left this open, and B3b's review found
     /// the consequence: the fact door silently cleared a phantom reference on
@@ -3768,6 +3986,7 @@ mod fact_topology {
             BookingError::ContradictoryProviderFact => "ContradictoryProviderFact",
             BookingError::InconsistentEffectIdentity => "InconsistentEffectIdentity",
             BookingError::IncoherentAggregate(_) => "IncoherentAggregate",
+            BookingError::IncoherentIntent(_) => "IncoherentIntent",
         }
     }
 
@@ -4448,7 +4667,9 @@ mod fact_topology {
     }
 
     /// An intent whose column and plan disagree with each other is a corrupt
-    /// row, refused rather than guessed about.
+    /// row, refused rather than guessed about — and refused as an *incoherent
+    /// intent*, not as a plan mismatch. The distinction is worth the words: the
+    /// fact is fine, the record it was compared against is not.
     #[tokio::test]
     async fn an_intent_whose_kind_and_plan_disagree_is_refused() {
         let (booking, fact, mut context) = bound_cell("BookingInProgress", 0);
@@ -4458,9 +4679,12 @@ mod fact_topology {
         let got = classify(&booking, fact, &context).await;
         assert_eq!(
             got,
-            FactResolution::Denied(BookingError::EffectPlanMismatch {
-                field: "operation_kind"
-            })
+            FactResolution::Denied(BookingError::IncoherentIntent(
+                IncoherentIntent::KindDisagreesWithPlan {
+                    column: "Book",
+                    plan: "Cancel",
+                }
+            ))
         );
     }
 
@@ -4542,10 +4766,15 @@ mod fact_topology {
                 pending_effect: None,
             };
             let got = classify(&booking, fact, &context).await;
-            assert_eq!(
-                got,
-                FactResolution::Denied(BookingError::ContradictoryProviderFact),
-                "status {status:?} with reference {reference:?} must be refused as malformed"
+            assert!(
+                matches!(
+                    got,
+                    FactResolution::Denied(BookingError::IncoherentIntent(
+                        IncoherentIntent::OutcomeShape { .. }
+                    ))
+                ),
+                "status {status:?} with reference {reference:?} must be refused as malformed, \
+                 got {got:?}"
             );
         }
     }

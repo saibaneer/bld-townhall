@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId};
+use bld_types::{
+    BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId, Provenance,
+    TransitionDriver,
+};
 use sqlx::{
     Row, SqlitePool,
     migrate::Migrator,
@@ -19,27 +22,60 @@ use townhall_domain::{
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// The only outcome an `audit_events` row can carry.
+///
+/// A row exists because a version advanced, so every one of them is a commit.
+/// `Converged` advances nothing and denials live in `denial_events` (ADR-017), so
+/// there is no second value to write — and a column that can only say one thing
+/// is better than an enum pretending otherwise.
+const COMMITTED_OUTCOME: &str = "Committed";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewBooking {
     pub id: BookingId,
     pub requirements: BookingRequirements,
 }
 
+/// One committed transition's audit record.
+///
+/// # Fields are private, and that is the point
+///
+/// ADR-017 requires the trail's provenance to be **derived from the decision, not
+/// asserted by whoever writes the row**. Public fields — or a public enum of
+/// driver classes — would let a caller label a proposal-driven commit as
+/// fact-driven, which is the same defect one layer along. So there is exactly one
+/// constructor, and it takes the *thing that drove the transition*: the type
+/// answers which door it came through, and there is no argument through which to
+/// lie.
+///
+/// A row exists here only because a version advanced — `audit_events` has
+/// `CHECK (to_version > from_version)` and mints its id from the version bump — so
+/// there is no `Converged`, `Denied` or `Undefined` outcome to record. Convergence
+/// advances nothing, and denials live in their own table (ADR-017).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransitionAudit {
-    pub proposal: String,
-    pub outcome: String,
-    pub evidence_summary: Option<String>,
+    provenance: Provenance,
+    driver_name: &'static str,
 }
 
 impl TransitionAudit {
+    /// Record a transition as driven by `driver`.
     #[must_use]
-    pub fn committed(proposal: impl Into<String>, evidence_summary: Option<String>) -> Self {
+    pub fn driven_by(driver: &impl TransitionDriver) -> Self {
         Self {
-            proposal: proposal.into(),
-            outcome: "Committed".to_owned(),
-            evidence_summary,
+            provenance: driver.provenance(),
+            driver_name: driver.driver_name(),
         }
+    }
+
+    #[must_use]
+    pub const fn provenance(&self) -> Provenance {
+        self.provenance
+    }
+
+    #[must_use]
+    pub const fn driver_name(&self) -> &'static str {
+        self.driver_name
     }
 }
 
@@ -52,9 +88,11 @@ pub struct AuditEvent {
     pub to_version: u64,
     pub from_state: String,
     pub to_state: String,
-    pub proposal: String,
+    /// Which provenance class drove this transition (ADR-017).
+    pub driver_kind: Provenance,
+    /// Which member of that vocabulary.
+    pub driver_detail: String,
     pub outcome: String,
-    pub evidence_summary: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -81,6 +119,52 @@ pub enum StoreError {
     IncoherentBooking {
         where_: &'static str,
         reason: IncoherentBooking,
+    },
+    #[error(
+        "effect {effect_intent_id} belongs to booking {actual_booking}, not {expected_booking}"
+    )]
+    EffectMismatch {
+        effect_intent_id: EffectIntentId,
+        expected_booking: BookingId,
+        actual_booking: BookingId,
+    },
+    #[error(
+        "the next booking still names effect {effect_intent_id}, which this operation is ending"
+    )]
+    EffectStillActive { effect_intent_id: EffectIntentId },
+    #[error(
+        "effect {effect_intent_id} is already {recorded} while the aggregate still waits on it;          a handoff cannot complete from that state"
+    )]
+    HandoffPredecessorAlreadyFinal {
+        effect_intent_id: EffectIntentId,
+        recorded: &'static str,
+    },
+    #[error(
+        "a handoff must leave the aggregate naming its successor {expected}, but it names          {actual:?}"
+    )]
+    SuccessorNotAdopted {
+        expected: EffectIntentId,
+        actual: Option<EffectIntentId>,
+    },
+    #[error("this is not a coherent handoff: {reason}")]
+    IncoherentHandoff { reason: &'static str },
+    #[error("{0} is not a terminal outcome; an effect can only be finalised to one that is")]
+    NotATerminalStatus(&'static str),
+    #[error(
+        "effect outcome {status} may not carry {}a provider reference",
+        if *.has_reference { "" } else { "no " }
+    )]
+    InvalidEffectOutcome {
+        status: &'static str,
+        has_reference: bool,
+    },
+    #[error(
+        "effect {effect_intent_id} is already {recorded}; refusing to record {attempted} — one          identity cannot have two outcomes"
+    )]
+    ContradictoryFinalisation {
+        effect_intent_id: EffectIntentId,
+        recorded: &'static str,
+        attempted: &'static str,
     },
     #[error("effect intent {0} was not found")]
     EffectNotFound(EffectIntentId),
@@ -159,6 +243,36 @@ pub trait BookingRepository: Send + Sync {
     /// with a different canonical plan — that is a boundary violation, not a
     /// retry, and it fails closed.
     async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError>;
+    /// Record an effect's terminal outcome and commit the resulting state,
+    /// atomically. Phase C's ending half.
+    ///
+    /// Idempotent: recording the *same* outcome again returns the committed
+    /// result with `replayed: true` and writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::NotATerminalStatus`] for a non-outcome;
+    /// [`StoreError::InvalidEffectOutcome`] for a status/reference shape the fact
+    /// door would refuse to read; [`StoreError::ContradictoryFinalisation`] when a
+    /// different outcome is already recorded — one identity cannot have two;
+    /// [`StoreError::NotAnInFlightState`] when the aggregate is not waiting on
+    /// this identity, which is what stops a stale intent being finalised while
+    /// the live one is orphaned.
+    async fn finalize_effect(&self, request: FinalizeEffect)
+    -> Result<FinalizedEffect, StoreError>;
+
+    /// Finalise one effect and start its successor, atomically. Phase C's
+    /// handoff half.
+    ///
+    /// Idempotent on the successor's uniqueness key **and** its predecessor: a
+    /// same-key successor recorded against a *different* predecessor is a
+    /// conflict, not a replay.
+    ///
+    /// # Errors
+    /// Everything `finalize_effect` can return for the finalising half, plus
+    /// [`StoreError::ConflictingPlan`] when a same-key successor exists with a
+    /// different plan or predecessor.
+    async fn handoff_effect(&self, request: HandoffEffect) -> Result<HandedOffEffect, StoreError>;
+
     /// Read one effect intent.
     ///
     /// # Errors
@@ -350,7 +464,7 @@ impl BookingRepository for SqliteBookingRepository {
             r"
             SELECT effect_intent_id, booking_id, operation_kind, source_version,
                    canonical_plan_json, status, expires_at_ms, provider_reference,
-                   created_at_ms, updated_at_ms
+                   outcome_detail, supersedes, created_at_ms, updated_at_ms
             FROM effect_intents
             WHERE booking_id = ? AND operation_kind = ? AND source_version = ?
             ",
@@ -386,8 +500,8 @@ impl BookingRepository for SqliteBookingRepository {
             INSERT INTO effect_intents (
                 effect_intent_id, booking_id, operation_kind, source_version,
                 canonical_plan_json, status, expires_at_ms, provider_reference,
-                last_error, created_at_ms, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                last_error, outcome_detail, supersedes, created_at_ms, updated_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
             ",
         )
         .bind(effect_intent_id.as_str())
@@ -415,9 +529,302 @@ impl BookingRepository for SqliteBookingRepository {
                 status: EffectStatus::Prepared,
                 expires_at_ms,
                 provider_reference: None,
+                outcome_detail: None,
+                supersedes: None,
                 created_at_ms: now,
                 updated_at_ms: now,
             },
+            replayed: false,
+        })
+    }
+
+    async fn finalize_effect(
+        &self,
+        request: FinalizeEffect,
+    ) -> Result<FinalizedEffect, StoreError> {
+        // Before the transaction, and before the replay path can return early —
+        // the same reasoning as `prepare_effect`'s gate.
+        if request.next.id != request.booking_id {
+            return Err(StoreError::IdentityChanged {
+                expected: request.booking_id.clone(),
+                actual: request.next.id.clone(),
+            });
+        }
+        // Finalising is what clears the pointer. An aggregate still naming the
+        // effect its intent row says has completed is exactly the disagreement
+        // `Booking::coherent` exists to prevent, on the one path that could
+        // create it.
+        if request.next.active_effect.as_ref() == Some(&request.effect_intent_id) {
+            return Err(StoreError::EffectStillActive {
+                effect_intent_id: request.effect_intent_id.clone(),
+            });
+        }
+
+        let now = now_ms()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let current = load_booking_in_tx(&mut tx, &request.booking_id).await?;
+        let classified = classify_finalisation(
+            &mut tx,
+            &request.booking_id,
+            &current,
+            &request.effect_intent_id,
+            request.status,
+            request.provider_reference.as_ref(),
+            request.outcome_detail.as_ref(),
+        )
+        .await?;
+
+        if let FinalisationState::AlreadyRecorded(intent) = classified {
+            // The version already advanced when the outcome was first recorded, so
+            // the CAS would fail; returning the truth is what lets a coordinator
+            // retry safely after a lost acknowledgement.
+            tx.commit().await?;
+            return Ok(FinalizedEffect {
+                aggregate: current,
+                intent: *intent,
+                replayed: true,
+            });
+        }
+
+        record_outcome(
+            &mut tx,
+            &request.effect_intent_id,
+            request.status,
+            request.provider_reference.as_ref(),
+            request.outcome_detail.as_ref(),
+            now,
+        )
+        .await?;
+
+        let aggregate = commit_in_tx(
+            &mut tx,
+            &request.booking_id,
+            request.source_version,
+            &request.next,
+            &request.audit,
+            now,
+        )
+        .await?;
+
+        let intent = load_effect_in_tx(&mut tx, &request.effect_intent_id).await?;
+        tx.commit().await?;
+
+        Ok(FinalizedEffect {
+            aggregate,
+            intent,
+            replayed: false,
+        })
+    }
+
+    // Four writes plus a replay path share one transaction, and that is the whole
+    // point of the operation — splitting it into helpers would scatter the
+    // atomicity a reader needs to verify in one place.
+    #[allow(clippy::too_many_lines)]
+    async fn handoff_effect(&self, request: HandoffEffect) -> Result<HandedOffEffect, StoreError> {
+        if request.next.id != request.booking_id {
+            return Err(StoreError::IdentityChanged {
+                expected: request.booking_id.clone(),
+                actual: request.next.id.clone(),
+            });
+        }
+
+        // A handoff is only coherent in one direction, and nothing so far checked
+        // it. Review found that a caller could record "the booking never happened"
+        // — `Absent`/`Rejected` with no reference — and in the same transaction
+        // create a cancellation for some booking reference. Two contradictory
+        // facts, committed atomically.
+        //
+        // The rule, stated without knowing what a booking is: a successor exists
+        // *because* its predecessor succeeded, and it acts on what the predecessor
+        // produced. So the predecessor must be `Confirmed` (which the shape rule
+        // then requires to carry a reference), and the successor's plan must act
+        // on exactly that reference — `BookingEffect::acts_on` is the domain's
+        // answer to "which reference does this plan operate on".
+        if request.finalising_status != EffectStatus::Confirmed {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "a successor effect exists only because its predecessor succeeded",
+            });
+        }
+        if request.successor_plan.acts_on() != request.finalising_reference.as_ref() {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "the successor must act on the reference its predecessor produced",
+            });
+        }
+        // And the aggregate must record that reference too, or the booking would
+        // point at one thing while its in-flight effect acts on another.
+        if request.next.booking_ref != request.finalising_reference {
+            return Err(StoreError::IncoherentHandoff {
+                reason: "the next booking must record the reference its predecessor produced",
+            });
+        }
+
+        let successor_kind = request.successor_plan.operation_kind();
+        let successor_id =
+            derive_effect_intent_id(&request.booking_id, successor_kind, request.source_version);
+
+        // The successor must not reuse the identity it replaces. The domain
+        // refuses this too (B3b); defence in depth is cheap and this is the layer
+        // that actually writes both rows.
+        if successor_id == request.finalising {
+            return Err(StoreError::EffectStillActive {
+                effect_intent_id: request.finalising.clone(),
+            });
+        }
+        // And the aggregate must name the successor — not merely stop naming the
+        // predecessor. An aggregate pointing at neither effect is the
+        // unrecoverable shape this operation exists to prevent, because recovery
+        // looks up effects by the identity the aggregate names.
+        if request.next.active_effect.as_ref() != Some(&successor_id) {
+            return Err(StoreError::SuccessorNotAdopted {
+                expected: successor_id,
+                actual: request.next.active_effect.clone(),
+            });
+        }
+
+        let plan_json = serde_json::to_string(&request.successor_plan)?;
+        let source_db = version_to_i64(request.source_version)?;
+
+        // ADR-016, same discipline as `prepare_effect`: sampled once, immediately
+        // before the transaction, never chosen by a caller.
+        let prepared_at_ms = now_ms()?;
+        let expires_at_ms = prepared_at_ms
+            .checked_add(self.effect_ttl_ms)
+            .ok_or(StoreError::ClockOutOfRange)?;
+        let now = prepared_at_ms;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // Replay first, exactly as `prepare_effect` does: if the successor already
+        // exists the version has advanced and the CAS would fail, stranding a
+        // coordinator with a handoff it cannot resume.
+        let existing = sqlx::query(
+            r"
+            SELECT effect_intent_id, booking_id, operation_kind, source_version,
+                   canonical_plan_json, status, expires_at_ms, provider_reference,
+                   outcome_detail, supersedes, created_at_ms, updated_at_ms
+            FROM effect_intents
+            WHERE effect_intent_id = ?
+            ",
+        )
+        .bind(successor_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(row) = existing {
+            let successor = decode_effect_row(&row)?;
+            // The uniqueness key names the successor only, so it cannot on its own
+            // distinguish "this exact handoff already happened" from "a different
+            // predecessor produced a same-key successor". `supersedes` is what
+            // makes the whole tuple checkable.
+            if successor.canonical_plan != request.successor_plan
+                || successor.supersedes.as_ref() != Some(&request.finalising)
+            {
+                return Err(StoreError::ConflictingPlan {
+                    booking_id: request.booking_id.clone(),
+                    operation_kind: successor_kind.name(),
+                    source_version: request.source_version,
+                });
+            }
+            let finalised = load_effect_in_tx(&mut tx, &request.finalising).await?;
+            // The successor matching is not enough on its own: a replay must agree
+            // about the *predecessor's outcome* too, or a request claiming a
+            // different finalisation would be answered as though it had been
+            // accepted.
+            if finalised.status != request.finalising_status
+                || finalised.provider_reference != request.finalising_reference
+                || finalised.outcome_detail != request.finalising_detail
+            {
+                return Err(StoreError::ContradictoryFinalisation {
+                    effect_intent_id: request.finalising.clone(),
+                    recorded: finalised.status.name(),
+                    attempted: request.finalising_status.name(),
+                });
+            }
+            let aggregate = load_booking_in_tx(&mut tx, &request.booking_id).await?;
+            tx.commit().await?;
+            return Ok(HandedOffEffect {
+                aggregate,
+                finalised,
+                successor,
+                replayed: true,
+            });
+        }
+
+        let current = load_booking_in_tx(&mut tx, &request.booking_id).await?;
+        let classified = classify_finalisation(
+            &mut tx,
+            &request.booking_id,
+            &current,
+            &request.finalising,
+            request.finalising_status,
+            request.finalising_reference.as_ref(),
+            request.finalising_detail.as_ref(),
+        )
+        .await?;
+
+        // The successor branch above is the only replay path. Reaching here with
+        // an already-terminal predecessor means it was finalised while the
+        // aggregate stayed pointed at it — which this operation and
+        // `finalize_effect` both commit atomically, so it cannot happen honestly.
+        // Refuse with a reason rather than proceed on a broken premise.
+        if let FinalisationState::AlreadyRecorded(intent) = classified {
+            return Err(StoreError::HandoffPredecessorAlreadyFinal {
+                effect_intent_id: request.finalising.clone(),
+                recorded: intent.status.name(),
+            });
+        }
+
+        record_outcome(
+            &mut tx,
+            &request.finalising,
+            request.finalising_status,
+            request.finalising_reference.as_ref(),
+            request.finalising_detail.as_ref(),
+            now,
+        )
+        .await?;
+
+        let aggregate = commit_in_tx(
+            &mut tx,
+            &request.booking_id,
+            request.source_version,
+            &request.next,
+            &request.audit,
+            now,
+        )
+        .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO effect_intents (
+                effect_intent_id, booking_id, operation_kind, source_version,
+                canonical_plan_json, status, expires_at_ms, provider_reference,
+                last_error, outcome_detail, supersedes, created_at_ms, updated_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+            ",
+        )
+        .bind(successor_id.as_str())
+        .bind(request.booking_id.as_str())
+        .bind(successor_kind.name())
+        .bind(source_db)
+        .bind(&plan_json)
+        .bind(EffectStatus::Prepared.name())
+        .bind(expires_at_ms)
+        .bind(request.finalising.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        let finalised = load_effect_in_tx(&mut tx, &request.finalising).await?;
+        let successor = load_effect_in_tx(&mut tx, &successor_id).await?;
+        tx.commit().await?;
+
+        Ok(HandedOffEffect {
+            aggregate,
+            finalised,
+            successor,
             replayed: false,
         })
     }
@@ -427,7 +834,7 @@ impl BookingRepository for SqliteBookingRepository {
             r"
             SELECT effect_intent_id, booking_id, operation_kind, source_version,
                    canonical_plan_json, status, expires_at_ms, provider_reference,
-                   created_at_ms, updated_at_ms
+                   outcome_detail, supersedes, created_at_ms, updated_at_ms
             FROM effect_intents
             WHERE effect_intent_id = ?
             ",
@@ -444,7 +851,7 @@ impl BookingRepository for SqliteBookingRepository {
         let rows = sqlx::query(
             r"
             SELECT sequence, event_id, booking_id, from_version, to_version,
-                   from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
+                   from_state, to_state, driver_kind, driver_detail, outcome, created_at_ms
             FROM audit_events
             WHERE booking_id = ?
             ORDER BY sequence ASC
@@ -526,9 +933,10 @@ fn decode_audit_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, StoreEr
         to_version: version_from_i64(row.try_get::<i64, _>("to_version")?)?,
         from_state: row.try_get("from_state")?,
         to_state: row.try_get("to_state")?,
-        proposal: row.try_get("proposal")?,
+        driver_kind: Provenance::parse(&row.try_get::<String, _>("driver_kind")?)
+            .map_err(|text| StoreError::CorruptRow(format!("unknown driver_kind {text:?}")))?,
+        driver_detail: row.try_get("driver_detail")?,
         outcome: row.try_get("outcome")?,
-        evidence_summary: row.try_get("evidence_summary")?,
         created_at_ms: row.try_get("created_at_ms")?,
     })
 }
@@ -658,7 +1066,7 @@ async fn commit_in_tx(
         r"
         INSERT INTO audit_events (
             event_id, booking_id, from_version, to_version,
-            from_state, to_state, proposal, outcome, evidence_summary, created_at_ms
+            from_state, to_state, driver_kind, driver_detail, outcome, created_at_ms
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ",
     )
@@ -668,9 +1076,9 @@ async fn commit_in_tx(
     .bind(next_db)
     .bind(&from_state)
     .bind(next.state.name())
-    .bind(&audit.proposal)
-    .bind(&audit.outcome)
-    .bind(&audit.evidence_summary)
+    .bind(audit.provenance().name())
+    .bind(audit.driver_name())
+    .bind(COMMITTED_OUTCOME)
     .bind(now)
     .execute(&mut **tx)
     .await?;
@@ -742,9 +1150,11 @@ fn now_ms() -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use bld_types::{Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
-    use townhall_domain::{BookingState, SelectedVenueRef, VenueFacts, VenueSelected};
+    use townhall_domain::{
+        BookingProposal, BookingState, SelectedVenueRef, VenueFacts, VenueSelected,
+    };
 
     fn requirements() -> BookingRequirements {
         BookingRequirements {
@@ -830,7 +1240,10 @@ mod tests {
                     booking_ref: None,
                     active_effect: None,
                 },
-                TransitionAudit::committed("SelectVenue", None),
+                TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                }),
             )
             .await
             .expect("first CAS should win");
@@ -842,7 +1255,9 @@ mod tests {
                 &id,
                 stale_copy_b.version,
                 Booking::from(&stale_copy_b),
-                TransitionAudit::committed("Cancel", None),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
             )
             .await
             .expect_err("stale copy must lose");
@@ -893,7 +1308,10 @@ mod tests {
             &id,
             0,
             next,
-            TransitionAudit::committed("SelectVenue", Some("no external effect".to_owned())),
+            TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
         )
         .await
         .expect("commit should succeed");
@@ -904,7 +1322,10 @@ mod tests {
         assert_eq!(audit[0].to_version, 1);
         assert_eq!(audit[0].from_state, "Draft");
         assert_eq!(audit[0].to_state, "VenueSelected");
-        assert_eq!(audit[0].proposal, "SelectVenue");
+        // The provenance is DERIVED: the row says a proposal drove this because a
+        // `BookingProposal` was what built the record, not because a caller typed it.
+        assert_eq!(audit[0].driver_kind, Provenance::Proposal);
+        assert_eq!(audit[0].driver_detail, "SelectVenue");
     }
 
     /// B3a put `id` on the domain's `Booking` so evidence can be bound to a
@@ -949,7 +1370,10 @@ mod tests {
                 &id,
                 0,
                 impostor,
-                TransitionAudit::committed("SelectVenue", None),
+                TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                    venue_id: VenueId::new("TH-A"),
+                    slot_id: SlotId::new("SLOT-A"),
+                }),
             )
             .await
             .expect_err("a transition that changes identity must be refused");
@@ -1000,7 +1424,7 @@ mod tests {
                 &id,
                 0,
                 contradictory,
-                TransitionAudit::committed("Book", None),
+                TransitionAudit::driven_by(&BookingProposal::Book),
             )
             .await
             .expect_err("a self-contradictory booking must not be persisted");
@@ -1136,7 +1560,7 @@ mod concurrency {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::Barrier;
-    use townhall_domain::{BookingState, SelectedVenueRef, VenueSelected};
+    use townhall_domain::{BookingProposal, BookingState, SelectedVenueRef, VenueSelected};
 
     /// Enough rounds that both interleavings (loser's SELECT before vs. after
     /// the winner's commit) are exercised, without making the suite slow.
@@ -1222,7 +1646,10 @@ mod concurrency {
                         &id,
                         expected,
                         write,
-                        TransitionAudit::committed("SelectVenue", None),
+                        TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        }),
                     )
                     .await
                 }));
@@ -1329,7 +1756,10 @@ mod concurrency {
                     &id,
                     0,
                     write,
-                    TransitionAudit::committed("SelectVenue", None),
+                    TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                        venue_id: VenueId::new("TH-A"),
+                        slot_id: SlotId::new("SLOT-A"),
+                    }),
                 )
                 .await
                 .map(|_| ())
@@ -1403,6 +1833,75 @@ impl PrepareEffect {
 /// past policy.
 pub const DEFAULT_EFFECT_TTL_MS: i64 = 30_000;
 
+/// Record an effect's terminal outcome and commit the state it produces.
+///
+/// Phase C's ending half (`docs/m4-effects-guidance.md`). One transaction: the
+/// aggregate CAS, the effect's terminal status, and the audit row. Returns
+/// *committed* state, so — like [`PrepareEffect`] — there is no signature through
+/// which a capability could be invoked while a transaction is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeEffect {
+    pub booking_id: BookingId,
+    /// The version the classification was derived from. Also the CAS expectation.
+    pub source_version: u64,
+    /// The effect ending.
+    pub effect_intent_id: EffectIntentId,
+    pub status: EffectStatus,
+    pub provider_reference: Option<CouncilBookingRef>,
+    /// Why, where the outcome has a reason worth keeping.
+    pub outcome_detail: Option<BoundedString>,
+    /// The complete next booking the domain decided.
+    pub next: Booking,
+    pub audit: TransitionAudit,
+}
+
+/// Replace one effect with another, atomically.
+///
+/// For the single transition that hands off rather than ends:
+/// `CancellationRequested + BookingExists -> CancellingBooking` finalises the
+/// booking intent *and* starts a cancellation.
+///
+/// This exists because doing it as finalise-then-prepare leaves a crash window
+/// whose halves are both unrecoverable: either a booking intent nobody will
+/// finalise, or a `CancellingBooking` naming a cancellation intent that does not
+/// exist — and recovery looks up effects by the identity the aggregate names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffEffect {
+    pub booking_id: BookingId,
+    pub source_version: u64,
+    /// The effect ending.
+    pub finalising: EffectIntentId,
+    pub finalising_status: EffectStatus,
+    pub finalising_reference: Option<CouncilBookingRef>,
+    pub finalising_detail: Option<BoundedString>,
+    /// The successor's canonical plan. Its **identity is derived here**, exactly
+    /// as `prepare_effect` derives one: the repository owns effect identity
+    /// because it holds the uniqueness key.
+    pub successor_plan: BookingEffect,
+    pub next: Booking,
+    pub audit: TransitionAudit,
+}
+
+/// The committed result of [`BookingRepository::finalize_effect`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizedEffect {
+    pub aggregate: BookingAggregate,
+    pub intent: EffectIntent,
+    /// True when this call found the outcome already recorded and wrote nothing.
+    pub replayed: bool,
+}
+
+/// The committed result of [`BookingRepository::handoff_effect`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandedOffEffect {
+    pub aggregate: BookingAggregate,
+    /// The effect that ended.
+    pub finalised: EffectIntent,
+    /// The effect that replaced it.
+    pub successor: EffectIntent,
+    pub replayed: bool,
+}
+
 /// The committed result of [`BookingRepository::prepare_effect`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedEffect {
@@ -1420,11 +1919,193 @@ impl StoreError {
     }
 }
 
+/// Read one effect intent inside an open transaction.
+async fn load_effect_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &EffectIntentId,
+) -> Result<EffectIntent, StoreError> {
+    let row = sqlx::query(
+        r"
+        SELECT effect_intent_id, booking_id, operation_kind, source_version,
+               canonical_plan_json, status, expires_at_ms, provider_reference,
+               outcome_detail, supersedes, created_at_ms, updated_at_ms
+        FROM effect_intents
+        WHERE effect_intent_id = ?
+        ",
+    )
+    .bind(id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| StoreError::EffectNotFound(id.clone()))?;
+    decode_effect_row(&row)
+}
+
+/// A terminal outcome's status and reference must be a shape the fact door would
+/// accept when it reads the row back (`resolve_fact`'s B4).
+///
+/// Checking it on the write path means a malformed record can never exist to be
+/// read: a `Confirmed` intent with no reference would otherwise converge against
+/// *any* provider reference, and a referenceless outcome carrying one would name
+/// an effect that officially does not exist.
+fn validate_outcome_shape(
+    status: EffectStatus,
+    provider_reference: Option<&CouncilBookingRef>,
+) -> Result<(), StoreError> {
+    if !status.is_terminal() {
+        return Err(StoreError::NotATerminalStatus(status.name()));
+    }
+    let has_reference = provider_reference.is_some();
+    let valid = match status {
+        EffectStatus::Confirmed => has_reference,
+        EffectStatus::Absent | EffectStatus::Rejected => !has_reference,
+        // Unreachable: is_terminal() already refused these.
+        EffectStatus::Prepared | EffectStatus::Unknown => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidEffectOutcome {
+            status: status.name(),
+            has_reference,
+        })
+    }
+}
+
+/// The outcome of asking whether a finalisation has already happened.
+enum FinalisationState {
+    /// Not yet recorded; proceed. The intent is re-read after the write, so there
+    /// is nothing to carry forward from here.
+    Fresh,
+    /// This exact outcome is already recorded; write nothing.
+    AlreadyRecorded(Box<EffectIntent>),
+}
+
+/// Load the effect being finalised and decide whether this is fresh or a replay.
+///
+/// The aggregate check is the important one, and it is why this takes the
+/// *committed* booking rather than trusting the caller's `next`: without it a
+/// caller could finalise an older intent that does belong to this booking while
+/// the aggregate is waiting on a different, live one — orphaning the live effect
+/// atomically and wrongly. The Phase C mirror of `verify_effect_identity`.
+async fn classify_finalisation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    booking_id: &BookingId,
+    current: &BookingAggregate,
+    effect_intent_id: &EffectIntentId,
+    status: EffectStatus,
+    provider_reference: Option<&CouncilBookingRef>,
+    outcome_detail: Option<&BoundedString>,
+) -> Result<FinalisationState, StoreError> {
+    validate_outcome_shape(status, provider_reference)?;
+
+    let row = sqlx::query(
+        r"
+        SELECT effect_intent_id, booking_id, operation_kind, source_version,
+               canonical_plan_json, status, expires_at_ms, provider_reference,
+               outcome_detail, supersedes, created_at_ms, updated_at_ms
+        FROM effect_intents
+        WHERE effect_intent_id = ?
+        ",
+    )
+    .bind(effect_intent_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| StoreError::EffectNotFound(effect_intent_id.clone()))?;
+
+    let intent = decode_effect_row(&row)?;
+
+    if intent.booking_id != *booking_id {
+        return Err(StoreError::EffectMismatch {
+            effect_intent_id: effect_intent_id.clone(),
+            expected_booking: booking_id.clone(),
+            actual_booking: intent.booking_id,
+        });
+    }
+
+    // Settled effects are decided by their own record, BEFORE the aggregate is
+    // consulted — and the order matters. A successful finalisation moves the
+    // aggregate off the effect, so checking the aggregate first would refuse the
+    // retry that a lost acknowledgement makes necessary. `prepare_effect` puts
+    // its replay lookup first for exactly this reason.
+    //
+    // This does not reopen the orphaning hole below: reaching a terminal record
+    // means there is nothing left to finalise, and neither branch here writes
+    // state.
+    if intent.status.is_terminal() {
+        let identical = intent.status == status
+            && intent.provider_reference.as_ref() == provider_reference
+            && intent.outcome_detail.as_ref() == outcome_detail;
+        return if identical {
+            Ok(FinalisationState::AlreadyRecorded(Box::new(intent)))
+        } else {
+            Err(StoreError::ContradictoryFinalisation {
+                effect_intent_id: effect_intent_id.clone(),
+                recorded: intent.status.name(),
+                attempted: status.name(),
+            })
+        };
+    }
+
+    // Still live, so this is a real finalisation — and the aggregate must be
+    // waiting on THIS identity, and on this kind of work. Without it a caller
+    // could finalise an effect that is merely *stale* while the aggregate waits
+    // on a different, live one, orphaning the live effect atomically and wrongly.
+    match current.state.effect_intent_id() {
+        Some(waiting_on) if waiting_on == effect_intent_id => {}
+        _ => {
+            return Err(StoreError::NotAnInFlightState {
+                state: current.state.name(),
+                expected: effect_intent_id.clone(),
+            });
+        }
+    }
+    if current.state.in_flight_kind() != Some(intent.operation_kind) {
+        return Err(StoreError::EffectKindMismatch {
+            state: current.state.name(),
+            state_kind: current
+                .state
+                .in_flight_kind()
+                .map_or("nothing", OperationKind::name),
+            plan_kind: intent.operation_kind.name(),
+        });
+    }
+
+    Ok(FinalisationState::Fresh)
+}
+
+/// Write an effect's terminal outcome.
+async fn record_outcome(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    effect_intent_id: &EffectIntentId,
+    status: EffectStatus,
+    provider_reference: Option<&CouncilBookingRef>,
+    outcome_detail: Option<&BoundedString>,
+    now: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r"
+        UPDATE effect_intents
+        SET status = ?, provider_reference = ?, outcome_detail = ?, updated_at_ms = ?
+        WHERE effect_intent_id = ?
+        ",
+    )
+    .bind(status.name())
+    .bind(provider_reference.map(ToString::to_string))
+    .bind(outcome_detail.map(|detail| detail.as_str().to_owned()))
+    .bind(now)
+    .bind(effect_intent_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, StoreError> {
     let kind_text: String = row.try_get("operation_kind")?;
     let status_text: String = row.try_get("status")?;
     let plan_json: String = row.try_get("canonical_plan_json")?;
     let provider_reference: Option<String> = row.try_get("provider_reference")?;
+    let outcome_detail: Option<String> = row.try_get("outcome_detail")?;
+    let supersedes: Option<String> = row.try_get("supersedes")?;
 
     Ok(EffectIntent {
         effect_intent_id: EffectIntentId::new(row.try_get::<String, _>("effect_intent_id")?),
@@ -1437,6 +2118,10 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
             .map_err(|bad| StoreError::corrupt(format!("unknown effect status {bad:?}")))?,
         expires_at_ms: row.try_get("expires_at_ms")?,
         provider_reference: provider_reference.map(CouncilBookingRef::new),
+        // Stored text is already bounded; `truncating` is the only constructor
+        // and re-applying it to an in-range value is the identity.
+        outcome_detail: outcome_detail.map(BoundedString::truncating),
+        supersedes: supersedes.map(EffectIntentId::new),
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
     })
@@ -1582,7 +2267,7 @@ mod effect_identity {
     use super::*;
     use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
-    use townhall_domain::{BookingState, SelectedVenueRef, VenueFacts};
+    use townhall_domain::{BookingProposal, BookingState, SelectedVenueRef, VenueFacts};
 
     fn requirements() -> BookingRequirements {
         BookingRequirements {
@@ -1643,7 +2328,7 @@ mod effect_identity {
             source_version: version,
             canonical_plan: plan_for(venue),
             next: in_progress_write(id, &effect),
-            audit: TransitionAudit::committed("Book", None),
+            audit: TransitionAudit::driven_by(&BookingProposal::Book),
         }
     }
 
@@ -1794,7 +2479,7 @@ mod effect_identity {
                 booking_ref: None,
                 active_effect: None,
             },
-            TransitionAudit::committed("ChangeVenue", None),
+            TransitionAudit::driven_by(&BookingProposal::ChangeVenue),
         )
         .await
         .expect("advance to v1");
@@ -2032,7 +2717,9 @@ mod effect_identity {
                     booking_ref: Some(CouncilBookingRef::new("TH-92718")),
                     active_effect: Some(effect.clone()),
                 },
-                audit: TransitionAudit::committed("Cancel", None),
+                audit: TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
             })
             .await
             .expect("cancellation prepare");
@@ -2072,5 +2759,981 @@ mod effect_identity {
             .expect("load after restart");
         assert_eq!(loaded.expires_at_ms, expected);
         assert_eq!(loaded.status, EffectStatus::Prepared);
+    }
+}
+
+/// Phase C — the repository half of "observe, validate and converge".
+///
+/// `prepare_effect` records an intent; these two record what became of it. The
+/// pair is what makes `docs/m4-effects-guidance.md`'s Phase C implementable at
+/// all: before slice C1 nothing could mark an effect terminal and commit the
+/// state it produced in one transaction.
+#[cfg(test)]
+mod phase_c {
+    use super::*;
+    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use tempfile::TempDir;
+    use townhall_domain::{
+        AwaitingBooking, Booked, BookingProposal, BookingState, CancellationRequested,
+        CancellingBooking, SelectedVenueRef, VenueFacts, VerifiedProviderFact,
+    };
+
+    const REF: &str = "TH-92718";
+
+    fn requirements() -> BookingRequirements {
+        BookingRequirements {
+            purpose: "community meeting".to_owned(),
+            requested_date: "2026-08-20".to_owned(),
+            time_window: TimeWindow {
+                from: "13:00".to_owned(),
+                to: "17:00".to_owned(),
+            },
+            attendees: 20,
+            wheelchair_accessible: true,
+            max_fee: Money::from_pence(5_000),
+        }
+    }
+
+    fn facts() -> VenueFacts {
+        VenueFacts {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        }
+    }
+
+    fn book_plan() -> BookingEffect {
+        BookingEffect::Book {
+            principal: PrincipalId::new("lucy"),
+            attendees: 20,
+            facts: facts(),
+        }
+    }
+
+    fn selection() -> SelectedVenueRef {
+        SelectedVenueRef {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+        }
+    }
+
+    fn booking_at(
+        id: &BookingId,
+        state: BookingState,
+        booking_ref: Option<&str>,
+        active: Option<&EffectIntentId>,
+    ) -> Booking {
+        let booking = Booking {
+            id: id.clone(),
+            state,
+            requirements: requirements(),
+            selected_venue: Some(selection()),
+            availability: Some(facts()),
+            booking_ref: booking_ref.map(CouncilBookingRef::new),
+            active_effect: active.cloned(),
+        };
+        booking
+            .coherent()
+            .expect("every fixture must be coherent, or it tests the wrong refusal");
+        booking
+    }
+
+    fn awaiting(id: &BookingId) -> Booking {
+        booking_at(
+            id,
+            BookingState::AwaitingBooking(AwaitingBooking {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                verified_fee: Money::from_pence(4_500),
+            }),
+            None,
+            None,
+        )
+    }
+
+    fn in_progress(id: &BookingId, effect: &EffectIntentId) -> Booking {
+        booking_at(
+            id,
+            BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                effect_intent_id: effect.clone(),
+            }),
+            None,
+            Some(effect),
+        )
+    }
+
+    fn booked(id: &BookingId) -> Booking {
+        booking_at(
+            id,
+            BookingState::Booked(Booked {
+                booking_ref: CouncilBookingRef::new(REF),
+            }),
+            Some(REF),
+            None,
+        )
+    }
+
+    async fn repo_in(temp: &TempDir) -> SqliteBookingRepository {
+        SqliteBookingRepository::open(temp.path().join("townhall.sqlite"))
+            .await
+            .expect("repository should open")
+    }
+
+    /// A booking sitting at `BookingInProgress` with its intent durable — the
+    /// state every Phase C test starts from.
+    async fn in_flight(
+        repo: &SqliteBookingRepository,
+        id: &BookingId,
+    ) -> (BookingAggregate, EffectIntentId) {
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+
+        let effect = derive_effect_intent_id(id, OperationKind::Book, 0);
+        let prepared = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: 0,
+                canonical_plan: book_plan(),
+                next: in_progress(id, &effect),
+                audit: TransitionAudit::driven_by(&BookingProposal::Book),
+            })
+            .await
+            .expect("prepare should succeed");
+        (prepared.aggregate, effect)
+    }
+
+    fn confirmed_fact(effect: &EffectIntentId) -> VerifiedProviderFact {
+        VerifiedProviderFact::BookingExists {
+            effect_intent_id: effect.clone(),
+            booking_ref: CouncilBookingRef::new(REF),
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+            attendees: 20,
+            fee: Money::from_pence(4_500),
+            principal: PrincipalId::new("lucy"),
+        }
+    }
+
+    fn absent_fact(effect: &EffectIntentId) -> VerifiedProviderFact {
+        VerifiedProviderFact::EffectAbsent {
+            effect_intent_id: effect.clone(),
+        }
+    }
+
+    fn finalize(
+        id: &BookingId,
+        version: u64,
+        effect: &EffectIntentId,
+        status: EffectStatus,
+        reference: Option<&str>,
+        next: Booking,
+        fact: &VerifiedProviderFact,
+    ) -> FinalizeEffect {
+        FinalizeEffect {
+            booking_id: id.clone(),
+            source_version: version,
+            effect_intent_id: effect.clone(),
+            status,
+            provider_reference: reference.map(CouncilBookingRef::new),
+            outcome_detail: None,
+            next,
+            audit: TransitionAudit::driven_by(fact),
+        }
+    }
+
+    // -------------------------------------------------- finalize_effect
+
+    /// The ordinary confirmation: state, effect status, reference and audit all
+    /// committed together, and the audit row records that a FACT drove it — which
+    /// before ADR-017 was unrepresentable.
+    #[tokio::test]
+    async fn a_confirmation_commits_state_status_and_provenance_together() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-FINAL");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        let fact = confirmed_fact(&effect);
+        let finalised = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &fact,
+            ))
+            .await
+            .expect("finalising a confirmed booking should succeed");
+
+        assert!(!finalised.replayed);
+        assert_eq!(finalised.aggregate.state.name(), "Booked");
+        assert_eq!(
+            finalised.aggregate.booking_ref,
+            Some(CouncilBookingRef::new(REF))
+        );
+        assert_eq!(finalised.aggregate.active_effect, None);
+        assert_eq!(finalised.intent.status, EffectStatus::Confirmed);
+        assert_eq!(
+            finalised.intent.provider_reference,
+            Some(CouncilBookingRef::new(REF))
+        );
+
+        let audit = repo.audit_events(&id).await.expect("audit");
+        let last = audit.last().expect("an audit row");
+        assert_eq!(last.driver_kind, Provenance::Fact);
+        assert_eq!(last.driver_detail, "BookingExists");
+        assert_eq!(last.to_state, "Booked");
+    }
+
+    /// Recording the same outcome again writes nothing. Asserted by version and
+    /// row count, not merely by the flag — a `replayed: true` that still wrote
+    /// would pass a flag-only check.
+    #[tokio::test]
+    async fn re_recording_the_same_outcome_writes_nothing() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-REPLAY");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+        let fact = confirmed_fact(&effect);
+
+        let first = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &fact,
+            ))
+            .await
+            .expect("first finalisation");
+        let rows_after_first = repo.audit_events(&id).await.expect("audit").len();
+
+        let again = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &fact,
+            ))
+            .await
+            .expect("a retry after a lost acknowledgement must not fail");
+
+        assert!(again.replayed, "the second call must report a replay");
+        assert_eq!(again.aggregate.version, first.aggregate.version);
+        assert_eq!(
+            repo.audit_events(&id).await.expect("audit").len(),
+            rows_after_first,
+            "a replay must write no audit row"
+        );
+        assert_eq!(again.intent, first.intent);
+    }
+
+    /// One identity cannot have two outcomes. `Confirmed` then `Absent` is not a
+    /// retry — it is two contradictory determinations, and picking one would mean
+    /// either forgetting a real booking or inventing one.
+    #[tokio::test]
+    async fn one_identity_cannot_be_finalised_two_ways() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-TWOWAYS");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        repo.finalize_effect(finalize(
+            &id,
+            aggregate.version,
+            &effect,
+            EffectStatus::Confirmed,
+            Some(REF),
+            booked(&id),
+            &confirmed_fact(&effect),
+        ))
+        .await
+        .expect("first finalisation");
+
+        let error = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Absent,
+                None,
+                awaiting(&id),
+                &absent_fact(&effect),
+            ))
+            .await
+            .expect_err("a contradictory outcome must be refused");
+
+        assert!(
+            matches!(error, StoreError::ContradictoryFinalisation { .. }),
+            "expected ContradictoryFinalisation, got {error:?}"
+        );
+    }
+
+    /// A non-outcome is not an outcome. `Prepared`/`Unknown` describe an effect
+    /// still in play; finalising to one would claim a determination nobody made.
+    #[tokio::test]
+    async fn a_non_terminal_status_is_not_an_outcome() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-NOTTERM");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        for status in [EffectStatus::Prepared, EffectStatus::Unknown] {
+            let error = repo
+                .finalize_effect(finalize(
+                    &id,
+                    aggregate.version,
+                    &effect,
+                    status,
+                    None,
+                    awaiting(&id),
+                    &absent_fact(&effect),
+                ))
+                .await
+                .expect_err("a non-terminal status must be refused");
+            assert!(
+                matches!(error, StoreError::NotATerminalStatus(_)),
+                "expected NotATerminalStatus for {status:?}, got {error:?}"
+            );
+        }
+    }
+
+    /// The status/reference shape must be one the fact door would accept on the
+    /// way back in. A `Confirmed` intent with no reference would otherwise
+    /// converge against *any* provider reference.
+    #[tokio::test]
+    async fn a_malformed_outcome_shape_cannot_be_persisted() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-SHAPE");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        let cases: &[(EffectStatus, Option<&str>)] = &[
+            (EffectStatus::Confirmed, None),
+            (EffectStatus::Absent, Some(REF)),
+            (EffectStatus::Rejected, Some(REF)),
+        ];
+        for (status, reference) in cases {
+            let error = repo
+                .finalize_effect(finalize(
+                    &id,
+                    aggregate.version,
+                    &effect,
+                    *status,
+                    *reference,
+                    awaiting(&id),
+                    &absent_fact(&effect),
+                ))
+                .await
+                .expect_err("a malformed outcome shape must be refused");
+            assert!(
+                matches!(error, StoreError::InvalidEffectOutcome { .. }),
+                "expected InvalidEffectOutcome for {status:?}/{reference:?}, got {error:?}"
+            );
+        }
+    }
+
+    /// The orphaning case. A booking waits on E2; a caller finalises the older,
+    /// dead E1 — which *does* belong to this booking, and whose `next` correctly
+    /// omits it. Without checking the aggregate, the CAS would succeed and E2
+    /// would be stranded: nobody left to finalise it, and the council possibly
+    /// holding a real booking against it.
+    #[tokio::test]
+    async fn a_stale_intent_cannot_be_finalised_while_another_is_live() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-ORPHANING");
+        let (aggregate, e1) = in_flight(&repo, &id).await;
+
+        // E1 fails; the booking returns to AwaitingBooking, then books again as E2.
+        let after_absent = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &e1,
+                EffectStatus::Absent,
+                None,
+                awaiting(&id),
+                &absent_fact(&e1),
+            ))
+            .await
+            .expect("first attempt goes absent");
+
+        let e2 = derive_effect_intent_id(&id, OperationKind::Book, after_absent.aggregate.version);
+        let second = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: after_absent.aggregate.version,
+                canonical_plan: book_plan(),
+                next: in_progress(&id, &e2),
+                audit: TransitionAudit::driven_by(&BookingProposal::Book),
+            })
+            .await
+            .expect("second attempt prepares");
+        assert_ne!(e1, e2, "a re-proposal must mint a fresh identity");
+
+        // Now finalise E1 again — a different outcome, so the replay path is not
+        // what refuses it.
+        let error = repo
+            .finalize_effect(finalize(
+                &id,
+                second.aggregate.version,
+                &e1,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &confirmed_fact(&e1),
+            ))
+            .await
+            .expect_err("finalising a stale intent must be refused");
+
+        assert!(
+            matches!(
+                error,
+                StoreError::ContradictoryFinalisation { .. }
+                    | StoreError::NotAnInFlightState { .. }
+            ),
+            "expected refusal, got {error:?}"
+        );
+
+        // E2 must still be live and findable — the whole point.
+        let live = repo.load_effect(&e2).await.expect("E2 must still exist");
+        assert_eq!(live.status, EffectStatus::Prepared);
+        let current = repo.load(&id).await.expect("load");
+        assert_eq!(current.active_effect, Some(e2));
+    }
+
+    /// The pure form of the orphaning refusal: the stale intent is still **live**,
+    /// so the replay and contradiction paths cannot be what refuses it — only the
+    /// aggregate check can.
+    ///
+    /// Reachable because `commit` moves state without consulting effects: a plain
+    /// commit off `BookingInProgress` leaves its intent `Prepared` and stale. If
+    /// finalising it were then allowed, the aggregate's *live* effect would be
+    /// orphaned — no one left to finalise it, and the council possibly holding a
+    /// real booking against it.
+    #[tokio::test]
+    async fn a_live_but_stale_intent_cannot_be_finalised() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-LIVESTALE");
+        let (aggregate, e1) = in_flight(&repo, &id).await;
+
+        // Move the aggregate off E1 without finalising it, then start E2.
+        let moved = repo
+            .commit(
+                &id,
+                aggregate.version,
+                awaiting(&id),
+                TransitionAudit::driven_by(&BookingProposal::ChangeVenue),
+            )
+            .await
+            .expect("a plain commit does not consult effects");
+        let e2 = derive_effect_intent_id(&id, OperationKind::Book, moved.version);
+        let second = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: moved.version,
+                canonical_plan: book_plan(),
+                next: in_progress(&id, &e2),
+                audit: TransitionAudit::driven_by(&BookingProposal::Book),
+            })
+            .await
+            .expect("second attempt prepares");
+
+        assert_eq!(
+            repo.load_effect(&e1).await.expect("E1").status,
+            EffectStatus::Prepared,
+            "E1 must still be live, or this tests the wrong refusal"
+        );
+
+        let error = repo
+            .finalize_effect(finalize(
+                &id,
+                second.aggregate.version,
+                &e1,
+                EffectStatus::Confirmed,
+                Some(REF),
+                booked(&id),
+                &confirmed_fact(&e1),
+            ))
+            .await
+            .expect_err("finalising a live-but-stale intent must be refused");
+
+        assert!(
+            matches!(error, StoreError::NotAnInFlightState { .. }),
+            "expected NotAnInFlightState, got {error:?}"
+        );
+
+        // E2 survives, findable, and still the one the aggregate names.
+        assert_eq!(
+            repo.load_effect(&e2).await.expect("E2").status,
+            EffectStatus::Prepared
+        );
+        assert_eq!(repo.load(&id).await.expect("load").active_effect, Some(e2));
+    }
+
+    /// Finalising is what clears the pointer. A `next` still naming the effect
+    /// would leave the aggregate claiming work the intent row says is done.
+    #[tokio::test]
+    async fn a_next_still_naming_the_finalised_effect_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-STILLACTIVE");
+        let (aggregate, effect) = in_flight(&repo, &id).await;
+
+        let error = repo
+            .finalize_effect(finalize(
+                &id,
+                aggregate.version,
+                &effect,
+                EffectStatus::Absent,
+                None,
+                in_progress(&id, &effect),
+                &absent_fact(&effect),
+            ))
+            .await
+            .expect_err("a next still naming the effect must be refused");
+
+        assert!(
+            matches!(error, StoreError::EffectStillActive { .. }),
+            "expected EffectStillActive, got {error:?}"
+        );
+    }
+
+    /// Two rejections with different reasons must stay distinguishable. Both are
+    /// terminal and both are referenceless, so without `outcome_detail` "the hall
+    /// is closed" and "the principal is barred" collapse into one row.
+    #[tokio::test]
+    async fn two_rejections_keep_their_separate_reasons() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+
+        let mut recorded = Vec::new();
+        for (index, reason) in ["hall closed for maintenance", "principal is barred"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = BookingId::new(format!("BKG-REASON-{index}"));
+            let (aggregate, effect) = in_flight(&repo, &id).await;
+            let fact = VerifiedProviderFact::ProviderRejected {
+                effect_intent_id: effect.clone(),
+                reason: BoundedString::truncating(reason),
+            };
+            repo.finalize_effect(FinalizeEffect {
+                booking_id: id.clone(),
+                source_version: aggregate.version,
+                effect_intent_id: effect.clone(),
+                status: EffectStatus::Rejected,
+                provider_reference: None,
+                outcome_detail: Some(BoundedString::truncating(reason)),
+                next: awaiting(&id),
+                audit: TransitionAudit::driven_by(&fact),
+            })
+            .await
+            .expect("rejection should finalise");
+            recorded.push(
+                repo.load_effect(&effect)
+                    .await
+                    .expect("load")
+                    .outcome_detail,
+            );
+        }
+
+        assert_eq!(
+            recorded[0].as_ref().map(BoundedString::as_str),
+            Some("hall closed for maintenance")
+        );
+        assert_eq!(
+            recorded[1].as_ref().map(BoundedString::as_str),
+            Some("principal is barred")
+        );
+        assert_ne!(recorded[0], recorded[1]);
+    }
+
+    // ---------------------------------------------------- handoff_effect
+
+    /// A cancellation asked for mid-booking, then the booking turns out to
+    /// exist. One transaction ends the booking intent and starts the
+    /// cancellation — and every part of it lands together.
+    #[tokio::test]
+    async fn a_handoff_ends_one_effect_and_starts_its_successor_atomically() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-HANDOFF");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+
+        // Reach CancellationRequested: still waiting on the booking intent.
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+
+        let cancel_effect = derive_effect_intent_id(&id, OperationKind::Cancel, requested.version);
+        let fact = confirmed_fact(&book_effect);
+        let handed = repo
+            .handoff_effect(HandoffEffect {
+                booking_id: id.clone(),
+                source_version: requested.version,
+                finalising: book_effect.clone(),
+                finalising_status: EffectStatus::Confirmed,
+                finalising_reference: Some(CouncilBookingRef::new(REF)),
+                finalising_detail: None,
+                successor_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new(REF),
+                },
+                next: booking_at(
+                    &id,
+                    BookingState::CancellingBooking(CancellingBooking {
+                        booking_ref: CouncilBookingRef::new(REF),
+                        effect_intent_id: cancel_effect.clone(),
+                    }),
+                    Some(REF),
+                    Some(&cancel_effect),
+                ),
+                audit: TransitionAudit::driven_by(&fact),
+            })
+            .await
+            .expect("the handoff should succeed");
+
+        assert!(!handed.replayed);
+        assert_eq!(handed.aggregate.state.name(), "CancellingBooking");
+        assert_eq!(handed.aggregate.active_effect, Some(cancel_effect.clone()));
+        // The booking intent ended, with its reference.
+        assert_eq!(handed.finalised.status, EffectStatus::Confirmed);
+        assert_eq!(
+            handed.finalised.provider_reference,
+            Some(CouncilBookingRef::new(REF))
+        );
+        // The cancellation began, and records what it replaced.
+        assert_eq!(handed.successor.effect_intent_id, cancel_effect);
+        assert_eq!(handed.successor.status, EffectStatus::Prepared);
+        assert_eq!(handed.successor.supersedes, Some(book_effect));
+        assert_eq!(
+            handed.successor.canonical_plan,
+            BookingEffect::CancelBooking {
+                booking_ref: CouncilBookingRef::new(REF)
+            }
+        );
+        // And the audit row attributes it to the fact, not to Lucy.
+        let audit = repo.audit_events(&id).await.expect("audit");
+        let last = audit.last().expect("a row");
+        assert_eq!(last.driver_kind, Provenance::Fact);
+        assert_eq!(last.driver_detail, "BookingExists");
+    }
+
+    /// A handoff is only coherent in one direction, and this is the test for it.
+    ///
+    /// Without the rule a caller could record "the booking never happened" —
+    /// `Absent` or `Rejected`, no reference — and in the same transaction create a
+    /// cancellation for some booking reference. Two contradictory facts committed
+    /// atomically, which is worse than either alone: the trail would say the
+    /// booking failed while a cancellation intent went to the council for it.
+    // Three fixtures inline, each isolating one contradiction, plus the positive
+    // control that proves the rule is not simply refusing everything. Splitting
+    // them into separate tests would duplicate the twelve-line setup four times.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_handoff_that_contradicts_itself_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-INCOHERENT");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+        let cancel_effect = derive_effect_intent_id(&id, OperationKind::Cancel, requested.version);
+
+        let coherent_next = booking_at(
+            &id,
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+                effect_intent_id: cancel_effect.clone(),
+            }),
+            Some(REF),
+            Some(&cancel_effect),
+        );
+        let base = || HandoffEffect {
+            booking_id: id.clone(),
+            source_version: requested.version,
+            finalising: book_effect.clone(),
+            finalising_status: EffectStatus::Confirmed,
+            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_detail: None,
+            successor_plan: BookingEffect::CancelBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+            },
+            next: coherent_next.clone(),
+            audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
+        };
+
+        // One defect per fixture, three ways to contradict.
+
+        // (a) The predecessor failed, so there is nothing for a successor to
+        //     continue. Isolated to that one defect: an `Absent` outcome carries no
+        //     reference, so the successor plan here is one that acts on nothing
+        //     either — every reference comparison agrees on `None`, and only the
+        //     status is wrong.
+        let book_successor = derive_effect_intent_id(&id, OperationKind::Book, requested.version);
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_status: EffectStatus::Absent,
+                finalising_reference: None,
+                successor_plan: book_plan(),
+                next: booking_at(
+                    &id,
+                    BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                        effect_intent_id: book_successor.clone(),
+                    }),
+                    None,
+                    Some(&book_successor),
+                ),
+                ..base()
+            })
+            .await
+            .expect_err("a failed predecessor cannot hand off");
+        assert!(
+            matches!(error, StoreError::IncoherentHandoff { .. }),
+            "expected IncoherentHandoff, got {error:?}"
+        );
+
+        // (b) The successor acts on a different booking than the one confirmed.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                successor_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new("TH-00000"),
+                },
+                ..base()
+            })
+            .await
+            .expect_err("a successor acting on another reference must be refused");
+        assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
+
+        // (c) The aggregate records a different reference than was confirmed.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                next: booking_at(
+                    &id,
+                    BookingState::CancellingBooking(CancellingBooking {
+                        booking_ref: CouncilBookingRef::new("TH-00000"),
+                        effect_intent_id: cancel_effect.clone(),
+                    }),
+                    Some("TH-00000"),
+                    Some(&cancel_effect),
+                ),
+                ..base()
+            })
+            .await
+            .expect_err("an aggregate recording another reference must be refused");
+        assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
+
+        // Nothing moved, and no cancellation intent exists.
+        let current = repo.load(&id).await.expect("load");
+        assert_eq!(current.version, requested.version);
+        assert_eq!(current.active_effect, Some(book_effect.clone()));
+        assert!(
+            repo.load_effect(&cancel_effect).await.is_err(),
+            "no successor may have been created"
+        );
+
+        // And the coherent request still works, so the rule is not simply refusing
+        // everything.
+        repo.handoff_effect(base())
+            .await
+            .expect("the coherent handoff must still succeed");
+    }
+
+    /// A replay must agree about the predecessor's outcome, not just the
+    /// successor. Otherwise a request claiming a different finalisation would be
+    /// answered as though it had been accepted.
+    #[tokio::test]
+    async fn a_replay_claiming_a_different_predecessor_outcome_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-REPLAYOUT");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+        let cancel_effect = derive_effect_intent_id(&id, OperationKind::Cancel, requested.version);
+        let next = booking_at(
+            &id,
+            BookingState::CancellingBooking(CancellingBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+                effect_intent_id: cancel_effect.clone(),
+            }),
+            Some(REF),
+            Some(&cancel_effect),
+        );
+        let request = HandoffEffect {
+            booking_id: id.clone(),
+            source_version: requested.version,
+            finalising: book_effect.clone(),
+            finalising_status: EffectStatus::Confirmed,
+            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_detail: None,
+            successor_plan: BookingEffect::CancelBooking {
+                booking_ref: CouncilBookingRef::new(REF),
+            },
+            next,
+            audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
+        };
+
+        repo.handoff_effect(request.clone())
+            .await
+            .expect("first handoff");
+        // The genuine retry is idempotent.
+        let replay = repo
+            .handoff_effect(request.clone())
+            .await
+            .expect("an identical retry must replay");
+        assert!(replay.replayed);
+
+        // A retry claiming the predecessor was rejected instead must not be
+        // answered as a replay. It is refused before the coherence rule, since a
+        // rejected predecessor cannot hand off at all.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_status: EffectStatus::Rejected,
+                finalising_reference: None,
+                ..request.clone()
+            })
+            .await
+            .expect_err("a contradictory retry must be refused");
+        assert!(
+            matches!(error, StoreError::IncoherentHandoff { .. }),
+            "expected refusal, got {error:?}"
+        );
+
+        // And a retry that is coherent, names the same successor, but disagrees
+        // about *why* the predecessor ended. `outcome_detail` is the one dimension
+        // the coherence rule leaves free, which is what makes this the fixture that
+        // isolates the replay path's outcome check — everything else matches, so
+        // only that comparison can refuse it.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                finalising_detail: Some(BoundedString::truncating("a different story")),
+                ..request
+            })
+            .await
+            .expect_err("a replay disagreeing about the outcome must be refused");
+        assert!(
+            matches!(error, StoreError::ContradictoryFinalisation { .. }),
+            "expected ContradictoryFinalisation, got {error:?}"
+        );
+    }
+
+    /// The aggregate must name the successor, not merely stop naming the
+    /// predecessor. An aggregate pointing at neither effect is unrecoverable,
+    /// because recovery looks effects up by the identity the aggregate names.
+    #[tokio::test]
+    async fn a_handoff_whose_aggregate_adopts_nothing_is_refused() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-ADOPT");
+        let (aggregate, book_effect) = in_flight(&repo, &id).await;
+        let requested = repo
+            .commit(
+                &id,
+                aggregate.version,
+                booking_at(
+                    &id,
+                    BookingState::CancellationRequested(CancellationRequested {
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                TransitionAudit::driven_by(&BookingProposal::Cancel {
+                    reason: "changed mind".to_owned(),
+                }),
+            )
+            .await
+            .expect("cancellation requested");
+
+        // A `Booked` next: it clears the predecessor and adopts nothing.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                booking_id: id.clone(),
+                source_version: requested.version,
+                finalising: book_effect.clone(),
+                finalising_status: EffectStatus::Confirmed,
+                finalising_reference: Some(CouncilBookingRef::new(REF)),
+                finalising_detail: None,
+                successor_plan: BookingEffect::CancelBooking {
+                    booking_ref: CouncilBookingRef::new(REF),
+                },
+                next: booked(&id),
+                audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
+            })
+            .await
+            .expect_err("a handoff adopting nothing must be refused");
+
+        assert!(
+            matches!(error, StoreError::SuccessorNotAdopted { .. }),
+            "expected SuccessorNotAdopted, got {error:?}"
+        );
+        // Nothing moved.
+        let current = repo.load(&id).await.expect("load");
+        assert_eq!(current.version, requested.version);
+        assert_eq!(current.active_effect, Some(book_effect));
     }
 }

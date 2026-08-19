@@ -1,0 +1,22 @@
+[package]
+name = "townhall-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bld-kernel = { path = "../bld-kernel" }
+bld-types = { path = "../bld-types" }
+townhall-domain = { path = "../townhall-domain" }
+townhall-store = { path = "../townhall-store" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

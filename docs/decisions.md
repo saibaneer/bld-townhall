@@ -660,6 +660,36 @@ aggregate, alive in the audit trail.
    `bld-kernel` rather than adding a peer type, and takes the same anti-forgery treatment
    as `Verified<T>`: private fields, no `Deserialize`.
 
+### Amendment, slice C2 — the deferral was one slice too long
+
+Point 4 deferred the returned value to M5. Slice C2 needs one earlier: `propose` must tell
+its caller *what happened*, and the aggregate alone cannot express four of the five answers —
+`Undefined`, `Denied`, `Converged` and "an effect is in flight and its outcome is not yet
+knowable". Returning the aggregate and leaving the caller to infer is how a transport ends up
+guessing.
+
+So `BoundaryOutcome` is revived now, as point 4 prescribes — **not** a peer type beside it,
+which is what a first draft of the C plan proposed and review correctly rejected. It gains the
+two outcomes the coordinator can genuinely produce and the proposal door cannot:
+
+```rust
+pub enum BoundaryOutcome<S, E> {
+    Undefined,
+    Denied(E),
+    Committed(S),
+    Converged,    // local state already reflected the evidence; nothing written
+    Unresolved,   // an effect is in flight; its outcome is not yet knowable
+}
+```
+
+`Unresolved` is the one that matters. A coordinator that collapsed it into `Denied` would
+return a booking to a re-proposable state while the council held a live booking, which is the
+failure M4 exists to prevent. It is neither success nor failure, and it must be sayable.
+
+What stays deferred to M5 is the *anti-forgery* treatment — private fields and no
+`Deserialize`. Nothing crosses a wire until M5's transport exists, and adding the ceremony
+before there is a wire to protect would be ritual rather than defence.
+
 ### Why tiered, not one of the simpler shapes
 
 The decision space was walked explicitly (eight options, from "keep not recording" to

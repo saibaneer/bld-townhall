@@ -5,6 +5,7 @@ members = [
   "crates/bld-kernel",
   "crates/townhall-domain",
   "crates/townhall-store",
+  "crates/townhall-service",
 ]
 
 [workspace.package]

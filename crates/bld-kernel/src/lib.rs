@@ -34,8 +34,13 @@
 //! forced the kernel to sit in the middle of a network call.
 
 use async_trait::async_trait;
+use bld_types::{BoundedString as BoundedDetail, EffectIntentId};
 
-/// The three outcomes a boundary evaluation can have.
+/// What a whole turn through the boundary amounted to.
+///
+/// [`Resolution`] and [`FactResolution`] are what a *door* answers, before
+/// anything is persisted. This is what a coordinator answers after the whole
+/// sequence — classify, maybe reach outside, maybe commit — has run.
 ///
 /// `Undefined` and `Denied` are **not** the same thing, and collapsing them is
 /// the most common way a boundary quietly rots:
@@ -45,11 +50,39 @@ use async_trait::async_trait;
 /// - `Denied(e)` — the behaviour exists here, but a deterministic guard refused
 ///   it, with a typed reason.
 /// - `Committed(s)` — checks passed and the next state was committed.
+/// - `Converged` — authoritative state already reflected the evidence, so there
+///   was nothing to commit. Success, not breakage: recovery re-applies facts by
+///   design.
+/// - `Unresolved` — an effect is in flight and its outcome is not yet knowable.
+///
+/// `Unresolved` is the one that carries weight. A coordinator that folded it
+/// into `Denied` would return a booking to a re-proposable state while the
+/// provider held a live one — the failure M4 exists to prevent. Timeout is
+/// neither success nor failure, and it has to be sayable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundaryOutcome<S, E> {
     Undefined,
     Denied(E),
     Committed(S),
+    Converged,
+    Unresolved,
+}
+
+impl<S, E> BoundaryOutcome<S, E> {
+    /// The committed state, if the turn committed one.
+    pub const fn committed(&self) -> Option<&S> {
+        match self {
+            Self::Committed(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Whether an external effect is still outstanding. The caller must not
+    /// treat this as either success or failure.
+    #[must_use]
+    pub const fn is_unresolved(&self) -> bool {
+        matches!(self, Self::Unresolved)
+    }
 }
 
 /// The same trichotomy, before anything is persisted.
@@ -639,3 +672,125 @@ mod tests {
         assert_eq!(fact.into_inner().effect_id, 7);
     }
 }
+
+/// Why an external attempt produced no usable answer.
+///
+/// **One variant, deliberately.** An earlier draft of slice C gave this a
+/// `Refused` variant and had the coordinator turn it into verified evidence
+/// directly — the coordinator asserting provenance, which is exactly what
+/// ADR-012 forbids, and which would let an adapter-level refusal (a malformed
+/// request, a rejected header) become ADR-016's much stronger claim that the
+/// provider permanently closed an effect.
+///
+/// So an authoritative refusal is a provider **response**, not a transport
+/// error. It travels in [`Capability::Raw`] and passes through a [`Verifier`]
+/// like any other response. This type is for ambiguity only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unknown {
+    detail: BoundedDetail,
+}
+
+impl Unknown {
+    /// The attempt produced neither success nor failure: a timeout, a dropped
+    /// connection, a 5xx.
+    ///
+    /// **Not failure.** A coordinator that treated this as failure would return
+    /// a resource to a re-proposable state while the provider held a live
+    /// effect — the failure M4 exists to prevent.
+    #[must_use]
+    pub fn new(detail: BoundedDetail) -> Self {
+        Self { detail }
+    }
+
+    #[must_use]
+    pub const fn detail(&self) -> &BoundedDetail {
+        &self.detail
+    }
+}
+
+impl core::fmt::Display for Unknown {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the outcome is unknown: {}", self.detail.as_str())
+    }
+}
+
+impl core::error::Error for Unknown {}
+
+/// Performs one external consequence, and reports what the provider said.
+///
+/// The capability receives the **canonical plan** the boundary derived, never
+/// model instructions — and the effect identity alongside it, because the plan
+/// deliberately does not carry one (the repository owns effect identity, since
+/// it holds the uniqueness key).
+///
+/// `Raw` is whatever the provider actually returned, unexamined. Establishing
+/// that it genuinely came from the provider, and what it means, is a
+/// [`Verifier`]'s job — not this trait's, and emphatically not the
+/// coordinator's.
+#[async_trait]
+pub trait Capability<E>: Send + Sync {
+    /// The provider's unexamined response. Carries success *and* authoritative
+    /// refusal, because both are things the provider said.
+    type Raw: Send;
+
+    /// Attempt the effect. Returns [`Unknown`] only when the attempt produced
+    /// no answer at all.
+    async fn execute(&self, effect: &E, id: &EffectIntentId) -> Result<Self::Raw, Unknown>;
+}
+
+/// Establishes that a raw provider response is genuine, and what fact it
+/// carries.
+///
+/// # The refusal burden is heavier than the success burden
+///
+/// For a success the verifier must establish provenance and integrity: this
+/// response really came from the provider, intact.
+///
+/// For a **refusal** it must additionally establish that the provider
+/// *permanently closed this exact effect identity*. A terminal rejection is
+/// acted on irreversibly — the resource returns to a re-proposable state and the
+/// intent is finalised — so anything short of permanent closure must not become
+/// one:
+///
+/// ```text
+/// authenticated, well-formed, durably closing this identity  -> the rejection fact
+/// authenticated, well-formed, but validation / authorization /
+///     rate limit / "try again"                               -> VerificationError::Unknown
+/// unauthenticated, malformed, unattributable                 -> VerificationError::Rejected
+/// ```
+///
+/// Without that distinction the provenance bypass simply relocates from the
+/// coordinator into this trait's implementations, and an ordinary 4xx becomes a
+/// durable tombstone.
+pub trait Verifier<R, F>: Send + Sync {
+    /// # Errors
+    /// [`VerificationError`] when no fact can be established.
+    fn verify(&self, raw: R) -> Result<Verified<F>, VerificationError>;
+}
+
+/// Why no fact could be established from a raw response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationError {
+    /// The response is genuine but establishes nothing terminal. Treated exactly
+    /// as [`Unknown`]: the effect stays in flight.
+    Unknown(BoundedDetail),
+    /// The response could not be attributed to the provider, or was malformed.
+    /// Also not a conclusion — a boundary that cannot read an answer has not
+    /// received one.
+    Rejected(BoundedDetail),
+}
+
+impl core::fmt::Display for VerificationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown(detail) => {
+                write!(f, "nothing terminal was established: {}", detail.as_str())
+            }
+            Self::Rejected(detail) => {
+                write!(f, "the response could not be trusted: {}", detail.as_str())
+            }
+        }
+    }
+}
+
+impl core::error::Error for VerificationError {}

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
 use bld_types::{
     ActorId, BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId,
-    Money, PrincipalId, SlotId, VenueId,
+    Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -542,7 +542,14 @@ impl EffectStatus {
 ///
 /// Persisted in the same transaction as the state transition that creates it,
 /// and always before the capability is called (ADR-014).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// No serde derives, and they were never load-bearing: the repository builds this
+/// field by field from a row and serialises `canonical_plan` on its own, so
+/// nothing ever round-tripped the struct whole. Dropping them is what lets
+/// `outcome_detail` be a [`BoundedString`], which deliberately has no serde impls
+/// because it also lives inside [`VerifiedProviderFact`] — and deserialising
+/// verified evidence is the forgery ADR-012 exists to prevent.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectIntent {
     pub effect_intent_id: EffectIntentId,
     pub booking_id: BookingId,
@@ -556,6 +563,17 @@ pub struct EffectIntent {
     /// definitive once the council has tombstoned the intent past this.
     pub expires_at_ms: i64,
     pub provider_reference: Option<CouncilBookingRef>,
+    /// Why, where the outcome had a reason worth keeping — a rejection's text
+    /// lands here. Without it two `Rejected` intents are indistinguishable:
+    /// both terminal, both referenceless.
+    pub outcome_detail: Option<BoundedString>,
+    /// What this effect replaced, for the one transition that hands off rather
+    /// than ends — `CancellationRequested + BookingExists` finalises the booking
+    /// intent and creates the cancellation in one transaction. The successor's
+    /// uniqueness key names only the successor, so without this a replay cannot
+    /// tell "this exact handoff already happened" from "a different predecessor
+    /// produced a same-key successor".
+    pub supersedes: Option<EffectIntentId>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -782,6 +800,42 @@ impl VerifiedProviderFact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SystemEvent {
     ReconciliationExhausted { effect_intent_id: EffectIntentId },
+}
+
+// The three provenance impls. Each type's class is fixed here and nowhere else,
+// so an audit record cannot be mislabelled by whoever assembles it — see
+// `TransitionDriver`.
+
+impl TransitionDriver for BookingProposal {
+    fn provenance(&self) -> Provenance {
+        Provenance::Proposal
+    }
+
+    fn driver_name(&self) -> &'static str {
+        self.name()
+    }
+}
+
+impl TransitionDriver for VerifiedProviderFact {
+    fn provenance(&self) -> Provenance {
+        Provenance::Fact
+    }
+
+    fn driver_name(&self) -> &'static str {
+        self.name()
+    }
+}
+
+impl TransitionDriver for SystemEvent {
+    fn provenance(&self) -> Provenance {
+        Provenance::SystemEvent
+    }
+
+    fn driver_name(&self) -> &'static str {
+        match self {
+            Self::ReconciliationExhausted { .. } => "ReconciliationExhausted",
+        }
+    }
 }
 
 /// What the coordinator supplies for fact binding.
@@ -3524,6 +3578,8 @@ mod fact_topology {
             status,
             expires_at_ms: 1_000_030_000,
             provider_reference: provider_reference.map(CouncilBookingRef::new),
+            outcome_detail: None,
+            supersedes: None,
             created_at_ms: 1_000_000_000,
             updated_at_ms: 1_000_000_000,
         }

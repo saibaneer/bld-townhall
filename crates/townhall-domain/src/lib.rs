@@ -502,6 +502,20 @@ pub enum EffectStatus {
     Rejected,
     /// The council tombstoned the intent: it never happened and never can.
     Absent,
+    /// **We** stopped tracking it. Says nothing whatever about the provider.
+    ///
+    /// Reconciliation ran out of attempts without ever establishing an outcome,
+    /// so the effect is no longer being chased — but the council may well hold a
+    /// live booking against it, and a human has to find out.
+    ///
+    /// Distinct from `Absent` deliberately, and this cost a review round to get
+    /// right. `Absent` is a *provider determination*, admissible only from a
+    /// definitive-absence response that tombstones the intent (ADR-016). Recording
+    /// exhaustion as `Absent` would assert a fact nobody established — and worse,
+    /// the fact door treats `Absent` as "did not happen", so a later
+    /// `BookingExists` for that identity would be refused as contradictory when it
+    /// is actually the news the human was waiting for.
+    Abandoned,
 }
 
 impl EffectStatus {
@@ -513,13 +527,17 @@ impl EffectStatus {
             Self::Confirmed => "Confirmed",
             Self::Rejected => "Rejected",
             Self::Absent => "Absent",
+            Self::Abandoned => "Abandoned",
         }
     }
 
     /// Whether this outcome is settled and can never change.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Confirmed | Self::Rejected | Self::Absent)
+        matches!(
+            self,
+            Self::Confirmed | Self::Rejected | Self::Absent | Self::Abandoned
+        )
     }
 
     /// Parse the persisted discriminator.
@@ -533,6 +551,7 @@ impl EffectStatus {
             "Confirmed" => Ok(Self::Confirmed),
             "Rejected" => Ok(Self::Rejected),
             "Absent" => Ok(Self::Absent),
+            "Abandoned" => Ok(Self::Abandoned),
             other => Err(other.to_owned()),
         }
     }
@@ -948,7 +967,8 @@ impl EffectIntent {
             EffectStatus::Prepared
             | EffectStatus::Unknown
             | EffectStatus::Absent
-            | EffectStatus::Rejected => !has_reference,
+            | EffectStatus::Rejected
+            | EffectStatus::Abandoned => !has_reference,
         };
         if !shape_ok {
             return Err(IncoherentIntent::OutcomeShape {
@@ -1171,7 +1191,10 @@ impl TownHallDomain {
         let contradiction = match intent.status {
             EffectStatus::Absent | EffectStatus::Rejected => fact.asserts_existence(),
             EffectStatus::Confirmed => !fact.asserts_existence(),
-            EffectStatus::Prepared | EffectStatus::Unknown => false,
+            // `Prepared`/`Unknown` are not yet determined; `Abandoned` records
+            // that we stopped asking, which asserts nothing a fact could
+            // contradict. Any fact about an abandoned effect is new information.
+            EffectStatus::Prepared | EffectStatus::Unknown | EffectStatus::Abandoned => false,
         };
         if contradiction {
             return Err(BookingError::ContradictoryProviderFact);
@@ -4433,6 +4456,89 @@ mod fact_topology {
         }
         assert_eq!(checked, LOCKED_FACTS.len() * FACT_COUNT);
         assert_eq!(checked, 40, "the matrix must cover every cell");
+    }
+
+    /// `fact_intended_effect_kind` restates the fact door's topology, and review
+    /// found nothing verified it: the matrix sweep injects `pending_effect`
+    /// directly, so the helper could answer `None` for the one external cell and
+    /// every domain test would still pass — while the coordinator denied the
+    /// handoff with `EffectIdentityMissing`, one layer away from the mistake.
+    #[tokio::test]
+    async fn the_fact_intended_effect_kind_agrees_with_the_topology() {
+        let mut external_cells = 0_usize;
+        for (state_name, _) in LOCKED_FACTS {
+            for fact_ix in 0..FACT_COUNT {
+                let (booking, fact, context) = bound_cell(state_name, fact_ix);
+                let fact_name = fact.name();
+                let predicted = TownHallDomain::fact_intended_effect_kind(&booking.state, &fact);
+                let got = classify(&booking, fact, &context).await;
+
+                match got {
+                    FactResolution::Ready(TransitionPlan::ExternalEffect { effect, .. }) => {
+                        external_cells += 1;
+                        assert_eq!(
+                            predicted,
+                            Some(effect.operation_kind()),
+                            "{state_name} + {fact_name} is external; the prediction must name \
+                             its kind"
+                        );
+                    }
+                    _ => assert_eq!(
+                        predicted, None,
+                        "{state_name} + {fact_name} is not external; the prediction must say so"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            external_cells, 1,
+            "the fact door has exactly one external edge; a change needs an ADR"
+        );
+    }
+
+    /// `Abandoned` records that *we* stopped asking. It asserts nothing about the
+    /// provider, so no fact can contradict it — unlike `Absent`, which is the
+    /// council's tombstone.
+    ///
+    /// This is what makes the distinction load-bearing rather than cosmetic: with
+    /// exhaustion recorded as `Absent`, a later confirmation for that identity
+    /// would be refused as contradictory, when it is exactly the news a human is
+    /// waiting for.
+    #[tokio::test]
+    async fn an_abandoned_effect_makes_no_claim_a_fact_could_contradict() {
+        let (booking, fact, _) = bound_cell("BookingInProgress", 0);
+
+        // Tombstoned, then "it exists" — a genuine contradiction.
+        let tombstoned = FactContext {
+            intent: Some(intent(
+                BOOK_ID,
+                OperationKind::Book,
+                EffectStatus::Absent,
+                None,
+            )),
+            pending_effect: None,
+        };
+        assert_eq!(
+            classify(&booking, fact.clone(), &tombstoned).await,
+            FactResolution::Denied(BookingError::ContradictoryProviderFact),
+            "a tombstone genuinely contradicts an existence fact"
+        );
+
+        // Abandoned, then "it exists" — new information, and it must land.
+        let abandoned = FactContext {
+            intent: Some(intent(
+                BOOK_ID,
+                OperationKind::Book,
+                EffectStatus::Abandoned,
+                None,
+            )),
+            pending_effect: None,
+        };
+        let got = classify(&booking, fact, &abandoned).await;
+        assert!(
+            got.is_ready(),
+            "a confirmation for an abandoned effect is news, not a contradiction, got {got:?}"
+        );
     }
 
     /// `LOCKED_FACTS` must name every state exactly once, or the sweep silently

@@ -240,11 +240,16 @@ where
                         booking_id: id.clone(),
                         source_version: aggregate.version,
                         effect_intent_id: effect,
-                        // Reconciliation ran out of attempts without ever
-                        // establishing an outcome. `Absent` is the only terminal
-                        // status that claims nothing about the provider — we are
-                        // recording that WE gave up, not that the council refused.
-                        status: townhall_domain::EffectStatus::Absent,
+                        // `Abandoned`, never `Absent`. Review caught this and it
+                        // was a real overclaim: `Absent` is a provider
+                        // determination, admissible only from a definitive-absence
+                        // response that tombstones the intent (ADR-016). Exhaustion
+                        // establishes nothing about the council — we stopped
+                        // asking, and it may well hold a live booking. Recording
+                        // `Absent` would also make a later `BookingExists` for that
+                        // identity look contradictory, when it is exactly the news
+                        // the human is waiting for.
+                        status: townhall_domain::EffectStatus::Abandoned,
                         provider_reference: None,
                         outcome_detail: Some(bld_types::BoundedString::truncating(
                             "reconciliation exhausted; escalated for human resolution",

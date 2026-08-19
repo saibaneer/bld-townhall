@@ -696,7 +696,18 @@ async fn exhausted_reconciliation_escalates_and_stops_pointing_at_the_effect() {
         "nothing may keep chasing an abandoned effect"
     );
     let intent = h.repo.load_effect(&effect).await.expect("the intent");
-    assert!(intent.status.is_terminal(), "the intent stops looking live");
+    // `Abandoned`, and the exact status is the assertion — `is_terminal()` alone
+    // would have let `Absent` through, which asserts the council tombstoned the
+    // intent. Nobody established that; we stopped asking.
+    assert_eq!(
+        intent.status,
+        EffectStatus::Abandoned,
+        "exhaustion must claim nothing about the provider"
+    );
+    assert_eq!(
+        intent.provider_reference, None,
+        "and must not invent a reference"
+    );
 
     let last = h
         .repo

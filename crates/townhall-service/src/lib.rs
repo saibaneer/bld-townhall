@@ -40,12 +40,13 @@ use bld_kernel::{
     BoundaryOutcome, Capability, FactResolution, Kernel, Resolution, TransitionPlan, Unknown,
     Verified, Verifier,
 };
-use bld_types::{BookingId, EffectIntentId, SlotId, VenueId};
+use bld_types::{BookingId, EffectAttempt, EffectIntentId, SlotId, VenueId};
 use std::sync::Arc;
 use thiserror::Error;
 use townhall_domain::{
     Booking, BookingAggregate, BookingContext, BookingEffect, BookingError, BookingProposal,
-    FactContext, SystemEvent, TownHallDomain, VenueFacts, VerifiedAuthority, VerifiedProviderFact,
+    FactContext, OperationKind, SystemEvent, TownHallDomain, VerifiedAuthority,
+    VerifiedAvailability, VerifiedProviderFact,
 };
 use townhall_store::{
     BookingRepository, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError, TransitionAudit,
@@ -65,9 +66,34 @@ pub mod fake;
 /// names, without knowing which proposals need them. That is deliberate — a
 /// coordinator that branched on "does `VerifySlot` need availability?" would hold
 /// a copy of the topology, and topology lives in one place.
+///
+/// Returns `None` for "no usable answer", which covers both "the provider does
+/// not know this slot" and "the answer could not be verified". Collapsing them is
+/// deliberate: an unverifiable availability response is not a weaker fact, it is
+/// no fact, and the proposal door already treats a missing observation as grounds
+/// to refuse rather than to proceed. Failing towards refusal is the only safe
+/// direction for context that three guards read.
 #[async_trait]
 pub trait AvailabilitySource: Send + Sync {
-    async fn read(&self, venue: &VenueId, slot: &SlotId) -> Option<VenueFacts>;
+    async fn read(&self, venue: &VenueId, slot: &SlotId) -> Option<Verified<VerifiedAvailability>>;
+}
+
+/// Asks a provider what became of an effect it may or may not have seen.
+///
+/// [`Capability`] *causes* an effect; this only asks about one, and that
+/// distinction is the whole of reconciliation. They are separate traits because a
+/// reconciler must be able to ask without any possibility of causing: a single
+/// trait with a flag would put "do not actually book anything" in a parameter,
+/// which is not where a guarantee belongs.
+///
+/// `Raw` is a type parameter rather than an associated type so a coordinator can
+/// require `EffectResolver<C::Raw>` and reuse the capability's verifier. Two
+/// independently-declared raw types that happen to coincide would be the same
+/// fact in two places, and a reconciler would need a second verifier bound to
+/// say so.
+#[async_trait]
+pub trait EffectResolver<Raw>: Send + Sync {
+    async fn resolve(&self, attempt: &EffectAttempt, kind: OperationKind) -> Result<Raw, Unknown>;
 }
 
 #[derive(Debug, Error)]
@@ -331,8 +357,18 @@ where
 
         let effect_id = prepared.intent.effect_intent_id.clone();
 
+        // Both halves come off the *persisted* intent, and this is the only place
+        // an attempt is built. The council binds `expires_at_ms` on first sight
+        // and treats it as immutable, so a capability that sourced its own would
+        // bind a value this row does not hold — and every later reconciliation
+        // lookup, sending this one, would be refused as a conflict forever.
+        let attempt = EffectAttempt {
+            id: effect_id.clone(),
+            expires_at_ms: prepared.intent.expires_at_ms,
+        };
+
         // PHASE B — outside, with no transaction open.
-        let raw = match self.capability.execute(&effect, &effect_id).await {
+        let raw = match self.capability.execute(&effect, &attempt).await {
             Ok(raw) => raw,
             // Neither success nor failure. The aggregate stays in flight and
             // reconciliation resolves it; treating this as failure would return

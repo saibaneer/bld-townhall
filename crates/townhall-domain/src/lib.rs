@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId,
-    Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
+    ActorId, AvailabilityGrant, BookingId, BookingRequirements, BoundedString, CouncilBookingRef,
+    EffectIntentId, Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -254,6 +254,34 @@ pub struct VenueFacts {
     pub wheelchair_accessible: bool,
     pub fee: Money,
     pub available: bool,
+}
+
+/// One availability observation: the council's facts, and its warrant for them.
+///
+/// # Why the facts alone are not enough
+///
+/// Three guards read these facts — `AccessibilityRequired`, `FeeExceeded`,
+/// `CapacityInsufficient` — and the booking they authorise happens later, in a
+/// separate turn. Between the two, the council's own catalogue can change. A room
+/// that was wheelchair accessible when Lucy's booking was authorised can have a
+/// broken lift by the time the booking is placed, and every field the create
+/// request carries would still match.
+///
+/// So the observation carries the council's [`AvailabilityGrant`] alongside the
+/// facts. The council issued it, signed it over its own row version and its own
+/// deadline, and will refuse the booking if the room has moved on. We carry it
+/// and hand it back; we never read it.
+///
+/// # Why they are one type rather than two fields passed together
+///
+/// The pair must not come apart. Facts from one observation with a grant from
+/// another is the failure mode this exists to prevent — the grant would verify,
+/// the facts would be stale, and the booking would commit. Keeping them in one
+/// value means the only way to hold a grant is to hold the facts it vouches for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAvailability {
+    pub facts: VenueFacts,
+    pub grant: AvailabilityGrant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,10 +635,23 @@ pub struct EffectIntent {
 /// fixed the `UpdateRequirements` bug in one place and left it live in another.
 #[derive(Clone, Debug)]
 pub struct BookingContext {
-    /// Facts loaded by a capability. Never authoritative on their own: every
-    /// behaviour that consumes them must first bind them to what the user
-    /// actually chose, which lives in the *booking*, not here.
-    pub selected_facts: Option<VenueFacts>,
+    /// One availability observation, with its provenance established.
+    ///
+    /// Never authoritative on its own: every behaviour that consumes it must
+    /// first bind it to what the user actually chose, which lives in the
+    /// *booking*, not here.
+    ///
+    /// `Verified<_>` because these facts decide three guards, and before slice D
+    /// they arrived as a plain value read over the network. A substituted
+    /// availability response — a lower fee, an accessibility flag flipped — made
+    /// the boundary approve from forged context with a clean audit trail. The
+    /// wrapper means an unverified observation cannot reach a guard, and the
+    /// compiler says so rather than a convention.
+    ///
+    /// It holds [`VerifiedAvailability`] rather than [`VenueFacts`] so the
+    /// council's grant travels with the facts it vouches for. Stripping it here
+    /// would leave the booking turn with nothing to hand back.
+    pub selected_facts: Option<Verified<VerifiedAvailability>>,
     /// The effect identity the coordinator derived for this turn.
     ///
     /// The domain cannot derive it: the repository owns effect identity because
@@ -646,6 +687,21 @@ pub enum BookingEffect {
         /// and headcount are not optional.
         attendees: u16,
         facts: VenueFacts,
+        /// The council's warrant for `facts`, to be handed back with the create.
+        ///
+        /// It is in the plan — and therefore persisted before the council is
+        /// called (ADR-014) — because it is issued in the turn that *authorises*
+        /// the booking and spent in the turn that *places* it. A capability that
+        /// re-read availability instead would receive a currently-valid warrant
+        /// for facts this plan no longer reflects, and the booking would commit
+        /// against a room that had changed underneath it.
+        ///
+        /// This does not repeat the reasoning that keeps `EffectIntentId` out of
+        /// this enum. That identity lives on the effect-intent row, which owns
+        /// the uniqueness key; a copy here would be a second home for it. The
+        /// grant has no other home — it is per-plan, not per-identity, and this
+        /// is its only one.
+        grant: AvailabilityGrant,
     },
     /// Cancel a council booking that is known to exist.
     CancelBooking { booking_ref: CouncilBookingRef },
@@ -1227,6 +1283,17 @@ impl TownHallDomain {
                     principal: plan_principal,
                     attendees: plan_attendees,
                     facts,
+                    // Deliberately not bound. The grant is something we *send*,
+                    // not something the council reports back, so there is no
+                    // provider-side value to compare it against. What it protects
+                    // — that the facts were still current when the booking
+                    // landed — the council enforced before creating anything;
+                    // re-checking it here would be checking our own input.
+                    //
+                    // Written as an explicit binding rather than `..` so a field
+                    // added later still fails to compile and gets this decision
+                    // made for it too.
+                    grant: _,
                 },
             ) => {
                 if *venue_id != facts.venue_id {
@@ -1727,6 +1794,35 @@ impl TownHallDomain {
     /// reason `BookingContext` no longer carries a copy: reading the context's
     /// would validate against whatever the coordinator happened to assemble
     /// rather than against what was committed.
+    /// Bind one verified availability observation to what the booking actually
+    /// selected, and check it against requirements and authority.
+    ///
+    /// Returns the whole observation, not just its facts, so a caller that needs
+    /// the council's grant gets it from the *same* observation it validated. A
+    /// signature returning only `&VenueFacts` would leave `resolve_book` to fetch
+    /// the grant separately, which is the mismatch [`VerifiedAvailability`]
+    /// exists to make unrepresentable.
+    fn bind_availability<'a>(
+        booking: &Booking,
+        context: &'a BookingContext,
+        venue_id: &VenueId,
+        slot_id: &SlotId,
+        authority: &VerifiedAuthority,
+    ) -> Result<&'a VerifiedAvailability, BookingError> {
+        let observation = context
+            .selected_facts
+            .as_ref()
+            .ok_or(BookingError::VenueFactsMissing)?
+            .get();
+        let facts = &observation.facts;
+        if facts.venue_id != *venue_id || facts.slot_id != *slot_id {
+            return Err(BookingError::VenueFactsMissing);
+        }
+        Self::validate_facts(facts, &booking.requirements, authority)?;
+        Ok(observation)
+    }
+
+    /// [`Self::bind_availability`] for the callers that need only the facts.
     fn bind_facts<'a>(
         booking: &Booking,
         context: &'a BookingContext,
@@ -1734,15 +1830,8 @@ impl TownHallDomain {
         slot_id: &SlotId,
         authority: &VerifiedAuthority,
     ) -> Result<&'a VenueFacts, BookingError> {
-        let facts = context
-            .selected_facts
-            .as_ref()
-            .ok_or(BookingError::VenueFactsMissing)?;
-        if facts.venue_id != *venue_id || facts.slot_id != *slot_id {
-            return Err(BookingError::VenueFactsMissing);
-        }
-        Self::validate_facts(facts, &booking.requirements, authority)?;
-        Ok(facts)
+        Self::bind_availability(booking, context, venue_id, slot_id, authority)
+            .map(|observation| &observation.facts)
     }
 
     /// Apply an `UpdateRequirements` patch. `None` means "leave unchanged".
@@ -1789,16 +1878,19 @@ impl TownHallDomain {
         if !authority.may_book {
             return Resolution::Denied(BookingError::BookingAuthorityRequired);
         }
-        let facts = match Self::bind_facts(
+        // The whole observation, so the grant that reaches the council is the one
+        // issued for the facts these guards just passed.
+        let observation = match Self::bind_availability(
             booking,
             context,
             &waiting.venue_id,
             &waiting.slot_id,
             authority,
         ) {
-            Ok(facts) => facts,
+            Ok(observation) => observation,
             Err(error) => return Resolution::Denied(error),
         };
+        let facts = &observation.facts;
         // The fee verified at `VerifySlot` is carried on the state precisely so a
         // fee that moved since then is detectable here.
         if facts.fee != waiting.verified_fee {
@@ -1820,6 +1912,7 @@ impl TownHallDomain {
                 principal: authority.principal.clone(),
                 attendees: booking.requirements.attendees,
                 facts: facts.clone(),
+                grant: observation.grant.clone(),
             },
         })
     }
@@ -2076,9 +2169,40 @@ fn update_requirements(
 /// proposal that is `Undefined` everywhere: recovery is runtime machinery and
 /// must run when the model is offline, hostile or absent (ADR-012). So the
 /// matrix is 10 states x 7 proposals = 70 cells, not 80.
+/// Test-only helpers shared by the suites below.
+#[cfg(test)]
+mod fixtures {
+    use super::{AvailabilityGrant, BookingEffect, PrincipalId, VenueFacts, VerifiedAvailability};
+    use bld_kernel::Verified;
+
+    /// Wrap facts as a verified observation, with a placeholder grant.
+    ///
+    /// A helper rather than an inline `Verified::assert_verified(..)` at forty
+    /// call sites, because `assert_verified` is meant to grep as an audit point.
+    /// Forty of them in test fixtures would drown the handful that matter.
+    pub fn observed(facts: VenueFacts) -> Verified<VerifiedAvailability> {
+        Verified::assert_verified(VerifiedAvailability {
+            facts,
+            grant: AvailabilityGrant::new("test-grant"),
+        })
+    }
+
+    /// A `Book` plan for `facts`, with the grant that `observed` would have
+    /// produced — so a plan built here matches one built from an observation.
+    pub fn book_plan(principal: PrincipalId, attendees: u16, facts: VenueFacts) -> BookingEffect {
+        BookingEffect::Book {
+            principal,
+            attendees,
+            facts,
+            grant: AvailabilityGrant::new("test-grant"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod topology {
     use super::*;
+    use crate::fixtures::observed;
     use bld_kernel::Resolution;
     use bld_types::{BookingRequirements, Money, SlotId, TimeWindow, VenueId};
 
@@ -2282,14 +2406,14 @@ mod topology {
 
     fn permissive_context() -> BookingContext {
         BookingContext {
-            selected_facts: Some(VenueFacts {
+            selected_facts: Some(observed(VenueFacts {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 capacity: 30,
                 wheelchair_accessible: true,
                 fee: Money::from_pence(4_500),
                 available: true,
-            }),
+            })),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
         }
     }
@@ -2484,6 +2608,7 @@ mod topology {
 #[cfg(test)]
 mod characterization {
     use super::*;
+    use crate::fixtures::observed;
     use bld_kernel::{Resolution, TransitionPlan};
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
@@ -2526,7 +2651,7 @@ mod characterization {
 
     fn context() -> BookingContext {
         BookingContext {
-            selected_facts: Some(good_facts()),
+            selected_facts: Some(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
         }
     }
@@ -2667,7 +2792,7 @@ mod characterization {
             BookingProposal::RevalidateVenue,
             &authority(),
             &BookingContext {
-                selected_facts: Some(too_small),
+                selected_facts: Some(observed(too_small)),
                 ..context()
             },
         )
@@ -2913,11 +3038,7 @@ mod characterization {
             booking_id: BookingId::new("BKG-1001"),
             operation_kind: OperationKind::Book,
             source_version: 0,
-            canonical_plan: BookingEffect::Book {
-                principal: PrincipalId::new("lucy"),
-                attendees: 20,
-                facts: good_facts(),
-            },
+            canonical_plan: crate::fixtures::book_plan(PrincipalId::new("lucy"), 20, good_facts()),
             status: EffectStatus::Prepared,
             expires_at_ms: 1_000_030_000,
             provider_reference: None,
@@ -3625,10 +3746,10 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_facts_for_a_different_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             venue_id: VenueId::new("TH-B"),
             ..good_facts()
-        });
+        }));
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3642,10 +3763,10 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_an_unavailable_slot() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             available: false,
             ..good_facts()
-        });
+        }));
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3659,10 +3780,10 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_insufficient_capacity() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             capacity: 12,
             ..good_facts()
-        });
+        }));
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3682,10 +3803,10 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_an_inaccessible_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             wheelchair_accessible: false,
             ..good_facts()
-        });
+        }));
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3701,10 +3822,10 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_a_fee_over_the_ceiling() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             fee: Money::from_pence(9_000),
             ..good_facts()
-        });
+        }));
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3736,10 +3857,10 @@ mod characterization {
     #[tokio::test]
     async fn revalidate_denies_facts_for_a_different_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             venue_id: VenueId::new("TH-B"),
             ..good_facts()
-        });
+        }));
         let got = turn(
             needs_revalidation(),
             BookingProposal::RevalidateVenue,
@@ -3771,10 +3892,10 @@ mod characterization {
     #[tokio::test]
     async fn book_denies_when_the_fee_moved_since_verification() {
         let mut ctx = context();
-        ctx.selected_facts = Some(VenueFacts {
+        ctx.selected_facts = Some(observed(VenueFacts {
             fee: Money::from_pence(4_600),
             ..good_facts()
-        });
+        }));
         let got = turn(
             awaiting_booking(),
             BookingProposal::Book,
@@ -3961,6 +4082,7 @@ mod characterization {
 #[cfg(test)]
 mod fact_topology {
     use super::*;
+    use crate::fixtures::observed;
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
     const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
@@ -3996,11 +4118,7 @@ mod fact_topology {
     }
 
     fn book_plan() -> BookingEffect {
-        BookingEffect::Book {
-            principal: PrincipalId::new("lucy"),
-            attendees: 20,
-            facts: good_facts(),
-        }
+        crate::fixtures::book_plan(PrincipalId::new("lucy"), 20, good_facts())
     }
 
     fn cancel_plan() -> BookingEffect {
@@ -5501,7 +5619,7 @@ mod fact_topology {
             may_cancel: true,
         };
         let proposal_context = BookingContext {
-            selected_facts: Some(good_facts()),
+            selected_facts: Some(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),
         };
         let proposals = || {

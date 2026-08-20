@@ -1153,7 +1153,9 @@ fn now_ms() -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bld_types::{Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId};
+    use bld_types::{
+        AvailabilityGrant, Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
+    };
     use tempfile::TempDir;
     use townhall_domain::{
         BookingProposal, BookingState, SelectedVenueRef, VenueFacts, VenueSelected,
@@ -1523,6 +1525,12 @@ mod tests {
                 fee: Money::from_pence(4_500),
                 available: true,
             },
+            // The grant belongs in this round-trip specifically. The plan is
+            // persisted as JSON between Phase A and Phase B, so a grant that did
+            // not survive serialisation would be silently absent exactly when the
+            // council needs it — and the create would either fail or fall back to
+            // re-reading availability, which is the defect it exists to prevent.
+            grant: AvailabilityGrant::new("GRANT-TH-A-SLOT-1-v7"),
         };
         let json = serde_json::to_string(&current).expect("serialise");
         assert_eq!(
@@ -2289,7 +2297,7 @@ pub fn derive_effect_intent_id(
 #[cfg(test)]
 mod effect_identity {
     use super::*;
-    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use bld_types::{AvailabilityGrant, Money, PrincipalId, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
     use townhall_domain::{BookingProposal, BookingState, SelectedVenueRef, VenueFacts};
 
@@ -2323,6 +2331,7 @@ mod effect_identity {
             principal: PrincipalId::new("lucy"),
             attendees: 20,
             facts: facts(venue),
+            grant: AvailabilityGrant::new("test-grant"),
         }
     }
 
@@ -2795,7 +2804,7 @@ mod effect_identity {
 #[cfg(test)]
 mod phase_c {
     use super::*;
-    use bld_types::{Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use bld_types::{AvailabilityGrant, Money, PrincipalId, SlotId, TimeWindow, VenueId};
     use tempfile::TempDir;
     use townhall_domain::{
         AwaitingBooking, Booked, BookingProposal, BookingState, CancellationRequested,
@@ -2834,6 +2843,7 @@ mod phase_c {
             principal: PrincipalId::new("lucy"),
             attendees: 20,
             facts: facts(),
+            grant: AvailabilityGrant::new("test-grant"),
         }
     }
 

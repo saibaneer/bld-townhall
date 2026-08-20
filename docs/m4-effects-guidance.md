@@ -80,9 +80,13 @@ ADR-016 closes this, and the shape matters:
 
 Three requirements on the mock council, all load-bearing:
 
-1. **Expiry binds at commit, atomically** — not at receipt. A council that accepts at
-   10:00:29.9, passes a receipt-time check, and writes at 10:00:30.2 reproduces the exact
-   defect with an expiry field that appears to prevent it.
+1. **The deadline is read and compared inside the write transaction**, after the writer lock is
+   acquired — never at receipt. A council that accepts at 10:00:29.9, passes a receipt-time
+   check, and writes at 10:00:30.2 reproduces the exact defect with an expiry field that appears
+   to prevent it. See ADR-016 §1 for what this does and does not guarantee: creation and absence
+   are mutually exclusive because **both are write transactions** and terminal states are
+   permanent; no bound on wall-clock delay is claimed, and the council must have exactly **one**
+   clock — the injectable one — with no second reading anywhere, including inside SQL.
 2. **The council owns the clock.** If our clock ran ahead we would declare absence while the
    council still considered the intent live. The comparison never happens on our side, which
    also keeps the domain clock-free as ADR-013 requires.
@@ -107,11 +111,17 @@ Three requirements on the mock council, all load-bearing:
    for — the create request never arrived, so the council has only an effect id and no record.
 
    So `expires_at_ms` travels on **both** paths: with the create request, and with the
-   reconciliation lookup (`GET /effects/{id}?expires_at_ms=...`). The council records it the
-   first time it sees that identity, from whichever path arrives first, and **once recorded it
-   is immutable** — a later request presenting a different expiry for the same identity is
-   rejected. Without that binding, a caller could shorten a deadline to force premature
-   absence and cancel a booking that was about to succeed.
+   reconciliation lookup (`POST /effects/{id}/resolve`, whose body carries `expires_at_ms` **and
+   `operation_kind`**). The council records both the first time it sees that identity, from
+   whichever path arrives first, and **once recorded they are immutable** — a later request
+   presenting a different expiry *or a different kind* for the same identity is rejected. Without
+   that binding, a caller could shorten a deadline to force premature absence and cancel a
+   booking that was about to succeed.
+
+   The kind is part of the binding because a booking intent and a cancellation intent are
+   different effects (ADR-013's supersession table), and the council must not have to parse our
+   id format to tell them apart. The lookup is a `POST` because answering it **writes** — see
+   ADR-016 §§3–4; a `GET` that tombstones is a lie about the method.
 
    Note this makes the reconciliation lookup a **trusted** surface: it asserts a deadline. It
    must not be reachable from proposer-facing transport, which the crate graph already
@@ -316,11 +326,17 @@ The exact schema can evolve, but the stable effect identity and durable plan can
 
 ## Phase B — Execute outside the transaction
 
-The capability adapter receives the canonical plan, not model instructions:
+The capability adapter receives the canonical plan, not model instructions — together with the
+**attempt envelope**, which carries the effect identity *and the persisted deadline*:
 
 ```text
-BookingCapability.execute(canonical_plan, effect_intent_id)
+BookingCapability.execute(canonical_plan, EffectAttempt { effect_intent_id, expires_at_ms })
 ```
+
+The deadline is in the envelope rather than re-derived by the adapter for a specific reason: the
+council binds `expires_at_ms` on first sight and treats it as immutable, so an adapter that
+recomputed it would bind a value the durable intent does not hold, and every later reconciliation
+lookup — sending the persisted one — would be refused as a conflict forever.
 
 The create request carries the expiry — it is not optional, and ADR-016's guarantees rest
 on the council seeing it:
@@ -329,11 +345,27 @@ on the council seeing it:
 POST /bookings
   effect_intent_id : E-9271
   expires_at_ms    : 1787230830000     <- mandatory
+  grant            : <opaque>          <- mandatory: the council's own warrant for
+                                          the availability facts this plan was built on
   ...canonical plan...
 ```
 
-The mock council must implement provider-side idempotency, and enforce expiry atomically at
-the commit point:
+The **grant** is the council's signed token over the venue, the slot, the catalogue row version and
+a validity deadline. It is issued with the availability read, persisted in the canonical plan by
+Phase A, and handed back here. Two rules make it worth having:
+
+- the adapter must send the **persisted** grant, never re-read availability to obtain a fresh one —
+  a re-fetch returns a *currently valid* warrant for facts the plan no longer reflects, and the
+  booking then commits against stale accessibility or capacity;
+- the council verifies its own token — signature, venue and slot against the request, row version
+  against the live catalogue row, and the validity deadline against **its own** clock. We never
+  parse it, compare it, or check its clock.
+
+This is the same discipline as the deadline, for the same reason: anything the provider must be
+handed back has to live in the durable plan in between, or the adapter will invent it.
+
+The mock council must implement provider-side idempotency, and evaluate expiry as a **predicate of
+the statement that performs the write**, under a write transaction (ADR-016 §1):
 
 ```text
 first request with E-9271, before expiry
@@ -343,7 +375,7 @@ retry with E-9271
     -> return TH-92718
     -> DO NOT create another booking
 
-request with E-9271 whose commit would land after expires_at_ms
+request with E-9271 that reaches the write transaction after expires_at_ms
     -> refuse, create nothing, AND durably commit the tombstone before responding
     -> (without the tombstone the refusal rests on the clock: a rollback would
        let the same intent commit later)
@@ -403,13 +435,19 @@ Never create a second effect identity merely because the first response was lost
 The mock council needs a lookup surface keyed by effect identity, not only by a provider-generated booking reference:
 
 ```text
-GET /effects/{effect_intent_id}?expires_at_ms={expires_at_ms}
-
-The expiry is **mandatory** on the lookup too. If the create request never arrived, this is
-the only way the council learns the deadline — and without it, it cannot distinguish "not yet"
-from "never". It records the value on first sight of that identity and treats it as immutable
-thereafter.
+POST /effects/{effect_intent_id}/resolve
+  expires_at_ms  : 1787230830000     <- mandatory
+  operation_kind : Book | Cancel     <- mandatory
 ```
+
+Both fields are **mandatory**. If the create request never arrived, this is the only way the
+council learns the deadline *and the kind* — and without them it cannot distinguish "not yet" from
+"never", nor tell a booking identity from a cancellation identity without parsing our id format.
+It records both on first sight of that identity and treats them as immutable thereafter.
+
+`POST`, not `GET`, because answering **writes**: definitive absence is a durable tombstone
+(ADR-016 §§3–4), so the lookup takes the write lock and may persist before it answers. A `GET`
+that tombstones is a lie about the method.
 
 Possible authoritative results:
 
@@ -675,7 +713,10 @@ Stop and raise an architecture question instead of improvising if any implementa
 - bypassing M3 CAS/version semantics;
 - evaluating `now > expires_at` locally instead of taking the council's determination
   (ADR-016);
-- a mock council that checks expiry at receipt rather than atomically at commit;
+- a mock council that compares the deadline in application code — at receipt, or before a
+  separate write — rather than inside the write transaction that lands it (ADR-016 §1);
+- a council with two clocks — one in application code and one read inside SQL — which can
+  disagree, and which makes the deadline untestable because only one of them is injectable;
 - a council that stops returning an effect that was committed before its expiry - that
   breaks stable identity and duplicates bookings on retry;
 - answering definitive absence without durably tombstoning the intent, which leaves the

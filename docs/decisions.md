@@ -166,8 +166,9 @@ that untrue.
 ```
 
 **Resolved by ADR-016:** `EffectAbsent` is admissible **only from the council's definitive
-absence response**, which atomically tombstones the effect intent. We never evaluate a
-deadline ourselves — anything short of that response is `Unknown`.
+absence response**, which durably tombstones the effect intent before that response is
+observable, in the same serialized write that excludes creation. We never evaluate a deadline
+ourselves — anything short of that response is `Unknown`.
 
 The verifier establishes *what is true externally*. The domain decides *what that truth
 means here*. A verifier that emitted state-specific observation variants would have to
@@ -502,15 +503,47 @@ Terminal local state, live external booking, and `Cancelled` is terminal so noth
 reconciles it.
 
 **Decision.** Every effect intent carries `expires_at_ms`, and absence becomes something the
-**council determines and reports** — never something we infer locally. Three parts, all
-load-bearing:
+**council determines and reports** — never something we infer locally. Four parts, all
+load-bearing, and §4 is where the guarantee finally rests:
 
-### 1. Expiry binds at the council's commit point, not at receipt
+### 1. The deadline is evaluated inside the write transaction, never at receipt
 
 The council's promise is not "I will not accept an expired intent". It is:
 
-> **An effect intent is never *committed* after its expiry, and that check is atomic with
-> the commit itself.**
+> **The deadline is read and compared inside the same write transaction that performs the write,
+> after the writer lock has been acquired. A request that waited is therefore judged on when it
+> reached the write — not on when it arrived.**
+
+*Amended three times during slice D, and the history is the point — each pass removed a claim
+rather than adding one.* The clause first read "*never committed after its expiry, and that check
+is atomic with the commit itself*": unachievable, because SQLite does not evaluate a clock
+predicate at `COMMIT`. The second attempt — "the last thing before an uninterruptible commit
+path" — was **also** an overclaim: there is no uninterruptible path, since a task awaiting
+`COMMIT` can be paused and a process can be stopped. The third moved the comparison into the
+SQL itself (`INSERT … WHERE unixepoch() <= expires_at_ms`) and bought a real problem for a
+guarantee it did not need: SQLite reads its own host clock, so the council would have had **two
+clocks** — the injected one the reconciler tests move, and the engine's — able to disagree. One
+fact in two places, which is the defect this project keeps finding.
+
+**What actually carries the safety, and it is not the clock.** Two properties, both structural:
+
+- **Serialization.** Creating an effect and settling it absent are *both* write transactions
+  (§3), so they cannot interleave. Whichever acquires the writer lock first decides.
+- **Permanence.** Whatever it decided is terminal (§4), so the loser is refused by the recorded
+  state — not by any clock reading, however stale or rolled back.
+
+Those two give *mutual exclusion of creation and absence*, which is exactly what the race at the
+top of this ADR needs, and all it needs. The deadline's freshness never enters that argument.
+
+**So what does this clause forbid?** Evaluating the deadline at receipt and treating that reading
+as authoritative for a write that happens later. A council doing that accepts arbitrarily late
+deliveries: a request that queued for a minute still writes, because it was judged on arrival.
+Reading the deadline inside the write transaction is what makes the *bounded execution window*
+below a real bound rather than a hopeful one.
+
+**What it does not claim.** Punctuality. A transaction can still be paused between its write and
+its `COMMIT`, so a commit can land marginally after the deadline that permitted it. That is
+harmless for the reasons above, and pretending otherwise is how this clause went wrong twice.
 
 Receipt-time checking is insufficient and reintroduces the original defect one level down:
 
@@ -546,7 +579,8 @@ The three rules above still leave absence resting on time, and time can move bac
 ```text
 1. council clock reads past expiry; the lookup serializes and answers "absent"
 2. the council's clock steps backward (NTP correction, VM migration, operator)
-3. a delayed request reaches the commit point, now appears unexpired, and commits
+3. a delayed request reaches its write transaction; the clock now reads before the deadline, so
+   the comparison passes and the write lands
 4. the already-verified absence is re-applied -> terminal Cancelled, live booking
 ```
 
@@ -588,10 +622,14 @@ above cannot occur.
 `Cancelled` until the council reports definitive absence. That latency is honest: before
 then, whether a booking exists is genuinely unknown, and a faster answer would be a guess.
 
-**A bounded execution window.** A first delivery slow enough to miss its deadline now fails
-authoritatively rather than eventually succeeding. That is a real behaviour change: the
-booking must be re-proposed, minting a *new* effect intent. Expiry converts an unbounded
-unknown into a bounded failure, which is the trade being made.
+**A bounded execution window.** A first delivery that does not reach the council's writer lock
+before its deadline now fails authoritatively rather than eventually succeeding. That is a real
+behaviour change: the booking must be re-proposed, minting a *new* effect intent. Expiry
+converts an unbounded unknown into a bounded failure, which is the trade being made.
+
+The failure condition is *reaching the write*, not wall-clock arrival — §1 is explicit that a
+commit can land marginally late and that this is safe. What expiry bounds is how long an
+undelivered intent stays creatable, not the latency of a delivery already at the door.
 
 **Permanent discoverability.** A booking committed *just before* expiry must remain
 discoverable and idempotently returnable **forever after**, including long past the

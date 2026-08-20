@@ -32,7 +32,9 @@
       "Bash(codex exec --model gpt-5.6-sol --sandbox read-only --skip-git-repo-check 'Read __TRACKED_VAR__/PLAN-D.md plus docs/decisions.md \\(ADR-012, ADR-014, ADR-015, ADR-016\\), docs/m4-effects-guidance.md \\(Phase B and numbered tests 14-22\\), docs/technical-spec-v0.4.2.md section 11, and crates/bld-kernel/src/lib.rs. *)",
       "Bash(awk '/^- \\\\*\\\\*\\(Critical|High|Medium|Nit|Sound\\)/{p=1} p' /private/tmp/claude-501/-Users-tobaajiboye-Documents-boundary-led-development/d4c49a33-2823-4bc1-9d4a-7870c4c10b57/scratchpad/review-r5-out.txt)",
       "Bash(sed -i '' 's/^use bld_types::{BoundedString as BoundedDetail, EffectIntentId};$/use bld_types::{BoundedString as BoundedDetail, EffectAttempt};/' crates/bld-kernel/src/lib.rs)",
-      "Bash(grep -n \"^\\\\s*\\)\\)\\),\\\\?$\" crates/townhall-domain/src/lib.rs)"
+      "Bash(grep -n \"^\\\\s*\\)\\)\\),\\\\?$\" crates/townhall-domain/src/lib.rs)",
+      "Bash(cargo search *)",
+      "Bash(cargo add *)"
     ],
     "additionalDirectories": [
       "/Users/tobaajiboye/Documents/boundary-led-development/crates/townhall-service"

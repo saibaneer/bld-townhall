@@ -6,6 +6,7 @@ members = [
   "crates/townhall-domain",
   "crates/townhall-store",
   "crates/townhall-service",
+  "crates/council-wire",
 ]
 
 [workspace.package]
@@ -23,6 +24,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tempfile = "3"
 static_assertions = "1"
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.23"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

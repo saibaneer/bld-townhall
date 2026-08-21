@@ -14,7 +14,10 @@
 
 use async_trait::async_trait;
 use bld_kernel::{Capability, Unknown, VerificationError, Verified, Verifier};
-use bld_types::{BoundedString, CouncilBookingRef, EffectIntentId, Money, PrincipalId};
+use bld_types::{
+    AvailabilityGrant, BoundedString, CouncilBookingRef, EffectAttempt, EffectIntentId, Money,
+    PrincipalId,
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -22,9 +25,15 @@ use std::{
 use townhall_domain::{BookingEffect, VerifiedProviderFact};
 
 /// What the council was asked to do, recorded in the order it was asked.
+///
+/// `expires_at_ms` is recorded, not just accepted, so a test can assert the
+/// deadline that arrived is the one the intent row holds. A fake that took the
+/// attempt and dropped it would let a capability substitute a deadline and no
+/// test would notice — which is exactly the defect the envelope exists to close.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
     pub effect_intent_id: EffectIntentId,
+    pub expires_at_ms: i64,
     pub plan: BookingEffect,
 }
 
@@ -165,10 +174,10 @@ impl Capability<BookingEffect> for ObservedCouncil {
     async fn execute(
         &self,
         effect: &BookingEffect,
-        id: &EffectIntentId,
+        attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
-        (self.during)(id);
-        self.council.execute(effect, id).await
+        (self.during)(&attempt.id);
+        self.council.execute(effect, attempt).await
     }
 }
 
@@ -179,11 +188,13 @@ impl Capability<BookingEffect> for FakeCouncil {
     async fn execute(
         &self,
         effect: &BookingEffect,
-        id: &EffectIntentId,
+        attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
+        let id = &attempt.id;
         let mut inner = self.lock();
         inner.calls.push(Call {
             effect_intent_id: id.clone(),
+            expires_at_ms: attempt.expires_at_ms,
             plan: effect.clone(),
         });
 
@@ -205,6 +216,13 @@ impl Capability<BookingEffect> for FakeCouncil {
                     principal,
                     attendees,
                     facts,
+                    // Recorded on the `Call` via `plan`, not inspected. This fake
+                    // does not model the catalogue, so it has no row version to
+                    // check a grant against, and pretending to validate one would
+                    // be the overclaim this module's header refuses elsewhere for
+                    // expiry. Slice D's real council is where the grant is
+                    // enforced.
+                    grant: _,
                 } => {
                     // One identity, one booking. A retry returns the original
                     // rather than creating a second — the property the real
@@ -313,16 +331,42 @@ impl Verifier<RawResponse, VerifiedProviderFact> for CouncilVerifier {
 
 /// Availability that always answers with the same verified facts.
 ///
-/// Slice D replaces this with a council lookup. It exists so the protocol tests
-/// are about the protocol.
+/// Slice D's `CouncilClient` replaces this with a signed council lookup. It exists
+/// so the protocol tests are about the protocol.
+///
+/// It issues a fixed placeholder grant. That is honest rather than lazy: this fake
+/// models no catalogue, so it has no row version and no validity window to sign,
+/// and the grant's guarantees are the real council's to provide. What the fake
+/// *does* establish is that the grant travels — through the context, into the
+/// plan, and out to the capability — which is a separate property from whether it
+/// is enforced, and the one the C-slice protocol tests are about.
 pub struct FixedAvailability {
     facts: townhall_domain::VenueFacts,
+    grant: AvailabilityGrant,
 }
+
+/// The token [`FixedAvailability::new`] issues.
+///
+/// Public so a test asserting "the plan the council was handed is the plan we
+/// persisted" can name the grant it expects, instead of repeating a string that
+/// silently stops matching. A test whose expected grant and issued grant drift
+/// apart passes for the wrong reason or fails for no reason.
+pub const FAKE_GRANT: &str = "fake-grant";
 
 impl FixedAvailability {
     #[must_use]
-    pub const fn new(facts: townhall_domain::VenueFacts) -> Self {
-        Self { facts }
+    pub fn new(facts: townhall_domain::VenueFacts) -> Self {
+        Self {
+            facts,
+            grant: AvailabilityGrant::new(FAKE_GRANT),
+        }
+    }
+
+    /// A source whose grant is a specific value, so a test can follow that exact
+    /// token from the availability read all the way to the council call.
+    #[must_use]
+    pub fn granting(facts: townhall_domain::VenueFacts, grant: AvailabilityGrant) -> Self {
+        Self { facts, grant }
     }
 }
 
@@ -332,9 +376,14 @@ impl crate::AvailabilitySource for FixedAvailability {
         &self,
         venue: &bld_types::VenueId,
         slot: &bld_types::SlotId,
-    ) -> Option<townhall_domain::VenueFacts> {
+    ) -> Option<Verified<townhall_domain::VerifiedAvailability>> {
         // Answers only for the venue it knows about, so a test cannot accidentally
         // bind facts to a venue nobody selected.
-        (self.facts.venue_id == *venue && self.facts.slot_id == *slot).then(|| self.facts.clone())
+        (self.facts.venue_id == *venue && self.facts.slot_id == *slot).then(|| {
+            Verified::assert_verified(townhall_domain::VerifiedAvailability {
+                facts: self.facts.clone(),
+                grant: self.grant.clone(),
+            })
+        })
     }
 }

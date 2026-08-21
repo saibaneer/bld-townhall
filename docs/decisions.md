@@ -166,8 +166,9 @@ that untrue.
 ```
 
 **Resolved by ADR-016:** `EffectAbsent` is admissible **only from the council's definitive
-absence response**, which atomically tombstones the effect intent. We never evaluate a
-deadline ourselves — anything short of that response is `Unknown`.
+absence response**, which durably tombstones the effect intent before that response is
+observable, in the same serialized write that excludes creation. We never evaluate a deadline
+ourselves — anything short of that response is `Unknown`.
 
 The verifier establishes *what is true externally*. The domain decides *what that truth
 means here*. A verifier that emitted state-specific observation variants would have to
@@ -502,15 +503,47 @@ Terminal local state, live external booking, and `Cancelled` is terminal so noth
 reconciles it.
 
 **Decision.** Every effect intent carries `expires_at_ms`, and absence becomes something the
-**council determines and reports** — never something we infer locally. Three parts, all
-load-bearing:
+**council determines and reports** — never something we infer locally. Four parts, all
+load-bearing, and §4 is where the guarantee finally rests:
 
-### 1. Expiry binds at the council's commit point, not at receipt
+### 1. The deadline is evaluated inside the write transaction, never at receipt
 
 The council's promise is not "I will not accept an expired intent". It is:
 
-> **An effect intent is never *committed* after its expiry, and that check is atomic with
-> the commit itself.**
+> **The deadline is read and compared inside the same write transaction that performs the write,
+> after the writer lock has been acquired. A request that waited is therefore judged on when it
+> reached the write — not on when it arrived.**
+
+*Amended three times during slice D, and the history is the point — each pass removed a claim
+rather than adding one.* The clause first read "*never committed after its expiry, and that check
+is atomic with the commit itself*": unachievable, because SQLite does not evaluate a clock
+predicate at `COMMIT`. The second attempt — "the last thing before an uninterruptible commit
+path" — was **also** an overclaim: there is no uninterruptible path, since a task awaiting
+`COMMIT` can be paused and a process can be stopped. The third moved the comparison into the
+SQL itself (`INSERT … WHERE unixepoch() <= expires_at_ms`) and bought a real problem for a
+guarantee it did not need: SQLite reads its own host clock, so the council would have had **two
+clocks** — the injected one the reconciler tests move, and the engine's — able to disagree. One
+fact in two places, which is the defect this project keeps finding.
+
+**What actually carries the safety, and it is not the clock.** Two properties, both structural:
+
+- **Serialization.** Creating an effect and settling it absent are *both* write transactions
+  (§3), so they cannot interleave. Whichever acquires the writer lock first decides.
+- **Permanence.** Whatever it decided is terminal (§4), so the loser is refused by the recorded
+  state — not by any clock reading, however stale or rolled back.
+
+Those two give *mutual exclusion of creation and absence*, which is exactly what the race at the
+top of this ADR needs, and all it needs. The deadline's freshness never enters that argument.
+
+**So what does this clause forbid?** Evaluating the deadline at receipt and treating that reading
+as authoritative for a write that happens later. A council doing that accepts arbitrarily late
+deliveries: a request that queued for a minute still writes, because it was judged on arrival.
+Reading the deadline inside the write transaction is what makes the *bounded execution window*
+below a real bound rather than a hopeful one.
+
+**What it does not claim.** Punctuality. A transaction can still be paused between its write and
+its `COMMIT`, so a commit can land marginally after the deadline that permitted it. That is
+harmless for the reasons above, and pretending otherwise is how this clause went wrong twice.
 
 Receipt-time checking is insufficient and reintroduces the original defect one level down:
 
@@ -546,7 +579,8 @@ The three rules above still leave absence resting on time, and time can move bac
 ```text
 1. council clock reads past expiry; the lookup serializes and answers "absent"
 2. the council's clock steps backward (NTP correction, VM migration, operator)
-3. a delayed request reaches the commit point, now appears unexpired, and commits
+3. a delayed request reaches its write transaction; the clock now reads before the deadline, so
+   the comparison passes and the write lands
 4. the already-verified absence is re-applied -> terminal Cancelled, live booking
 ```
 
@@ -588,10 +622,14 @@ above cannot occur.
 `Cancelled` until the council reports definitive absence. That latency is honest: before
 then, whether a booking exists is genuinely unknown, and a faster answer would be a guess.
 
-**A bounded execution window.** A first delivery slow enough to miss its deadline now fails
-authoritatively rather than eventually succeeding. That is a real behaviour change: the
-booking must be re-proposed, minting a *new* effect intent. Expiry converts an unbounded
-unknown into a bounded failure, which is the trade being made.
+**A bounded execution window.** A first delivery that does not reach the council's writer lock
+before its deadline now fails authoritatively rather than eventually succeeding. That is a real
+behaviour change: the booking must be re-proposed, minting a *new* effect intent. Expiry
+converts an unbounded unknown into a bounded failure, which is the trade being made.
+
+The failure condition is *reaching the write*, not wall-clock arrival — §1 is explicit that a
+commit can land marginally late and that this is safe. What expiry bounds is how long an
+undelivered intent stays creatable, not the latency of a delivery already at the door.
 
 **Permanent discoverability.** A booking committed *just before* expiry must remain
 discoverable and idempotently returnable **forever after**, including long past the
@@ -724,3 +762,188 @@ The symmetry with ADR-012, stated once: **denial reasons are the vocabulary the 
 half is meant to see** — the outbound feedback channel. **Evidence types are the vocabulary
 it must not be able to name.** Information flows out as typed refusals; it never flows in
 as claimed facts.
+
+## ADR-018 — The transition topology stays synthesisable, as a discipline
+
+No hardware is being built. This POC targets Rust on a general-purpose machine and nothing
+else. But the state machine is kept in a form that *could* be moved to a fixed-function
+target — an FPGA, a safety-certified controller, a robot — and that constraint is retained
+deliberately, because it forbids exactly the things that would rot the design anyway.
+
+The motivation is not portability. It is that a state machine whose permitted transitions
+are a **fixed, total table** cannot be driven somewhere nobody specified. On hardware that
+stops being a rule you enforce and becomes a wire that is not there. If the same machine
+one day drives an actuator instead of a booking, "the robot can only do what this state
+permits" is the property worth having.
+
+### Which door the claim is about, and why that is the strong version
+
+**The proposal door**, and the system-event door with it. Not the fact door, and PR review
+caught an earlier draft of this ADR claiming otherwise.
+
+`resolve_fact` reads the persisted intent — its kind, its status, its canonical plan — and the
+same `(state, fact)` pair can be a convergence, a contradiction or a handoff depending on what
+was in flight. `EffectAbsent` at `Booked` against a *cancellation* intent already recorded
+`Absent` is `Converged`: a cancellation that did not happen leaves the booking booked, and
+re-applying that absence is the re-apply-by-design case ADR-012 exists for. That door is not a
+combinational table and must not be exported as one. `docs/topology.json` now marks each door
+`fixed_table: true | false` and names the axes it varies.
+
+**That scoping is not a retreat.** The proposal door is the only one an untrusted proposer can
+reach: ADR-012 made facts and system events separate types that proposer-facing crates cannot
+name, so an agent submits proposals or nothing. "The robot can only do what this state permits"
+is therefore a claim about the proposal door, and *there* it is exactly true — `Undefined` is
+decided from `(state, proposal)` before any guard reads the aggregate.
+
+`resolve_system_event` takes no context at all, so that door is a fixed table too, and for a
+sharper reason: there is nothing else in reach.
+
+### What makes it possible today
+
+The seam already exists, and it is ADR-004 plus the `Undefined`/`Denied` split:
+
+| | Meaning | Fixed-function form |
+|---|---|---|
+| `Undefined` | no edge exists from this state for this input | a table — combinational, data-independent |
+| `Denied(e)` | the edge exists; a guard refused it this time | comparators over the guard's inputs |
+
+`resolve_proposal` decides `Undefined` from the `(state, proposal)` pair **before** any guard
+reads the aggregate, and says so in a comment at the point where it matters. That is what makes
+the proposal door extractable as a table at all, and `docs/topology.json` is the extract —
+with each door labelled for what it is.
+
+### What this forbids
+
+Four things, and each is already true — the value of writing them down is that a future
+change would otherwise break the property without anyone noticing:
+
+1. **`Undefined` must never depend on data — on the proposal door.** The moment whether a
+   *behaviour* exists depends on the aggregate's contents, the menu stops being a table and
+   becomes a program. Guards may depend on data; the menu may not. The fact door is exempt
+   because it is not a menu: it interprets evidence against a persisted intent, and that is
+   what it is for.
+2. **The domain performs no I/O, reads no clock, and uses no randomness.** Context is
+   *given* to it (ADR-013). This is why ADR-016 §2 keeps the deadline comparison on the
+   council's side rather than the domain's — that was argued as a provenance matter, and it
+   is the same constraint seen from another angle.
+3. **States stay finite and enumerable.** Ten variants today. A state carrying unbounded
+   data that transitions *branch on* would end the property; a state carrying unbounded data
+   that only guards read would not.
+4. **Guards stay comparisons over enumerable inputs.** Fee against a ceiling, capacity
+   against a headcount, a boolean flag. Not "ask a service whether this is allowed" — a
+   guard that reached outside would be a transition deciding its own admissibility, which
+   ADR-013 already refuses for a different reason.
+
+### When data becomes a state, and when it stays a guard
+
+Rule 1 forbids a behaviour whose *existence* depends on data, which invites the obvious
+worry: does every data condition now become a state? Eight states for "verified AND deposit
+paid AND insurance confirmed"? No, and the line is sharp:
+
+> **Promote data to a state when it changes *which behaviours exist*.**
+> **Leave it as a guard when it only changes *whether a behaviour succeeds*.**
+
+Applied to what already exists:
+
+| Condition | Changes the behaviour set? | Form |
+|---|---|---|
+| the slot has been verified | yes — `Book` appears | a **state**, `AwaitingBooking` |
+| the fee exceeds the principal's ceiling | no — `Book` exists and is denied | a guard |
+| the room is not wheelchair accessible | no | a guard |
+| the room is too small | no | a guard |
+
+Three guards, one state. The heuristic reproduces the current design without having been
+consulted about it, which is the reason to trust it.
+
+**The distinction in plainer terms.** A state decides *what can be asked for here* — the
+menu. A guard decides *whether this particular ask succeeds* — the answer. A cash machine
+showing "insert card" is not refusing your withdrawal; there is no withdrawal screen. Once
+your card is in, "insufficient funds" is a refusal: the option was there, you took it, the
+answer was no.
+
+So the test is: **if the data were fixed, would a new option appear on the menu, or would the
+same option start working?** Verifying a slot makes `Book` *appear* — a new menu. Topping up
+a fee ceiling makes the existing `Book` *succeed* — the same menu, a different answer.
+
+**Two further rules, which settle the cases the first one leaves open:**
+
+- **Two candidate states with identical menus are one state.** This is what stops promotion
+  from exploding: "verified" plus "deposit paid" plus "insurance confirmed" is not eight
+  states, because `VerifiedWithoutDeposit` and `VerifiedWithDeposit` would offer the same
+  four behaviours. Same menu, so one state and a guard on `Book`.
+- **State belongs to the resource, never to the caller.** A booking's state is a fact about
+  the booking; authority is a fact about who is asking. The same booking in the same state
+  offers `Book` to a principal who may book and refuses one who may not — so if authority
+  were a state, the state would change depending on who looked at it. Anything that varies by
+  requester is therefore a guard by construction, which is why `may_book` and the fee ceiling
+  are guards and not states.
+
+**When the three still leave it ambiguous, choose the state.** The two errors are not
+symmetric. Wrongly choosing a guard produces the failures below — a booking at a price nobody
+approved, a room too small — and no test necessarily catches either. Wrongly choosing a state
+makes the topology noisier and the design more tedious to read. One is a silent correctness
+failure; the other is untidiness.
+
+**Why the extra state is worth its cost, twice over.** Both of these are defects this project
+has already had, and both are structurally impossible under a state rather than test-covered
+under a guard.
+
+*A 22-seat room booked for 25 people.* The slot is verified for 20 attendees; the headcount
+is then raised to 25. As a state, `UpdateRequirements` leaves `AwaitingBooking` for
+`NeedsRevalidation` and `Book` **stops existing** — re-verification is the only way forward,
+and it refuses. As a guard, the aggregate still carries availability for the same room, so
+`Book` still exists and still passes; preventing it requires remembering to clear a field
+whenever requirements change, and forgetting once is silent.
+
+*The fee that moved.* A slot is verified at £45 against a £100 ceiling. The council later
+raises it to £90. As a guard, the only fee available is the one just read: £90 is under £100,
+so the booking succeeds at a price the principal never approved. The guard asked *"is it
+under the ceiling?"* when the question that mattered was *"is it the price that was agreed?"*
+— and it **cannot ask that**, because there is nowhere for the agreed price to live except
+the availability record that just changed. As a state, `AwaitingBooking` carries
+`verified_fee`, `Book` compares £90 against £45, and the refusal sends the booking back to
+re-verification where the new price is decided on deliberately.
+
+That is the general form, and it is the reason this rule exists rather than merely tidying
+the graph: **a state can carry evidence of its own precondition; a conditional inside a
+behaviour cannot.** The failure is not that the guard is harder to write correctly — it is
+that the correct check is unwriteable, because the value it needs was never kept.
+
+The failure mode to watch for in review is small and quiet: someone adds `if data.is_some()`
+inside a behaviour under time pressure. No test fails. `docs/topology.json` still generates
+and still looks total — it has simply stopped being true of anything but the fixture.
+
+### What is explicitly out of scope
+
+**External effects have no fixed-function analogue and do not need one.** Calling the
+council is at the boundary's edge, not inside the transition logic: the topology records
+*that* an edge reaches outside, never how. A hardware target would substitute an actuator
+command and inherit ADR-014 unchanged — record what you are about to command before
+commanding it, because a crash mid-motion leaves you needing to know what you asked for.
+Higher stakes than a room booking, identical discipline.
+
+**Guard synthesis is not attempted.** Exporting the comparisons and their data sources is a
+further step nobody has asked for. The topology is the part that carries the safety claim.
+
+### What it costs
+
+Almost nothing, because everything it forbids was already forbidden for other reasons. The
+one real cost is a standing constraint on future design: a tempting shortcut where a
+behaviour's *existence* depends on data — "`Book` only exists once a venue is verified,
+which we can tell from `availability.is_some()`" — is closed. That case must be modelled as
+a distinct state, which is what `AwaitingBooking` already is.
+
+That is not a workaround. It is the thesis: if a behaviour comes and goes with the data, the
+data is a state and should be named as one. The section above draws the line, so the
+prohibition comes with somewhere to go rather than only somewhere not to.
+
+### Alternatives rejected
+
+**Say nothing and keep the property by accident.** It survives exactly until someone has a
+good reason to make `Undefined` conditional, and then it is gone with no test failing —
+`docs/topology.json` would still generate, and would still be total. It would simply no
+longer be true of anything but the fixture. The property needs a stated owner.
+
+**Target hardware now.** Nothing in the POC needs it, no requirement asks for it, and
+building a synthesis path for a booking system would be the clearest possible case of
+solving a problem nobody has.

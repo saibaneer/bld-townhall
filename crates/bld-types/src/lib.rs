@@ -37,6 +37,76 @@ id_type!(ActorId);
 id_type!(EffectIntentId);
 id_type!(CouncilBookingRef);
 
+/// One attempt at one external effect: its identity, and the deadline the
+/// provider must bind.
+///
+/// # Why the deadline travels with the identity
+///
+/// The provider records `expires_at_ms` on first sight of an identity and treats
+/// it as immutable (ADR-016 §1). So the value it binds must be the one the
+/// *durable intent* holds — and the only code that can know that is whatever
+/// loaded the intent.
+///
+/// Before this type, [`crate::EffectIntentId`] travelled alone and a capability
+/// adapter had to obtain the deadline some other way. Every available way was
+/// wrong: recomputing it binds a value the intent does not hold, so every later
+/// reconciliation lookup sends the persisted one and is refused as a conflict —
+/// permanently, because neither value ever changes again. Caching it beside the
+/// call is the same defect with a race in front of it.
+///
+/// Pairing them makes the correct thing the only representable thing: an adapter
+/// receives the deadline it must send, and never has an opportunity to source
+/// one.
+///
+/// A struct rather than a second parameter because the resolve path needs the
+/// same pair, and because the next thing this protocol needs would otherwise be
+/// a fourth positional argument.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectAttempt {
+    pub id: EffectIntentId,
+    /// Wall-clock milliseconds. Read from the persisted intent, never derived.
+    pub expires_at_ms: i64,
+}
+
+/// A provider's warrant for one observation it made, opaque to the holder.
+///
+/// The provider issues this alongside facts it owns, signs it over whatever it
+/// needs to re-check later, and we hand it back when acting on those facts. We
+/// never parse it, compare it, or evaluate any deadline inside it — there is no
+/// accessor here that would let us, and that is the point.
+///
+/// # Why opacity is the mechanism, not modesty
+///
+/// The alternative is for the holder to check freshness itself, which fails in
+/// both directions: a holder clock running fast refuses live facts, and one
+/// running slow accepts dead ones. Only the issuer can compare its own deadline
+/// against its own clock and its own current state. So the holder's job is
+/// reduced to *carrying* — and a type with no readable interior cannot acquire a
+/// larger job by accident.
+///
+/// Serde is present, unlike [`BoundedString`], because this must survive in a
+/// persisted canonical plan: it is issued during one turn and spent during a
+/// later one, and the durable plan is the only honest place for it to wait.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AvailabilityGrant(String);
+
+impl AvailabilityGrant {
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The token, for putting on the wire and nothing else.
+    ///
+    /// Deliberately not named `as_str`: this is not text to read, and the name
+    /// is the only thing stopping a caller from treating it as such.
+    #[must_use]
+    pub fn on_the_wire(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Money {
     pence: u64,

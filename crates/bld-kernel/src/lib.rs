@@ -34,7 +34,7 @@
 //! forced the kernel to sit in the middle of a network call.
 
 use async_trait::async_trait;
-use bld_types::{BoundedString as BoundedDetail, EffectIntentId};
+use bld_types::{BoundedString as BoundedDetail, EffectAttempt};
 
 /// What a whole turn through the boundary amounted to.
 ///
@@ -719,9 +719,23 @@ impl core::error::Error for Unknown {}
 /// Performs one external consequence, and reports what the provider said.
 ///
 /// The capability receives the **canonical plan** the boundary derived, never
-/// model instructions — and the effect identity alongside it, because the plan
-/// deliberately does not carry one (the repository owns effect identity, since
-/// it holds the uniqueness key).
+/// model instructions — and an [`EffectAttempt`] alongside it, because the plan
+/// deliberately does not carry an identity (the repository owns effect identity,
+/// since it holds the uniqueness key).
+///
+/// # Why an attempt and not just an identity
+///
+/// A provider that enforces a deadline must bind the deadline the *durable
+/// intent* holds, not one the adapter arrived at independently. Passing only an
+/// identity leaves the adapter to source the deadline itself, and there is no
+/// correct way to do that from inside a capability — see [`EffectAttempt`] for
+/// the failure this prevents.
+///
+/// Everything else the provider must be handed back travels in the **plan**, for
+/// the same reason and by the same rule: a value issued during one turn and spent
+/// during a later one has to wait somewhere durable, and the persisted canonical
+/// plan is the only honest place. An adapter that re-fetches instead gets a
+/// *currently valid* answer about facts the plan no longer reflects.
 ///
 /// `Raw` is whatever the provider actually returned, unexamined. Establishing
 /// that it genuinely came from the provider, and what it means, is a
@@ -735,7 +749,7 @@ pub trait Capability<E>: Send + Sync {
 
     /// Attempt the effect. Returns [`Unknown`] only when the attempt produced
     /// no answer at all.
-    async fn execute(&self, effect: &E, id: &EffectIntentId) -> Result<Self::Raw, Unknown>;
+    async fn execute(&self, effect: &E, attempt: &EffectAttempt) -> Result<Self::Raw, Unknown>;
 }
 
 /// Establishes that a raw provider response is genuine, and what fact it

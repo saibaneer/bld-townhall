@@ -1,0 +1,29 @@
+[package]
+name = "council-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bld-kernel = { path = "../bld-kernel" }
+bld-types = { path = "../bld-types" }
+council-wire = { path = "../council-wire" }
+reqwest.workspace = true
+thiserror.workspace = true
+townhall-domain = { path = "../townhall-domain" }
+townhall-service = { path = "../townhall-service" }
+
+[dev-dependencies]
+axum.workspace = true
+ed25519-dalek.workspace = true
+mock-council = { path = "../../services/mock-council" }
+sqlx.workspace = true
+townhall-store = { path = "../townhall-store" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true

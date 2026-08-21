@@ -6,8 +6,8 @@
 
 use bld_kernel::{BoundaryOutcome, Capability, Verified};
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, EffectIntentId, Money, PrincipalId, Provenance,
-    SlotId, TimeWindow, VenueId,
+    ActorId, AvailabilityGrant, BookingId, BookingRequirements, EffectAttempt, EffectIntentId,
+    Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
 };
 use std::{path::PathBuf, sync::Arc};
 use tempfile::TempDir;
@@ -17,7 +17,7 @@ use townhall_domain::{
 };
 use townhall_service::{
     Coordinator, ServiceError,
-    fake::{CouncilVerifier, FakeCouncil, FixedAvailability, ObservedCouncil, Script},
+    fake::{CouncilVerifier, FAKE_GRANT, FakeCouncil, FixedAvailability, ObservedCouncil, Script},
 };
 use townhall_store::{
     BookingRepository, NewBooking, SqliteBookingRepository, derive_effect_intent_id,
@@ -75,6 +75,11 @@ fn book_plan() -> BookingEffect {
         principal: PrincipalId::new("lucy"),
         attendees: 20,
         facts: facts(),
+        // The grant the availability source issued, not one this test invented.
+        // The plan the coordinator derives carries whatever the observation
+        // carried, so naming a different token here would assert a plan the
+        // boundary never builds.
+        grant: AvailabilityGrant::new(FAKE_GRANT),
     }
 }
 
@@ -596,16 +601,22 @@ async fn an_unknown_outcome_survives_restart_without_a_second_identity() {
 async fn one_identity_yields_one_booking() {
     let h = harness().await;
     let id = BookingId::new("BKG-IDEMPOTENT");
-    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+    // Both calls present the same attempt — same identity *and* same deadline.
+    // A retry that re-derived its deadline would present a different one, which
+    // is what the envelope exists to make impossible on the coordinator path.
+    let attempt = EffectAttempt {
+        id: derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK),
+        expires_at_ms: 1_000_030_000,
+    };
 
     let first = h
         .council
-        .execute(&book_plan(), &effect)
+        .execute(&book_plan(), &attempt)
         .await
         .expect("first call");
     let again = h
         .council
-        .execute(&book_plan(), &effect)
+        .execute(&book_plan(), &attempt)
         .await
         .expect("second call");
 

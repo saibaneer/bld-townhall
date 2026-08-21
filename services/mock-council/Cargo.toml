@@ -1,0 +1,24 @@
+[package]
+name = "mock-council"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+council-wire = { path = "../../crates/council-wire" }
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

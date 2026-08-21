@@ -35,7 +35,11 @@
       "Bash(grep -n \"^\\\\s*\\)\\)\\),\\\\?$\" crates/townhall-domain/src/lib.rs)",
       "Bash(cargo search *)",
       "Bash(cargo add *)",
-      "Bash(awk -F' ' '{s+=$1} END {print s\" passed\"}')"
+      "Bash(awk -F' ' '{s+=$1} END {print s\" passed\"}')",
+      "Bash(awk '{s+=$1} END {print s\" tests passing\"}')",
+      "Bash(UPDATE_TOPOLOGY=1 cargo test -p townhall-domain --test topology)",
+      "Bash(python3 -c ' *)",
+      "Bash(sed -n '/## The fact door/,/## The system/p' docs/topology.md)"
     ],
     "additionalDirectories": [
       "/Users/tobaajiboye/Documents/boundary-led-development/crates/townhall-service"

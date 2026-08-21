@@ -76,6 +76,8 @@ pub enum CodecError {
     NotAPresenceByte { found: u8 },
     #[error("the text field is not UTF-8")]
     NotUtf8,
+    #[error("{value} is before the Unix epoch, which this wire cannot represent")]
+    NegativeTimestamp { value: i64 },
 }
 
 /// Builds a canonical payload.
@@ -121,6 +123,22 @@ impl Encoder {
         self.bytes.push(1);
         self.bytes.extend_from_slice(&value.to_be_bytes());
         self
+    }
+
+    /// A wall-clock millisecond timestamp.
+    ///
+    /// Refuses a negative value rather than clamping it. Clamping is what this
+    /// method exists to prevent: `-1` and `0` would encode identically, so two
+    /// distinct deadlines would produce the same signature and one would decode as
+    /// the other. That destroys the injectivity the whole encoding rests on, and it
+    /// is not hypothetical — a grant issued at `-1` would open as `0` and be
+    /// accepted a millisecond later.
+    ///
+    /// # Errors
+    /// [`CodecError::NegativeTimestamp`] if `value` is before the Unix epoch.
+    pub fn timestamp(&mut self, value: i64) -> Result<&mut Self, CodecError> {
+        let unsigned = u64::try_from(value).map_err(|_| CodecError::NegativeTimestamp { value })?;
+        Ok(self.number(unsigned))
     }
 
     pub fn boolean(&mut self, value: bool) -> &mut Self {
@@ -372,6 +390,24 @@ mod tests {
             decoder.boolean().err(),
             Some(CodecError::NotABool { found: 2 })
         );
+    }
+
+    /// The injectivity failure a clamp would have introduced, as its own gate.
+    ///
+    /// `-1` must not encode as `0`. If it did, a deadline of `-1` and a deadline of
+    /// `0` would share a signature, and a grant minted at the first would verify as
+    /// the second.
+    #[test]
+    fn a_negative_timestamp_is_refused_not_clamped() {
+        let mut encoder = Encoder::new(MessageType::Grant);
+        assert_eq!(
+            encoder.timestamp(-1).err(),
+            Some(CodecError::NegativeTimestamp { value: -1 })
+        );
+
+        let mut zero = Encoder::new(MessageType::Grant);
+        zero.timestamp(0).expect("zero is representable");
+        assert!(!zero.finish().is_empty());
     }
 
     #[test]

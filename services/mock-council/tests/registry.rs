@@ -98,6 +98,16 @@ impl Harness {
             .map(|row| row.get::<String, _>("state"))
     }
 
+    async fn row_version(&self, venue: &str, slot: &str) -> i64 {
+        sqlx::query("SELECT row_version FROM venue_slots WHERE venue_id = ? AND slot_id = ?")
+            .bind(venue)
+            .bind(slot)
+            .fetch_one(self.council.pool())
+            .await
+            .expect("read the row version")
+            .get("row_version")
+    }
+
     async fn booking_count(&self) -> i64 {
         sqlx::query("SELECT COUNT(*) AS n FROM bookings")
             .fetch_one(self.council.pool())
@@ -830,6 +840,122 @@ async fn a_create_pauses_at_every_point() {
     assert_eq!(observer.count(PausePoint::BeforeExpiryWrite), 1);
     assert_eq!(observer.count(PausePoint::BeforeSettleCommit), 1);
     assert_eq!(observer.count(PausePoint::AfterSettleCommit), 1);
+}
+
+// ------------------------------------------- the version cannot be stepped around
+
+/// The row version can be advanced but never held still or wound back.
+///
+/// A grant binds to a version, so what matters is that a version it once named
+/// can never be current again. PR review found the original trigger fired only
+/// `WHEN NEW.row_version = OLD.row_version`, so an update that *named* a version
+/// slipped past it — and a grant for version 1, after a write that set the row
+/// back to 1, matched a row that had since changed.
+#[tokio::test]
+async fn a_write_cannot_hold_or_rewind_the_row_version() {
+    let h = Harness::new().await;
+
+    let start = h.row_version("TH-A", "SLOT-A").await;
+
+    // An ordinary update, not naming the version at all.
+    sqlx::query("UPDATE venue_slots SET accessible = 0 WHERE venue_id = ? AND slot_id = ?")
+        .bind("TH-A")
+        .bind("SLOT-A")
+        .execute(h.council.pool())
+        .await
+        .expect("update");
+    let bumped = h.row_version("TH-A", "SLOT-A").await;
+    assert!(bumped > start, "an ordinary update advances it");
+
+    // An update that tries to set the version back to where it was.
+    sqlx::query(
+        "UPDATE venue_slots SET accessible = 1, row_version = ? WHERE venue_id = ? AND slot_id = ?",
+    )
+    .bind(start)
+    .bind("TH-A")
+    .bind("SLOT-A")
+    .execute(h.council.pool())
+    .await
+    .expect("update");
+    assert!(
+        h.row_version("TH-A", "SLOT-A").await > bumped,
+        "naming an older version does not get you one"
+    );
+}
+
+/// And the grant that follows from it: a stale version cannot be made current
+/// again by a write that names it.
+#[tokio::test]
+async fn a_grant_cannot_be_revived_by_rewinding_the_version() {
+    let h = Harness::new().await;
+    let grant = h.grant_for("TH-A", "SLOT-A").await;
+    let issued_at = h.row_version("TH-A", "SLOT-A").await;
+
+    // The lift breaks, then someone tries to put the version back.
+    sqlx::query("UPDATE venue_slots SET accessible = 0 WHERE venue_id = ? AND slot_id = ?")
+        .bind("TH-A")
+        .bind("SLOT-A")
+        .execute(h.council.pool())
+        .await
+        .expect("update");
+    sqlx::query("UPDATE venue_slots SET row_version = ? WHERE venue_id = ? AND slot_id = ?")
+        .bind(issued_at)
+        .bind("TH-A")
+        .bind("SLOT-A")
+        .execute(h.council.pool())
+        .await
+        .expect("update");
+
+    let outcome = h
+        .create_with("EFF-REVIVED", "TH-A", "SLOT-A", 20, 4_500, grant)
+        .await;
+    assert!(
+        matches!(outcome, EffectOutcome::ProviderRejected { .. }),
+        "the stale grant must stay stale: {outcome:?}"
+    );
+    assert_eq!(h.booking_count().await, 0);
+}
+
+// ------------------------------------- a corrupt catalogue is no answer, not a lie
+
+/// A stored value that cannot be represented is refused, not clamped.
+///
+/// The direction is the reason. Clamping a negative fee reports a free room and
+/// clamping a negative capacity reports one holding 65535 people — both
+/// *permissive*, both passing the guard they should fail. SQL would refuse the
+/// eventual booking, but a false fact would already have crossed the boundary and
+/// been committed as verified.
+#[tokio::test]
+async fn a_negative_stored_fee_is_refused_rather_than_reported_as_free() {
+    let h = Harness::new().await;
+    sqlx::query("UPDATE venue_slots SET fee_pence = -1 WHERE venue_id = ? AND slot_id = ?")
+        .bind("TH-A")
+        .bind("SLOT-A")
+        .execute(h.council.pool())
+        .await
+        .expect("update");
+
+    let answer = h.registry().availability("TH-A", "SLOT-A").await;
+    assert!(
+        answer.is_err(),
+        "a corrupt catalogue must yield no answer, not a free room"
+    );
+}
+
+#[tokio::test]
+async fn a_negative_stored_capacity_is_refused_rather_than_reported_as_huge() {
+    let h = Harness::new().await;
+    sqlx::query("UPDATE venue_slots SET capacity = -1 WHERE venue_id = ? AND slot_id = ?")
+        .bind("TH-A")
+        .bind("SLOT-A")
+        .execute(h.council.pool())
+        .await
+        .expect("update");
+
+    assert!(
+        h.registry().availability("TH-A", "SLOT-A").await.is_err(),
+        "a corrupt catalogue must yield no answer"
+    );
 }
 
 // ------------------------------------------------------------------ one clock

@@ -42,7 +42,8 @@
       "Bash(sed -n '/## The fact door/,/## The system/p' docs/topology.md)",
       "Bash(awk 'length > 100 {print FILENAME\": \"NR\": \"length}' docs/decisions.md)",
       "Bash(awk 'length > 100 {print NR\": \"length}' docs/decisions.md)",
-      "Bash(awk '{s+=$1} END {print s\" passing\"}')"
+      "Bash(awk '{s+=$1} END {print s\" passing\"}')",
+      "Bash(gh pr create --base main --head m4d-the-real-mock-council --title 'M4 slice D: the real mock council' --body ' *)"
     ],
     "additionalDirectories": [
       "/Users/tobaajiboye/Documents/boundary-led-development/crates/townhall-service"

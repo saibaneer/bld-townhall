@@ -16,24 +16,34 @@ CREATE TABLE venue_slots (
     accessible   INTEGER NOT NULL CHECK (accessible IN (0, 1)),
     available    INTEGER NOT NULL CHECK (available  IN (0, 1)),
 
-    -- Bumped by EVERY mutation of this row, without exception.
+    -- Strictly increasing across every update of this row.
     --
-    -- A grant binds to this number, so a field the bump rule misses is a field a
-    -- stale grant can still vouch for. The case that motivates it: change only
-    -- accessibility, leaving fee, capacity and availability untouched. A version
-    -- that tracked "the fields a booking checks" would not move, the stale grant
-    -- would verify, and an inaccessible room would be booked for someone who
+    -- A grant binds to this number, so what the version must guarantee is that a
+    -- value it once named can never be current again. The case that motivates it:
+    -- change only accessibility, leaving fee, capacity and availability untouched.
+    -- A version tracking "the fields a booking checks" would not move, the stale
+    -- grant would verify, and an inaccessible room would be booked for someone who
     -- needs an accessible one.
-    --
-    -- Hence a trigger rather than discipline at call sites.
     row_version  INTEGER NOT NULL DEFAULT 1,
 
     PRIMARY KEY (venue_id, slot_id)
 );
 
-CREATE TRIGGER venue_slots_bump_row_version
+-- Monotonicity, not "the trigger always fires".
+--
+-- An earlier version fired only `WHEN NEW.row_version = OLD.row_version`, and the
+-- comment above it claimed every mutation bumped without exception. Both were
+-- wrong: `UPDATE venue_slots SET accessible = 0, row_version = 1` names a
+-- different version, so the trigger stayed silent and a grant for version 1
+-- matched a row that had since changed. A trigger is only discipline-free if it
+-- cannot be stepped around by writing the guarded column.
+--
+-- So the condition is `<=`: any update that fails to advance the version has it
+-- advanced for it. An update may jump forward, but it can never hold still and
+-- never go back, which is the property a grant actually needs.
+CREATE TRIGGER venue_slots_advance_row_version
 AFTER UPDATE ON venue_slots
-FOR EACH ROW WHEN NEW.row_version = OLD.row_version
+FOR EACH ROW WHEN NEW.row_version <= OLD.row_version
 BEGIN
     UPDATE venue_slots
        SET row_version = OLD.row_version + 1

@@ -140,6 +140,21 @@ pub enum CouncilError {
     Unreadable { field: &'static str, value: String },
     #[error("a guarded terminal write affected {rows} rows, not 1")]
     NotOpen { rows: u64 },
+    /// A stored number cannot be represented in the type it is read into.
+    ///
+    /// A refusal rather than a clamp, and the direction is the reason. Clamping a
+    /// capacity of `-1` reports a room holding 65535 people; clamping a negative fee
+    /// reports a free one. Both are *permissive* — a false fact would cross the
+    /// boundary and pass the guard it was supposed to fail, and the booking would
+    /// only be caught later by SQL comparing the real stored value. A catalogue
+    /// holding such a value is corrupt, and the honest answer about a corrupt
+    /// catalogue is no answer.
+    #[error("{field} holds {value}, which is not representable as {expected}")]
+    Unrepresentable {
+        field: &'static str,
+        value: i64,
+        expected: &'static str,
+    },
     #[error(transparent)]
     Wire(#[from] council_wire::codec::CodecError),
 }
@@ -245,21 +260,27 @@ impl Registry {
         let Some(row) = row else { return Ok(None) };
 
         let valid_until_ms = self.clock.now_ms().saturating_add(self.availability_ttl_ms);
-        let row_version: i64 = row.try_get("row_version")?;
+
+        // Every number is checked rather than coerced, and refused if it will not
+        // fit. See `CouncilError::Unrepresentable` for why the direction matters:
+        // a clamp here reports a free room or one holding 65535 people, and both
+        // pass the guard they were supposed to fail.
+        let row_version = unsigned(&row, "row_version")?;
+        let capacity = small(&row, "capacity")?;
+        let fee_pence = unsigned(&row, "fee_pence")?;
+
         let grant = self.signer.mint_grant(&GrantClaims {
             venue_id: venue_id.to_owned(),
             slot_id: slot_id.to_owned(),
-            row_version: u64::try_from(row_version).unwrap_or(0),
+            row_version,
             valid_until_ms,
         })?;
 
-        let capacity: i64 = row.try_get("capacity")?;
-        let fee: i64 = row.try_get("fee_pence")?;
         Ok(Some(AvailabilityAnswer {
-            capacity: u16::try_from(capacity).unwrap_or(u16::MAX),
+            capacity,
             accessible: row.try_get::<i64, _>("accessible")? == 1,
             available: row.try_get::<i64, _>("available")? == 1,
-            fee_pence: u64::try_from(fee).unwrap_or(0),
+            fee_pence,
             grant,
             valid_until_ms,
         }))
@@ -672,14 +693,12 @@ impl Registry {
             value: format!("{booking_reference} has no booking row"),
         })?;
 
-        let attendees: i64 = row.try_get("attendees")?;
-        let fee: i64 = row.try_get("fee_pence")?;
         Ok(EffectOutcome::BookingCreated(BookingFacts {
             booking_reference,
             venue_id: row.try_get("venue_id")?,
             slot_id: row.try_get("slot_id")?,
-            attendees: u16::try_from(attendees).unwrap_or(u16::MAX),
-            fee_pence: u64::try_from(fee).unwrap_or(0),
+            attendees: small(&row, "attendees")?,
+            fee_pence: unsigned(&row, "fee_pence")?,
             principal: row.try_get("principal")?,
         }))
     }
@@ -865,6 +884,26 @@ pub struct AvailabilityAnswer {
     pub fee_pence: u64,
     pub grant: String,
     pub valid_until_ms: i64,
+}
+
+/// Read a stored integer that must be non-negative.
+fn unsigned(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> Result<u64, CouncilError> {
+    let value: i64 = row.try_get(field)?;
+    u64::try_from(value).map_err(|_| CouncilError::Unrepresentable {
+        field,
+        value,
+        expected: "u64",
+    })
+}
+
+/// Read a stored integer that must fit a headcount.
+fn small(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> Result<u16, CouncilError> {
+    let value: i64 = row.try_get(field)?;
+    u16::try_from(value).map_err(|_| CouncilError::Unrepresentable {
+        field,
+        value,
+        expected: "u16",
+    })
 }
 
 async fn load_effect(

@@ -205,7 +205,7 @@ fn availability_payload(
             encoder.boolean(facts.available);
             encoder.number(facts.fee_pence);
             encoder.text(&facts.grant)?;
-            encoder.number(u64::try_from(facts.valid_until_ms).unwrap_or(0));
+            encoder.timestamp(facts.valid_until_ms)?;
         }
         None => {
             encoder.boolean(false);
@@ -219,7 +219,7 @@ fn grant_payload(claims: &GrantClaims) -> Result<Vec<u8>, CodecError> {
     encoder.text(&claims.venue_id)?;
     encoder.text(&claims.slot_id)?;
     encoder.number(claims.row_version);
-    encoder.number(u64::try_from(claims.valid_until_ms).unwrap_or(0));
+    encoder.timestamp(claims.valid_until_ms)?;
     Ok(encoder.finish())
 }
 

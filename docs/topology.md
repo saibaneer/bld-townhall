@@ -36,15 +36,32 @@ stateDiagram-v2
     AwaitingBooking --> BookingInProgress : Book ⇗
     AwaitingBooking --> Cancelled : Cancel
     Booked --> CancellingBooking : Cancel ⇗
-    BookingInProgress -.-> Booked : BookingExists
-    BookingInProgress -.-> AwaitingBooking : EffectAbsent
-    BookingInProgress -.-> AwaitingBooking : ProviderRejected
-    CancellationRequested -.-> CancellingBooking : BookingExists ⇗
-    CancellationRequested -.-> Cancelled : EffectAbsent
-    CancellationRequested -.-> Cancelled : ProviderRejected
-    CancellingBooking -.-> Booked : EffectAbsent
-    CancellingBooking -.-> Cancelled : CancellationExists
-    CancellingBooking -.-> Booked : ProviderRejected
+    BookingInProgress -.-> Booked : BookingExists · intent Book Prepared
+    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Prepared
+    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Prepared
+    BookingInProgress -.-> Booked : BookingExists · intent Book Unknown
+    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Unknown
+    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Unknown
+    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Rejected
+    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Rejected
+    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Absent
+    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Absent
+    BookingInProgress -.-> Booked : BookingExists · intent Book Abandoned
+    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Abandoned
+    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Abandoned
+    CancellationRequested -.-> CancellingBooking : BookingExists · intent Book Prepared ⇗
+    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Prepared
+    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Prepared
+    CancellationRequested -.-> CancellingBooking : BookingExists · intent Book Unknown ⇗
+    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Unknown
+    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Unknown
+    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Rejected
+    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Rejected
+    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Absent
+    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Absent
+    CancellationRequested -.-> CancellingBooking : BookingExists · intent Book Abandoned ⇗
+    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Abandoned
+    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Abandoned
     BookingInProgress ==> NeedsHuman : ReconciliationExhausted
     CancellationRequested ==> NeedsHuman : ReconciliationExhausted
     CancellingBooking ==> NeedsHuman : ReconciliationExhausted
@@ -53,6 +70,8 @@ stateDiagram-v2
 `⇗` marks an edge that asks the outside world for something, so it commits an in-flight state first and settles later on verified evidence (ADR-014).
 
 ## The proposal door
+
+**A fixed table**, over `state x proposal`. Every cell is decided by the state and the input alone — nothing else is in reach — so this enumeration is complete and no input sequence can reach a cell nobody specified. This is where the safety claim lives, and it is the door an untrusted proposer can reach.
 
 | from | SelectVenue | VerifySlot | ChangeVenue | UpdateRequirements | RevalidateVenue | Book | Cancel |
 |---|---|---|---|---|---|---|---|
@@ -69,20 +88,52 @@ stateDiagram-v2
 
 ## The fact door
 
-| from | BookingExists | EffectAbsent | CancellationExists | ProviderRejected |
-|---|---|---|---|---|
-| **Draft** | — | — | — | — |
-| **VenueSelected** | — | — | — | — |
-| **NeedsRevalidation** | — | — | — | — |
-| **AwaitingBooking** | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence's kind and the effect's kind disagree) | guarded (the evidence contradicts a durable determination already recorded) |
-| **BookingInProgress** | → Booked | → AwaitingBooking | guarded (the evidence's kind and the effect's kind disagree) | → AwaitingBooking |
-| **CancellationRequested** | → CancellingBooking ⇗ CancelBooking | → Cancelled | guarded (the evidence's kind and the effect's kind disagree) | → Cancelled |
-| **Booked** | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence's kind and the effect's kind disagree) | guarded (the evidence contradicts a durable determination already recorded) |
-| **CancellingBooking** | guarded (the evidence's kind and the effect's kind disagree) | → Booked | → Cancelled | → Booked |
-| **Cancelled** | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence contradicts a durable determination already recorded) | guarded (the evidence's kind and the effect's kind disagree) | guarded (the evidence contradicts a durable determination already recorded) |
-| **NeedsHuman** | — | — | — | — |
+**Not a fixed table.** This door reads the *persisted intent*, so its axes are `state x fact x intent kind x intent status` — the same fact means different things depending on what was in flight, which is ADR-012 working as designed rather than a wrinkle. Every axis above is varied below, but do not read this as a combinational table: it is a reachability view.
+
+Only the edges are listed. A pair absent from this list has no edge, and there are too many columns for a matrix to be readable.
+
+- **AwaitingBooking** on `EffectAbsent · intent Book Rejected` converged
+- **AwaitingBooking** on `ProviderRejected · intent Book Rejected` converged
+- **AwaitingBooking** on `EffectAbsent · intent Book Absent` converged
+- **AwaitingBooking** on `ProviderRejected · intent Book Absent` converged
+- **BookingInProgress** on `BookingExists · intent Book Prepared` → Booked
+- **BookingInProgress** on `EffectAbsent · intent Book Prepared` → AwaitingBooking
+- **BookingInProgress** on `ProviderRejected · intent Book Prepared` → AwaitingBooking
+- **BookingInProgress** on `BookingExists · intent Book Unknown` → Booked
+- **BookingInProgress** on `EffectAbsent · intent Book Unknown` → AwaitingBooking
+- **BookingInProgress** on `ProviderRejected · intent Book Unknown` → AwaitingBooking
+- **BookingInProgress** on `EffectAbsent · intent Book Rejected` → AwaitingBooking
+- **BookingInProgress** on `ProviderRejected · intent Book Rejected` → AwaitingBooking
+- **BookingInProgress** on `EffectAbsent · intent Book Absent` → AwaitingBooking
+- **BookingInProgress** on `ProviderRejected · intent Book Absent` → AwaitingBooking
+- **BookingInProgress** on `BookingExists · intent Book Abandoned` → Booked
+- **BookingInProgress** on `EffectAbsent · intent Book Abandoned` → AwaitingBooking
+- **BookingInProgress** on `ProviderRejected · intent Book Abandoned` → AwaitingBooking
+- **CancellationRequested** on `BookingExists · intent Book Prepared` → CancellingBooking ⇗ CancelBooking
+- **CancellationRequested** on `EffectAbsent · intent Book Prepared` → Cancelled
+- **CancellationRequested** on `ProviderRejected · intent Book Prepared` → Cancelled
+- **CancellationRequested** on `BookingExists · intent Book Unknown` → CancellingBooking ⇗ CancelBooking
+- **CancellationRequested** on `EffectAbsent · intent Book Unknown` → Cancelled
+- **CancellationRequested** on `ProviderRejected · intent Book Unknown` → Cancelled
+- **CancellationRequested** on `EffectAbsent · intent Book Rejected` → Cancelled
+- **CancellationRequested** on `ProviderRejected · intent Book Rejected` → Cancelled
+- **CancellationRequested** on `EffectAbsent · intent Book Absent` → Cancelled
+- **CancellationRequested** on `ProviderRejected · intent Book Absent` → Cancelled
+- **CancellationRequested** on `BookingExists · intent Book Abandoned` → CancellingBooking ⇗ CancelBooking
+- **CancellationRequested** on `EffectAbsent · intent Book Abandoned` → Cancelled
+- **CancellationRequested** on `ProviderRejected · intent Book Abandoned` → Cancelled
+- **Booked** on `EffectAbsent · intent Cancel Rejected` converged
+- **Booked** on `ProviderRejected · intent Cancel Rejected` converged
+- **Booked** on `EffectAbsent · intent Cancel Absent` converged
+- **Booked** on `ProviderRejected · intent Cancel Absent` converged
+- **Cancelled** on `EffectAbsent · intent Book Rejected` converged
+- **Cancelled** on `ProviderRejected · intent Book Rejected` converged
+- **Cancelled** on `EffectAbsent · intent Book Absent` converged
+- **Cancelled** on `ProviderRejected · intent Book Absent` converged
 
 ## The system_event door
+
+**A fixed table**, over `state x event`. Every cell is decided by the state and the input alone — nothing else is in reach — so this enumeration is complete and no input sequence can reach a cell nobody specified. This is where the safety claim lives, and it is the door an untrusted proposer can reach.
 
 | from | ReconciliationExhausted |
 |---|---|

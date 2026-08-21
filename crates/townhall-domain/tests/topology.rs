@@ -109,6 +109,20 @@ struct Door {
     inputs: Vec<String>,
     /// `cells[state_index][input_index]`
     cells: Vec<Vec<Cell>>,
+    /// Whether this door's cells are decided by `(state, input)` alone.
+    ///
+    /// True for the proposal and system-event doors, and that is the whole of the
+    /// safety claim: those cells are a fixed table, so no sequence of inputs can
+    /// reach one nobody specified.
+    ///
+    /// False for the fact door. Its cells read the *persisted intent* — kind, and
+    /// status — so the same fact means different things depending on what was in
+    /// flight. That is ADR-012 working as designed rather than a wrinkle: reality's
+    /// meaning depends on what we were doing. PR review caught this claimed as a
+    /// fixed table when it is not one.
+    fixed_table: bool,
+    /// What a machine-readable consumer needs to know about the axes.
+    dimensions: &'static str,
 }
 
 // ------------------------------------------------------------------- fixtures
@@ -265,8 +279,21 @@ fn facts_about(effect: &str) -> Vec<VerifiedProviderFact> {
     ]
 }
 
-fn intent_for(state: &BookingState, effect: &str) -> EffectIntent {
-    let kind = state.in_flight_kind().unwrap_or(OperationKind::Book);
+/// The persisted intent a fact is bound against.
+///
+/// `kind` is a *parameter* rather than derived from the state, and that is the
+/// correction PR review forced. Deriving it — `in_flight_kind().unwrap_or(Book)` —
+/// gave every settled state a *booking* intent, so the export reported
+/// `Booked + EffectAbsent` as guarded. The real domain converges there when the
+/// intent is a **cancellation**: a cancellation that did not happen leaves the
+/// booking booked. The fixture was answering a question the machine was not asked.
+fn intent_for(
+    state: &BookingState,
+    effect: &str,
+    kind: OperationKind,
+    status: EffectStatus,
+) -> EffectIntent {
+    let _ = state;
     EffectIntent {
         effect_intent_id: EffectIntentId::new(effect),
         booking_id: BookingId::new("BKG-1001"),
@@ -283,7 +310,7 @@ fn intent_for(state: &BookingState, effect: &str) -> EffectIntent {
                 booking_ref: CouncilBookingRef::new(REFERENCE),
             },
         },
-        status: EffectStatus::Unknown,
+        status,
         expires_at_ms: 1_000_030_000,
         provider_reference: None,
         outcome_detail: None,
@@ -347,6 +374,8 @@ async fn proposal_door() -> Door {
             .map(|p| p.name().to_owned())
             .collect(),
         cells,
+        fixed_table: true,
+        dimensions: "state x proposal",
     }
 }
 
@@ -361,7 +390,7 @@ async fn fact_door() -> Door {
                 _ => BOOK_EFFECT,
             });
         let mut row = Vec::new();
-        for fact in facts_about(effect) {
+        for (kind, status, fact) in fact_inputs() {
             // Mirrors how the coordinator builds this context, which is the only
             // way the artifact describes the machine rather than the fixture.
             //
@@ -378,7 +407,7 @@ async fn fact_door() -> Door {
             // cell mints a successor effect. Its value only needs to be present;
             // the repository verifies the actual identity.
             let context = FactContext {
-                intent: Some(intent_for(&state, effect)),
+                intent: Some(intent_for(&state, effect, kind, status)),
                 pending_effect: TownHallDomain::fact_intended_effect_kind(&state, &fact)
                     .map(|_| EffectIntentId::new(SUCCESSOR_EFFECT)),
             };
@@ -400,12 +429,50 @@ async fn fact_door() -> Door {
     Door {
         name: "fact",
         arrow: "-.->",
-        inputs: facts_about(BOOK_EFFECT)
+        inputs: fact_inputs()
             .iter()
-            .map(|f| f.name().to_owned())
+            .map(|(kind, status, fact)| {
+                format!("{} · intent {} {status:?}", fact.name(), kind.name())
+            })
             .collect(),
         cells,
+        fixed_table: false,
+        dimensions: "state x fact x intent kind x intent status",
     }
+}
+
+/// The fact door reads the persisted intent, so its input is not the fact alone.
+///
+/// Both dimensions were found by PR review, in two steps. The intent's **kind**
+/// first: the same fact against a booking intent and against a cancellation intent
+/// means different things. Then its **status**, which is what decides whether a
+/// fact is fresh news or a re-application of something already settled — a
+/// cancellation that did not happen leaves a booking `Booked`, and re-applying
+/// that absence once the intent is already `Absent` is `Converged` rather than a
+/// contradiction.
+///
+/// Enumerating facts alone exported a quarter of the input space and called it
+/// total.
+fn fact_inputs() -> Vec<(OperationKind, EffectStatus, VerifiedProviderFact)> {
+    let statuses = [
+        EffectStatus::Prepared,
+        EffectStatus::Unknown,
+        EffectStatus::Confirmed,
+        EffectStatus::Rejected,
+        EffectStatus::Absent,
+        EffectStatus::Abandoned,
+    ];
+
+    [OperationKind::Book, OperationKind::Cancel]
+        .into_iter()
+        .flat_map(move |kind| {
+            statuses.into_iter().flat_map(move |status| {
+                facts_about(BOOK_EFFECT)
+                    .into_iter()
+                    .map(move |fact| (kind, status, fact))
+            })
+        })
+        .collect()
 }
 
 async fn system_event_door() -> Door {
@@ -436,6 +503,10 @@ async fn system_event_door() -> Door {
         arrow: "==>",
         inputs: vec!["ReconciliationExhausted".to_owned()],
         cells,
+        // `resolve_system_event` takes no context at all, so this door is decided
+        // by (state, event) with nothing else in reach.
+        fixed_table: true,
+        dimensions: "state x event",
     }
 }
 
@@ -449,7 +520,7 @@ fn to_json(doors: &[Door], states: &[String]) -> String {
     );
     let _ = writeln!(
         out,
-        "  \"note\": \"Derived by running the domain. Every (state, input) pair has an entry: a `no_edge` cell is a transition that does not exist, not one refused at runtime.\","
+        "  \"note\": \"Derived by running the domain. A `no_edge` cell is a transition that does not exist, not one refused at runtime. Read `fixed_table` per door before relying on a cell: where it is true the door is decided by (state, input) alone and the enumeration is complete; where it is false the door reads persisted data and `dimensions` names every axis varied here.\","
     );
     let _ = write!(out, "  \"states\": [");
     let names: Vec<String> = states.iter().map(|s| format!("\"{s}\"")).collect();
@@ -460,6 +531,8 @@ fn to_json(doors: &[Door], states: &[String]) -> String {
     for (door_ix, door) in doors.iter().enumerate() {
         let _ = writeln!(out, "    {{");
         let _ = writeln!(out, "      \"name\": \"{}\",", door.name);
+        let _ = writeln!(out, "      \"fixed_table\": {},", door.fixed_table);
+        let _ = writeln!(out, "      \"dimensions\": \"{}\",", door.dimensions);
         let inputs: Vec<String> = door.inputs.iter().map(|i| format!("\"{i}\"")).collect();
         let _ = writeln!(out, "      \"inputs\": [{}],", inputs.join(", "));
         let _ = writeln!(out, "      \"cells\": [");
@@ -538,32 +611,11 @@ fn to_markdown(doors: &[Door], states: &[String]) -> String {
 
     for door in doors {
         let _ = writeln!(out, "## The {} door\n", door.name);
-        let _ = write!(out, "| from |");
-        for input in &door.inputs {
-            let _ = write!(out, " {input} |");
+        if door.fixed_table {
+            out.push_str(&fixed_table_section(door, states));
+        } else {
+            out.push_str(&reachability_section(door, states));
         }
-        out.push('\n');
-        let _ = write!(out, "|---|");
-        for _ in &door.inputs {
-            out.push_str("---|");
-        }
-        out.push('\n');
-
-        for (state_ix, row) in door.cells.iter().enumerate() {
-            let _ = write!(out, "| **{}** |", states[state_ix]);
-            for cell in row {
-                let text = match cell {
-                    Cell::NoEdge => "—".to_owned(),
-                    Cell::Local { to } => format!("→ {to}"),
-                    Cell::External { to, effect } => format!("→ {to} ⇗ {effect}"),
-                    Cell::Guarded { refused } => format!("guarded ({refused})"),
-                    Cell::Converged => "converged".to_owned(),
-                };
-                let _ = write!(out, " {text} |");
-            }
-            out.push('\n');
-        }
-        out.push('\n');
     }
 
     out.push_str(
@@ -573,6 +625,97 @@ fn to_markdown(doors: &[Door], states: &[String]) -> String {
          refusal — a reconciler re-applies facts by design.\n",
     );
     out
+}
+
+/// A door decided by `(state, input)` alone, as a matrix.
+fn fixed_table_section(door: &Door, states: &[String]) -> String {
+    let mut out = String::new();
+    {
+        {
+            let _ = writeln!(
+                out,
+                "**A fixed table**, over `{}`. Every cell is decided by the state and the input \
+                 alone — nothing else is in reach — so this enumeration is complete and no input \
+                 sequence can reach a cell nobody specified. This is where the safety claim lives, \
+                 and it is the door an untrusted proposer can reach.\n",
+                door.dimensions
+            );
+        }
+    }
+
+    let _ = write!(out, "| from |");
+    for input in &door.inputs {
+        let _ = write!(out, " {input} |");
+    }
+    out.push('\n');
+    let _ = write!(out, "|---|");
+    for _ in &door.inputs {
+        out.push_str("---|");
+    }
+    out.push('\n');
+
+    for (state_ix, row) in door.cells.iter().enumerate() {
+        let _ = write!(out, "| **{}** |", states[state_ix]);
+        for cell in row {
+            let _ = write!(out, " {} |", describe(cell));
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// A door that reads persisted data, as a list of the edges found.
+fn reachability_section(door: &Door, states: &[String]) -> String {
+    let mut out = String::new();
+    {
+        {
+            let _ = writeln!(
+                out,
+                "**Not a fixed table.** This door reads the *persisted intent*, so its axes are \
+                 `{}` — the same fact means different things depending on what was in flight, \
+                 which is ADR-012 working as designed rather than a wrinkle. Every axis above is \
+                 varied below, but do not read this as a combinational table: it is a reachability \
+                 view.\n\n\
+                 Only the edges are listed. A pair absent from this list has no edge, and there \
+                 are too many columns for a matrix to be readable.\n",
+                door.dimensions
+            );
+        }
+    }
+
+    let mut any = false;
+    for (state_ix, row) in door.cells.iter().enumerate() {
+        for (input_ix, cell) in row.iter().enumerate() {
+            let text = match cell {
+                Cell::Local { to } => format!("→ {to}"),
+                Cell::External { to, effect } => format!("→ {to} ⇗ {effect}"),
+                Cell::Converged => "converged".to_owned(),
+                Cell::NoEdge | Cell::Guarded { .. } => continue,
+            };
+            any = true;
+            let _ = writeln!(
+                out,
+                "- **{}** on `{}` {text}",
+                states[state_ix], door.inputs[input_ix]
+            );
+        }
+    }
+    if !any {
+        out.push_str("- (none)\n");
+    }
+    out.push('\n');
+    out
+}
+
+fn describe(cell: &Cell) -> String {
+    match cell {
+        Cell::NoEdge => "—".to_owned(),
+        Cell::Local { to } => format!("→ {to}"),
+        Cell::External { to, effect } => format!("→ {to} ⇗ {effect}"),
+        Cell::Guarded { refused } => format!("guarded ({refused})"),
+        Cell::Converged => "converged".to_owned(),
+    }
 }
 
 // --------------------------------------------------------------------- the gate

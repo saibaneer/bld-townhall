@@ -774,8 +774,29 @@ The motivation is not portability. It is that a state machine whose permitted tr
 are a **fixed, total table** cannot be driven somewhere nobody specified. On hardware that
 stops being a rule you enforce and becomes a wire that is not there. If the same machine
 one day drives an actuator instead of a booking, "the robot can only do what this state
-permits" is the property worth having, and it is only available if the topology never
-depends on anything but the state and the input.
+permits" is the property worth having.
+
+### Which door the claim is about, and why that is the strong version
+
+**The proposal door**, and the system-event door with it. Not the fact door, and PR review
+caught an earlier draft of this ADR claiming otherwise.
+
+`resolve_fact` reads the persisted intent — its kind, its status, its canonical plan — and the
+same `(state, fact)` pair can be a convergence, a contradiction or a handoff depending on what
+was in flight. `EffectAbsent` at `Booked` against a *cancellation* intent already recorded
+`Absent` is `Converged`: a cancellation that did not happen leaves the booking booked, and
+re-applying that absence is the re-apply-by-design case ADR-012 exists for. That door is not a
+combinational table and must not be exported as one. `docs/topology.json` now marks each door
+`fixed_table: true | false` and names the axes it varies.
+
+**That scoping is not a retreat.** The proposal door is the only one an untrusted proposer can
+reach: ADR-012 made facts and system events separate types that proposer-facing crates cannot
+name, so an agent submits proposals or nothing. "The robot can only do what this state permits"
+is therefore a claim about the proposal door, and *there* it is exactly true — `Undefined` is
+decided from `(state, proposal)` before any guard reads the aggregate.
+
+`resolve_system_event` takes no context at all, so that door is a fixed table too, and for a
+sharper reason: there is nothing else in reach.
 
 ### What makes it possible today
 
@@ -787,17 +808,20 @@ The seam already exists, and it is ADR-004 plus the `Undefined`/`Denied` split:
 | `Denied(e)` | the edge exists; a guard refused it this time | comparators over the guard's inputs |
 
 `resolve_proposal` decides `Undefined` from the `(state, proposal)` pair **before** any guard
-reads the aggregate, and says so in a comment at the point where it matters. That is what
-makes the topology extractable at all, and `docs/topology.json` is the extract.
+reads the aggregate, and says so in a comment at the point where it matters. That is what makes
+the proposal door extractable as a table at all, and `docs/topology.json` is the extract —
+with each door labelled for what it is.
 
 ### What this forbids
 
 Four things, and each is already true — the value of writing them down is that a future
 change would otherwise break the property without anyone noticing:
 
-1. **`Undefined` must never depend on data.** The moment whether a behaviour *exists*
-   depends on the aggregate's contents, the topology stops being a table and becomes a
-   program. Guards may depend on data; the graph may not.
+1. **`Undefined` must never depend on data — on the proposal door.** The moment whether a
+   *behaviour* exists depends on the aggregate's contents, the menu stops being a table and
+   becomes a program. Guards may depend on data; the menu may not. The fact door is exempt
+   because it is not a menu: it interprets evidence against a persisted intent, and that is
+   what it is for.
 2. **The domain performs no I/O, reads no clock, and uses no randomness.** Context is
    *given* to it (ADR-013). This is why ADR-016 §2 keeps the deadline comparison on the
    council's side rather than the domain's — that was argued as a provenance matter, and it

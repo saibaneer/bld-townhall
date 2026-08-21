@@ -47,14 +47,16 @@ use axum::{
 };
 use clock::{Clock, SystemClock};
 use council_wire::{
-    AvailabilityFacts, CouncilSigner, EffectOutcome, SignedAvailabilityResponse,
-    SignedEffectResponse,
+    AvailabilityFacts, CouncilSigner, EffectOutcome, SignedEffectResponse,
+    body::{
+        AvailabilityResponseBody, CancelBookingBody, CreateBookingBody, EffectResponseBody,
+        ResolveBody,
+    },
 };
 use pause::{NeverPauses, Pauses};
 use registry::{
     ApplyCancellation, CouncilError, CreateBooking, OperationKind, Registry, ResolveEffect,
 };
-use serde::{Deserialize, Serialize};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -209,83 +211,6 @@ impl Council {
             .route("/effects/{effect_intent_id}/resolve", post(resolve_effect))
             .with_state(Arc::clone(&self.registry))
     }
-}
-
-// ---------------------------------------------------------------- wire bodies
-
-#[derive(Debug, Deserialize)]
-pub struct CreateBookingBody {
-    pub effect_intent_id: String,
-    pub expires_at_ms: i64,
-    pub venue_id: String,
-    pub slot_id: String,
-    pub attendees: u16,
-    /// The fee the caller believes applies. Checked, never stored.
-    pub fee_pence: u64,
-    pub principal: String,
-    /// The council's warrant for the availability facts this plan was built on.
-    pub grant: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CancelBookingBody {
-    pub effect_intent_id: String,
-    pub expires_at_ms: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ResolveBody {
-    pub expires_at_ms: i64,
-    /// Explicit, because the council must not have to parse our identity format
-    /// to tell a booking from a cancellation.
-    pub operation_kind: String,
-}
-
-/// An effect answer on the wire.
-///
-/// The outcome is a tag plus its fields rather than an externally-tagged enum, so
-/// the JSON shape is stable and readable in a test failure.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EffectResponseBody {
-    pub effect_intent_id: String,
-    pub outcome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub booking_reference: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub venue_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slot_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attendees: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_pence: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub principal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AvailabilityResponseBody {
-    pub venue_id: String,
-    pub slot_id: String,
-    pub outcome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accessible: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub available: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_pence: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub grant: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub valid_until_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
 }
 
 // ------------------------------------------------------------------- handlers
@@ -470,7 +395,7 @@ fn effect_reply(
         outcome,
         signature,
     };
-    (status_for(&response.outcome), Json(to_body(response)))
+    (status_for(&response.outcome), Json(response.into()))
 }
 
 const fn status_for(outcome: &EffectOutcome) -> StatusCode {
@@ -483,140 +408,4 @@ const fn status_for(outcome: &EffectOutcome) -> StatusCode {
         EffectOutcome::ProtocolConflict { .. } => StatusCode::CONFLICT,
         EffectOutcome::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
     }
-}
-
-fn to_body(response: SignedEffectResponse) -> EffectResponseBody {
-    let mut body = EffectResponseBody {
-        effect_intent_id: response.effect_intent_id,
-        outcome: String::new(),
-        booking_reference: None,
-        venue_id: None,
-        slot_id: None,
-        attendees: None,
-        fee_pence: None,
-        principal: None,
-        reason: None,
-        signature: response.signature,
-    };
-
-    match response.outcome {
-        EffectOutcome::BookingCreated(facts) => {
-            "BookingCreated".clone_into(&mut body.outcome);
-            body.booking_reference = Some(facts.booking_reference);
-            body.venue_id = Some(facts.venue_id);
-            body.slot_id = Some(facts.slot_id);
-            body.attendees = Some(facts.attendees);
-            body.fee_pence = Some(facts.fee_pence);
-            body.principal = Some(facts.principal);
-        }
-        EffectOutcome::CancellationApplied { booking_reference } => {
-            "CancellationApplied".clone_into(&mut body.outcome);
-            body.booking_reference = Some(booking_reference);
-        }
-        EffectOutcome::DefinitivelyAbsent => {
-            "DefinitivelyAbsent".clone_into(&mut body.outcome);
-        }
-        EffectOutcome::NotYetVisible => {
-            "NotYetVisible".clone_into(&mut body.outcome);
-        }
-        EffectOutcome::ProviderRejected { reason } => {
-            "ProviderRejected".clone_into(&mut body.outcome);
-            body.reason = Some(reason);
-        }
-        EffectOutcome::ProtocolConflict { reason } => {
-            "ProtocolConflict".clone_into(&mut body.outcome);
-            body.reason = Some(reason);
-        }
-        EffectOutcome::Unavailable { reason } => {
-            "Unavailable".clone_into(&mut body.outcome);
-            body.reason = Some(reason);
-        }
-    }
-    body
-}
-
-/// Read an availability body back into the verifiable payload shape.
-///
-/// # Errors
-/// Never — malformed bodies simply produce `facts: None`, which the client treats
-/// as no answer.
-#[must_use]
-pub fn availability_from_body(body: AvailabilityResponseBody) -> SignedAvailabilityResponse {
-    let facts = match (
-        body.capacity,
-        body.accessible,
-        body.available,
-        body.fee_pence,
-        body.grant,
-        body.valid_until_ms,
-    ) {
-        (
-            Some(capacity),
-            Some(accessible),
-            Some(available),
-            Some(fee_pence),
-            Some(grant),
-            Some(valid_until_ms),
-        ) => Some(AvailabilityFacts {
-            capacity,
-            accessible,
-            available,
-            fee_pence,
-            grant,
-            valid_until_ms,
-        }),
-        _ => None,
-    };
-    SignedAvailabilityResponse {
-        venue_id: body.venue_id,
-        slot_id: body.slot_id,
-        facts,
-        signature: body.signature,
-    }
-}
-
-/// Read an effect body back into the verifiable payload shape.
-///
-/// # Errors
-/// [`council_wire::WireError::UnknownOutcome`] if the tag is not one the council
-/// emits, and [`council_wire::WireError::Codec`] if a tagged outcome is missing a
-/// field it must carry — both refusals rather than a guessed outcome.
-pub fn effect_from_body(
-    body: EffectResponseBody,
-) -> Result<SignedEffectResponse, council_wire::WireError> {
-    use council_wire::{BookingFacts, WireError};
-
-    let missing = |field: &'static str| WireError::UnknownOutcome(format!("missing {field}"));
-
-    let outcome = match body.outcome.as_str() {
-        "BookingCreated" => EffectOutcome::BookingCreated(BookingFacts {
-            booking_reference: body.booking_reference.ok_or_else(|| missing("reference"))?,
-            venue_id: body.venue_id.ok_or_else(|| missing("venue_id"))?,
-            slot_id: body.slot_id.ok_or_else(|| missing("slot_id"))?,
-            attendees: body.attendees.ok_or_else(|| missing("attendees"))?,
-            fee_pence: body.fee_pence.ok_or_else(|| missing("fee_pence"))?,
-            principal: body.principal.ok_or_else(|| missing("principal"))?,
-        }),
-        "CancellationApplied" => EffectOutcome::CancellationApplied {
-            booking_reference: body.booking_reference.ok_or_else(|| missing("reference"))?,
-        },
-        "DefinitivelyAbsent" => EffectOutcome::DefinitivelyAbsent,
-        "NotYetVisible" => EffectOutcome::NotYetVisible,
-        "ProviderRejected" => EffectOutcome::ProviderRejected {
-            reason: body.reason.ok_or_else(|| missing("reason"))?,
-        },
-        "ProtocolConflict" => EffectOutcome::ProtocolConflict {
-            reason: body.reason.ok_or_else(|| missing("reason"))?,
-        },
-        "Unavailable" => EffectOutcome::Unavailable {
-            reason: body.reason.unwrap_or_default(),
-        },
-        other => return Err(WireError::UnknownOutcome(other.to_owned())),
-    };
-
-    Ok(SignedEffectResponse {
-        effect_intent_id: body.effect_intent_id,
-        outcome,
-        signature: body.signature,
-    })
 }

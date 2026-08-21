@@ -26,6 +26,7 @@
 //! key distribution, and for a POC with a pinned test key it is out of scope —
 //! stated rather than glossed.
 
+pub mod body;
 pub mod codec;
 
 use base64::Engine as _;

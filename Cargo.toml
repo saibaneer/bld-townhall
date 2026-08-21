@@ -7,6 +7,7 @@ members = [
   "crates/townhall-store",
   "crates/townhall-service",
   "crates/council-wire",
+  "crates/council-client",
   "services/mock-council",
 ]
 
@@ -27,7 +28,11 @@ tempfile = "3"
 static_assertions = "1"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 axum = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+# No TLS feature: this client talks to a council on localhost over plain HTTP.
+# Provenance here comes from the signature on the payload, not from the
+# transport, which is deliberate — a signed answer is verifiable after it has
+# been stored, relayed or replayed, and a TLS session is not.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 base64 = "0.23"
 
 [workspace.lints.rust]

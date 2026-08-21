@@ -762,3 +762,83 @@ The symmetry with ADR-012, stated once: **denial reasons are the vocabulary the 
 half is meant to see** — the outbound feedback channel. **Evidence types are the vocabulary
 it must not be able to name.** Information flows out as typed refusals; it never flows in
 as claimed facts.
+
+## ADR-018 — The transition topology stays synthesisable, as a discipline
+
+No hardware is being built. This POC targets Rust on a general-purpose machine and nothing
+else. But the state machine is kept in a form that *could* be moved to a fixed-function
+target — an FPGA, a safety-certified controller, a robot — and that constraint is retained
+deliberately, because it forbids exactly the things that would rot the design anyway.
+
+The motivation is not portability. It is that a state machine whose permitted transitions
+are a **fixed, total table** cannot be driven somewhere nobody specified. On hardware that
+stops being a rule you enforce and becomes a wire that is not there. If the same machine
+one day drives an actuator instead of a booking, "the robot can only do what this state
+permits" is the property worth having, and it is only available if the topology never
+depends on anything but the state and the input.
+
+### What makes it possible today
+
+The seam already exists, and it is ADR-004 plus the `Undefined`/`Denied` split:
+
+| | Meaning | Fixed-function form |
+|---|---|---|
+| `Undefined` | no edge exists from this state for this input | a table — combinational, data-independent |
+| `Denied(e)` | the edge exists; a guard refused it this time | comparators over the guard's inputs |
+
+`resolve_proposal` decides `Undefined` from the `(state, proposal)` pair **before** any guard
+reads the aggregate, and says so in a comment at the point where it matters. That is what
+makes the topology extractable at all, and `docs/topology.json` is the extract.
+
+### What this forbids
+
+Four things, and each is already true — the value of writing them down is that a future
+change would otherwise break the property without anyone noticing:
+
+1. **`Undefined` must never depend on data.** The moment whether a behaviour *exists*
+   depends on the aggregate's contents, the topology stops being a table and becomes a
+   program. Guards may depend on data; the graph may not.
+2. **The domain performs no I/O, reads no clock, and uses no randomness.** Context is
+   *given* to it (ADR-013). This is why ADR-016 §2 keeps the deadline comparison on the
+   council's side rather than the domain's — that was argued as a provenance matter, and it
+   is the same constraint seen from another angle.
+3. **States stay finite and enumerable.** Ten variants today. A state carrying unbounded
+   data that transitions *branch on* would end the property; a state carrying unbounded data
+   that only guards read would not.
+4. **Guards stay comparisons over enumerable inputs.** Fee against a ceiling, capacity
+   against a headcount, a boolean flag. Not "ask a service whether this is allowed" — a
+   guard that reached outside would be a transition deciding its own admissibility, which
+   ADR-013 already refuses for a different reason.
+
+### What is explicitly out of scope
+
+**External effects have no fixed-function analogue and do not need one.** Calling the
+council is at the boundary's edge, not inside the transition logic: the topology records
+*that* an edge reaches outside, never how. A hardware target would substitute an actuator
+command and inherit ADR-014 unchanged — record what you are about to command before
+commanding it, because a crash mid-motion leaves you needing to know what you asked for. Higher stakes than a room booking, identical discipline.
+
+**Guard synthesis is not attempted.** Exporting the comparisons and their data sources is a
+further step nobody has asked for. The topology is the part that carries the safety claim.
+
+### What it costs
+
+Almost nothing, because everything it forbids was already forbidden for other reasons. The
+one real cost is a standing constraint on future design: a tempting shortcut where a
+behaviour's *existence* depends on data — "`Book` only exists once a venue is verified,
+which we can tell from `availability.is_some()`" — is closed. That case must be modelled as
+a distinct state, which is what `AwaitingBooking` already is.
+
+That is not a workaround. It is the thesis: if a behaviour comes and goes with the data, the
+data is a state and should be named as one.
+
+### Alternatives rejected
+
+**Say nothing and keep the property by accident.** It survives exactly until someone has a
+good reason to make `Undefined` conditional, and then it is gone with no test failing —
+`docs/topology.json` would still generate, and would still be total. It would simply no
+longer be true of anything but the fixture. The property needs a stated owner.
+
+**Target hardware now.** Nothing in the POC needs it, no requirement asks for it, and
+building a synthesis path for a booking system would be the clearest possible case of
+solving a problem nobody has.

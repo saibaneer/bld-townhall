@@ -810,13 +810,56 @@ change would otherwise break the property without anyone noticing:
    guard that reached outside would be a transition deciding its own admissibility, which
    ADR-013 already refuses for a different reason.
 
+### When data becomes a state, and when it stays a guard
+
+Rule 1 forbids a behaviour whose *existence* depends on data, which invites the obvious
+worry: does every data condition now become a state? Eight states for "verified AND deposit
+paid AND insurance confirmed"? No, and the line is sharp:
+
+> **Promote data to a state when it changes *which behaviours exist*.**
+> **Leave it as a guard when it only changes *whether a behaviour succeeds*.**
+
+Applied to what already exists:
+
+| Condition | Changes the behaviour set? | Form |
+|---|---|---|
+| the slot has been verified | yes — `Book` appears | a **state**, `AwaitingBooking` |
+| the fee exceeds the principal's ceiling | no — `Book` exists and is denied | a guard |
+| the room is not wheelchair accessible | no | a guard |
+| the room is too small | no | a guard |
+
+Three guards, one state. The heuristic reproduces the current design without having been
+consulted about it, which is the reason to trust it.
+
+**Why the extra state is worth its cost, twice over.** Both of these are defects this project
+has already had, and both are structurally impossible under a state rather than test-covered
+under a guard.
+
+*A 22-seat room booked for 25 people.* The slot is verified for 20 attendees; the headcount
+is then raised to 25. As a state, `UpdateRequirements` leaves `AwaitingBooking` for
+`NeedsRevalidation` and `Book` **stops existing** — re-verification is the only way forward,
+and it refuses. As a guard, the aggregate still carries availability for the same room, so
+`Book` still exists and still passes; preventing it requires remembering to clear a field
+whenever requirements change, and forgetting once is silent.
+
+*The fee that moved.* `AwaitingBooking` carries `verified_fee` — the price that was true when
+the slot was checked — and `Book` compares the current fee against it. Under a guard there is
+nowhere for that value to live except the availability record itself, so "the price approved"
+and "the price now" become one field and drift is undetectable. **A state can carry evidence
+of its own precondition; a conditional inside a behaviour cannot.**
+
+The failure mode to watch for in review is small and quiet: someone adds `if data.is_some()`
+inside a behaviour under time pressure. No test fails. `docs/topology.json` still generates
+and still looks total — it has simply stopped being true of anything but the fixture.
+
 ### What is explicitly out of scope
 
 **External effects have no fixed-function analogue and do not need one.** Calling the
 council is at the boundary's edge, not inside the transition logic: the topology records
 *that* an edge reaches outside, never how. A hardware target would substitute an actuator
 command and inherit ADR-014 unchanged — record what you are about to command before
-commanding it, because a crash mid-motion leaves you needing to know what you asked for. Higher stakes than a room booking, identical discipline.
+commanding it, because a crash mid-motion leaves you needing to know what you asked for.
+Higher stakes than a room booking, identical discipline.
 
 **Guard synthesis is not attempted.** Exporting the comparisons and their data sources is a
 further step nobody has asked for. The topology is the part that carries the safety claim.
@@ -830,7 +873,8 @@ which we can tell from `availability.is_some()`" — is closed. That case must b
 a distinct state, which is what `AwaitingBooking` already is.
 
 That is not a workaround. It is the thesis: if a behaviour comes and goes with the data, the
-data is a state and should be named as one.
+data is a state and should be named as one. The section above draws the line, so the
+prohibition comes with somewhere to go rather than only somewhere not to.
 
 ### Alternatives rejected
 

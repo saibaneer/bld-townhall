@@ -39,7 +39,9 @@
       "Bash(awk '{s+=$1} END {print s\" tests passing\"}')",
       "Bash(UPDATE_TOPOLOGY=1 cargo test -p townhall-domain --test topology)",
       "Bash(python3 -c ' *)",
-      "Bash(sed -n '/## The fact door/,/## The system/p' docs/topology.md)"
+      "Bash(sed -n '/## The fact door/,/## The system/p' docs/topology.md)",
+      "Bash(awk 'length > 100 {print FILENAME\": \"NR\": \"length}' docs/decisions.md)",
+      "Bash(awk 'length > 100 {print NR\": \"length}' docs/decisions.md)"
     ],
     "additionalDirectories": [
       "/Users/tobaajiboye/Documents/boundary-led-development/crates/townhall-service"

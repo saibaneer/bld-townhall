@@ -19,6 +19,8 @@ townhall-service = { path = "../townhall-service" }
 axum.workspace = true
 ed25519-dalek.workspace = true
 mock-council = { path = "../../services/mock-council" }
+sqlx.workspace = true
+townhall-store = { path = "../townhall-store" }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

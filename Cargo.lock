@@ -209,11 +209,13 @@ dependencies = [
  "mock-council",
  "reqwest",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
  "townhall-domain",
  "townhall-service",
+ "townhall-store",
 ]
 
 [[package]]

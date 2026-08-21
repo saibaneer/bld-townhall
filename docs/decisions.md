@@ -831,6 +831,35 @@ Applied to what already exists:
 Three guards, one state. The heuristic reproduces the current design without having been
 consulted about it, which is the reason to trust it.
 
+**The distinction in plainer terms.** A state decides *what can be asked for here* — the
+menu. A guard decides *whether this particular ask succeeds* — the answer. A cash machine
+showing "insert card" is not refusing your withdrawal; there is no withdrawal screen. Once
+your card is in, "insufficient funds" is a refusal: the option was there, you took it, the
+answer was no.
+
+So the test is: **if the data were fixed, would a new option appear on the menu, or would the
+same option start working?** Verifying a slot makes `Book` *appear* — a new menu. Topping up
+a fee ceiling makes the existing `Book` *succeed* — the same menu, a different answer.
+
+**Two further rules, which settle the cases the first one leaves open:**
+
+- **Two candidate states with identical menus are one state.** This is what stops promotion
+  from exploding: "verified" plus "deposit paid" plus "insurance confirmed" is not eight
+  states, because `VerifiedWithoutDeposit` and `VerifiedWithDeposit` would offer the same
+  four behaviours. Same menu, so one state and a guard on `Book`.
+- **State belongs to the resource, never to the caller.** A booking's state is a fact about
+  the booking; authority is a fact about who is asking. The same booking in the same state
+  offers `Book` to a principal who may book and refuses one who may not — so if authority
+  were a state, the state would change depending on who looked at it. Anything that varies by
+  requester is therefore a guard by construction, which is why `may_book` and the fee ceiling
+  are guards and not states.
+
+**When the three still leave it ambiguous, choose the state.** The two errors are not
+symmetric. Wrongly choosing a guard produces the failures below — a booking at a price nobody
+approved, a room too small — and no test necessarily catches either. Wrongly choosing a state
+makes the topology noisier and the design more tedious to read. One is a silent correctness
+failure; the other is untidiness.
+
 **Why the extra state is worth its cost, twice over.** Both of these are defects this project
 has already had, and both are structurally impossible under a state rather than test-covered
 under a guard.
@@ -842,11 +871,19 @@ and it refuses. As a guard, the aggregate still carries availability for the sam
 `Book` still exists and still passes; preventing it requires remembering to clear a field
 whenever requirements change, and forgetting once is silent.
 
-*The fee that moved.* `AwaitingBooking` carries `verified_fee` — the price that was true when
-the slot was checked — and `Book` compares the current fee against it. Under a guard there is
-nowhere for that value to live except the availability record itself, so "the price approved"
-and "the price now" become one field and drift is undetectable. **A state can carry evidence
-of its own precondition; a conditional inside a behaviour cannot.**
+*The fee that moved.* A slot is verified at £45 against a £100 ceiling. The council later
+raises it to £90. As a guard, the only fee available is the one just read: £90 is under £100,
+so the booking succeeds at a price the principal never approved. The guard asked *"is it
+under the ceiling?"* when the question that mattered was *"is it the price that was agreed?"*
+— and it **cannot ask that**, because there is nowhere for the agreed price to live except
+the availability record that just changed. As a state, `AwaitingBooking` carries
+`verified_fee`, `Book` compares £90 against £45, and the refusal sends the booking back to
+re-verification where the new price is decided on deliberately.
+
+That is the general form, and it is the reason this rule exists rather than merely tidying
+the graph: **a state can carry evidence of its own precondition; a conditional inside a
+behaviour cannot.** The failure is not that the guard is harder to write correctly — it is
+that the correct check is unwriteable, because the value it needs was never kept.
 
 The failure mode to watch for in review is small and quiet: someone adds `if data.is_some()`
 inside a behaviour under time pressure. No test fails. `docs/topology.json` still generates

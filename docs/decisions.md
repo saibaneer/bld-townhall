@@ -980,9 +980,12 @@ plan established what that costs, concretely:
   must therefore be correct when authoritative facts arrive *after* someone gave up.
 
 By ADR-018's own rule — promote data to a state when it changes **which behaviours exist** —
-`NeedsHuman` is not a state today: its menu is empty, and the in-flight menus it interrupts are
-also empty, so the promotion changed no behaviour anywhere. It was a label wearing a state's
-costume, and the costume destroyed information.
+`NeedsHuman` is not a state today, and the accurate form of the argument matters: it is not that
+the menus involved are empty (`BookingInProgress` has a deliberately pending `Cancel` cell that
+slice F opens, so they are not), it is that **escalation changes no menu.** Every behaviour an
+in-flight state has before giving up, it must still have after — a user may cancel a booking we
+are unsure about — and `NeedsHuman` offered nothing those states lack. A promotion that changes
+no behaviour is a label wearing a state's costume, and this one's costume destroyed information.
 
 ### Decision
 
@@ -1011,8 +1014,10 @@ The status stays `Unknown` — which is the truth, and which is what keeps the i
 finalisable through the ordinary path when the answer eventually arrives. **No store guard is
 weakened**: `finalize_effect`'s `EffectStillActive` gate, the terminal-contradiction check and
 `Booking::coherent` all stand exactly as they are, because nothing about this write goes near
-them. `EffectStatus::Abandoned` is removed; every remaining status is preparation or
-provider-determined.
+them. `EffectStatus::Abandoned` is removed — not because the remaining column is a pure
+provenance partition (`Unknown` is ours too: a knowledge state), but because `Abandoned` was a
+*decision* wearing an outcome's terminality, and its terminality is what refused the late fact.
+Statuses describe what is known; decisions about pursuit live on the pursuit axis.
 
 **3. Giving up means chasing slowly, not never asking again.** Escalation pushes
 `next_attempt_after_ms` far out (hours, not seconds) and flags the intent for a human. The

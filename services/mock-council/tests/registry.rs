@@ -1026,6 +1026,12 @@ impl RecordsPauses {
             PausePoint::BeforeExpiryWrite => self.before_expiry.load(Ordering::SeqCst),
             PausePoint::BeforeSettleCommit => self.before_commit.load(Ordering::SeqCst),
             PausePoint::AfterSettleCommit => self.after_commit.load(Ordering::SeqCst),
+            // The registry suite drives storage directly, so the resolve-lock
+            // pair and the HTTP-layer reply point are exercised by the harness
+            // suite instead; counting them here would count nothing.
+            PausePoint::BeforeResolveLock
+            | PausePoint::AfterResolveLock
+            | PausePoint::BeforeReply => 0,
         }
     }
 }
@@ -1037,6 +1043,11 @@ impl Pauses for RecordsPauses {
             PausePoint::BeforeExpiryWrite => &self.before_expiry,
             PausePoint::BeforeSettleCommit => &self.before_commit,
             PausePoint::AfterSettleCommit => &self.after_commit,
+            PausePoint::BeforeResolveLock
+            | PausePoint::AfterResolveLock
+            | PausePoint::BeforeReply => {
+                return;
+            }
         }
         .fetch_add(1, Ordering::SeqCst);
 

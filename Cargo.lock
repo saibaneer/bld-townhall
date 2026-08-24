@@ -1006,6 +1006,7 @@ dependencies = [
  "axum",
  "council-wire",
  "ed25519-dalek",
+ "futures-util",
  "serde",
  "serde_json",
  "sqlx",

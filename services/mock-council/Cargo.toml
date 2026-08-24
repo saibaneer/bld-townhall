@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "mock-council"
+path = "src/main.rs"
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
@@ -14,7 +18,11 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time", "net"] }
+futures-util = { version = "0.3", default-features = false, optional = true }
+
+[features]
+test-faults = ["dep:futures-util"]
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -36,6 +36,9 @@
 //! cancellation *is* an external effect with an identity of its own.
 
 pub mod clock;
+#[cfg(feature = "test-faults")]
+pub mod faults;
+pub mod ipc;
 pub mod pause;
 pub mod registry;
 
@@ -53,7 +56,7 @@ use council_wire::{
         ResolveBody,
     },
 };
-use pause::{NeverPauses, Pauses};
+use pause::{NeverPauses, PausePoint, Pauses};
 use registry::{
     ApplyCancellation, CouncilError, CreateBooking, OperationKind, Registry, ResolveEffect,
 };
@@ -204,23 +207,76 @@ impl Council {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
+        let state = AppState {
+            registry: Arc::clone(&self.registry),
+            #[cfg(feature = "test-faults")]
+            faults: Arc::new(faults::FaultBank::default()),
+        };
+        Self::router_with(state)
+    }
+
+    fn router_with(state: AppState) -> Router {
+        let router = Router::new()
             .route("/venues/{venue_id}/slots/{slot_id}", get(get_availability))
             .route("/bookings", post(create_booking))
             .route("/bookings/{booking_reference}/cancel", post(cancel_booking))
-            .route("/effects/{effect_intent_id}/resolve", post(resolve_effect))
-            .with_state(Arc::clone(&self.registry))
+            .route("/effects/{effect_intent_id}/resolve", post(resolve_effect));
+
+        // The fault surface exists only in a build that asked for it; an
+        // ordinary binary has no such route to secure.
+        #[cfg(feature = "test-faults")]
+        let router = router
+            .route("/test/faults", post(arm_fault))
+            .route("/test/faults/{fault_id}", get(fault_status));
+
+        router.with_state(state)
+    }
+}
+
+/// Handler state: the registry, plus — in fault-injection builds only — the
+/// armed misbehaviour.
+#[derive(Clone)]
+pub struct AppState {
+    registry: Arc<Registry>,
+    #[cfg(feature = "test-faults")]
+    faults: Arc<faults::FaultBank>,
+}
+
+#[cfg(feature = "test-faults")]
+async fn arm_fault(
+    State(state): State<AppState>,
+    Json(request): Json<faults::ArmRequest>,
+) -> Json<serde_json::Value> {
+    let id = state.faults.arm(request);
+    Json(serde_json::json!({ "fault_id": id }))
+}
+
+#[cfg(feature = "test-faults")]
+async fn fault_status(
+    State(state): State<AppState>,
+    Path(fault_id): Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.faults.status(fault_id) {
+        Some(status) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(status).unwrap_or_default()),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such fault" })),
+        ),
     }
 }
 
 // ------------------------------------------------------------------- handlers
 
-type Reg = State<Arc<Registry>>;
+type Reg = State<AppState>;
 
 async fn get_availability(
-    State(registry): Reg,
+    State(state): Reg,
     Path((venue_id, slot_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<AvailabilityResponseBody>) {
+    let registry = &state.registry;
     // Unsigned on purpose when the council could not build an answer: a body it
     // could not produce is not its statement about anything, and signing an error
     // would make it look like one.
@@ -285,11 +341,12 @@ async fn get_availability(
 }
 
 async fn create_booking(
-    State(registry): Reg,
+    State(state): Reg,
     Json(body): Json<CreateBookingBody>,
-) -> (StatusCode, Json<EffectResponseBody>) {
+) -> axum::response::Response {
     let id = body.effect_intent_id.clone();
-    let outcome = registry
+    let outcome = state
+        .registry
         .create_booking(&CreateBooking {
             effect_intent_id: body.effect_intent_id,
             expires_at_ms: body.expires_at_ms,
@@ -301,51 +358,61 @@ async fn create_booking(
             grant: body.grant,
         })
         .await;
-    effect_reply(&registry, id, outcome)
+    effect_reply(&state, id, EffectRoute::Create, outcome).await
 }
 
 async fn cancel_booking(
-    State(registry): Reg,
+    State(state): Reg,
     Path(booking_reference): Path<String>,
     Json(body): Json<CancelBookingBody>,
-) -> (StatusCode, Json<EffectResponseBody>) {
+) -> axum::response::Response {
     let id = body.effect_intent_id.clone();
-    let outcome = registry
+    let outcome = state
+        .registry
         .apply_cancellation(&ApplyCancellation {
             effect_intent_id: body.effect_intent_id,
             expires_at_ms: body.expires_at_ms,
             booking_reference,
         })
         .await;
-    effect_reply(&registry, id, outcome)
+    effect_reply(&state, id, EffectRoute::Cancel, outcome).await
 }
 
 async fn resolve_effect(
-    State(registry): Reg,
+    State(state): Reg,
     Path(effect_intent_id): Path<String>,
     Json(body): Json<ResolveBody>,
-) -> (StatusCode, Json<EffectResponseBody>) {
+) -> axum::response::Response {
     let kind = match body.operation_kind.as_str() {
         "Book" => OperationKind::Book,
         "Cancel" => OperationKind::Cancel,
         other => {
             // An unreadable kind cannot be bound, so nothing is written and the
             // answer says nothing about the effect.
-            return unsigned_unavailable(
+            return axum::response::IntoResponse::into_response(unsigned_unavailable(
                 effect_intent_id,
                 format!("unknown operation_kind {other:?}"),
-            );
+            ));
         }
     };
 
-    let outcome = registry
+    let outcome = state
+        .registry
         .resolve(&ResolveEffect {
             effect_intent_id: effect_intent_id.clone(),
             expires_at_ms: body.expires_at_ms,
             kind,
         })
         .await;
-    effect_reply(&registry, effect_intent_id, outcome)
+    effect_reply(&state, effect_intent_id, EffectRoute::Resolve, outcome).await
+}
+
+/// Which effect path a request took — the scoping half of a fault's arming key.
+#[derive(Clone, Copy)]
+enum EffectRoute {
+    Create,
+    Cancel,
+    Resolve,
 }
 
 fn unsigned_unavailable(
@@ -374,11 +441,24 @@ fn unsigned_unavailable(
 /// A storage failure becomes `Unavailable`, never a rejection: a council that
 /// could not write says nothing about whether the effect exists, and a rejection
 /// is acted on irreversibly.
-fn effect_reply(
-    registry: &Arc<Registry>,
+async fn effect_reply(
+    state: &AppState,
     effect_intent_id: String,
+    route: EffectRoute,
     outcome: Result<EffectOutcome, CouncilError>,
-) -> (StatusCode, Json<EffectResponseBody>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let _ = route; // read only by fault-injection builds
+
+    // Reached on EVERY effect path — replays and NotYetVisible included, which
+    // never touch a settlement commit and would otherwise be unpositionable by
+    // a harness.
+    state
+        .registry
+        .pauses()
+        .reach(PausePoint::BeforeReply, &effect_intent_id)
+        .await;
+
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => EffectOutcome::Unavailable {
@@ -386,7 +466,30 @@ fn effect_reply(
         },
     };
 
-    let signature = registry
+    // Faults transform the RESPONSE, never the work: whatever the registry
+    // committed stands (M12), and what the caller sees is the misbehaviour.
+    #[cfg(feature = "test-faults")]
+    {
+        let wire_route = match route {
+            EffectRoute::Create => faults::Route::Create,
+            EffectRoute::Cancel => faults::Route::Cancel,
+            EffectRoute::Resolve => faults::Route::Resolve,
+        };
+        if let Some(fault) = state.faults.consume(&effect_intent_id, wire_route) {
+            return misbehave(state, effect_intent_id, outcome, fault).await;
+        }
+    }
+
+    honest_reply(state, effect_intent_id, outcome).into_response()
+}
+
+fn honest_reply(
+    state: &AppState,
+    effect_intent_id: String,
+    outcome: EffectOutcome,
+) -> (StatusCode, Json<EffectResponseBody>) {
+    let signature = state
+        .registry
         .signer()
         .sign_effect(&effect_intent_id, &outcome)
         .ok();
@@ -396,6 +499,72 @@ fn effect_reply(
         signature,
     };
     (status_for(&response.outcome), Json(response.into()))
+}
+
+#[cfg(feature = "test-faults")]
+async fn misbehave(
+    state: &AppState,
+    effect_intent_id: String,
+    outcome: EffectOutcome,
+    fault: faults::Fault,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    match fault {
+        // The commit already happened above; only the answer is eaten. The body
+        // stream errors immediately, so the client sees a transport failure —
+        // which is exactly what a dropped response is.
+        faults::Fault::DropResponse => {
+            let broken = futures_util::stream::iter([Err::<axum::body::Bytes, std::io::Error>(
+                std::io::Error::other("response dropped by armed fault"),
+            )]);
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(axum::body::Body::from_stream(broken))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        // Deliberately real lateness — this is the fault whose whole content is
+        // time, and the client's injected timeout is what turns it into Unknown.
+        faults::Fault::Delay { ms } => {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            honest_reply(state, effect_intent_id, outcome).into_response()
+        }
+        faults::Fault::Garbage => (StatusCode::OK, "this is not the protocol {{{").into_response(),
+        faults::Fault::Unsigned => {
+            let (status, Json(mut body)) = honest_reply(state, effect_intent_id, outcome);
+            body.signature = None;
+            (status, Json(body)).into_response()
+        }
+        // A signed answer of the wrong KIND: genuinely council-originated, so it
+        // passes the verifier correctly — and must then be refused by the
+        // domain's binding, which is what test 2c exists to prove.
+        faults::Fault::WrongKind => {
+            let facts = council_wire::BookingFacts {
+                booking_reference: "TH-99999".to_owned(),
+                venue_id: "TH-A".to_owned(),
+                slot_id: "SLOT-A".to_owned(),
+                attendees: 20,
+                fee_pence: 4_500,
+                principal: "lucy".to_owned(),
+            };
+            let wrong = EffectOutcome::BookingCreated(facts);
+            let signature = state
+                .registry
+                .signer()
+                .sign_effect(&effect_intent_id, &wrong)
+                .ok();
+            let response = SignedEffectResponse {
+                effect_intent_id,
+                outcome: wrong,
+                signature,
+            };
+            (
+                status_for(&response.outcome),
+                Json(EffectResponseBody::from(response)),
+            )
+                .into_response()
+        }
+    }
 }
 
 const fn status_for(outcome: &EffectOutcome) -> StatusCode {

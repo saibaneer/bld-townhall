@@ -166,8 +166,7 @@ async fn main() -> ExitCode {
     };
     let port = listener
         .local_addr()
-        .map(|address| address.port())
-        .unwrap_or(args.port);
+        .map_or(args.port, |address| address.port());
 
     // The startup signal. Printed after bind and after migrations, so a parent
     // that reads it can connect immediately — the no-sleep rule starts here.

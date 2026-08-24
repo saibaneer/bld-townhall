@@ -658,8 +658,34 @@ Expiry is what makes the first answer reachable at all.
 
 ## ADR-017 — Audit provenance is typed and derived; denials are recorded tiered
 
-Decided 2026-08-18 with the project owner. Implementation lands in **slice C** with the
-coordinator, which is the first component that sees both the resolution and the commit.
+Decided 2026-08-18 with the project owner. Point 1 landed in **slice C** with the coordinator;
+point 2 (denial recording) was moved to **slice E** by the owner, and this header originally said
+otherwise.
+
+### Amendment, slice E — the key, the store, and a declined permission
+
+Three changes, each forced by review against the real code:
+
+1. **The dedup key is `(booking_id, driver_kind, driver_detail, reason, principal,
+   window_start_ms)`**, not the original `(booking_id, principal, reason)`. The original could
+   not be formed at the fact or system-event doors — no `VerifiedAuthority` exists there — which
+   silently scoped recording to `propose` and left `DuplicateProviderEffect`, the most
+   consequential refusal in the system, unrecorded. `principal` stays **in** the key (dropping it
+   attributes one person's refusals to another) and is *derived* per door: the fact's own where
+   it carries one, else the persisted plan's, else the empty string — which means **explicitly
+   unattributed**, not unknown. `reason` is the error's stable name, never its display text,
+   which interpolates data and would split identical refusals. `window_start_ms` (hour floor)
+   restores the "per window" semantics an early draft lost: a flood is one row per hour, and
+   history keeps its shape.
+2. **Denials live in their own database file with their own writer.** Writing them on the
+   boundary's writer queues real work behind attacker-priced audit writes (`BEGIN IMMEDIATE`
+   serialises them); every buffered design hands the adversary control of retention. A separate
+   file removes the contention instead of budgeting it.
+3. **The "may be asynchronous" permission is declined.** Review broke every off-path design; the
+   write is a synchronous upsert against the separate store, *after* the answer is computed, and
+   a failed write is logged and dropped — the guarantee this ADR actually cares about ("a lost
+   denial record strands nothing", "the answer is never rate-limited") is preserved by ordering
+   and separation rather than by buffering.
 
 ### Context: the audit trail asserts, and can only say one thing
 

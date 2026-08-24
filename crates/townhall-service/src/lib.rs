@@ -146,6 +146,10 @@ pub struct Coordinator<R, C, V, A> {
     availability: Arc<A>,
     kernel: Kernel,
     domain: TownHallDomain,
+    /// The denial log, when one is wired. One field serving all three doors, so
+    /// "wire one door and call ADR-017 done" — the failure review predicted —
+    /// is not expressible: either every refusal records, or none do.
+    denials: Option<Arc<townhall_store::denials::DenialLog>>,
     /// How many times Phase C may reload and re-classify after losing a
     /// compare-and-set.
     ///
@@ -176,8 +180,17 @@ where
             availability,
             kernel: Kernel,
             domain: TownHallDomain,
+            denials: None,
             attempts: 3,
         }
+    }
+
+    /// Wire the denial log. Every refusal at every door then leaves a trace:
+    /// `Denied` a durable row, `Undefined` an in-memory count (ADR-017).
+    #[must_use]
+    pub fn with_denial_log(mut self, log: Arc<townhall_store::denials::DenialLog>) -> Self {
+        self.denials = Some(log);
+        self
     }
 
     /// Override the Phase C attempt budget. For tests that want contention to be
@@ -216,10 +229,31 @@ where
             .await;
 
         match resolved {
-            // Nothing ran and nothing was touched. ADR-017's recording of these
-            // is a separate concern and is not wired here yet.
-            Resolution::Undefined => Ok(BoundaryOutcome::Undefined),
-            Resolution::Denied(error) => Ok(BoundaryOutcome::Denied(error)),
+            // Nothing ran and nothing was touched — counted, never rowed:
+            // `Undefined` is constructible from pure garbage, and a durable row
+            // per garbage request is a disk-filling attack (ADR-017).
+            Resolution::Undefined => {
+                if let Some(log) = &self.denials {
+                    log.note_undefined(booking.state.name(), audit.driver_name());
+                }
+                Ok(BoundaryOutcome::Undefined)
+            }
+            Resolution::Denied(error) => {
+                // The answer is computed first and returned regardless: the
+                // recording is an audit fact, and a boundary whose answers
+                // depended on its logbook would no longer be deterministic.
+                if let Some(log) = &self.denials {
+                    log.record_denied(townhall_store::denials::Denial {
+                        booking_id: id.to_string(),
+                        driver_kind: audit.provenance(),
+                        driver_detail: audit.driver_name(),
+                        reason: error.name(),
+                        principal: authority.principal.to_string(),
+                    })
+                    .await;
+                }
+                Ok(BoundaryOutcome::Denied(error))
+            }
 
             Resolution::Ready(TransitionPlan::Local { next_state }) => {
                 let committed = self
@@ -398,6 +432,7 @@ where
 
             let effect_id = fact.get().effect_intent_id().clone();
             let intent = self.repository.load_effect(&effect_id).await?;
+            let plan_for_denials = intent.canonical_plan.clone();
 
             let successor_kind =
                 TownHallDomain::fact_intended_effect_kind(&booking.state, fact.get());
@@ -413,8 +448,32 @@ where
                 .await;
 
             let attempt = match classified {
-                FactResolution::Undefined => return Ok(BoundaryOutcome::Undefined),
-                FactResolution::Denied(error) => return Ok(BoundaryOutcome::Denied(error)),
+                FactResolution::Undefined => {
+                    if let Some(log) = &self.denials {
+                        log.note_undefined(booking.state.name(), fact.get().name());
+                    }
+                    return Ok(BoundaryOutcome::Undefined);
+                }
+                FactResolution::Denied(error) => {
+                    // The fact door's refusals include the most consequential
+                    // ones the system can produce — DuplicateProviderEffect is
+                    // one identity resolving to two council bookings — and the
+                    // review that shaped ADR-017's amendment found the original
+                    // design recording none of them. The principal is derived
+                    // where one exists: the fact's own, else the persisted
+                    // plan's, else explicitly unattributed.
+                    if let Some(log) = &self.denials {
+                        log.record_denied(townhall_store::denials::Denial {
+                            booking_id: id.to_string(),
+                            driver_kind: bld_types::Provenance::Fact,
+                            driver_detail: fact.get().name(),
+                            reason: error.name(),
+                            principal: principal_of_fact(fact.get(), &plan_for_denials),
+                        })
+                        .await;
+                    }
+                    return Ok(BoundaryOutcome::Denied(error));
+                }
                 // Authoritative state already reflects the fact. Nothing to
                 // write, and that is success — a reconciler re-applies facts by
                 // design.
@@ -519,6 +578,23 @@ impl Committed {
             replayed: handed.replayed,
         }
     }
+}
+
+/// Who was refused at the fact or system-event door, where anyone knows.
+///
+/// The fact's own principal where it carries one (`BookingExists` does), else
+/// the persisted plan's (`Book` carries one), else the empty string — which the
+/// amended ADR-017 defines as **explicitly unattributed**: "someone was refused
+/// and no principal is recoverable", not "unknown". A cancellation plan carries
+/// no principal today; persisting the cancelling authority is slice F's.
+fn principal_of_fact(fact: &VerifiedProviderFact, plan: &BookingEffect) -> String {
+    if let VerifiedProviderFact::BookingExists { principal, .. } = fact {
+        return principal.to_string();
+    }
+    if let BookingEffect::Book { principal, .. } = plan {
+        return principal.to_string();
+    }
+    String::new()
 }
 
 /// The effect identity a coordinator would derive for a booking at `version`.
@@ -732,8 +808,30 @@ where
             }
             // The aggregate is no longer waiting on this effect (or is
             // incoherent, which is an operator matter below the domain). Nothing
-            // to escalate; nothing is written.
-            _ => Ok(Attended::NotDue),
+            // to escalate; nothing is written — but a refusal at this door is
+            // still a refusal, and it records like any other.
+            bld_kernel::SystemEventResolution::Denied(error) => {
+                if let Some(log) = &self.coordinator.denials {
+                    log.record_denied(townhall_store::denials::Denial {
+                        booking_id: claimed.intent.booking_id.to_string(),
+                        driver_kind: bld_types::Provenance::SystemEvent,
+                        driver_detail: "ReconciliationExhausted",
+                        reason: error.name(),
+                        principal: match &claimed.intent.canonical_plan {
+                            BookingEffect::Book { principal, .. } => principal.to_string(),
+                            BookingEffect::CancelBooking { .. } => String::new(),
+                        },
+                    })
+                    .await;
+                }
+                Ok(Attended::NotDue)
+            }
+            bld_kernel::SystemEventResolution::Undefined => {
+                if let Some(log) = &self.coordinator.denials {
+                    log.note_undefined(booking.state.name(), "ReconciliationExhausted");
+                }
+                Ok(Attended::NotDue)
+            }
         }
     }
 }

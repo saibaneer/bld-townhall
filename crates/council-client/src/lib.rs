@@ -69,8 +69,27 @@ pub struct CouncilClient {
 impl CouncilClient {
     #[must_use]
     pub fn new(base_url: impl Into<String>, key: CouncilKey) -> Self {
+        Self::with_timeout(base_url, key, std::time::Duration::from_secs(10))
+    }
+
+    /// A client whose patience is explicit.
+    ///
+    /// Without a timeout, a slow answer is merely slow — it never becomes
+    /// `Unknown`, so a council that answers after five minutes holds the caller
+    /// for five minutes and the `Delay` fault tests nothing. With one, lateness
+    /// becomes what it honestly is: no answer within our patience, which says
+    /// nothing about whether the effect happened — exactly `Unknown`'s meaning.
+    #[must_use]
+    pub fn with_timeout(
+        base_url: impl Into<String>,
+        key: CouncilKey,
+        timeout: std::time::Duration,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             key,
         }

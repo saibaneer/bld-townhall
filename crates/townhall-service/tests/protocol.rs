@@ -6,13 +6,13 @@
 
 use bld_kernel::{BoundaryOutcome, Capability, Verified};
 use bld_types::{
-    ActorId, AvailabilityGrant, BookingId, BookingRequirements, EffectAttempt, EffectIntentId,
-    Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
+    ActorId, AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectAttempt,
+    EffectIntentId, Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
 };
 use std::{path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use townhall_domain::{
-    BookingEffect, BookingProposal, EffectStatus, OperationKind, VenueFacts,
+    BookingEffect, BookingError, BookingProposal, EffectStatus, OperationKind, VenueFacts,
     VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_service::{
@@ -86,7 +86,7 @@ fn book_plan() -> BookingEffect {
 type Sut = Coordinator<SqliteBookingRepository, FakeCouncil, CouncilVerifier, FixedAvailability>;
 
 struct Harness {
-    _temp: TempDir,
+    temp: TempDir,
     path: PathBuf,
     repo: Arc<SqliteBookingRepository>,
     council: Arc<FakeCouncil>,
@@ -152,7 +152,7 @@ async fn harness() -> Harness {
         Arc::clone(&council),
     );
     Harness {
-        _temp: temp,
+        temp,
         path,
         repo,
         council,
@@ -1128,4 +1128,196 @@ async fn a_fact_that_loses_a_race_is_re_classified_not_dropped() {
     let intent = h.repo.load_effect(&effect).await.expect("the intent");
     assert_eq!(intent.status, EffectStatus::Confirmed);
     assert_eq!(intent.supersedes, None, "no second effect was minted");
+}
+
+// -------------------------------------------------------- the denial logbook
+
+/// A harness with the logbook wired.
+async fn harness_with_denials() -> (Harness, Arc<townhall_store::denials::DenialLog>) {
+    let mut h = harness().await;
+    let log = Arc::new(
+        townhall_store::denials::DenialLog::open(
+            h.temp.path().join("denials.sqlite"),
+            Arc::clone(&h.clock) as Arc<dyn townhall_store::StoreClock>,
+        )
+        .await
+        .expect("open the denial log"),
+    );
+    h.coordinator = Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    )
+    .with_denial_log(Arc::clone(&log));
+    (h, log)
+}
+
+/// A refusal is provable from the database afterwards: who, what, why, when —
+/// and the reason is the stable name, never display text with numbers in it.
+#[tokio::test]
+async fn a_refusal_leaves_a_durable_row() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-DENY");
+    awaiting(&h, &id, requirements()).await;
+
+    // Lucy tries to book with no booking authority: the door exists, the guard
+    // says no.
+    let mut no_authority = authority();
+    no_authority.may_book = false;
+    let outcome = h
+        .coordinator
+        .propose(&id, BookingProposal::Book, &no_authority)
+        .await
+        .expect("turn");
+    assert!(matches!(outcome, BoundaryOutcome::Denied(_)));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].booking_id, id.to_string());
+    assert_eq!(rows[0].driver_kind, "Proposal");
+    assert_eq!(rows[0].driver_detail, "Book");
+    assert_eq!(rows[0].reason, "BookingAuthorityRequired");
+    assert_eq!(rows[0].principal, "lucy");
+    assert_eq!(rows[0].occurrences, 1);
+}
+
+/// Identical refusals compress; different people do not. Two principals refused
+/// identically are TWO rows — collapsing them would attribute one person's
+/// refusals to the other, which is a false record, not a compression.
+#[tokio::test]
+async fn identical_refusals_compress_but_principals_never_merge() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-FLOOD");
+    awaiting(&h, &id, requirements()).await;
+
+    let mut lucy = authority();
+    lucy.may_book = false;
+    let mut marco = authority();
+    marco.principal = PrincipalId::new("marco");
+    marco.may_book = false;
+
+    // Lucy is refused 40 times; Marco once. Every answer is the same typed
+    // refusal — the 40th identical denial costs the caller nothing different.
+    for _ in 0..40 {
+        let outcome = h
+            .coordinator
+            .propose(&id, BookingProposal::Book, &lucy)
+            .await
+            .expect("turn");
+        assert!(matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::BookingAuthorityRequired)
+        ));
+    }
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &marco)
+        .await
+        .expect("turn");
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one row per principal, not one total");
+    let lucy_row = rows.iter().find(|r| r.principal == "lucy").expect("lucy");
+    let marco_row = rows.iter().find(|r| r.principal == "marco").expect("marco");
+    assert_eq!(
+        lucy_row.occurrences, 40,
+        "the flood is a counter, not 40 rows"
+    );
+    assert_eq!(marco_row.occurrences, 1);
+}
+
+/// The same refusal in a different hour is a different row: "4,000 times
+/// between 02:00 and 03:00, and twice in August" must stay answerable.
+#[tokio::test]
+async fn the_same_refusal_next_hour_is_a_new_row() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-WINDOWS");
+    awaiting(&h, &id, requirements()).await;
+    let mut lucy = authority();
+    lucy.may_book = false;
+
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &lucy)
+        .await
+        .expect("turn");
+    h.clock.advance(60 * 60 * 1000 + 1);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &lucy)
+        .await
+        .expect("turn");
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one row per hour");
+    assert_ne!(rows[0].window_start_ms, rows[1].window_start_ms);
+}
+
+/// Asking for a button that does not exist is counted, never rowed — it is
+/// forgeable from pure garbage, and a durable row per garbage request is a
+/// disk-filling attack (ADR-017).
+#[tokio::test]
+async fn asking_for_a_nonexistent_behaviour_is_counted_not_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-UNDEFINED");
+    h.repo
+        .create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+
+    // Book from Draft: no such edge. Three times.
+    for _ in 0..3 {
+        let outcome = h
+            .coordinator
+            .propose(&id, BookingProposal::Book, &authority())
+            .await
+            .expect("turn");
+        assert_eq!(outcome, BoundaryOutcome::Undefined);
+    }
+
+    assert_eq!(log.undefined_count("Draft", "Book"), 3);
+    assert!(
+        log.rows().await.expect("rows").is_empty(),
+        "no durable row for a behaviour that does not exist"
+    );
+}
+
+/// The refusal at the FACT door records too — this is where the refusals that
+/// matter most live, and the design review found the original ADR wiring only
+/// the proposal door. An unattributable one is recorded as exactly that.
+#[tokio::test]
+async fn a_fact_door_refusal_records_with_a_derived_principal() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-FACTDENY");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+
+    // A signed cancellation fact arrives for a BOOKING intent: wrong kind, and
+    // the domain refuses it. Nobody proposed anything — the principal comes
+    // from the persisted plan.
+    let wrong_kind = Verified::assert_verified(VerifiedProviderFact::CancellationExists {
+        effect_intent_id: effect.clone(),
+        booking_ref: CouncilBookingRef::new("TH-99999"),
+    });
+    let outcome = h.coordinator.observe(&id, wrong_kind).await.expect("turn");
+    assert!(matches!(
+        outcome,
+        BoundaryOutcome::Denied(BookingError::EffectKindMismatch)
+    ));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "Fact");
+    assert_eq!(rows[0].driver_detail, "CancellationExists");
+    assert_eq!(rows[0].reason, "EffectKindMismatch");
+    assert_eq!(
+        rows[0].principal, "lucy",
+        "derived from the persisted plan, since no one proposed anything"
+    );
 }

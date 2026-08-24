@@ -766,6 +766,34 @@ pub enum BookingError {
     IncoherentIntent(IncoherentIntent),
 }
 
+impl BookingError {
+    /// The variant's stable name — the denial log's dedup key uses this rather
+    /// than `Display`, because `Display` interpolates data ("capacity 22 below
+    /// required 25") and identical refusals must compress to one row (ADR-017).
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::BookingAuthorityRequired => "BookingAuthorityRequired",
+            Self::CancellationAuthorityRequired => "CancellationAuthorityRequired",
+            Self::VenueFactsMissing => "VenueFactsMissing",
+            Self::SlotUnavailable => "SlotUnavailable",
+            Self::CapacityInsufficient { .. } => "CapacityInsufficient",
+            Self::AccessibilityRequired => "AccessibilityRequired",
+            Self::FeeExceeded => "FeeExceeded",
+            Self::EffectIdentityMissing => "EffectIdentityMissing",
+            Self::EffectPlanMissing => "EffectPlanMissing",
+            Self::EffectMismatch => "EffectMismatch",
+            Self::EffectKindMismatch => "EffectKindMismatch",
+            Self::EffectPlanMismatch { .. } => "EffectPlanMismatch",
+            Self::DuplicateProviderEffect => "DuplicateProviderEffect",
+            Self::ContradictoryProviderFact => "ContradictoryProviderFact",
+            Self::InconsistentEffectIdentity => "InconsistentEffectIdentity",
+            Self::IncoherentAggregate(_) => "IncoherentAggregate",
+            Self::IncoherentIntent(_) => "IncoherentIntent",
+        }
+    }
+}
+
 /// Externally verified reality. State-neutral: the verifier establishes *what
 /// is true*, the domain decides *what it means here* — one `EffectAbsent` fact
 /// means three different things at three different states (ADR-012).

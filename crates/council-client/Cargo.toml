@@ -12,11 +12,14 @@ bld-types = { path = "../bld-types" }
 council-wire = { path = "../council-wire" }
 reqwest.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 townhall-domain = { path = "../townhall-domain" }
 townhall-service = { path = "../townhall-service" }
+townhall-store = { path = "../townhall-store" }
 
 [dev-dependencies]
 axum.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 ed25519-dalek.workspace = true
 mock-council = { path = "../../services/mock-council" }
 sqlx.workspace = true

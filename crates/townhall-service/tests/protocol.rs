@@ -12,11 +12,11 @@ use bld_types::{
 use std::{path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use townhall_domain::{
-    BookingEffect, BookingProposal, EffectStatus, OperationKind, SystemEvent, VenueFacts,
+    BookingEffect, BookingProposal, EffectStatus, OperationKind, VenueFacts,
     VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_service::{
-    Coordinator, ServiceError,
+    Attended, Coordinator, Reconciliation, ServiceError,
     fake::{CouncilVerifier, FAKE_GRANT, FakeCouncil, FixedAvailability, ObservedCouncil, Script},
 };
 use townhall_store::{
@@ -91,15 +91,49 @@ struct Harness {
     repo: Arc<SqliteBookingRepository>,
     council: Arc<FakeCouncil>,
     coordinator: Sut,
+    reconciliation: Reconciliation<
+        SqliteBookingRepository,
+        FakeCouncil,
+        CouncilVerifier,
+        FixedAvailability,
+        FakeCouncil,
+    >,
+    /// The store's clock, movable — reconciliation cadences are real times, and
+    /// this suite's no-sleep rule means the clock moves instead of the test
+    /// waiting.
+    clock: Arc<ProtocolClock>,
+}
+
+/// A movable store clock for this suite.
+#[derive(Debug)]
+struct ProtocolClock(std::sync::atomic::AtomicI64);
+
+impl ProtocolClock {
+    fn advance(&self, by_ms: i64) {
+        self.0.fetch_add(by_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl townhall_store::StoreClock for ProtocolClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 async fn harness() -> Harness {
     let temp = TempDir::new().expect("temp dir");
     let path = temp.path().join("townhall.sqlite");
+    let clock = Arc::new(ProtocolClock(std::sync::atomic::AtomicI64::new(
+        1_000_000_000,
+    )));
     let repo = Arc::new(
-        SqliteBookingRepository::open(&path)
-            .await
-            .expect("repository should open"),
+        SqliteBookingRepository::open_with(
+            &path,
+            townhall_store::DEFAULT_EFFECT_TTL_MS,
+            Arc::clone(&clock) as Arc<dyn townhall_store::StoreClock>,
+        )
+        .await
+        .expect("repository should open"),
     );
     let council = Arc::new(FakeCouncil::new());
     let coordinator = Coordinator::new(
@@ -108,12 +142,23 @@ async fn harness() -> Harness {
         Arc::new(CouncilVerifier),
         Arc::new(FixedAvailability::new(facts())),
     );
+    let reconciliation = Reconciliation::new(
+        Coordinator::new(
+            Arc::clone(&repo),
+            Arc::clone(&council),
+            Arc::new(CouncilVerifier),
+            Arc::new(FixedAvailability::new(facts())),
+        ),
+        Arc::clone(&council),
+    );
     Harness {
         _temp: temp,
         path,
         repo,
         council,
         coordinator,
+        reconciliation,
+        clock,
     }
 }
 
@@ -307,10 +352,24 @@ async fn a_crash_before_the_call_leaves_no_external_consequence() {
         .clone()
         .expect("and must find what it is waiting on");
     let intent = reopened.load_effect(&effect).await.expect("the intent");
+    // `Unknown`, not `Prepared` — and the change is the point (ADR-019 §4 /
+    // decision 5). This fixture scripts a call that got no answer, and Phase B
+    // now records the attempt BEFORE the wire, so "a call began" is durable and
+    // `Prepared` finally means what it says: never attempted. The true
+    // crash-BEFORE-the-call case — where `Prepared` is the assertion — needs a
+    // killable BLD process, and gets one in E's subprocess harness.
     assert_eq!(
         intent.status,
-        EffectStatus::Prepared,
-        "nothing was established about this effect"
+        EffectStatus::Unknown,
+        "a call began and nothing came back; the row must say so"
+    );
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "one lost answer is nowhere near a human's problem yet"
     );
     assert_eq!(intent.canonical_plan.operation_kind(), OperationKind::Book);
     assert_eq!(
@@ -436,10 +495,15 @@ async fn the_intent_is_durable_before_the_council_is_asked() {
         .expect("book");
 
     let observation = seen.lock().expect("lock").clone();
+    // `Unknown` mid-call, observed from a SECOND connection while the capability
+    // is being invoked — which is gate M10's property, and it must be `Unknown`
+    // rather than `Prepared` because Phase B records the attempt before the wire
+    // (ADR-014 one level in). An implementation that wrote `Unknown` after the
+    // timeout would read `Prepared` here and fail.
     assert_eq!(
         observation,
-        Some((id.to_string(), EffectStatus::Prepared)),
-        "the intent must be readable, and Prepared, from another connection during the call"
+        Some((id.to_string(), EffectStatus::Unknown)),
+        "the attempt must be durable, as Unknown, before the council is asked"
     );
 }
 
@@ -672,100 +736,103 @@ async fn re_observing_a_settled_booking_converges() {
 
 // -------------------------------------------------------------- giving up
 
-/// `NeedsHuman` is reachable only through the system-event door, and giving up
-/// finalises the effect it gave up on — a `NeedsHuman` still pointing at a live
-/// intent would invite a reconciler to keep chasing what was just abandoned.
+/// Giving up is a pursuit decision (ADR-019): the booking does not move, the
+/// pointer stays, and the intent's status stays `Unknown` — because the council
+/// may well hold the room and any other claim would assert what nobody
+/// established. Then the part the old design made impossible: the council
+/// finally answers, and the booking is adopted through the ordinary fact arms.
 #[tokio::test]
-async fn exhausted_reconciliation_escalates_and_stops_pointing_at_the_effect() {
+async fn exhaustion_marks_the_intent_and_a_late_fact_still_lands() {
     let h = harness().await;
     let id = BookingId::new("BKG-EXHAUSTED");
     awaiting(&h, &id, requirements()).await;
-    h.council.script([Script::GoQuiet("timed out")]);
+
+    // The initial call is the dropped-response scenario: the council CREATES the
+    // booking and the answer never arrives. One attempt spent, outcome unknown —
+    // and unknown is now recorded as such before the wire, not left as Prepared.
+    h.council
+        .script([Script::SucceedThenGoQuiet("response eaten")]);
     h.coordinator
         .propose(&id, BookingProposal::Book, &authority())
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
-
-    let outcome = h
-        .coordinator
-        .record(
-            &id,
-            SystemEvent::ReconciliationExhausted {
-                effect_intent_id: effect.clone(),
-            },
-        )
-        .await
-        .expect("no service error");
-
-    let BoundaryOutcome::Committed(aggregate) = outcome else {
-        panic!("exhaustion is an outcome and must commit, got {outcome:?}");
-    };
-    assert_eq!(aggregate.state.name(), "NeedsHuman");
-    assert_eq!(
-        aggregate.active_effect, None,
-        "nothing may keep chasing an abandoned effect"
-    );
-    let intent = h.repo.load_effect(&effect).await.expect("the intent");
-    // `Abandoned`, and the exact status is the assertion — `is_terminal()` alone
-    // would have let `Absent` through, which asserts the council tombstoned the
-    // intent. Nobody established that; we stopped asking.
-    assert_eq!(
-        intent.status,
-        EffectStatus::Abandoned,
-        "exhaustion must claim nothing about the provider"
-    );
-    assert_eq!(
-        intent.provider_reference, None,
-        "and must not invent a reference"
-    );
-
-    let last = h
-        .repo
-        .audit_events(&id)
-        .await
-        .expect("audit")
-        .pop()
-        .expect("a row");
-    assert_eq!(
-        last.driver_kind,
-        Provenance::SystemEvent,
-        "the runtime, not the council and not Lucy, concluded this"
-    );
-}
-
-/// Exhaustion of a *different* effect says nothing about this booking.
-#[tokio::test]
-async fn exhaustion_of_another_effect_changes_nothing() {
-    let h = harness().await;
-    let id = BookingId::new("BKG-OTHEREFFECT");
-    awaiting(&h, &id, requirements()).await;
-    h.council.script([Script::GoQuiet("timed out")]);
-    h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
-        .await
-        .expect("book");
     let before = h.repo.load(&id).await.expect("load");
 
-    let outcome = h
-        .coordinator
-        .record(
-            &id,
-            SystemEvent::ReconciliationExhausted {
-                effect_intent_id: EffectIntentId::new("EFF-SOMEBODY-ELSE"),
-            },
-        )
-        .await
-        .expect("no service error");
+    // Spend the rest of the budget through real reconciliation turns — scripted
+    // no-answers, the store clock advanced past the cadence between turns, never
+    // a sleep. The escalating turn consumes no script: it asks the domain, not
+    // the council, which is the point.
+    h.council.script([
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+    ]);
+    for turn in 0..5 {
+        h.clock.advance(10_000);
+        let attended = h.reconciliation.attend(&effect).await.expect("attend");
+        if turn < 4 {
+            assert!(
+                matches!(attended, Attended::StillUnknown { .. }),
+                "turn {turn}: expected StillUnknown, got {attended:?}"
+            );
+        } else {
+            assert_eq!(attended, Attended::Escalated, "the budget is spent");
+        }
+    }
 
-    assert!(
-        matches!(outcome, BoundaryOutcome::Denied(_)),
-        "a refusal with a reason, not a silent gap, got {outcome:?}"
+    // Escalated: flagged for a human, and NOTHING else changed.
+    let after = h.repo.load(&id).await.expect("load");
+    assert_eq!(
+        after.state.name(),
+        "BookingInProgress",
+        "the state is the story"
     );
     assert_eq!(
-        h.repo.load(&id).await.expect("load").version,
-        before.version,
-        "nothing moved"
+        after.active_effect,
+        Some(effect.clone()),
+        "the pointer survives — a late fact must still bind"
+    );
+    assert_eq!(
+        after.version, before.version,
+        "escalation touches only the intent row, never the aggregate"
+    );
+    let intent = h.repo.load_effect(&effect).await.expect("intent");
+    assert_eq!(
+        intent.status,
+        EffectStatus::Unknown,
+        "the outcome IS unknown, and the status says so"
+    );
+    assert_eq!(
+        h.repo.escalated_unresolved(10).await.expect("queue"),
+        vec![effect.clone()],
+        "the human queue holds exactly this question"
+    );
+
+    // The council finally answers — the ADR-019 payoff. The booking it created
+    // under this identity all along is adopted, through the unmodified arms.
+    h.clock.advance(townhall_store::MAX_CADENCE_MS + 1);
+    h.council.script([Script::Succeed]);
+    // Make the fake actually hold a booking for this identity: the original
+    // create landed even though its response was eaten.
+    assert_eq!(
+        h.council.booking_count(),
+        1,
+        "the council held it all along"
+    );
+    let settled = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(settled, Attended::Settled);
+
+    let adopted = h.repo.load(&id).await.expect("load");
+    assert_eq!(adopted.state.name(), "Booked");
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "the question was answered, so it leaves the queue"
     );
 }
 

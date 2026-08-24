@@ -207,6 +207,45 @@ impl<P, E> FactResolution<P, E> {
     }
 }
 
+/// The system-event door's range.
+///
+/// Its own type, following [`FactResolution`]'s precedent: when a door's range
+/// grows, the range gets a type rather than a variant bolted onto
+/// [`Resolution`] that every other door would have to refuse.
+///
+/// The variant that earns the type is `Record`. A runtime fact like "our retry
+/// budget is exhausted" is legitimate at a state and yet **moves nothing** —
+/// the truthful next state is the current one, and [`TransitionPlan`]'s
+/// variants both carry a next state, so expressing "record this, transition
+/// nothing" through a plan means writing a plan that lies (ADR-019). `Record`
+/// deliberately carries **no payload**: everything the eventual write needs is
+/// either already in the event (the effect identity) or must be *derived at the
+/// write* (the attempt count) — a payload here would be a value the domain
+/// cannot know, asserted by whoever built it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemEventResolution<E> {
+    /// The behaviour does not exist in this state at all.
+    Undefined,
+    /// The event is refused, with a typed reason.
+    Denied(E),
+    /// Legitimate at this state, about the effect the event names: record it.
+    Record,
+}
+
+impl<E> SystemEventResolution<E> {
+    /// Whether the event was accepted for recording.
+    #[must_use]
+    pub const fn is_record(&self) -> bool {
+        matches!(self, Self::Record)
+    }
+
+    /// Whether the behaviour exists in this state at all.
+    #[must_use]
+    pub const fn is_undefined(&self) -> bool {
+        matches!(self, Self::Undefined)
+    }
+}
+
 /// What a legal transition will do.
 ///
 /// The distinction is load-bearing, not descriptive. A `Local` transition can
@@ -299,11 +338,14 @@ pub trait BoundaryDomain: Send + Sync {
     /// the effect this state is waiting on", and the state carries that
     /// identity. Nothing but state and event is what lets this door run with
     /// no provider reachable and no model present.
+    ///
+    /// Returns [`SystemEventResolution`], not a plan: per ADR-019 a runtime
+    /// fact records a pursuit decision against the effect and moves no state.
     async fn resolve_system_event(
         &self,
         state: &Self::State,
         event: Self::SystemEvent,
-    ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error>;
+    ) -> SystemEventResolution<Self::Error>;
 }
 
 /// Deterministic transition resolution — the three provenance doors, in one
@@ -362,7 +404,7 @@ impl Kernel {
         domain: &D,
         state: &D::State,
         event: D::SystemEvent,
-    ) -> Resolution<TransitionPlan<D::State, D::Effect>, D::Error> {
+    ) -> SystemEventResolution<D::Error> {
         domain.resolve_system_event(state, event).await
     }
 }
@@ -487,13 +529,11 @@ mod tests {
             &self,
             state: &Self::State,
             event: Self::SystemEvent,
-        ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+        ) -> SystemEventResolution<Self::Error> {
             let Event::GaveUp = event;
             match state {
-                State::Reaching => Resolution::Ready(TransitionPlan::Local {
-                    next_state: State::Start,
-                }),
-                _ => Resolution::Undefined,
+                State::Reaching => SystemEventResolution::Record,
+                _ => SystemEventResolution::Undefined,
             }
         }
     }
@@ -625,13 +665,14 @@ mod tests {
         assert_eq!(*plan.next_state(), State::Done);
     }
 
-    /// The system-event door: reachable only where something is in flight.
+    /// The system-event door: recordable only where something is in flight —
+    /// and it records rather than transitions (ADR-019).
     #[tokio::test]
-    async fn a_system_event_moves_only_an_in_flight_state() {
-        let moved = Kernel
+    async fn a_system_event_records_only_at_an_in_flight_state() {
+        let recorded = Kernel
             .resolve_system_event(&Domain, &State::Reaching, Event::GaveUp)
             .await;
-        assert!(moved.is_ready());
+        assert!(recorded.is_record());
 
         let nowhere = Kernel
             .resolve_system_event(&Domain, &State::Done, Event::GaveUp)

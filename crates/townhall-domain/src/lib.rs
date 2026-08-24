@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
+use bld_kernel::{
+    BoundaryDomain, FactResolution, Resolution, SystemEventResolution, TransitionPlan, Verified,
+};
 use bld_types::{
     ActorId, AvailabilityGrant, BookingId, BookingRequirements, BoundedString, CouncilBookingRef,
     EffectIntentId, Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
@@ -530,20 +532,14 @@ pub enum EffectStatus {
     Rejected,
     /// The council tombstoned the intent: it never happened and never can.
     Absent,
-    /// **We** stopped tracking it. Says nothing whatever about the provider.
-    ///
-    /// Reconciliation ran out of attempts without ever establishing an outcome,
-    /// so the effect is no longer being chased — but the council may well hold a
-    /// live booking against it, and a human has to find out.
-    ///
-    /// Distinct from `Absent` deliberately, and this cost a review round to get
-    /// right. `Absent` is a *provider determination*, admissible only from a
-    /// definitive-absence response that tombstones the intent (ADR-016). Recording
-    /// exhaustion as `Absent` would assert a fact nobody established — and worse,
-    /// the fact door treats `Absent` as "did not happen", so a later
-    /// `BookingExists` for that identity would be refused as contradictory when it
-    /// is actually the news the human was waiting for.
-    Abandoned,
+    // There is deliberately no `Abandoned`. It existed in C2/D as "we stopped
+    // tracking it", and ADR-019 removed it: it was the one value in this column
+    // that was a *decision of ours* rather than preparation, our knowledge state,
+    // or a provider determination — and its terminality is exactly what refused
+    // the late fact it existed to await. Giving up now lives on the pursuit axis
+    // (`escalated_at_ms` on the intent row) with the status left at `Unknown`,
+    // which is the truth. A database still holding the old value is refused at
+    // open — see the store's preflight.
 }
 
 impl EffectStatus {
@@ -555,17 +551,13 @@ impl EffectStatus {
             Self::Confirmed => "Confirmed",
             Self::Rejected => "Rejected",
             Self::Absent => "Absent",
-            Self::Abandoned => "Abandoned",
         }
     }
 
     /// Whether this outcome is settled and can never change.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Confirmed | Self::Rejected | Self::Absent | Self::Abandoned
-        )
+        matches!(self, Self::Confirmed | Self::Rejected | Self::Absent)
     }
 
     /// Parse the persisted discriminator.
@@ -579,7 +571,6 @@ impl EffectStatus {
             "Confirmed" => Ok(Self::Confirmed),
             "Rejected" => Ok(Self::Rejected),
             "Absent" => Ok(Self::Absent),
-            "Abandoned" => Ok(Self::Abandoned),
             other => Err(other.to_owned()),
         }
     }
@@ -1023,8 +1014,7 @@ impl EffectIntent {
             EffectStatus::Prepared
             | EffectStatus::Unknown
             | EffectStatus::Absent
-            | EffectStatus::Rejected
-            | EffectStatus::Abandoned => !has_reference,
+            | EffectStatus::Rejected => !has_reference,
         };
         if !shape_ok {
             return Err(IncoherentIntent::OutcomeShape {
@@ -1247,10 +1237,10 @@ impl TownHallDomain {
         let contradiction = match intent.status {
             EffectStatus::Absent | EffectStatus::Rejected => fact.asserts_existence(),
             EffectStatus::Confirmed => !fact.asserts_existence(),
-            // `Prepared`/`Unknown` are not yet determined; `Abandoned` records
+            // `Prepared`/`Unknown` are not yet determined; escalation records
             // that we stopped asking, which asserts nothing a fact could
             // contradict. Any fact about an abandoned effect is new information.
-            EffectStatus::Prepared | EffectStatus::Unknown | EffectStatus::Abandoned => false,
+            EffectStatus::Prepared | EffectStatus::Unknown => false,
         };
         if contradiction {
             return Err(BookingError::ContradictoryProviderFact);
@@ -2062,29 +2052,39 @@ impl BoundaryDomain for TownHallDomain {
         }
     }
 
-    /// The system-event door. One variant, three edges, no context.
+    /// The system-event door. One variant, three states that admit it, no
+    /// context — and, per ADR-019, **no transition.**
     ///
-    /// `NeedsHuman` is reachable only through here — neither a proposer nor a
-    /// provider fact can conclude that *our own* retry budget is exhausted.
+    /// Exhaustion is a fact about our own accounting, and the honest response
+    /// to it is a pursuit record on the effect, not a state change: the council
+    /// may well hold the booking, so any state other than the current one would
+    /// assert something nobody established. The domain's job here is exactly
+    /// its classification third — is this state waiting on this effect, is the
+    /// aggregate coherent — and `Record` means "yes, write it down", with the
+    /// writing (and the deriving of the attempt count) belonging to the store,
+    /// under the caller's lease.
+    ///
+    /// An earlier design moved the booking to `NeedsHuman` here, clearing
+    /// `active_effect` — which destroyed the one distinction a late fact needs
+    /// (a `BookingExists` from `BookingInProgress` means `Booked`; from
+    /// `CancellationRequested` it means "now cancel it") and made its own
+    /// idempotency out of that destruction. ADR-019 records why that died.
     async fn resolve_system_event(
         &self,
         booking: &Self::State,
         event: Self::SystemEvent,
-    ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+    ) -> SystemEventResolution<Self::Error> {
         let SystemEvent::ReconciliationExhausted { effect_intent_id } = event;
 
         // Only a state with an effect in flight has a retry budget to exhaust.
         let Some(waiting_on) = booking.state.effect_intent_id() else {
-            return Resolution::Undefined;
+            return SystemEventResolution::Undefined;
         };
 
-        // The same self-consistency check as the fact door. Note the freeze
-        // itself would also be refused by the store — `admissible` runs
-        // `coherent()` on every write — so refusing here with a precise reason
-        // beats an opaque refusal later; either way an aggregate this broken
-        // needs an operator below the domain, not automation above it.
+        // The same self-consistency check as the fact door: an aggregate this
+        // broken needs an operator below the domain, not automation above it.
         if let Err(why) = booking.coherent() {
-            return Resolution::Denied(match why {
+            return SystemEventResolution::Denied(match why {
                 IncoherentBooking::EffectIdentity { .. } => {
                     BookingError::InconsistentEffectIdentity
                 }
@@ -2094,19 +2094,10 @@ impl BoundaryDomain for TownHallDomain {
 
         // Exhaustion of some OTHER effect says nothing about this state.
         if *waiting_on != effect_intent_id {
-            return Resolution::Denied(BookingError::EffectMismatch);
+            return SystemEventResolution::Denied(BookingError::EffectMismatch);
         }
 
-        // Give up: no automation will act on this effect again, so the pointer
-        // is cleared — a NeedsHuman still carrying an active_effect would
-        // invite a reconciler to keep chasing what it just abandoned.
-        Resolution::Ready(TransitionPlan::Local {
-            next_state: Booking {
-                state: BookingState::NeedsHuman(NeedsHuman),
-                active_effect: None,
-                ..booking.clone()
-            },
-        })
+        SystemEventResolution::Record
     }
 }
 
@@ -4642,20 +4633,23 @@ mod fact_topology {
             "a tombstone genuinely contradicts an existence fact"
         );
 
-        // Abandoned, then "it exists" — new information, and it must land.
-        let abandoned = FactContext {
+        // Escalated-then-"it exists" — new information, and it must land. Under
+        // ADR-019 escalation leaves the status at `Unknown` (the pursuit marker
+        // lives on the intent row, invisible to this door on purpose), so the
+        // late-fact adoption this pins is exactly the Unknown path.
+        let escalated = FactContext {
             intent: Some(intent(
                 BOOK_ID,
                 OperationKind::Book,
-                EffectStatus::Abandoned,
+                EffectStatus::Unknown,
                 None,
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact, &abandoned).await;
+        let got = classify(&booking, fact, &escalated).await;
         assert!(
             got.is_ready(),
-            "a confirmation for an abandoned effect is news, not a contradiction, got {got:?}"
+            "a confirmation for an escalated effect is news, not a contradiction, got {got:?}"
         );
     }
 
@@ -5810,10 +5804,18 @@ mod system_event_topology {
         }
     }
 
-    /// The whole matrix: exactly the three in-flight states move to
-    /// `NeedsHuman`; everywhere else the behaviour does not exist.
+    /// The whole matrix: exactly the three in-flight states accept the event —
+    /// as a **record**, with no transition (ADR-019) — and everywhere else the
+    /// behaviour does not exist.
+    ///
+    /// This sweep used to assert a move to `NeedsHuman` with the pointer
+    /// cleared. That move destroyed the one distinction a late fact needs, and
+    /// the domain's answer is now `Record`: the booking stays exactly where it
+    /// is, which is what makes `BookingExists`-after-giving-up land as `Booked`
+    /// from `BookingInProgress` and as a cancellation handoff from
+    /// `CancellationRequested`, through the ordinary fact arms.
     #[tokio::test]
-    async fn exhaustion_moves_exactly_the_in_flight_states() {
+    async fn exhaustion_records_at_exactly_the_in_flight_states() {
         let mut checked = 0_usize;
         for booking in all_states() {
             let state_name = booking.state.name();
@@ -5822,31 +5824,13 @@ mod system_event_topology {
             let got = TownHallDomain.resolve_system_event(&booking, event).await;
 
             if in_flight.is_some() {
-                let Resolution::Ready(plan) = &got else {
-                    panic!(
-                        "{state_name} has an effect in flight and must reach NeedsHuman, got {got:?}"
-                    );
-                };
-                let next = plan.next_state();
-                next.coherent()
-                    .unwrap_or_else(|why| panic!("{state_name} produced incoherence: {why}"));
-                // The complete booking, not the discriminator: giving up
-                // clears the pointer — no automation acts on this effect again
-                // — and touches nothing else.
-                assert_eq!(
-                    plan,
-                    &TransitionPlan::Local {
-                        next_state: Booking {
-                            state: BookingState::NeedsHuman(NeedsHuman),
-                            active_effect: None,
-                            ..booking.clone()
-                        },
-                    },
-                    "at {state_name}"
+                assert!(
+                    got.is_record(),
+                    "{state_name} has an effect in flight; exhaustion must be recordable, got {got:?}"
                 );
             } else {
                 assert!(
-                    matches!(got, Resolution::Undefined),
+                    got.is_undefined(),
                     "{state_name} has no retry budget to exhaust; expected Undefined, got {got:?}"
                 );
             }
@@ -5869,7 +5853,7 @@ mod system_event_topology {
                 .await;
             assert_eq!(
                 got,
-                Resolution::Denied(BookingError::EffectMismatch),
+                SystemEventResolution::Denied(BookingError::EffectMismatch),
                 "at {}",
                 booking.state.name()
             );
@@ -5893,7 +5877,7 @@ mod system_event_topology {
             .await;
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::InconsistentEffectIdentity)
+            SystemEventResolution::Denied(BookingError::InconsistentEffectIdentity)
         );
     }
 }

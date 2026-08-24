@@ -46,9 +46,6 @@ stateDiagram-v2
     BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Rejected
     BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Absent
     BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Absent
-    BookingInProgress -.-> Booked : BookingExists · intent Book Abandoned
-    BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Abandoned
-    BookingInProgress -.-> AwaitingBooking : ProviderRejected · intent Book Abandoned
     CancellationRequested -.-> CancellingBooking : BookingExists · intent Book Prepared ⇗
     CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Prepared
     CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Prepared
@@ -59,12 +56,6 @@ stateDiagram-v2
     CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Rejected
     CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Absent
     CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Absent
-    CancellationRequested -.-> CancellingBooking : BookingExists · intent Book Abandoned ⇗
-    CancellationRequested -.-> Cancelled : EffectAbsent · intent Book Abandoned
-    CancellationRequested -.-> Cancelled : ProviderRejected · intent Book Abandoned
-    BookingInProgress ==> NeedsHuman : ReconciliationExhausted
-    CancellationRequested ==> NeedsHuman : ReconciliationExhausted
-    CancellingBooking ==> NeedsHuman : ReconciliationExhausted
 ```
 
 `⇗` marks an edge that asks the outside world for something, so it commits an in-flight state first and settles later on verified evidence (ADR-014).
@@ -106,9 +97,6 @@ Only the edges are listed. A pair absent from this list has no edge, and there a
 - **BookingInProgress** on `ProviderRejected · intent Book Rejected` → AwaitingBooking
 - **BookingInProgress** on `EffectAbsent · intent Book Absent` → AwaitingBooking
 - **BookingInProgress** on `ProviderRejected · intent Book Absent` → AwaitingBooking
-- **BookingInProgress** on `BookingExists · intent Book Abandoned` → Booked
-- **BookingInProgress** on `EffectAbsent · intent Book Abandoned` → AwaitingBooking
-- **BookingInProgress** on `ProviderRejected · intent Book Abandoned` → AwaitingBooking
 - **CancellationRequested** on `BookingExists · intent Book Prepared` → CancellingBooking ⇗ CancelBooking
 - **CancellationRequested** on `EffectAbsent · intent Book Prepared` → Cancelled
 - **CancellationRequested** on `ProviderRejected · intent Book Prepared` → Cancelled
@@ -119,9 +107,6 @@ Only the edges are listed. A pair absent from this list has no edge, and there a
 - **CancellationRequested** on `ProviderRejected · intent Book Rejected` → Cancelled
 - **CancellationRequested** on `EffectAbsent · intent Book Absent` → Cancelled
 - **CancellationRequested** on `ProviderRejected · intent Book Absent` → Cancelled
-- **CancellationRequested** on `BookingExists · intent Book Abandoned` → CancellingBooking ⇗ CancelBooking
-- **CancellationRequested** on `EffectAbsent · intent Book Abandoned` → Cancelled
-- **CancellationRequested** on `ProviderRejected · intent Book Abandoned` → Cancelled
 - **Booked** on `EffectAbsent · intent Cancel Rejected` converged
 - **Booked** on `ProviderRejected · intent Cancel Rejected` converged
 - **Booked** on `EffectAbsent · intent Cancel Absent` converged
@@ -141,10 +126,10 @@ Only the edges are listed. A pair absent from this list has no edge, and there a
 | **VenueSelected** | — |
 | **NeedsRevalidation** | — |
 | **AwaitingBooking** | — |
-| **BookingInProgress** | → NeedsHuman |
-| **CancellationRequested** | → NeedsHuman |
+| **BookingInProgress** | records ⏺ |
+| **CancellationRequested** | records ⏺ |
 | **Booked** | — |
-| **CancellingBooking** | → NeedsHuman |
+| **CancellingBooking** | records ⏺ |
 | **Cancelled** | — |
 | **NeedsHuman** | — |
 

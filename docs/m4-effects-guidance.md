@@ -215,9 +215,12 @@ budget. It becomes:
 
 Canonical definition in ADR-012.
 
-M4 builds this door with exactly that one variant. Without it `NeedsHuman` is unreachable
-and an exhausted reconciliation would sit in-progress forever. Deriving the event from
-durable retry/deadline accounting — not from an in-memory counter — is part of the work.
+M4 builds this door with exactly that one variant, and deriving the event from durable
+retry/deadline accounting — not from an in-memory counter — is part of the work. Per ADR-019 the
+door records a pursuit decision on the effect rather than moving the booking: an exhausted
+reconciliation deliberately stays in-progress, chased at a long cadence, and a late authoritative
+fact settles it through the ordinary fact-door arms. `NeedsHuman` is unreachable until the
+milestone that gives a human something to do (M6 at the earliest).
 
 ### `Reconcile` leaves the proposal vocabulary
 

@@ -26,6 +26,7 @@ test-faults = ["dep:futures-util"]
 
 [dev-dependencies]
 async-trait.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking"] }
 tempfile.workspace = true
 
 [lints]

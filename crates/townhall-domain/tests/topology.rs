@@ -80,6 +80,10 @@ enum Cell {
     Guarded { refused: String },
     /// Authoritative state already reflects this input. Fact door only.
     Converged,
+    /// Accepted, and recorded durably against the effect — with **no**
+    /// transition. System-event door only (ADR-019): exhaustion writes a pursuit
+    /// marker and the booking stays exactly where it is.
+    Records,
 }
 
 impl Cell {
@@ -90,6 +94,7 @@ impl Cell {
             Self::External { .. } => "external",
             Self::Guarded { .. } => "guarded",
             Self::Converged => "converged",
+            Self::Records => "records",
         }
     }
 
@@ -460,7 +465,6 @@ fn fact_inputs() -> Vec<(OperationKind, EffectStatus, VerifiedProviderFact)> {
         EffectStatus::Confirmed,
         EffectStatus::Rejected,
         EffectStatus::Absent,
-        EffectStatus::Abandoned,
     ];
 
     [OperationKind::Book, OperationKind::Cancel]
@@ -490,11 +494,14 @@ async fn system_event_door() -> Door {
         };
         let resolved = TownHallDomain.resolve_system_event(&booking, event).await;
         cells.push(vec![match resolved {
-            Resolution::Undefined => Cell::NoEdge,
-            Resolution::Denied(error) => Cell::Guarded {
+            bld_kernel::SystemEventResolution::Undefined => Cell::NoEdge,
+            bld_kernel::SystemEventResolution::Denied(error) => Cell::Guarded {
                 refused: error.to_string(),
             },
-            Resolution::Ready(plan) => classify_plan(&plan),
+            // A durable record with no transition — ADR-019. Neither `no_edge`
+            // (there is behaviour), nor `local` (nothing moves), nor `converged`
+            // (something is written): its own tag, or the artifact lies.
+            bld_kernel::SystemEventResolution::Record => Cell::Records,
         }]);
     }
 
@@ -691,6 +698,7 @@ fn reachability_section(door: &Door, states: &[String]) -> String {
                 Cell::Local { to } => format!("→ {to}"),
                 Cell::External { to, effect } => format!("→ {to} ⇗ {effect}"),
                 Cell::Converged => "converged".to_owned(),
+                Cell::Records => "records ⏺ (no transition)".to_owned(),
                 Cell::NoEdge | Cell::Guarded { .. } => continue,
             };
             any = true;
@@ -715,6 +723,7 @@ fn describe(cell: &Cell) -> String {
         Cell::External { to, effect } => format!("→ {to} ⇗ {effect}"),
         Cell::Guarded { refused } => format!("guarded ({refused})"),
         Cell::Converged => "converged".to_owned(),
+        Cell::Records => "records ⏺".to_owned(),
     }
 }
 

@@ -6,17 +6,17 @@
 
 use bld_kernel::{BoundaryOutcome, Capability, Verified};
 use bld_types::{
-    ActorId, AvailabilityGrant, BookingId, BookingRequirements, EffectAttempt, EffectIntentId,
-    Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
+    ActorId, AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectAttempt,
+    EffectIntentId, Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
 };
 use std::{path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use townhall_domain::{
-    BookingEffect, BookingProposal, EffectStatus, OperationKind, SystemEvent, VenueFacts,
+    BookingEffect, BookingError, BookingProposal, EffectStatus, OperationKind, VenueFacts,
     VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_service::{
-    Coordinator, ServiceError,
+    Attended, Coordinator, Reconciliation, ServiceError,
     fake::{CouncilVerifier, FAKE_GRANT, FakeCouncil, FixedAvailability, ObservedCouncil, Script},
 };
 use townhall_store::{
@@ -86,20 +86,54 @@ fn book_plan() -> BookingEffect {
 type Sut = Coordinator<SqliteBookingRepository, FakeCouncil, CouncilVerifier, FixedAvailability>;
 
 struct Harness {
-    _temp: TempDir,
+    temp: TempDir,
     path: PathBuf,
     repo: Arc<SqliteBookingRepository>,
     council: Arc<FakeCouncil>,
     coordinator: Sut,
+    reconciliation: Reconciliation<
+        SqliteBookingRepository,
+        FakeCouncil,
+        CouncilVerifier,
+        FixedAvailability,
+        FakeCouncil,
+    >,
+    /// The store's clock, movable — reconciliation cadences are real times, and
+    /// this suite's no-sleep rule means the clock moves instead of the test
+    /// waiting.
+    clock: Arc<ProtocolClock>,
+}
+
+/// A movable store clock for this suite.
+#[derive(Debug)]
+struct ProtocolClock(std::sync::atomic::AtomicI64);
+
+impl ProtocolClock {
+    fn advance(&self, by_ms: i64) {
+        self.0.fetch_add(by_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl townhall_store::StoreClock for ProtocolClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 async fn harness() -> Harness {
     let temp = TempDir::new().expect("temp dir");
     let path = temp.path().join("townhall.sqlite");
+    let clock = Arc::new(ProtocolClock(std::sync::atomic::AtomicI64::new(
+        1_000_000_000,
+    )));
     let repo = Arc::new(
-        SqliteBookingRepository::open(&path)
-            .await
-            .expect("repository should open"),
+        SqliteBookingRepository::open_with(
+            &path,
+            townhall_store::DEFAULT_EFFECT_TTL_MS,
+            Arc::clone(&clock) as Arc<dyn townhall_store::StoreClock>,
+        )
+        .await
+        .expect("repository should open"),
     );
     let council = Arc::new(FakeCouncil::new());
     let coordinator = Coordinator::new(
@@ -108,12 +142,23 @@ async fn harness() -> Harness {
         Arc::new(CouncilVerifier),
         Arc::new(FixedAvailability::new(facts())),
     );
+    let reconciliation = Reconciliation::new(
+        Coordinator::new(
+            Arc::clone(&repo),
+            Arc::clone(&council),
+            Arc::new(CouncilVerifier),
+            Arc::new(FixedAvailability::new(facts())),
+        ),
+        Arc::clone(&council),
+    );
     Harness {
-        _temp: temp,
+        temp,
         path,
         repo,
         council,
         coordinator,
+        reconciliation,
+        clock,
     }
 }
 
@@ -307,10 +352,24 @@ async fn a_crash_before_the_call_leaves_no_external_consequence() {
         .clone()
         .expect("and must find what it is waiting on");
     let intent = reopened.load_effect(&effect).await.expect("the intent");
+    // `Unknown`, not `Prepared` — and the change is the point (ADR-019 §4 /
+    // decision 5). This fixture scripts a call that got no answer, and Phase B
+    // now records the attempt BEFORE the wire, so "a call began" is durable and
+    // `Prepared` finally means what it says: never attempted. The true
+    // crash-BEFORE-the-call case — where `Prepared` is the assertion — needs a
+    // killable BLD process, and gets one in E's subprocess harness.
     assert_eq!(
         intent.status,
-        EffectStatus::Prepared,
-        "nothing was established about this effect"
+        EffectStatus::Unknown,
+        "a call began and nothing came back; the row must say so"
+    );
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "one lost answer is nowhere near a human's problem yet"
     );
     assert_eq!(intent.canonical_plan.operation_kind(), OperationKind::Book);
     assert_eq!(
@@ -436,10 +495,15 @@ async fn the_intent_is_durable_before_the_council_is_asked() {
         .expect("book");
 
     let observation = seen.lock().expect("lock").clone();
+    // `Unknown` mid-call, observed from a SECOND connection while the capability
+    // is being invoked — which is gate M10's property, and it must be `Unknown`
+    // rather than `Prepared` because Phase B records the attempt before the wire
+    // (ADR-014 one level in). An implementation that wrote `Unknown` after the
+    // timeout would read `Prepared` here and fail.
     assert_eq!(
         observation,
-        Some((id.to_string(), EffectStatus::Prepared)),
-        "the intent must be readable, and Prepared, from another connection during the call"
+        Some((id.to_string(), EffectStatus::Unknown)),
+        "the attempt must be durable, as Unknown, before the council is asked"
     );
 }
 
@@ -672,100 +736,119 @@ async fn re_observing_a_settled_booking_converges() {
 
 // -------------------------------------------------------------- giving up
 
-/// `NeedsHuman` is reachable only through the system-event door, and giving up
-/// finalises the effect it gave up on — a `NeedsHuman` still pointing at a live
-/// intent would invite a reconciler to keep chasing what was just abandoned.
+/// Giving up is a pursuit decision (ADR-019): the booking does not move, the
+/// pointer stays, and the intent's status stays `Unknown` — because the council
+/// may well hold the room and any other claim would assert what nobody
+/// established. Then the part the old design made impossible: the council
+/// finally answers, and the booking is adopted through the ordinary fact arms.
 #[tokio::test]
-async fn exhausted_reconciliation_escalates_and_stops_pointing_at_the_effect() {
+async fn exhaustion_marks_the_intent_and_a_late_fact_still_lands() {
     let h = harness().await;
     let id = BookingId::new("BKG-EXHAUSTED");
     awaiting(&h, &id, requirements()).await;
-    h.council.script([Script::GoQuiet("timed out")]);
+
+    // The initial call is the dropped-response scenario: the council CREATES the
+    // booking and the answer never arrives. One attempt spent, outcome unknown —
+    // and unknown is now recorded as such before the wire, not left as Prepared.
+    h.council
+        .script([Script::SucceedThenGoQuiet("response eaten")]);
     h.coordinator
         .propose(&id, BookingProposal::Book, &authority())
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
+    let before = h.repo.load(&id).await.expect("load");
+    let audit_before = h.repo.audit_events(&id).await.expect("audit").len();
 
-    let outcome = h
-        .coordinator
-        .record(
-            &id,
-            SystemEvent::ReconciliationExhausted {
-                effect_intent_id: effect.clone(),
-            },
-        )
-        .await
-        .expect("no service error");
+    // Spend the rest of the budget through real reconciliation turns — scripted
+    // no-answers, the store clock advanced past the cadence between turns, never
+    // a sleep. The escalating turn consumes no script: it asks the domain, not
+    // the council, which is the point.
+    h.council.script([
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+    ]);
+    for turn in 0..5 {
+        h.clock.advance(10_000);
+        let attended = h.reconciliation.attend(&effect).await.expect("attend");
+        if turn < 4 {
+            assert!(
+                matches!(attended, Attended::StillUnknown { .. }),
+                "turn {turn}: expected StillUnknown, got {attended:?}"
+            );
+        } else {
+            assert_eq!(attended, Attended::Escalated, "the budget is spent");
+        }
+    }
 
-    let BoundaryOutcome::Committed(aggregate) = outcome else {
-        panic!("exhaustion is an outcome and must commit, got {outcome:?}");
-    };
-    assert_eq!(aggregate.state.name(), "NeedsHuman");
+    // Escalated: flagged for a human, and NOTHING else changed.
+    let after = h.repo.load(&id).await.expect("load");
     assert_eq!(
-        aggregate.active_effect, None,
-        "nothing may keep chasing an abandoned effect"
+        after.state.name(),
+        "BookingInProgress",
+        "the state is the story"
     );
-    let intent = h.repo.load_effect(&effect).await.expect("the intent");
-    // `Abandoned`, and the exact status is the assertion — `is_terminal()` alone
-    // would have let `Absent` through, which asserts the council tombstoned the
-    // intent. Nobody established that; we stopped asking.
+    assert_eq!(
+        after.active_effect,
+        Some(effect.clone()),
+        "the pointer survives — a late fact must still bind"
+    );
+    assert_eq!(
+        after.version, before.version,
+        "escalation touches only the intent row, never the aggregate"
+    );
+    let intent = h.repo.load_effect(&effect).await.expect("intent");
     assert_eq!(
         intent.status,
-        EffectStatus::Abandoned,
-        "exhaustion must claim nothing about the provider"
+        EffectStatus::Unknown,
+        "the outcome IS unknown, and the status says so"
     );
     assert_eq!(
-        intent.provider_reference, None,
-        "and must not invent a reference"
+        h.repo.escalated_unresolved(10).await.expect("queue"),
+        vec![effect.clone()],
+        "the human queue holds exactly this question"
     );
-
-    let last = h
-        .repo
-        .audit_events(&id)
-        .await
-        .expect("audit")
-        .pop()
-        .expect("a row");
     assert_eq!(
-        last.driver_kind,
-        Provenance::SystemEvent,
-        "the runtime, not the council and not Lucy, concluded this"
+        h.repo.audit_events(&id).await.expect("audit").len(),
+        audit_before,
+        "escalation is a marker on the intent, never an audit event — the \
+         audit trail records the aggregate's story, and the aggregate did not move"
     );
-}
 
-/// Exhaustion of a *different* effect says nothing about this booking.
-#[tokio::test]
-async fn exhaustion_of_another_effect_changes_nothing() {
-    let h = harness().await;
-    let id = BookingId::new("BKG-OTHEREFFECT");
-    awaiting(&h, &id, requirements()).await;
-    h.council.script([Script::GoQuiet("timed out")]);
-    h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
-        .await
-        .expect("book");
-    let before = h.repo.load(&id).await.expect("load");
+    // Straight back for another turn: the escalated cadence holds. A second
+    // escalation cannot happen through this door (the once-only write is the
+    // store's own gate), and neither can an early re-ask.
+    assert_eq!(
+        h.reconciliation.attend(&effect).await.expect("attend"),
+        Attended::NotDue,
+        "escalated means hourly, and the hour is not up"
+    );
 
-    let outcome = h
-        .coordinator
-        .record(
-            &id,
-            SystemEvent::ReconciliationExhausted {
-                effect_intent_id: EffectIntentId::new("EFF-SOMEBODY-ELSE"),
-            },
-        )
-        .await
-        .expect("no service error");
+    // The council finally answers — the ADR-019 payoff. The booking it created
+    // under this identity all along is adopted, through the unmodified arms.
+    h.clock.advance(townhall_store::MAX_CADENCE_MS + 1);
+    h.council.script([Script::Succeed]);
+    // Make the fake actually hold a booking for this identity: the original
+    // create landed even though its response was eaten.
+    assert_eq!(
+        h.council.booking_count(),
+        1,
+        "the council held it all along"
+    );
+    let settled = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(settled, Attended::Settled);
 
+    let adopted = h.repo.load(&id).await.expect("load");
+    assert_eq!(adopted.state.name(), "Booked");
     assert!(
-        matches!(outcome, BoundaryOutcome::Denied(_)),
-        "a refusal with a reason, not a silent gap, got {outcome:?}"
-    );
-    assert_eq!(
-        h.repo.load(&id).await.expect("load").version,
-        before.version,
-        "nothing moved"
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "the question was answered, so it leaves the queue"
     );
 }
 
@@ -1061,4 +1144,449 @@ async fn a_fact_that_loses_a_race_is_re_classified_not_dropped() {
     let intent = h.repo.load_effect(&effect).await.expect("the intent");
     assert_eq!(intent.status, EffectStatus::Confirmed);
     assert_eq!(intent.supersedes, None, "no second effect was minted");
+}
+
+// -------------------------------------------------------- the denial logbook
+
+/// A harness with the logbook wired.
+async fn harness_with_denials() -> (Harness, Arc<townhall_store::denials::DenialLog>) {
+    let mut h = harness().await;
+    let log = Arc::new(
+        townhall_store::denials::DenialLog::open(
+            h.temp.path().join("denials.sqlite"),
+            Arc::clone(&h.clock) as Arc<dyn townhall_store::StoreClock>,
+        )
+        .await
+        .expect("open the denial log"),
+    );
+    h.coordinator = Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    )
+    .with_denial_log(Arc::clone(&log));
+    // The reconciler's door refuses too (the system-event door), so its own
+    // coordinator carries the same logbook.
+    h.reconciliation = Reconciliation::new(
+        Coordinator::new(
+            Arc::clone(&h.repo),
+            Arc::clone(&h.council),
+            Arc::new(CouncilVerifier),
+            Arc::new(FixedAvailability::new(facts())),
+        )
+        .with_denial_log(Arc::clone(&log)),
+        Arc::clone(&h.council),
+    );
+    (h, log)
+}
+
+/// A refusal is provable from the database afterwards: who, what, why, when —
+/// and the reason is the stable name, never display text with numbers in it.
+#[tokio::test]
+async fn a_refusal_leaves_a_durable_row() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-DENY");
+    awaiting(&h, &id, requirements()).await;
+
+    // Lucy tries to book with no booking authority: the door exists, the guard
+    // says no.
+    let mut no_authority = authority();
+    no_authority.may_book = false;
+    let outcome = h
+        .coordinator
+        .propose(&id, BookingProposal::Book, &no_authority)
+        .await
+        .expect("turn");
+    assert!(matches!(outcome, BoundaryOutcome::Denied(_)));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].booking_id, id.to_string());
+    assert_eq!(rows[0].driver_kind, "Proposal");
+    assert_eq!(rows[0].driver_detail, "Book");
+    assert_eq!(rows[0].reason, "BookingAuthorityRequired");
+    assert_eq!(rows[0].principal, "lucy");
+    assert_eq!(rows[0].occurrences, 1);
+}
+
+/// Identical refusals compress; different people do not. Two principals refused
+/// identically are TWO rows — collapsing them would attribute one person's
+/// refusals to the other, which is a false record, not a compression.
+#[tokio::test]
+async fn identical_refusals_compress_but_principals_never_merge() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-FLOOD");
+    awaiting(&h, &id, requirements()).await;
+
+    let mut lucy = authority();
+    lucy.may_book = false;
+    let mut marco = authority();
+    marco.principal = PrincipalId::new("marco");
+    marco.may_book = false;
+
+    // Lucy is refused 40 times; Marco once. Every answer is the same typed
+    // refusal — the 40th identical denial costs the caller nothing different.
+    for _ in 0..40 {
+        let outcome = h
+            .coordinator
+            .propose(&id, BookingProposal::Book, &lucy)
+            .await
+            .expect("turn");
+        assert!(matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::BookingAuthorityRequired)
+        ));
+    }
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &marco)
+        .await
+        .expect("turn");
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one row per principal, not one total");
+    let lucy_row = rows.iter().find(|r| r.principal == "lucy").expect("lucy");
+    let marco_row = rows.iter().find(|r| r.principal == "marco").expect("marco");
+    assert_eq!(
+        lucy_row.occurrences, 40,
+        "the flood is a counter, not 40 rows"
+    );
+    assert_eq!(marco_row.occurrences, 1);
+}
+
+/// The same refusal in a different hour is a different row: "4,000 times
+/// between 02:00 and 03:00, and twice in August" must stay answerable.
+#[tokio::test]
+async fn the_same_refusal_next_hour_is_a_new_row() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-WINDOWS");
+    awaiting(&h, &id, requirements()).await;
+    let mut lucy = authority();
+    lucy.may_book = false;
+
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &lucy)
+        .await
+        .expect("turn");
+    h.clock.advance(60 * 60 * 1000 + 1);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &lucy)
+        .await
+        .expect("turn");
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one row per hour");
+    assert_ne!(rows[0].window_start_ms, rows[1].window_start_ms);
+}
+
+/// Asking for a button that does not exist is counted, never rowed — it is
+/// forgeable from pure garbage, and a durable row per garbage request is a
+/// disk-filling attack (ADR-017).
+#[tokio::test]
+async fn asking_for_a_nonexistent_behaviour_is_counted_not_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-UNDEFINED");
+    h.repo
+        .create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+
+    // Book from Draft: no such edge. Three times.
+    for _ in 0..3 {
+        let outcome = h
+            .coordinator
+            .propose(&id, BookingProposal::Book, &authority())
+            .await
+            .expect("turn");
+        assert_eq!(outcome, BoundaryOutcome::Undefined);
+    }
+
+    assert_eq!(log.undefined_count("Draft", "Book"), 3);
+    assert!(
+        log.rows().await.expect("rows").is_empty(),
+        "no durable row for a behaviour that does not exist"
+    );
+}
+
+/// The refusal at the FACT door records too — this is where the refusals that
+/// matter most live, and the design review found the original ADR wiring only
+/// the proposal door. An unattributable one is recorded as exactly that.
+#[tokio::test]
+async fn a_fact_door_refusal_records_with_a_derived_principal() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-FACTDENY");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+
+    // A signed cancellation fact arrives for a BOOKING intent: wrong kind, and
+    // the domain refuses it. Nobody proposed anything — the principal comes
+    // from the persisted plan.
+    let wrong_kind = Verified::assert_verified(VerifiedProviderFact::CancellationExists {
+        effect_intent_id: effect.clone(),
+        booking_ref: CouncilBookingRef::new("TH-99999"),
+    });
+    let outcome = h.coordinator.observe(&id, wrong_kind).await.expect("turn");
+    assert!(matches!(
+        outcome,
+        BoundaryOutcome::Denied(BookingError::EffectKindMismatch)
+    ));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "Fact");
+    assert_eq!(rows[0].driver_detail, "CancellationExists");
+    assert_eq!(rows[0].reason, "EffectKindMismatch");
+    assert_eq!(
+        rows[0].principal, "lucy",
+        "derived from the persisted plan, since no one proposed anything"
+    );
+}
+
+/// One identity, two provider references — duplication, corruption or broken
+/// idempotency, and never silent convergence (gate M6's named refusal). The
+/// booking is genuinely `Booked` when the second reference arrives, so an
+/// implementation that shrugs "already booked, close enough" fails here.
+#[tokio::test]
+async fn a_second_provider_reference_for_one_identity_is_refused_and_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-TWOREFS");
+    awaiting(&h, &id, requirements()).await;
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let booked = h.repo.load(&id).await.expect("load");
+    assert_eq!(booked.state.name(), "Booked");
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+
+    // A signed fact arrives claiming the SAME intent produced a DIFFERENT
+    // booking. Field-perfect otherwise — the reference is the lie.
+    let second_reference = Verified::assert_verified(VerifiedProviderFact::BookingExists {
+        effect_intent_id: effect,
+        booking_ref: CouncilBookingRef::new("TH-00001"),
+        venue_id: VenueId::new("TH-A"),
+        slot_id: SlotId::new("SLOT-A"),
+        attendees: 20,
+        fee: Money::from_pence(4_500),
+        principal: PrincipalId::new("lucy"),
+    });
+    let outcome = h
+        .coordinator
+        .observe(&id, second_reference)
+        .await
+        .expect("turn");
+    assert!(
+        matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::DuplicateProviderEffect)
+        ),
+        "one identity cannot have booked two rooms: {outcome:?}"
+    );
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "Fact");
+    assert_eq!(rows[0].driver_detail, "BookingExists");
+    assert_eq!(rows[0].reason, "DuplicateProviderEffect");
+    assert_eq!(rows[0].principal, "lucy");
+}
+
+/// The THIRD door records its refusals too. An exhausted chase for an effect
+/// the booking is not waiting on is `Denied(EffectMismatch)` by the domain —
+/// and that refusal lands in the logbook like any other, attributed from the
+/// stale intent's own persisted plan.
+#[tokio::test]
+async fn an_exhausted_chase_for_the_wrong_effect_is_denied_and_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-STALECHASE");
+    awaiting(&h, &id, requirements()).await;
+
+    // Lucy's booking is honestly in flight on its OWN effect...
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let live = in_flight_effect(&h, &id).await;
+
+    // ...and a STALE intent for the same booking sits in the store with its
+    // budget long spent — the leftover a crashed, older deployment could leave.
+    // Planted raw because no current door can mint it, which is the point: the
+    // reconciler will meet rows history wrote, not only rows this build writes.
+    let plan_json: String = sqlx::query_scalar(
+        "SELECT canonical_plan_json FROM effect_intents WHERE effect_intent_id = ?",
+    )
+    .bind(live.as_str())
+    .fetch_one(h.repo.pool())
+    .await
+    .expect("the live plan");
+    sqlx::query(
+        r"
+        INSERT INTO effect_intents (effect_intent_id, booking_id, operation_kind,
+                                    source_version, canonical_plan_json, status,
+                                    expires_at_ms, created_at_ms, updated_at_ms,
+                                    attempts_started, attempts_finished)
+        VALUES (?, ?, 'Book', 99, ?, 'Unknown', ?, 0, 0, 1000, 1000)
+        ",
+    )
+    .bind("EFF-STALE-CHASE")
+    .bind(id.to_string())
+    .bind(&plan_json)
+    .bind(i64::MAX / 2)
+    .execute(h.repo.pool())
+    .await
+    .expect("plant the stale intent");
+
+    let stale = EffectIntentId::new("EFF-STALE-CHASE");
+    let attended = h.reconciliation.attend(&stale).await.expect("attend");
+    assert_eq!(
+        attended,
+        Attended::NotDue,
+        "nothing to escalate: the booking is not waiting on this effect"
+    );
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "no marker was written — the domain said no, so the store wrote nothing"
+    );
+    let untouched = h.repo.load(&id).await.expect("load");
+    assert_eq!(untouched.state.name(), "BookingInProgress");
+    assert_eq!(untouched.active_effect, Some(live));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "SystemEvent");
+    assert_eq!(rows[0].driver_detail, "ReconciliationExhausted");
+    assert_eq!(rows[0].reason, "EffectMismatch");
+    assert_eq!(
+        rows[0].principal, "lucy",
+        "attributed from the stale intent's own persisted plan"
+    );
+}
+
+// ------------------------------------------------------------- lease visibility
+
+/// Gate M15: Phase B PARTICIPATES in leasing — observed, not narrated. While
+/// the coordinator's call is on the wire, a second connection must see the
+/// lease held, and a reconciler asked to attend the same intent must answer
+/// `NotDue` rather than racing the call. When the turn ends, the lease is gone.
+#[tokio::test]
+async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
+    let temp = TempDir::new().expect("temp dir");
+    let path = temp.path().join("townhall.sqlite");
+    let repo = Arc::new(SqliteBookingRepository::open(&path).await.expect("open"));
+    let council = Arc::new(FakeCouncil::new());
+
+    let observed_path = path.clone();
+    let seen: Arc<std::sync::Mutex<Option<(bool, Attended)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let seen_in_hook = Arc::clone(&seen);
+
+    let observer = Arc::new(ObservedCouncil::new(
+        Arc::clone(&council),
+        Arc::new(move |effect_id: &EffectIntentId| {
+            let path = observed_path.clone();
+            let effect_id = effect_id.clone();
+            let slot = Arc::clone(&seen_in_hook);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async move {
+                    let other = Arc::new(
+                        SqliteBookingRepository::open(&path)
+                            .await
+                            .expect("a second connection must open"),
+                    );
+                    // The lease, read from the row itself — the row is the
+                    // only witness the reconciler gets.
+                    let held: Option<i64> = sqlx::query_scalar(
+                        "SELECT lease_until_ms FROM effect_intents \
+                         WHERE effect_intent_id = ?",
+                    )
+                    .bind(effect_id.as_str())
+                    .fetch_one(other.pool())
+                    .await
+                    .expect("the intent row");
+                    // And the reconciler's own answer while the call is live.
+                    let bystander = Arc::new(FakeCouncil::new());
+                    let reconciliation = Reconciliation::new(
+                        Coordinator::new(
+                            Arc::clone(&other),
+                            Arc::clone(&bystander),
+                            Arc::new(CouncilVerifier),
+                            Arc::new(FixedAvailability::new(facts())),
+                        ),
+                        Arc::clone(&bystander),
+                    );
+                    let attended = reconciliation
+                        .attend(&effect_id)
+                        .await
+                        .expect("attend must not error");
+                    *slot.lock().expect("lock") = Some((held.is_some(), attended));
+                });
+            })
+            .join()
+            .expect("the observation must not panic");
+        }),
+    ));
+
+    let coordinator = Coordinator::new(
+        Arc::clone(&repo),
+        observer,
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    let id = BookingId::new("BKG-LEASED");
+    repo.create(NewBooking {
+        id: id.clone(),
+        requirements: requirements(),
+    })
+    .await
+    .expect("create");
+    for proposal in [select(), BookingProposal::VerifySlot] {
+        coordinator
+            .propose(&id, proposal, &authority())
+            .await
+            .expect("setup");
+    }
+    // The call itself goes quiet, so the turn ends unresolved — the lease's
+    // release must not depend on an answer arriving.
+    council.script([Script::GoQuiet("no answer")]);
+    coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+
+    let observation = seen.lock().expect("lock").clone();
+    assert_eq!(
+        observation,
+        Some((true, Attended::NotDue)),
+        "mid-call: the lease is held on the row, and the reconciler defers to it"
+    );
+
+    // The turn is over: the lease is given back, answer or no answer, so the
+    // reconciler owns the chase at its ordinary cadence rather than waiting
+    // out a dead owner.
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+    let released: Option<i64> =
+        sqlx::query_scalar("SELECT lease_until_ms FROM effect_intents WHERE effect_intent_id = ?")
+            .bind(effect.as_str())
+            .fetch_one(repo.pool())
+            .await
+            .expect("the intent row");
+    assert_eq!(released, None, "the lease does not outlive the turn");
 }

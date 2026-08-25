@@ -199,6 +199,12 @@ impl Registry {
         &self.signer
     }
 
+    /// The pause hook, for the HTTP layer's `before_reply` point — the one pause
+    /// that must fire on paths the registry itself never sees settle.
+    pub fn pauses(&self) -> &Arc<dyn Pauses> {
+        &self.pauses
+    }
+
     /// Seed the catalogue. Council-side setup, not a request path.
     ///
     /// # Errors
@@ -544,7 +550,22 @@ impl Registry {
     /// # Errors
     /// [`CouncilError`] on a storage failure or an unreadable stored row.
     pub async fn resolve(&self, request: &ResolveEffect) -> Result<EffectOutcome, CouncilError> {
+        // Positioned *before* the transaction opens, so a harness can know the
+        // resolve has arrived without it yet contending for the writer lock —
+        // pausing after `begin_with` would deadlock against the very create the
+        // test wants it to block on.
+        self.pauses
+            .reach(PausePoint::BeforeResolveLock, &request.effect_intent_id)
+            .await;
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // And once the lock is actually held. This arriving only after a
+        // competing create's release is what proves the resolve blocked on it,
+        // rather than never having been scheduled until the create was done.
+        self.pauses
+            .reach(PausePoint::AfterResolveLock, &request.effect_intent_id)
+            .await;
 
         if let Some(settled) = self
             .classify_existing(

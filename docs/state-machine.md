@@ -132,19 +132,20 @@ and a diff to it needs an ADR.
 Reachable only through `SystemEvent` via `resolve_system_event`. Neither intent nor
 external fact: the council cannot tell us our own retry budget is exhausted.
 
-```mermaid
-stateDiagram-v2
-    BookingInProgress --> NeedsHuman: ReconciliationExhausted
-    CancellationRequested --> NeedsHuman: ReconciliationExhausted
-    CancellingBooking --> NeedsHuman: ReconciliationExhausted
-```
+Per ADR-019 this door **moves no state**. `ReconciliationExhausted` at an in-flight state records
+a pursuit decision against the effect — we stop chasing at retry cadence, flag it for a human,
+and keep asking slowly — and the booking stays exactly where it is, because the council may well
+hold the effect and any other state would assert what nobody established. A late authoritative
+fact then lands through the ordinary fact-door arms above, whose per-state meanings are the
+information a state change would have destroyed.
 
-`NeedsHuman` is reachable only this way, which is why M4 builds this door rather than
-deferring it.
+`NeedsHuman` is currently unreachable: it awaits the milestone that gives a human something to
+do (M6 at the earliest), and per ADR-019 §7 it is deleted rather than promoted if human actions
+turn out to attach to any in-flight state rather than only to given-up ones.
 
 ## Terminal states
 
-`Cancelled` and `NeedsHuman` have no outbound edges through any door.
+`Cancelled` has no outbound edges through any door.
 
 ## State-scoped behaviour rule
 

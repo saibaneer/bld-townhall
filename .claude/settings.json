@@ -43,7 +43,13 @@
       "Bash(awk 'length > 100 {print FILENAME\": \"NR\": \"length}' docs/decisions.md)",
       "Bash(awk 'length > 100 {print NR\": \"length}' docs/decisions.md)",
       "Bash(awk '{s+=$1} END {print s\" passing\"}')",
-      "Bash(gh pr create --base main --head m4d-the-real-mock-council --title 'M4 slice D: the real mock council' --body ' *)"
+      "Bash(gh pr create --base main --head m4d-the-real-mock-council --title 'M4 slice D: the real mock council' --body ' *)",
+      "Bash(git -C /Users/tobaajiboye/Documents/boundary-led-development log --oneline -40)",
+      "Bash(grep -n '```' docs/m4-effects-guidance.md)",
+      "Bash(awk 'NR>=637 && NR<=690 {printf \"%d: %s\\\\n\", NR, $0}' /Users/tobaajiboye/Documents/boundary-led-development/docs/m4-effects-guidance.md)",
+      "Bash(git check-ignore *)",
+      "Bash(awk '/^\\\\*\\\\*Critical|^\\\\*\\\\*High|^\\\\*\\\\*Medium|^\\\\*\\\\*Nit|^\\\\*\\\\*Sound|^- \\\\*\\\\*Critical|^- \\\\*\\\\*High|^- \\\\*\\\\*Medium|^- \\\\*\\\\*Nit|^- \\\\*\\\\*Sound|^## /{f=1} f' /private/tmp/claude-501/-Users-tobaajiboye-Documents-boundary-led-development/d4c49a33-2823-4bc1-9d4a-7870c4c10b57/scratchpad/review-e-r1-out.txt)",
+      "Bash(awk '/^\\(codex|## Findings|\\\\*\\\\*Critical|- \\\\*\\\\*Critical\\)/{f=1} f' /private/tmp/claude-501/-Users-tobaajiboye-Documents-boundary-led-development/d4c49a33-2823-4bc1-9d4a-7870c4c10b57/scratchpad/review-e-r2-out.txt)"
     ],
     "additionalDirectories": [
       "/Users/tobaajiboye/Documents/boundary-led-development/crates/townhall-service"

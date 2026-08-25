@@ -259,13 +259,19 @@ Removing the variant takes proposals from 8 to 7 and the intent topology from 80
 ### `reconciliation_failed` is a system event, not a provider observation
 
 The council can tell us a booking exists or does not. It cannot tell us our retry budget is
-exhausted. `ReconciliationExhausted { effect_intent_id }` belongs to the third class, and
-`NeedsHuman` is reachable only through that door.
+exhausted. `ReconciliationExhausted { effect_intent_id }` belongs to the third class: only the
+runtime can conclude a fact about its own accounting, and neither a proposer nor a provider may
+be able to counterfeit it.
 
-**Therefore M4 builds that door**, with exactly that one variant. Deferring it would leave
-`NeedsHuman` unreachable and an exhausted reconciliation sitting in-progress forever. The
-event must be derived from durable retry/deadline accounting, not an in-memory counter, or
-a restart resets the budget.
+**Therefore M4 builds that door**, with exactly that one variant, and the event must be derived
+from durable retry/deadline accounting, not an in-memory counter, or a restart resets the budget.
+
+*Amended by ADR-019.* This section originally justified the door by reachability — "deferring it
+would leave `NeedsHuman` unreachable and an exhausted reconciliation sitting in-progress
+forever." ADR-019 makes exhaustion a pursuit record rather than a transition, so `NeedsHuman` is
+deliberately unreachable and an exhausted reconciliation deliberately stays in-progress — chased
+slowly, resolvable by a late fact. The provenance argument above is the door's justification and
+it survives unchanged; what the door *returns* is ADR-019 §5's.
 
 ## ADR-013 — The kernel classifies; the coordinator commits
 
@@ -380,6 +386,7 @@ reader to trip over:
 | `POST /bookings` without an expiry | spec §11 | ADR-016 — `expires_at_ms` is mandatory on create |
 | `GET /effects/{id}` without an expiry | spec §11 | ADR-016 — mandatory on lookup too, or absence is undecidable |
 | A generic `NotFound` reconciliation result | spec §11 | ADR-016 — `DefinitivelyAbsent` and `NotYetVisible` are different answers |
+| `NeedsHuman` as a reachable state | spec §7 L369/378/381 | ADR-019 — exhaustion records a pursuit decision on the effect; the booking's state does not change |
 
 The specification is not edited: it remains the v0.4.2 execution contract of record, and
 these ADRs are the amendment trail against it. Spec §5.1's sequencing *intent* is preserved
@@ -651,8 +658,34 @@ Expiry is what makes the first answer reachable at all.
 
 ## ADR-017 — Audit provenance is typed and derived; denials are recorded tiered
 
-Decided 2026-08-18 with the project owner. Implementation lands in **slice C** with the
-coordinator, which is the first component that sees both the resolution and the commit.
+Decided 2026-08-18 with the project owner. Point 1 landed in **slice C** with the coordinator;
+point 2 (denial recording) was moved to **slice E** by the owner, and this header originally said
+otherwise.
+
+### Amendment, slice E — the key, the store, and a declined permission
+
+Three changes, each forced by review against the real code:
+
+1. **The dedup key is `(booking_id, driver_kind, driver_detail, reason, principal,
+   window_start_ms)`**, not the original `(booking_id, principal, reason)`. The original could
+   not be formed at the fact or system-event doors — no `VerifiedAuthority` exists there — which
+   silently scoped recording to `propose` and left `DuplicateProviderEffect`, the most
+   consequential refusal in the system, unrecorded. `principal` stays **in** the key (dropping it
+   attributes one person's refusals to another) and is *derived* per door: the fact's own where
+   it carries one, else the persisted plan's, else the empty string — which means **explicitly
+   unattributed**, not unknown. `reason` is the error's stable name, never its display text,
+   which interpolates data and would split identical refusals. `window_start_ms` (hour floor)
+   restores the "per window" semantics an early draft lost: a flood is one row per hour, and
+   history keeps its shape.
+2. **Denials live in their own database file with their own writer.** Writing them on the
+   boundary's writer queues real work behind attacker-priced audit writes (`BEGIN IMMEDIATE`
+   serialises them); every buffered design hands the adversary control of retention. A separate
+   file removes the contention instead of budgeting it.
+3. **The "may be asynchronous" permission is declined.** Review broke every off-path design; the
+   write is a synchronous upsert against the separate store, *after* the answer is computed, and
+   a failed write is logged and dropped — the guarantee this ADR actually cares about ("a lost
+   denial record strands nothing", "the answer is never rate-limited") is preserved by ordering
+   and separation rather than by buffering.
 
 ### Context: the audit trail asserts, and can only say one thing
 
@@ -681,14 +714,19 @@ aggregate, alive in the audit trail.
      rowed**: in-memory counters per `(state, proposal)`, flushed periodically,
      crash-lossy by design.
    - `Denied` — requires a real booking in a real state — gets **durable rows**,
-     deduplicated per `(booking_id, principal, reason)` per window: the first N are
+     deduplicated per `(booking_id, principal, reason)` per window
+     *[superseded by the slice-E amendment above: the key is
+     `(booking_id, driver_kind, driver_detail, reason, principal, window_start_ms)` —
+     the original could not be formed at the fact or system-event doors]*: the first N are
      recorded, further identical refusals increment a suppressed-count. Identical retries
      are compressible precisely because they are identical: the rows carry the *what*, the
      counter carries the *how many*. Nothing forensic is lost.
-   - Denial writes may be **asynchronous and off the request path**. A lost denial record
-     strands nothing — no state changed, no recovery waits on it — so it does not need the
-     commit-grade durability that effect intents need. This is deliberate tiering of
-     durability by consequence, not corner-cutting.
+   - Denial writes may be **asynchronous and off the request path**
+     *[permission declined in the slice-E amendment above: the write is a synchronous
+     upsert against the separate store, after the answer is computed]*. A lost denial
+     record strands nothing — no state changed, no recovery waits on it — so it does not
+     need the commit-grade durability that effect intents need. This is deliberate
+     tiering of durability by consequence, not corner-cutting.
 3. **The boundary's answer is never rate-limited.** Classification is a pure function;
    request 501 receives the same deterministic `Denied` as request 1, at match-arm cost.
    Only the audit trail's appetite for identical rows saturates. A boundary whose answers
@@ -947,3 +985,156 @@ longer be true of anything but the fixture. The property needs a stated owner.
 **Target hardware now.** Nothing in the POC needs it, no requirement asks for it, and
 building a synthesis path for a booking system would be the clearest possible case of
 solving a problem nobody has.
+
+## ADR-019 — Giving up is a pursuit decision, not a state and not an outcome
+
+Decided 2026-08-24 with the project owner, during slice E's planning. This amends the
+`reconciliation_failed` reachability argument in ADR-012 and supersedes the `NeedsHuman`
+transition drawn in spec §7 (three lines of its ASCII diagram — the spec names `NeedsHuman` in
+no invariant, no acceptance test, and no Definition-of-Done item).
+
+### Context: the state that ate the reason
+
+When reconciliation exhausts its retry budget, the design to date moved the booking to
+`BookingState::NeedsHuman` and cleared `active_effect`. Three review rounds against slice E's
+plan established what that costs, concretely:
+
+- `NeedsHuman` is a unit struct with **zero outbound edges across all three doors** — 56 cells,
+  not one arrow — and no fields. It cannot say *why* a human is needed, cannot say *which effect*
+  it gave up on, and cannot say *which state* it interrupted. A late `BookingExists` from
+  `BookingInProgress` means `Booked`; the same fact from `CancellationRequested` means "now
+  cancel it". After the move to `NeedsHuman` those are indistinguishable, so a late fact either
+  gets discarded (the booking is stranded while the council holds a live room) or lands on the
+  wrong side of a cancellation the user already made.
+- No finite lease can rescue this with concurrency control: a reconciler can send a request,
+  lose its lease, **die**, and the request still lands at the council. Whatever design exists
+  must therefore be correct when authoritative facts arrive *after* someone gave up.
+
+By ADR-018's own rule — promote data to a state when it changes **which behaviours exist** —
+`NeedsHuman` is not a state today, and the accurate form of the argument matters: it is not that
+the menus involved are empty (`BookingInProgress` has a deliberately pending `Cancel` cell that
+slice F opens, so they are not), it is that **escalation changes no menu.** Every behaviour an
+in-flight state has before giving up, it must still have after — a user may cancel a booking we
+are unsure about — and `NeedsHuman` offered nothing those states lack. A promotion that changes
+no behaviour is a label wearing a state's costume, and this one's costume destroyed information.
+
+### Decision
+
+**1. Exhaustion does not move the booking.** The state stays `BookingInProgress`,
+`CancellationRequested` or `CancellingBooking`, and `active_effect` stays set — because that is
+what is true. The council may well hold the booking; asserting anything else is the overclaim
+this project exists to refuse. A late authoritative fact then lands through the **existing**
+fact-door arms, whose per-state meanings are exactly the distinctions `NeedsHuman` erased.
+
+**2. Exhaustion is recorded on the effect intent, on its own axis.** Not as an
+`EffectStatus`. The status column's other values are preparation (`Prepared`), our own
+ambiguity (`Unknown`), or provider determinations (`Confirmed`, `Rejected`, `Absent`) —
+`Abandoned` was the one value that was a fact about *us*, and slice C2 already spent a review
+round keeping it from being confused with `Absent`. The confusion is structural: one column,
+two provenances. So the pursuit facts get their own columns on `effect_intents`:
+
+```text
+attempts_started    INTEGER   calls begun (bounds the loop across crashes)
+attempts_finished   INTEGER   calls that returned control, answer or not
+next_attempt_after_ms INTEGER when the reconciler may ask again
+escalated_at_ms     INTEGER   NULL until we gave up
+escalation_attempts INTEGER   the count at the moment we gave up
+```
+
+The status stays `Unknown` — which is the truth, and which is what keeps the intent
+finalisable through the ordinary path when the answer eventually arrives. **No store guard is
+weakened**: `finalize_effect`'s `EffectStillActive` gate, the terminal-contradiction check and
+`Booking::coherent` all stand exactly as they are, because nothing about this write goes near
+them. `EffectStatus::Abandoned` is removed — not because the remaining column is a pure
+provenance partition (`Unknown` is ours too: a knowledge state), but because `Abandoned` was a
+*decision* wearing an outcome's terminality, and its terminality is what refused the late fact.
+Statuses describe what is known; decisions about pursuit live on the pursuit axis.
+
+**3. Giving up means chasing slowly, not never asking again.** Escalation pushes
+`next_attempt_after_ms` far out (hours, not seconds) and flags the intent for a human. The
+asking never stops, because the *exit and the stop condition must not be the same query*: the
+council is pull-only, so a fact only ever arrives because something performed a lookup. A
+design in which abandonment silenced the reconciler would replace an ending with a promise its
+own stop condition guarantees is never kept.
+
+ADR-016 is what makes this converge rather than spin: past the effect's deadline, the first
+lookup that reaches the council gets a definitive answer — `BookingExists` or a tombstoned
+`DefinitivelyAbsent` — and either one finalises the intent through the existing arms. Every
+story ends the moment the council is reachable again. The only story that never ends is a
+council that is unreachable forever, and no design ends that one without asserting something
+nobody established.
+
+**4. Escalation touches only the intent row.** No booking commit, no version bump, no
+`audit_events` row. The marker columns are the durable record, and they are queryable:
+*"escalated and unresolved"* is one indexed predicate, which is the human queue. This also
+makes escalation free of the aggregate's compare-and-set — a repeated escalation cannot starve
+a late fact's commit by churning the version, because it does not touch the version.
+
+The write is conditional (`WHERE escalated_at_ms IS NULL AND status IN ('Prepared','Unknown')`),
+so it is once-only and a lost race against a settling fact is a no-op rather than an error.
+
+**5. The system-event door stays, and gains an honest range.** The domain still classifies
+`ReconciliationExhausted` — is this state waiting on this effect, is the aggregate coherent —
+because that is a domain question (ADR-012's provenance argument survives untouched). What
+changes is the answer's shape: the door returns *"record this against the effect"* rather than
+a `TransitionPlan`, because `TransitionPlan`'s two variants both carry a next state and the
+truthful next state is "none". A plan type that must lie to say "nothing moves" is the wrong
+type. This follows FactResolution's precedent: when a door's range grew, the range got its own
+type rather than a bolted-on variant every other door must refuse.
+
+**6. The human queue is a question queue, not an ownership ledger.** A booking appears in it
+because a question needs a person (*"what happened to this effect?"*) and leaves it when the
+question is answered — including when a late fact answers it and automation resumes. In M4
+nobody is notified, because no human channel exists until **M6** (not M5 — an earlier draft of
+this decision misdated it, and the correction matters because the whole "promote it later"
+argument hangs on when a human can actually act).
+
+**7. `BookingState::NeedsHuman` is retained, unreachable, and conditionally disposable.** It is
+kept only until the human-behaviour set is designed. ADR-018's heuristic predicts promotion
+*only if* escalation changes which behaviours exist — and if M6/M7's human actions turn out to
+attach to *any* in-flight booking rather than only to given-up ones (the likelier design), the
+menus never differ, the promotion never arrives, and the variant is deleted rather than
+promoted. Its empty menu must not be read through ADR-018's collapsing rule as "merge it into
+`Cancelled`" — both menus are empty, but that rule is for live states, and conflating "we do
+not know" with "it is cancelled" is the exact confusion `Abandoned`/`Absent` already refused.
+
+### What this must never be read as
+
+The escalation reason is a fact about **our accounting** and nothing else. Its vocabulary is
+"N attempts produced no answer" — never "the council is gone", never "the deadline passed",
+never anything that could invite a reader (or a future match arm) to treat abandonment as
+absence. Only the council determines absence (ADR-016 §2), and the entire point of keeping the
+booking in-flight is that we are *still waiting to be told*.
+
+### What it costs
+
+**An in-flight state can now be old.** Before, `BookingInProgress` implied active pursuit;
+now it may be hours old with a marker. Queries that need the difference have it — the marker —
+but the state name alone no longer carries recency, and anything that assumed it did is wrong.
+
+**The audit trail thins at the aggregate level.** A booking whose effect was escalated shows
+no aggregate event for it; the record lives on the intent row. Answering "what happened to
+BKG-1001" requires the join. Accepted deliberately: the alternative was a version-bumping
+no-op commit whose audit row could name neither the effect nor the reason.
+
+**Slice F must respect the marker.** `BookingInProgress + Cancel → CancellationRequested`
+(F's cell) will be proposable on an escalated booking. That is correct — a user may cancel a
+booking we are unsure about — but F's cancellation handling inherits an intent being chased
+slowly, and must not assume the cadence.
+
+### Alternatives rejected
+
+**Keep `NeedsHuman` and make it remember** (effect id, originating state, reason). Rejected:
+a state carrying a copy of the state it came from is one fact in two places, the defect this
+project has now caught eight times, and every recovery path would need to re-derive which
+story it interrupted from stored copies rather than from the state itself.
+
+**`EffectStatus::Abandoned` as the marker.** Rejected as unwritable, proven against the real
+store: `finalize_effect` refuses any write whose aggregate still names the effect
+(`EffectStillActive`), and a terminal `Abandoned` makes the late `BookingExists` — the
+decision's whole point — die as `ContradictoryFinalisation`. Making `Abandoned` non-terminal
+instead would split `is_terminal` into two meanings and weaken the one predicate the
+contradiction check depends on.
+
+**Stop asking after giving up.** Rejected: the exit and the stop condition become the same
+query, and the design's only exit is an event it has just guaranteed will never be produced.

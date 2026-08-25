@@ -32,6 +32,17 @@ pub trait Clock: Send + Sync + fmt::Debug {
     fn now_ms(&self) -> i64;
 }
 
+/// A clock that can be moved — the pause driver's requirement.
+///
+/// Separate from [`Clock`] deliberately: the registry needs only to read, and a
+/// driver holding a read-only handle could acknowledge a `SETCLOCK` it has no
+/// way to apply. The driver is constructed with the *same* handle the registry
+/// reads, so a clock command and the deadline comparison after the pause cannot
+/// disagree — there is no second source of time to reconcile.
+pub trait SettableClock: Clock {
+    fn set(&self, now_ms: i64);
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
@@ -75,5 +86,11 @@ impl TestClock {
 impl Clock for TestClock {
     fn now_ms(&self) -> i64 {
         self.now_ms.load(Ordering::SeqCst)
+    }
+}
+
+impl SettableClock for TestClock {
+    fn set(&self, now_ms: i64) {
+        Self::set(self, now_ms);
     }
 }

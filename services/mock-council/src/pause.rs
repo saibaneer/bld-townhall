@@ -31,7 +31,7 @@
 use async_trait::async_trait;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PausePoint {
     /// Inside the write transaction, after the writer lock is held and before the
     /// deadline is read.
@@ -40,6 +40,24 @@ pub enum PausePoint {
     /// deadline. A council that checked expiry on arrival cannot survive it: its
     /// check already passed, so it writes anyway.
     BeforeExpiryWrite,
+    /// Before a resolve opens its transaction — so before it contends for the
+    /// writer lock.
+    ///
+    /// A test that wants "a resolve blocked on a create's lock" needs to know
+    /// the resolve is *positioned* before releasing anything; a pause after the
+    /// lock attempt would deadlock (the lock is held by the paused create), and
+    /// no pause at all would leave positioning to the scheduler.
+    BeforeResolveLock,
+    /// Once a resolve *holds* the writer lock.
+    ///
+    /// The other half of the contention observation: this arriving only after
+    /// the competing create's release is what proves the resolve actually
+    /// blocked, rather than never being scheduled until the create was done.
+    AfterResolveLock,
+    /// Immediately before the response body is written to the socket, on every
+    /// path — including replays and `NotYetVisible`, which never reach a
+    /// settlement commit and would otherwise be unpositionable.
+    BeforeReply,
     /// After the terminal row is written and before `COMMIT`.
     ///
     /// Killed here, nothing must be discoverable — no absence answered, no
@@ -53,10 +71,31 @@ pub enum PausePoint {
     AfterSettleCommit,
 }
 
+impl PausePoint {
+    /// Parse the wire spelling. The IPC driver reads these from a parent's
+    /// configuration line, and an unknown spelling must be a startup error, not
+    /// a silently ignored pause.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "before_expiry_write" => Some(Self::BeforeExpiryWrite),
+            "before_resolve_lock" => Some(Self::BeforeResolveLock),
+            "after_resolve_lock" => Some(Self::AfterResolveLock),
+            "before_reply" => Some(Self::BeforeReply),
+            "before_settle_commit" => Some(Self::BeforeSettleCommit),
+            "after_settle_commit" => Some(Self::AfterSettleCommit),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for PausePoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::BeforeExpiryWrite => "before_expiry_write",
+            Self::BeforeResolveLock => "before_resolve_lock",
+            Self::AfterResolveLock => "after_resolve_lock",
+            Self::BeforeReply => "before_reply",
             Self::BeforeSettleCommit => "before_settle_commit",
             Self::AfterSettleCommit => "after_settle_commit",
         };

@@ -215,9 +215,12 @@ budget. It becomes:
 
 Canonical definition in ADR-012.
 
-M4 builds this door with exactly that one variant. Without it `NeedsHuman` is unreachable
-and an exhausted reconciliation would sit in-progress forever. Deriving the event from
-durable retry/deadline accounting — not from an in-memory counter — is part of the work.
+M4 builds this door with exactly that one variant, and deriving the event from durable
+retry/deadline accounting — not from an in-memory counter — is part of the work. Per ADR-019 the
+door records a pursuit decision on the effect rather than moving the booking: an exhausted
+reconciliation deliberately stays in-progress, chased at a long cadence, and a late authoritative
+fact settles it through the ordinary fact-door arms. `NeedsHuman` is unreachable until the
+milestone that gives a human something to do (M6 at the earliest).
 
 ### `Reconcile` leaves the proposal vocabulary
 
@@ -664,7 +667,15 @@ M4 is primarily a recovery milestone. Add deterministic tests for:
     `Cancelled` while the intent could still be committed;
 15. **accepted before expiry, commit paused until after expiry, lookup concurrent with it** —
     this is the test that distinguishes commit-time expiry from receipt-time expiry, and a
-    council doing the latter must fail it;
+    council doing the latter must fail it. *Scope note (slice E): the commit-time-vs-receipt-time
+    half runs against the real process; the concurrent-lookup half is structurally unrunnable
+    there — the paused create sits inside the write transaction holding the database's one
+    writer lock, and a resolve is itself a settling write that queues behind it (the M13
+    crash-matrix test's header records the deadlock the first attempt produced). What
+    the concurrent lookup would prove — nothing is discoverable before the settlement commits —
+    is proven in-process from a second connection at the same pause point
+    (`nothing_is_discoverable_before_the_settlement_commits`), where the pause is a fake that
+    holds no lock;*
 16. **BLD clock deliberately ahead of the council's** — we must still not manufacture
     absence, because we never evaluate the deadline ourselves;
 17. **post-expiry `EffectAbsent` loses a CAS, is re-applied, while a competing request was

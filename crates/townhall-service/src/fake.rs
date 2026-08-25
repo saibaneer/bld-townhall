@@ -52,6 +52,11 @@ pub enum Script {
     RefuseTemporarily(&'static str),
     /// Answer nothing at all. Neither success nor failure.
     GoQuiet(&'static str),
+    /// Do the work — the booking is created, exactly as an honest call would —
+    /// and then answer nothing. The dropped-response scenario: the council
+    /// committed, the network ate the answer, and only a later lookup under the
+    /// same identity can discover what happened.
+    SucceedThenGoQuiet(&'static str),
     /// Return a response that cannot be attributed to the council.
     Forge,
 }
@@ -182,6 +187,68 @@ impl Capability<BookingEffect> for ObservedCouncil {
 }
 
 #[async_trait]
+impl crate::EffectResolver<RawResponse> for FakeCouncil {
+    /// Ask what became of an identity. The fake's honest answers only: a created
+    /// booking or cancellation is returned; anything else is `Unknown`, because
+    /// this fake deliberately does not enforce expiry and therefore can never
+    /// determine absence (see the module header). The script is consulted first,
+    /// so a test can make the lookup itself misbehave.
+    async fn resolve(
+        &self,
+        attempt: &EffectAttempt,
+        _kind: townhall_domain::OperationKind,
+    ) -> Result<RawResponse, Unknown> {
+        let mut inner = self.lock();
+
+        let step = if inner.script.is_empty() {
+            Script::Succeed
+        } else {
+            inner.script.remove(0)
+        };
+
+        let attested = step != Script::Forge;
+        let id = &attempt.id;
+        let body = match step {
+            Script::GoQuiet(detail) | Script::SucceedThenGoQuiet(detail) => {
+                return Err(Unknown::new(BoundedString::truncating(detail)));
+            }
+            Script::RefusePermanently(reason) => RawBody::RefusedPermanently { reason },
+            Script::RefuseTemporarily(reason) => RawBody::RefusedForNow { reason },
+            Script::Succeed | Script::Forge => {
+                if let Some(reference) = inner.cancelled.get(id.as_str()) {
+                    RawBody::Cancelled {
+                        booking_ref: reference.clone(),
+                    }
+                } else if let Some(reference) = inner.created.get(id.as_str()) {
+                    // The fake keeps no catalogue, so the canonical facts echo
+                    // the fixture's; the real council derives them (slice D).
+                    RawBody::Created {
+                        booking_ref: reference.clone(),
+                        principal: PrincipalId::new("lucy"),
+                        venue_id: "TH-A".to_owned(),
+                        slot_id: "SLOT-A".to_owned(),
+                        attendees: 20,
+                        fee: Money::from_pence(4_500),
+                    }
+                } else {
+                    // Never seen, deadline unenforced: the only honest answer is
+                    // no answer.
+                    return Err(Unknown::new(BoundedString::truncating(
+                        "the fake council has nothing for this identity",
+                    )));
+                }
+            }
+        };
+
+        Ok(RawResponse {
+            effect_intent_id: id.clone(),
+            body,
+            attested,
+        })
+    }
+}
+
+#[async_trait]
 impl Capability<BookingEffect> for FakeCouncil {
     type Raw = RawResponse;
 
@@ -207,6 +274,21 @@ impl Capability<BookingEffect> for FakeCouncil {
         let attested = step != Script::Forge;
         let body = match step {
             Script::GoQuiet(detail) => {
+                return Err(Unknown::new(BoundedString::truncating(detail)));
+            }
+            Script::SucceedThenGoQuiet(detail) => {
+                // The work happens — same idempotent create as Succeed — and the
+                // answer does not.
+                if let BookingEffect::Book { .. } = effect {
+                    if !inner.created.contains_key(id.as_str()) {
+                        inner.next_reference += 1;
+                        let minted = CouncilBookingRef::new(format!(
+                            "TH-{:05}",
+                            90_000 + inner.next_reference
+                        ));
+                        inner.created.insert(id.as_str().to_owned(), minted);
+                    }
+                }
                 return Err(Unknown::new(BoundedString::truncating(detail)));
             }
             Script::RefusePermanently(reason) => RawBody::RefusedPermanently { reason },

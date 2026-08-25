@@ -49,8 +49,8 @@ use townhall_domain::{
     VerifiedAvailability, VerifiedProviderFact,
 };
 use townhall_store::{
-    BookingRepository, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError, TransitionAudit,
-    derive_effect_intent_id,
+    BookingRepository, ClaimedEffect, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError,
+    TransitionAudit, derive_effect_intent_id,
 };
 
 pub mod fake;
@@ -120,6 +120,24 @@ pub enum ServiceError {
 /// The turn's answer, as a caller sees it.
 pub type Turn = BoundaryOutcome<BookingAggregate, BookingError>;
 
+/// How long Phase B may hold an intent while it calls out.
+const PHASE_B_LEASE_MS: i64 = 30_000;
+
+/// How soon after an inconclusive call the reconciler may ask again.
+const RETRY_CADENCE_MS: i64 = 5_000;
+
+/// How soon after ESCALATION the reconciler may ask again: hours, not seconds.
+/// Giving up changes the cadence, never the asking — the council is pull-only,
+/// so an exit of "a late fact settles it" is only real if lookups keep
+/// happening (ADR-019 §3).
+const ESCALATED_CADENCE_MS: i64 = townhall_store::MAX_CADENCE_MS;
+
+/// How many started calls may accumulate before a turn escalates instead of
+/// asking again. Conservative — a call that died mid-flight still counts —
+/// and cheap to be conservative about, because under ADR-019 an early
+/// escalation costs a longer cadence, not a stranding.
+const ATTEMPT_BUDGET: u32 = 5;
+
 /// Sequences the three phases around one proposal.
 pub struct Coordinator<R, C, V, A> {
     repository: Arc<R>,
@@ -128,6 +146,10 @@ pub struct Coordinator<R, C, V, A> {
     availability: Arc<A>,
     kernel: Kernel,
     domain: TownHallDomain,
+    /// The denial log, when one is wired. One field serving all three doors, so
+    /// "wire one door and call ADR-017 done" — the failure review predicted —
+    /// is not expressible: either every refusal records, or none do.
+    denials: Option<Arc<townhall_store::denials::DenialLog>>,
     /// How many times Phase C may reload and re-classify after losing a
     /// compare-and-set.
     ///
@@ -158,8 +180,17 @@ where
             availability,
             kernel: Kernel,
             domain: TownHallDomain,
+            denials: None,
             attempts: 3,
         }
+    }
+
+    /// Wire the denial log. Every refusal at every door then leaves a trace:
+    /// `Denied` a durable row, `Undefined` an in-memory count (ADR-017).
+    #[must_use]
+    pub fn with_denial_log(mut self, log: Arc<townhall_store::denials::DenialLog>) -> Self {
+        self.denials = Some(log);
+        self
     }
 
     /// Override the Phase C attempt budget. For tests that want contention to be
@@ -198,10 +229,31 @@ where
             .await;
 
         match resolved {
-            // Nothing ran and nothing was touched. ADR-017's recording of these
-            // is a separate concern and is not wired here yet.
-            Resolution::Undefined => Ok(BoundaryOutcome::Undefined),
-            Resolution::Denied(error) => Ok(BoundaryOutcome::Denied(error)),
+            // Nothing ran and nothing was touched — counted, never rowed:
+            // `Undefined` is constructible from pure garbage, and a durable row
+            // per garbage request is a disk-filling attack (ADR-017).
+            Resolution::Undefined => {
+                if let Some(log) = &self.denials {
+                    log.note_undefined(booking.state.name(), audit.driver_name());
+                }
+                Ok(BoundaryOutcome::Undefined)
+            }
+            Resolution::Denied(error) => {
+                // The answer is computed first and returned regardless: the
+                // recording is an audit fact, and a boundary whose answers
+                // depended on its logbook would no longer be deterministic.
+                if let Some(log) = &self.denials {
+                    log.record_denied(townhall_store::denials::Denial {
+                        booking_id: id.to_string(),
+                        driver_kind: audit.provenance(),
+                        driver_detail: audit.driver_name(),
+                        reason: error.name(),
+                        principal: authority.principal.to_string(),
+                    })
+                    .await;
+                }
+                Ok(BoundaryOutcome::Denied(error))
+            }
 
             Resolution::Ready(TransitionPlan::Local { next_state }) => {
                 let committed = self
@@ -229,72 +281,6 @@ where
         fact: Verified<VerifiedProviderFact>,
     ) -> Result<Turn, ServiceError> {
         self.settle(id, &fact).await
-    }
-
-    /// Carry a runtime determination into the boundary.
-    ///
-    /// # Errors
-    /// [`ServiceError::Store`] for a persistence failure.
-    pub async fn record(&self, id: &BookingId, event: SystemEvent) -> Result<Turn, ServiceError> {
-        let aggregate = self.repository.load(id).await?;
-        let booking = Booking::from(&aggregate);
-        let audit = TransitionAudit::driven_by(&event);
-        // Read before classifying: the effect this event is about is the one the
-        // state is waiting on, and the domain refuses the event outright if there
-        // is none.
-        let in_flight = booking.active_effect.clone();
-
-        match self
-            .kernel
-            .resolve_system_event(&self.domain, &booking, event)
-            .await
-        {
-            Resolution::Undefined => Ok(BoundaryOutcome::Undefined),
-            Resolution::Denied(error) => Ok(BoundaryOutcome::Denied(error)),
-            Resolution::Ready(TransitionPlan::Local { next_state }) => {
-                // Giving up finalises the effect it gave up on: the intent must
-                // stop looking live, or a reconciler would keep chasing what this
-                // event just abandoned.
-                let Some(effect) = in_flight else {
-                    return Err(ServiceError::UnexpectedPlan {
-                        reason: "a system event moved a state with no effect in flight",
-                    });
-                };
-                let finalised = self
-                    .repository
-                    .finalize_effect(FinalizeEffect {
-                        booking_id: id.clone(),
-                        source_version: aggregate.version,
-                        effect_intent_id: effect,
-                        // `Abandoned`, never `Absent`. Review caught this and it
-                        // was a real overclaim: `Absent` is a provider
-                        // determination, admissible only from a definitive-absence
-                        // response that tombstones the intent (ADR-016). Exhaustion
-                        // establishes nothing about the council — we stopped
-                        // asking, and it may well hold a live booking. Recording
-                        // `Absent` would also make a later `BookingExists` for that
-                        // identity look contradictory, when it is exactly the news
-                        // the human is waiting for.
-                        status: townhall_domain::EffectStatus::Abandoned,
-                        provider_reference: None,
-                        outcome_detail: Some(bld_types::BoundedString::truncating(
-                            "reconciliation exhausted; escalated for human resolution",
-                        )),
-                        next: next_state,
-                        audit,
-                    })
-                    .await?;
-                Ok(BoundaryOutcome::Committed(finalised.aggregate))
-            }
-            // A system event never plans an external effect. Refused by name
-            // rather than guessed at, so a future edit that changed that would
-            // fail loudly here instead of quietly reaching outside.
-            Resolution::Ready(TransitionPlan::ExternalEffect { .. }) => {
-                Err(ServiceError::UnexpectedPlan {
-                    reason: "a system event asked to reach outside the boundary",
-                })
-            }
-        }
     }
 
     /// Assemble what the proposal door needs and the booking cannot know.
@@ -357,6 +343,32 @@ where
 
         let effect_id = prepared.intent.effect_intent_id.clone();
 
+        // The coordinator is a WORKER, not an owner: it claims the same lease a
+        // reconciler would, holds it across the call and Phase C, and releases it
+        // after — otherwise it is an unfenced concurrent writer racing its own
+        // reconciler, which can spend the budget under it and escalate an intent
+        // whose very first call is still in flight (review round 2).
+        let Some(claimed) = self
+            .repository
+            .claim_effect(&effect_id, PHASE_B_LEASE_MS)
+            .await?
+        else {
+            // Someone else already owns this turn. The intent is durable and
+            // whoever holds the lease is doing exactly what we would do.
+            return Ok(BoundaryOutcome::Unresolved);
+        };
+
+        // The attempt is durable BEFORE the wire (ADR-014 one level in): the row
+        // moves Prepared -> Unknown here, so `Prepared` keeps meaning "never
+        // attempted" and a crash mid-call still spent budget.
+        if !self
+            .repository
+            .note_attempt_started(&effect_id, claimed.token)
+            .await?
+        {
+            return Ok(BoundaryOutcome::Unresolved);
+        }
+
         // Both halves come off the *persisted* intent, and this is the only place
         // an attempt is built. The council binds `expires_at_ms` on first sight
         // and treats it as immutable, so a capability that sourced its own would
@@ -368,23 +380,34 @@ where
         };
 
         // PHASE B — outside, with no transaction open.
-        let raw = match self.capability.execute(&effect, &attempt).await {
-            Ok(raw) => raw,
+        let outcome = match self.capability.execute(&effect, &attempt).await {
             // Neither success nor failure. The aggregate stays in flight and
             // reconciliation resolves it; treating this as failure would return
             // the booking to a re-proposable state while the council may hold a
             // live one.
-            Err(Unknown { .. }) => return Ok(BoundaryOutcome::Unresolved),
+            Err(Unknown { .. }) => Ok(BoundaryOutcome::Unresolved),
+            Ok(raw) => match self.verifier.verify(raw) {
+                // Provenance is the verifier's to establish. A response this
+                // crate cannot have verified is not evidence.
+                Err(_) => Ok(BoundaryOutcome::Unresolved),
+                Ok(fact) => self.settle(id, &fact).await,
+            },
         };
 
-        // Provenance is the verifier's to establish. A response this crate cannot
-        // have verified is not evidence, and a coordinator that concluded anything
-        // from it would be asserting provenance it does not have.
-        let Ok(fact) = self.verifier.verify(raw) else {
-            return Ok(BoundaryOutcome::Unresolved);
-        };
+        // The call returned control — answer or not — and the turn is over.
+        // Recorded and released even on the unresolved paths, so the reconciler
+        // may pick the intent up at its ordinary cadence rather than waiting out
+        // a dead lease.
+        let _ = self
+            .repository
+            .note_attempt_finished(&effect_id, claimed.token, RETRY_CADENCE_MS)
+            .await;
+        let _ = self
+            .repository
+            .release_lease(&effect_id, claimed.token)
+            .await;
 
-        self.settle(id, &fact).await
+        outcome
     }
 
     /// PHASE C — classify the evidence against freshly loaded state, and commit.
@@ -409,6 +432,7 @@ where
 
             let effect_id = fact.get().effect_intent_id().clone();
             let intent = self.repository.load_effect(&effect_id).await?;
+            let plan_for_denials = intent.canonical_plan.clone();
 
             let successor_kind =
                 TownHallDomain::fact_intended_effect_kind(&booking.state, fact.get());
@@ -424,8 +448,32 @@ where
                 .await;
 
             let attempt = match classified {
-                FactResolution::Undefined => return Ok(BoundaryOutcome::Undefined),
-                FactResolution::Denied(error) => return Ok(BoundaryOutcome::Denied(error)),
+                FactResolution::Undefined => {
+                    if let Some(log) = &self.denials {
+                        log.note_undefined(booking.state.name(), fact.get().name());
+                    }
+                    return Ok(BoundaryOutcome::Undefined);
+                }
+                FactResolution::Denied(error) => {
+                    // The fact door's refusals include the most consequential
+                    // ones the system can produce — DuplicateProviderEffect is
+                    // one identity resolving to two council bookings — and the
+                    // review that shaped ADR-017's amendment found the original
+                    // design recording none of them. The principal is derived
+                    // where one exists: the fact's own, else the persisted
+                    // plan's, else explicitly unattributed.
+                    if let Some(log) = &self.denials {
+                        log.record_denied(townhall_store::denials::Denial {
+                            booking_id: id.to_string(),
+                            driver_kind: bld_types::Provenance::Fact,
+                            driver_detail: fact.get().name(),
+                            reason: error.name(),
+                            principal: principal_of_fact(fact.get(), &plan_for_denials),
+                        })
+                        .await;
+                    }
+                    return Ok(BoundaryOutcome::Denied(error));
+                }
                 // Authoritative state already reflects the fact. Nothing to
                 // write, and that is success — a reconciler re-applies facts by
                 // design.
@@ -532,6 +580,23 @@ impl Committed {
     }
 }
 
+/// Who was refused at the fact or system-event door, where anyone knows.
+///
+/// The fact's own principal where it carries one (`BookingExists` does), else
+/// the persisted plan's (`Book` carries one), else the empty string — which the
+/// amended ADR-017 defines as **explicitly unattributed**: "someone was refused
+/// and no principal is recoverable", not "unknown". A cancellation plan carries
+/// no principal today; persisting the cancelling authority is slice F's.
+fn principal_of_fact(fact: &VerifiedProviderFact, plan: &BookingEffect) -> String {
+    if let VerifiedProviderFact::BookingExists { principal, .. } = fact {
+        return principal.to_string();
+    }
+    if let BookingEffect::Book { principal, .. } = plan {
+        return principal.to_string();
+    }
+    String::new()
+}
+
 /// The effect identity a coordinator would derive for a booking at `version`.
 ///
 /// Exposed so tests and a reconciler can name an effect without reimplementing
@@ -543,4 +608,230 @@ pub fn effect_identity_for(
     version: u64,
 ) -> EffectIntentId {
     derive_effect_intent_id(id, kind, version)
+}
+
+// ---------------------------------------------------------------- reconciliation
+
+/// The whole reconciliation turn, behind a surface with nothing dangerous on it.
+///
+/// # Why the loop is given this and nothing else
+///
+/// Three designs died in review before this one. A reconciler holding
+/// `BookingRepository` can call `finalize_effect` with a status it invented — the
+/// forbidden `BookingInProgress → AwaitingBooking` edge with no fact and no
+/// domain. One holding a `Coordinator` is one public accessor from the same
+/// place. One that verifies for itself must name `bld-kernel`, and can then mint
+/// `Verified<EffectAbsent>` out of nothing — converting *our silence* into *the
+/// council's determination*, which is the milestone's defect inside the component
+/// built to prevent it.
+///
+/// So the loop receives [`Reconciliation::due`] and [`Reconciliation::attend`],
+/// and **nothing this type returns can be used to assert anything**: identities
+/// in, outcomes out. The asking, the verifying, the classifying, the committing
+/// and the giving-up all happen inside, under a lease token the caller never
+/// sees. Per ADR-012, this is a surface guarantee rather than a compiler one —
+/// and it is stated at exactly that strength.
+pub struct Reconciliation<R, C, V, A, L> {
+    coordinator: Coordinator<R, C, V, A>,
+    resolver: Arc<L>,
+}
+
+/// What one reconciliation turn amounted to.
+///
+/// Deliberately coarse. `Settled` carries no aggregate, no fact and no state
+/// name: a caller with an outcome can log it and loop, and nothing more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attended {
+    /// Not eligible right now: leased elsewhere, not yet due, or already
+    /// settled. `attend` re-checks eligibility inside the claim, atomically —
+    /// calling it in a tight loop with a known id cannot pump the budget.
+    NotDue,
+    /// The council answered; the boundary classified and committed (or found
+    /// itself already converged — same thing from out here).
+    Settled,
+    /// No usable answer. The count advanced; the cadence decides when next.
+    StillUnknown { attempts_started: u32 },
+    /// This turn found the budget spent and recorded the escalation — the
+    /// booking did not move, and the chase continues at the long cadence
+    /// (ADR-019).
+    Escalated,
+}
+
+impl<R, C, V, A, L> Reconciliation<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    pub fn new(coordinator: Coordinator<R, C, V, A>, resolver: Arc<L>) -> Self {
+        Self {
+            coordinator,
+            resolver,
+        }
+    }
+
+    /// Identities due for attention, longest-neglected first. Identities only —
+    /// not intents, so the caller cannot read a canonical plan out of this and
+    /// build a fact shaped like it.
+    ///
+    /// # Errors
+    /// [`ServiceError::Store`] on a read failure.
+    pub async fn due(&self, limit: u32) -> Result<Vec<EffectIntentId>, ServiceError> {
+        Ok(self.coordinator.repository.due_effects(limit).await?)
+    }
+
+    /// One whole turn for one identity: claim, ask, verify, classify, commit —
+    /// or escalate, if this turn finds the budget already spent.
+    ///
+    /// # Errors
+    /// [`ServiceError::Store`] on a persistence failure mid-turn.
+    pub async fn attend(&self, id: &EffectIntentId) -> Result<Attended, ServiceError> {
+        let repository = &self.coordinator.repository;
+
+        // The claim IS the eligibility check, atomically — not `due`, which only
+        // suggests. `None` covers leased-elsewhere, not-yet-due and settled
+        // alike, and none of them advances any count.
+        let Some(claimed) = repository.claim_effect(id, PHASE_B_LEASE_MS).await? else {
+            return Ok(Attended::NotDue);
+        };
+
+        let turn = self.attend_claimed(id, &claimed).await;
+
+        // The lease is given back whatever happened — including on an error path,
+        // where leaving it to expire would stall the intent for the lease term
+        // for no one's benefit.
+        let _ = repository.release_lease(id, claimed.token).await;
+        turn
+    }
+
+    async fn attend_claimed(
+        &self,
+        id: &EffectIntentId,
+        claimed: &ClaimedEffect,
+    ) -> Result<Attended, ServiceError> {
+        let repository = &self.coordinator.repository;
+
+        // Budget spent? Then this turn escalates instead of asking — ONCE, and
+        // fenced: the write is conditional on the token, on `escalated_at_ms IS
+        // NULL`, and on the intent still being live, so a replay, a race with a
+        // settling fact, and a stale owner all collapse to a no-op.
+        if claimed.attempts_started >= ATTEMPT_BUDGET && !claimed.escalated {
+            return self.escalate(id, claimed).await;
+        }
+
+        // The attempt is durable before the wire — same discipline as Phase B.
+        if !repository.note_attempt_started(id, claimed.token).await? {
+            return Ok(Attended::NotDue);
+        }
+
+        let attempt = EffectAttempt {
+            id: id.clone(),
+            expires_at_ms: claimed.intent.expires_at_ms,
+        };
+        let asked = self
+            .resolver
+            .resolve(&attempt, claimed.intent.operation_kind)
+            .await;
+
+        let outcome = match asked {
+            Err(Unknown { .. }) => None,
+            Ok(raw) => self.coordinator.verifier.verify(raw).ok(),
+        };
+
+        let cadence = if claimed.escalated {
+            ESCALATED_CADENCE_MS
+        } else {
+            RETRY_CADENCE_MS
+        };
+        let _ = repository
+            .note_attempt_finished(id, claimed.token, cadence)
+            .await;
+
+        match outcome {
+            // The reconciler never interprets the fact — the coordinator's
+            // settle path asks the domain and commits, exactly as it would for
+            // a fact that arrived any other way.
+            Some(fact) => {
+                let booking_id = claimed.intent.booking_id.clone();
+                match self.coordinator.settle(&booking_id, &fact).await? {
+                    BoundaryOutcome::Committed(_) | BoundaryOutcome::Converged => {
+                        Ok(Attended::Settled)
+                    }
+                    // `Denied`/`Undefined` here mean the fact did not fit the
+                    // state — a wrong-kind answer, a stale fact. Nothing was
+                    // asserted, nothing committed; the intent stays live and
+                    // the cadence decides when to ask again.
+                    _ => Ok(Attended::StillUnknown {
+                        attempts_started: claimed.attempts_started + 1,
+                    }),
+                }
+            }
+            None => Ok(Attended::StillUnknown {
+                attempts_started: claimed.attempts_started + 1,
+            }),
+        }
+    }
+
+    /// Give up chasing at retry cadence — with the domain consulted first,
+    /// because only the domain can say whether exhaustion is even coherent at
+    /// this state (ADR-013). `Record` moves nothing: the write is a pursuit
+    /// marker on the intent, the count derived in the write itself, and the
+    /// booking stays exactly where it is (ADR-019).
+    async fn escalate(
+        &self,
+        id: &EffectIntentId,
+        claimed: &ClaimedEffect,
+    ) -> Result<Attended, ServiceError> {
+        let repository = &self.coordinator.repository;
+        let aggregate = repository.load(&claimed.intent.booking_id).await?;
+        let booking = Booking::from(&aggregate);
+
+        let event = SystemEvent::ReconciliationExhausted {
+            effect_intent_id: id.clone(),
+        };
+        match self
+            .coordinator
+            .kernel
+            .resolve_system_event(&self.coordinator.domain, &booking, event)
+            .await
+        {
+            bld_kernel::SystemEventResolution::Record => {
+                let wrote = repository
+                    .mark_escalated(id, claimed.token, ESCALATED_CADENCE_MS)
+                    .await?;
+                Ok(match wrote {
+                    townhall_store::EscalationWrite::Recorded => Attended::Escalated,
+                    townhall_store::EscalationWrite::Noop => Attended::NotDue,
+                })
+            }
+            // The aggregate is no longer waiting on this effect (or is
+            // incoherent, which is an operator matter below the domain). Nothing
+            // to escalate; nothing is written — but a refusal at this door is
+            // still a refusal, and it records like any other.
+            bld_kernel::SystemEventResolution::Denied(error) => {
+                if let Some(log) = &self.coordinator.denials {
+                    log.record_denied(townhall_store::denials::Denial {
+                        booking_id: claimed.intent.booking_id.to_string(),
+                        driver_kind: bld_types::Provenance::SystemEvent,
+                        driver_detail: "ReconciliationExhausted",
+                        reason: error.name(),
+                        principal: match &claimed.intent.canonical_plan {
+                            BookingEffect::Book { principal, .. } => principal.to_string(),
+                            BookingEffect::CancelBooking { .. } => String::new(),
+                        },
+                    })
+                    .await;
+                }
+                Ok(Attended::NotDue)
+            }
+            bld_kernel::SystemEventResolution::Undefined => {
+                if let Some(log) = &self.coordinator.denials {
+                    log.note_undefined(booking.state.name(), "ReconciliationExhausted");
+                }
+                Ok(Attended::NotDue)
+            }
+        }
+    }
 }

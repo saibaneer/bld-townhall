@@ -758,6 +758,7 @@ async fn exhaustion_marks_the_intent_and_a_late_fact_still_lands() {
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
     let before = h.repo.load(&id).await.expect("load");
+    let audit_before = h.repo.audit_events(&id).await.expect("audit").len();
 
     // Spend the rest of the budget through real reconciliation turns — scripted
     // no-answers, the store clock advanced past the cadence between turns, never
@@ -808,6 +809,21 @@ async fn exhaustion_marks_the_intent_and_a_late_fact_still_lands() {
         h.repo.escalated_unresolved(10).await.expect("queue"),
         vec![effect.clone()],
         "the human queue holds exactly this question"
+    );
+    assert_eq!(
+        h.repo.audit_events(&id).await.expect("audit").len(),
+        audit_before,
+        "escalation is a marker on the intent, never an audit event — the \
+         audit trail records the aggregate's story, and the aggregate did not move"
+    );
+
+    // Straight back for another turn: the escalated cadence holds. A second
+    // escalation cannot happen through this door (the once-only write is the
+    // store's own gate), and neither can an early re-ask.
+    assert_eq!(
+        h.reconciliation.attend(&effect).await.expect("attend"),
+        Attended::NotDue,
+        "escalated means hourly, and the hour is not up"
     );
 
     // The council finally answers — the ADR-019 payoff. The booking it created
@@ -1150,6 +1166,18 @@ async fn harness_with_denials() -> (Harness, Arc<townhall_store::denials::Denial
         Arc::new(FixedAvailability::new(facts())),
     )
     .with_denial_log(Arc::clone(&log));
+    // The reconciler's door refuses too (the system-event door), so its own
+    // coordinator carries the same logbook.
+    h.reconciliation = Reconciliation::new(
+        Coordinator::new(
+            Arc::clone(&h.repo),
+            Arc::clone(&h.council),
+            Arc::new(CouncilVerifier),
+            Arc::new(FixedAvailability::new(facts())),
+        )
+        .with_denial_log(Arc::clone(&log)),
+        Arc::clone(&h.council),
+    );
     (h, log)
 }
 
@@ -1320,4 +1348,245 @@ async fn a_fact_door_refusal_records_with_a_derived_principal() {
         rows[0].principal, "lucy",
         "derived from the persisted plan, since no one proposed anything"
     );
+}
+
+/// One identity, two provider references — duplication, corruption or broken
+/// idempotency, and never silent convergence (gate M6's named refusal). The
+/// booking is genuinely `Booked` when the second reference arrives, so an
+/// implementation that shrugs "already booked, close enough" fails here.
+#[tokio::test]
+async fn a_second_provider_reference_for_one_identity_is_refused_and_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-TWOREFS");
+    awaiting(&h, &id, requirements()).await;
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let booked = h.repo.load(&id).await.expect("load");
+    assert_eq!(booked.state.name(), "Booked");
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+
+    // A signed fact arrives claiming the SAME intent produced a DIFFERENT
+    // booking. Field-perfect otherwise — the reference is the lie.
+    let second_reference = Verified::assert_verified(VerifiedProviderFact::BookingExists {
+        effect_intent_id: effect,
+        booking_ref: CouncilBookingRef::new("TH-00001"),
+        venue_id: VenueId::new("TH-A"),
+        slot_id: SlotId::new("SLOT-A"),
+        attendees: 20,
+        fee: Money::from_pence(4_500),
+        principal: PrincipalId::new("lucy"),
+    });
+    let outcome = h
+        .coordinator
+        .observe(&id, second_reference)
+        .await
+        .expect("turn");
+    assert!(
+        matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::DuplicateProviderEffect)
+        ),
+        "one identity cannot have booked two rooms: {outcome:?}"
+    );
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "Fact");
+    assert_eq!(rows[0].driver_detail, "BookingExists");
+    assert_eq!(rows[0].reason, "DuplicateProviderEffect");
+    assert_eq!(rows[0].principal, "lucy");
+}
+
+/// The THIRD door records its refusals too. An exhausted chase for an effect
+/// the booking is not waiting on is `Denied(EffectMismatch)` by the domain —
+/// and that refusal lands in the logbook like any other, attributed from the
+/// stale intent's own persisted plan.
+#[tokio::test]
+async fn an_exhausted_chase_for_the_wrong_effect_is_denied_and_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-STALECHASE");
+    awaiting(&h, &id, requirements()).await;
+
+    // Lucy's booking is honestly in flight on its OWN effect...
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let live = in_flight_effect(&h, &id).await;
+
+    // ...and a STALE intent for the same booking sits in the store with its
+    // budget long spent — the leftover a crashed, older deployment could leave.
+    // Planted raw because no current door can mint it, which is the point: the
+    // reconciler will meet rows history wrote, not only rows this build writes.
+    let plan_json: String = sqlx::query_scalar(
+        "SELECT canonical_plan_json FROM effect_intents WHERE effect_intent_id = ?",
+    )
+    .bind(live.as_str())
+    .fetch_one(h.repo.pool())
+    .await
+    .expect("the live plan");
+    sqlx::query(
+        r"
+        INSERT INTO effect_intents (effect_intent_id, booking_id, operation_kind,
+                                    source_version, canonical_plan_json, status,
+                                    expires_at_ms, created_at_ms, updated_at_ms,
+                                    attempts_started, attempts_finished)
+        VALUES (?, ?, 'Book', 99, ?, 'Unknown', ?, 0, 0, 1000, 1000)
+        ",
+    )
+    .bind("EFF-STALE-CHASE")
+    .bind(id.to_string())
+    .bind(&plan_json)
+    .bind(i64::MAX / 2)
+    .execute(h.repo.pool())
+    .await
+    .expect("plant the stale intent");
+
+    let stale = EffectIntentId::new("EFF-STALE-CHASE");
+    let attended = h.reconciliation.attend(&stale).await.expect("attend");
+    assert_eq!(
+        attended,
+        Attended::NotDue,
+        "nothing to escalate: the booking is not waiting on this effect"
+    );
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "no marker was written — the domain said no, so the store wrote nothing"
+    );
+    let untouched = h.repo.load(&id).await.expect("load");
+    assert_eq!(untouched.state.name(), "BookingInProgress");
+    assert_eq!(untouched.active_effect, Some(live));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_kind, "SystemEvent");
+    assert_eq!(rows[0].driver_detail, "ReconciliationExhausted");
+    assert_eq!(rows[0].reason, "EffectMismatch");
+    assert_eq!(
+        rows[0].principal, "lucy",
+        "attributed from the stale intent's own persisted plan"
+    );
+}
+
+// ------------------------------------------------------------- lease visibility
+
+/// Gate M15: Phase B PARTICIPATES in leasing — observed, not narrated. While
+/// the coordinator's call is on the wire, a second connection must see the
+/// lease held, and a reconciler asked to attend the same intent must answer
+/// `NotDue` rather than racing the call. When the turn ends, the lease is gone.
+#[tokio::test]
+async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
+    let temp = TempDir::new().expect("temp dir");
+    let path = temp.path().join("townhall.sqlite");
+    let repo = Arc::new(SqliteBookingRepository::open(&path).await.expect("open"));
+    let council = Arc::new(FakeCouncil::new());
+
+    let observed_path = path.clone();
+    let seen: Arc<std::sync::Mutex<Option<(bool, Attended)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let seen_in_hook = Arc::clone(&seen);
+
+    let observer = Arc::new(ObservedCouncil::new(
+        Arc::clone(&council),
+        Arc::new(move |effect_id: &EffectIntentId| {
+            let path = observed_path.clone();
+            let effect_id = effect_id.clone();
+            let slot = Arc::clone(&seen_in_hook);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async move {
+                    let other = Arc::new(
+                        SqliteBookingRepository::open(&path)
+                            .await
+                            .expect("a second connection must open"),
+                    );
+                    // The lease, read from the row itself — the row is the
+                    // only witness the reconciler gets.
+                    let held: Option<i64> = sqlx::query_scalar(
+                        "SELECT lease_until_ms FROM effect_intents \
+                         WHERE effect_intent_id = ?",
+                    )
+                    .bind(effect_id.as_str())
+                    .fetch_one(other.pool())
+                    .await
+                    .expect("the intent row");
+                    // And the reconciler's own answer while the call is live.
+                    let bystander = Arc::new(FakeCouncil::new());
+                    let reconciliation = Reconciliation::new(
+                        Coordinator::new(
+                            Arc::clone(&other),
+                            Arc::clone(&bystander),
+                            Arc::new(CouncilVerifier),
+                            Arc::new(FixedAvailability::new(facts())),
+                        ),
+                        Arc::clone(&bystander),
+                    );
+                    let attended = reconciliation
+                        .attend(&effect_id)
+                        .await
+                        .expect("attend must not error");
+                    *slot.lock().expect("lock") = Some((held.is_some(), attended));
+                });
+            })
+            .join()
+            .expect("the observation must not panic");
+        }),
+    ));
+
+    let coordinator = Coordinator::new(
+        Arc::clone(&repo),
+        observer,
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    let id = BookingId::new("BKG-LEASED");
+    repo.create(NewBooking {
+        id: id.clone(),
+        requirements: requirements(),
+    })
+    .await
+    .expect("create");
+    for proposal in [select(), BookingProposal::VerifySlot] {
+        coordinator
+            .propose(&id, proposal, &authority())
+            .await
+            .expect("setup");
+    }
+    // The call itself goes quiet, so the turn ends unresolved — the lease's
+    // release must not depend on an answer arriving.
+    council.script([Script::GoQuiet("no answer")]);
+    coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+
+    let observation = seen.lock().expect("lock").clone();
+    assert_eq!(
+        observation,
+        Some((true, Attended::NotDue)),
+        "mid-call: the lease is held on the row, and the reconciler defers to it"
+    );
+
+    // The turn is over: the lease is given back, answer or no answer, so the
+    // reconciler owns the chase at its ordinary cadence rather than waiting
+    // out a dead owner.
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+    let released: Option<i64> =
+        sqlx::query_scalar("SELECT lease_until_ms FROM effect_intents WHERE effect_intent_id = ?")
+            .bind(effect.as_str())
+            .fetch_one(repo.pool())
+            .await
+            .expect("the intent row");
+    assert_eq!(released, None, "the lease does not outlive the turn");
 }

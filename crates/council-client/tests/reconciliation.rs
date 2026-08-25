@@ -367,6 +367,91 @@ async fn a_crash_after_the_councils_commit_adopts_rather_than_duplicates() {
     let healed = repo.load(&id).await.expect("load");
     assert_eq!(healed.state.name(), "Booked");
     assert_eq!(council_bookings(&world).await, 1, "adopted, not duplicated");
+
+    // Gate M1 — budget honesty across the crash. The dead process's attempt
+    // STARTED (durably, before the wire) and never finished; recovery's
+    // attempt did both. The columns must say exactly that: an implementation
+    // that only counts after the wire reads 1/1 here, and one that never
+    // writes `attempts_finished` reads 2/0.
+    let (started, finished) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT attempts_started, attempts_finished FROM effect_intents \
+         WHERE effect_intent_id = ?",
+    )
+    .bind(effect.as_str())
+    .fetch_one(repo.pool())
+    .await
+    .expect("the intent row");
+    assert_eq!(
+        (started, finished),
+        (2, 1),
+        "two conversations begun, one returned control — the crash is IN the ledger"
+    );
+}
+
+/// Test 7: the council is UNREACHABLE — not slow, not garbled; gone. An
+/// unreachable provider says NOTHING about whether the booking exists, so the
+/// workflow must stay in flight and keep asking — an implementation that maps
+/// "connection refused" to "nothing exists out there" books Lucy's room twice
+/// the moment the council comes back.
+#[tokio::test]
+async fn an_unreachable_council_leaves_the_booking_unknown_and_in_flight() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut world = spawn_council(dir.path());
+
+    // The dropped-response scenario first, so the intent is genuinely
+    // unsettled: the council booked the room and nobody heard.
+    let id = BookingId::new("BKG-OUTAGE");
+    let effect =
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+    reqwest::Client::new()
+        .post(format!("{}/test/faults", world.council_url))
+        .json(&serde_json::json!({
+            "effect_intent_id": effect.as_str(),
+            "route": "create",
+            "fault": "drop_response",
+        }))
+        .send()
+        .await
+        .expect("arm the drop");
+    let status = run_driver(&world, "BKG-OUTAGE", "never");
+    assert!(status.success());
+
+    // Now the council is GONE — a real dead socket, not an armed answer.
+    let _ = world.council.kill();
+    let _ = world.council.wait();
+
+    let (reconciliation, repo, clock) = reconciler_over(&world).await;
+    clock.advance(60_000);
+    assert_eq!(
+        reconciliation.due(10).await.expect("due"),
+        vec![effect.clone()],
+        "recovery still finds its own work — due is a local question"
+    );
+    let attended = reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(
+        attended,
+        Attended::StillUnknown {
+            attempts_started: 2
+        },
+        "an unreachable council is no answer, and the attempt still spent budget"
+    );
+
+    // In flight, in both records we can still read: the state and the intent.
+    let waiting = repo.load(&id).await.expect("load");
+    assert_eq!(waiting.state.name(), "BookingInProgress");
+    let intent = repo.load_effect(&effect).await.expect("intent");
+    assert_eq!(intent.status.name(), "Unknown");
+
+    // And the chase CONTINUES — the next turn asks again rather than deciding
+    // the silence means something.
+    clock.advance(60_000);
+    assert_eq!(
+        reconciliation.attend(&effect).await.expect("attend"),
+        Attended::StillUnknown {
+            attempts_started: 3
+        },
+        "still asking; silence never becomes a fact"
+    );
 }
 
 /// Test 2c: a SIGNED answer of the wrong kind. It really is the council's, so

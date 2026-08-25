@@ -19,13 +19,14 @@
 //! connect, so no harness ever sleeps to wait for a socket. With any pause
 //! point armed, the stdin/stdout protocol in [`mock_council::ipc`] is live.
 //!
-//! # Outage lives here, at the accept loop
+//! # There is no outage fault, deliberately
 //!
-//! `Outage` cannot be scoped to a request: refusing a connection happens before
-//! any byte of a route is readable. So it is process-wide — armed via
-//! `POST /test/outage {"until_ms": ...}` in fault builds — and enforced where
-//! connections are accepted: during the window, sockets are accepted and
-//! immediately dropped, which a client experiences as a connection error.
+//! Unavailability cannot be scoped to a request: refusing a connection happens
+//! before any byte of a route is readable, so it cannot live in the fault bank.
+//! Rather than build a process-wide fault window here, the suite makes the
+//! council unavailable the honest way — it kills this process and talks to the
+//! dead socket (test 7 in `council-client/tests/reconciliation.rs`). An armed
+//! imitation of an outage would only ever prove the imitation.
 
 use mock_council::{
     Council,

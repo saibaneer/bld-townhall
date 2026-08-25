@@ -4283,3 +4283,463 @@ mod phase_c {
         assert_eq!(current.active_effect, Some(book_effect));
     }
 }
+
+#[cfg(test)]
+mod pursuit {
+    //! The pursuit axis under a movable clock: lease fencing (gate M2), the
+    //! once-only escalation write (gate M4's replay half), and the skew clamp
+    //! under rollback (gate M17's rollback half). These are the writes the
+    //! recovery path stands on, tested where the clock can be moved both ways.
+
+    use super::*;
+    use bld_types::{AvailabilityGrant, Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use tempfile::TempDir;
+    use townhall_domain::{BookingProposal, BookingState, SelectedVenueRef, VenueFacts};
+
+    const T0: i64 = 1_000_000_000;
+
+    /// A clock the tests move — forwards past leases, and BACKWARDS, which is
+    /// the half nothing else in the suite can produce.
+    #[derive(Debug)]
+    struct RewindableClock(AtomicI64);
+
+    impl RewindableClock {
+        fn starting() -> Arc<Self> {
+            Arc::new(Self(AtomicI64::new(T0)))
+        }
+        fn set(&self, ms: i64) {
+            self.0.store(ms, Ordering::SeqCst);
+        }
+        fn advance(&self, by_ms: i64) {
+            self.0.fetch_add(by_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl StoreClock for RewindableClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn requirements() -> BookingRequirements {
+        BookingRequirements {
+            purpose: "community meeting".to_owned(),
+            requested_date: "2026-08-20".to_owned(),
+            time_window: TimeWindow {
+                from: "13:00".to_owned(),
+                to: "17:00".to_owned(),
+            },
+            attendees: 20,
+            wheelchair_accessible: true,
+            max_fee: Money::from_pence(5_000),
+        }
+    }
+
+    fn facts() -> VenueFacts {
+        VenueFacts {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+            capacity: 30,
+            wheelchair_accessible: true,
+            fee: Money::from_pence(4_500),
+            available: true,
+        }
+    }
+
+    fn in_progress_write(id: &BookingId, effect: &EffectIntentId) -> Booking {
+        Booking {
+            id: id.clone(),
+            state: BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                effect_intent_id: effect.clone(),
+            }),
+            requirements: requirements(),
+            selected_venue: Some(SelectedVenueRef {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+            }),
+            availability: Some(facts()),
+            booking_ref: None,
+            active_effect: Some(effect.clone()),
+        }
+    }
+
+    fn prepare_at(id: &BookingId, version: u64) -> PrepareEffect {
+        let effect = derive_effect_intent_id(id, OperationKind::Book, version);
+        PrepareEffect {
+            booking_id: id.clone(),
+            source_version: version,
+            canonical_plan: BookingEffect::Book {
+                principal: PrincipalId::new("lucy"),
+                attendees: 20,
+                facts: facts(),
+                grant: AvailabilityGrant::new("test-grant"),
+            },
+            next: in_progress_write(id, &effect),
+            audit: TransitionAudit::driven_by(&BookingProposal::Book),
+        }
+    }
+
+    /// A repository over the movable clock, with one intent prepared and
+    /// claimable — the position every test here starts from.
+    async fn claimable_world(
+        temp: &TempDir,
+    ) -> (SqliteBookingRepository, Arc<RewindableClock>, EffectIntentId) {
+        let clock = RewindableClock::starting();
+        let repo = SqliteBookingRepository::open_with(
+            temp.path().join("townhall.sqlite"),
+            DEFAULT_EFFECT_TTL_MS,
+            Arc::clone(&clock) as Arc<dyn StoreClock>,
+        )
+        .await
+        .expect("open");
+        let id = BookingId::new("BKG-PURSUIT");
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+        repo.prepare_effect(prepare_at(&id, 0)).await.expect("prepare");
+        let effect = derive_effect_intent_id(&id, OperationKind::Book, 0);
+        (repo, clock, effect)
+    }
+
+    /// The pursuit columns, read raw — these tests are ABOUT the writes, so
+    /// they read the row rather than trusting a struct that might derive.
+    async fn pursuit_row(
+        repo: &SqliteBookingRepository,
+        id: &EffectIntentId,
+    ) -> (i64, i64, Option<i64>, Option<i64>) {
+        let row = sqlx::query(
+            r"
+            SELECT attempts_started, attempts_finished, escalated_at_ms,
+                   escalation_attempts
+              FROM effect_intents WHERE effect_intent_id = ?
+            ",
+        )
+        .bind(id.as_str())
+        .fetch_one(repo.pool())
+        .await
+        .expect("the intent row exists");
+        (
+            row.get("attempts_started"),
+            row.get("attempts_finished"),
+            row.get("escalated_at_ms"),
+            row.get("escalation_attempts"),
+        )
+    }
+
+    /// Gate M2 — the lease fences, and expiry is recovery.
+    ///
+    /// The story: a worker takes Lucy's file, walks off with the key, and dies.
+    /// The next worker MUST be able to take over — a dead owner cannot hold
+    /// work hostage — and when the first worker's ghost wanders back, every
+    /// write it makes with the key it died holding must open nothing.
+    #[tokio::test]
+    async fn an_expired_lease_reopens_and_the_stale_token_writes_nothing() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        let first = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("a prepared intent is claimable");
+        assert!(repo.note_attempt_started(&effect, first.token).await.expect("note"));
+        assert!(
+            repo.claim_effect(&effect, 30_000).await.expect("claim").is_none(),
+            "a live lease refuses a second claimant"
+        );
+
+        // The owner dies. Time passes; the lease expires.
+        clock.advance(MAX_LEASE_MS + 1);
+        let second = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("an expired lease is recoverable — recovery is required, not refused");
+        assert!(second.token > first.token, "a new claim is a NEW token");
+
+        // The ghost's late writes, every kind of them: nothing matches.
+        assert!(
+            !repo.note_attempt_started(&effect, first.token).await.expect("write"),
+            "a stale token starts nothing"
+        );
+        assert!(
+            !repo
+                .note_attempt_finished(&effect, first.token, 5_000)
+                .await
+                .expect("write"),
+            "a stale token finishes nothing"
+        );
+        assert_eq!(
+            repo.mark_escalated(&effect, first.token, MAX_CADENCE_MS)
+                .await
+                .expect("write"),
+            EscalationWrite::Noop,
+            "a stale token escalates nothing"
+        );
+        repo.release_lease(&effect, first.token).await.expect("release");
+        assert!(
+            repo.claim_effect(&effect, 30_000).await.expect("claim").is_none(),
+            "the stale release did not free the live owner's lease"
+        );
+
+        let (started, finished, escalated_at, _) = pursuit_row(&repo, &effect).await;
+        assert_eq!(
+            (started, finished),
+            (1, 0),
+            "only the live owner's writes landed; the ghost's counted for nothing"
+        );
+        assert!(escalated_at.is_none());
+    }
+
+    /// Gate M4's replay half — escalation is written ONCE. A second write with
+    /// the same live token, later, moves nothing: not the timestamp, not the
+    /// derived count, and the human queue still holds exactly one question.
+    #[tokio::test]
+    async fn escalation_is_recorded_once_and_a_replay_is_a_noop() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert_eq!(
+            repo.mark_escalated(&effect, claimed.token, MAX_CADENCE_MS)
+                .await
+                .expect("mark"),
+            EscalationWrite::Recorded
+        );
+        let (_, _, first_at, first_count) = pursuit_row(&repo, &effect).await;
+        assert_eq!(first_at, Some(T0), "escalated at the moment of giving up");
+
+        // Later — so a second write WOULD move the timestamp if it landed.
+        clock.advance(10_000);
+        assert_eq!(
+            repo.mark_escalated(&effect, claimed.token, MAX_CADENCE_MS)
+                .await
+                .expect("mark"),
+            EscalationWrite::Noop
+        );
+        let (_, _, second_at, second_count) = pursuit_row(&repo, &effect).await;
+        assert_eq!(second_at, first_at, "the marker did not move");
+        assert_eq!(second_count, first_count, "the derived count did not move");
+        assert_eq!(
+            repo.escalated_unresolved(10).await.expect("queue"),
+            vec![effect.clone()],
+            "one question in the queue, not two"
+        );
+    }
+
+    /// Gate M17's rollback half — the skew clamp (spec §3.4). Escalation
+    /// schedules the next ask an hour out; if the clock then winds BACK, that
+    /// schedule is suddenly hours in the future and a plain `<= now` would
+    /// silence the chase for the rollback's whole length. The clamp treats
+    /// "scheduled further out than the longest legal cadence" as due — no live
+    /// code writes such a value, so it can only mean the clock moved, and the
+    /// honest response to a moved clock is to go ask.
+    #[tokio::test]
+    async fn a_clock_rollback_cannot_silence_the_chase() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert_eq!(
+            repo.mark_escalated(&effect, claimed.token, MAX_CADENCE_MS)
+                .await
+                .expect("mark"),
+            EscalationWrite::Recorded
+        );
+        repo.release_lease(&effect, claimed.token).await.expect("release");
+
+        // Sanity: at the long cadence, not yet due.
+        assert!(
+            repo.due_effects(10).await.expect("due").is_empty(),
+            "escalated means slower, and the hour is not up"
+        );
+
+        // The rollback: two hours backwards. The scheduled ask is now three
+        // hours in the future — an impossible value, which is the signal.
+        clock.set(T0 - 2 * MAX_CADENCE_MS);
+        assert_eq!(
+            repo.due_effects(10).await.expect("due"),
+            vec![effect.clone()],
+            "the clamp surfaces the intent the rollback tried to bury"
+        );
+        // And the claim's own atomic recheck agrees — a turn could actually run.
+        assert!(
+            repo.claim_effect(&effect, 30_000)
+                .await
+                .expect("claim")
+                .is_some(),
+            "claimable under the same clamp, so the chase continues"
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_gate {
+    //! Gate M18 — migration 0004 meets a pre-ADR-019 database.
+    //!
+    //! Two doors: a database holding the retired `Abandoned` status is REFUSED
+    //! at open (this build cannot carry what that value claims), and a lying
+    //! pre-E `Prepared` row — one an old Phase B may have called the council
+    //! about — is reopened as `Unknown` with its budget honestly spent.
+
+    use super::*;
+    use std::borrow::Cow;
+    use tempfile::TempDir;
+
+    /// The world as a pre-slice-E build left it: schema at migration 0003,
+    /// built by the REAL migrator so it cannot drift from what 0004 actually
+    /// meets, with whatever rows the test plants on top.
+    async fn pre_e_database(temp: &TempDir) -> std::path::PathBuf {
+        let path = temp.path().join("townhall.sqlite");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("open the fixture database");
+        let up_to_0003 = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| migration.version <= 3)
+                    .cloned()
+                    .collect(),
+            ),
+            ..MIGRATOR
+        };
+        up_to_0003.run(&pool).await.expect("migrate to 0003");
+        pool.close().await;
+        path
+    }
+
+    /// Plant one booking and one effect row in the pre-E schema. The JSON
+    /// payloads are placeholders on purpose: both tests read raw columns and
+    /// neither loads an aggregate, so a decodable payload would only disguise
+    /// what the fixture is — a foreign database this code must judge, not use.
+    async fn plant(path: &std::path::Path, status: &str, active: bool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(path))
+            .await
+            .expect("reopen the fixture");
+        sqlx::query(
+            r"
+            INSERT INTO bookings (id, version, state_name, state_json,
+                                  requirements_json, active_effect,
+                                  created_at_ms, updated_at_ms)
+            VALUES ('BKG-OLD', 3, 'BookingInProgress', '{}', '{}', ?, 0, 0)
+            ",
+        )
+        .bind(active.then_some("EFF-OLD"))
+        .execute(&pool)
+        .await
+        .expect("plant the booking");
+        sqlx::query(
+            r"
+            INSERT INTO effect_intents (effect_intent_id, booking_id,
+                                        operation_kind, source_version,
+                                        canonical_plan_json, status,
+                                        expires_at_ms, created_at_ms,
+                                        updated_at_ms)
+            VALUES ('EFF-OLD', 'BKG-OLD', 'Book', 3, '{}', ?, 0, 0, 0)
+            ",
+        )
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("plant the intent");
+        pool.close().await;
+    }
+
+    /// An `Abandoned` row is a decision this schema no longer carries, and the
+    /// originating state it destroyed cannot be recovered automatically —
+    /// so the open REFUSES, with the recovery route in the message (ADR-019).
+    #[tokio::test]
+    async fn a_database_holding_abandoned_rows_is_refused_at_open() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = pre_e_database(&temp).await;
+        plant(&path, "Abandoned", true).await;
+
+        let refused = SqliteBookingRepository::open(&path)
+            .await
+            .expect_err("a pre-ADR-019 database must be refused, not translated");
+        assert!(
+            matches!(refused, StoreError::AbandonedRowsPresent { count: 1 }),
+            "expected AbandonedRowsPresent, got {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("ADR-019"),
+            "the refusal names its reasoning: {refused}"
+        );
+    }
+
+    /// A pre-E `Prepared` row joined to a booking's active effect may LIE —
+    /// the old Phase B could call the council, time out, and leave the row
+    /// claiming "never attempted". 0004 reopens it as `Unknown` with one
+    /// attempt spent: conservative in the safe direction, because `Unknown`
+    /// gets re-asked and a false "never attempted" does not.
+    #[tokio::test]
+    async fn a_lying_prepared_row_reopens_as_unknown_with_budget_spent() {
+        use sqlx::Row as _;
+        let temp = TempDir::new().expect("temp dir");
+        let path = pre_e_database(&temp).await;
+        plant(&path, "Prepared", true).await;
+
+        let repo = SqliteBookingRepository::open(&path)
+            .await
+            .expect("an Abandoned-free database migrates");
+        let row = sqlx::query(
+            "SELECT status, attempts_started FROM effect_intents \
+             WHERE effect_intent_id = 'EFF-OLD'",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .expect("the planted row survived");
+        assert_eq!(row.get::<String, _>("status"), "Unknown");
+        assert_eq!(row.get::<i64, _>("attempts_started"), 1);
+    }
+
+    /// The backfill's predicate is the JOIN, not the status: a `Prepared` row
+    /// NO booking actively waits on is a plain never-attempted intent, and
+    /// rewriting it would invent an attempt that never happened.
+    #[tokio::test]
+    async fn a_prepared_row_nothing_waits_on_is_left_alone() {
+        use sqlx::Row as _;
+        let temp = TempDir::new().expect("temp dir");
+        let path = pre_e_database(&temp).await;
+        plant(&path, "Prepared", false).await;
+
+        let repo = SqliteBookingRepository::open(&path)
+            .await
+            .expect("migrates");
+        let row = sqlx::query(
+            "SELECT status, attempts_started FROM effect_intents \
+             WHERE effect_intent_id = 'EFF-OLD'",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .expect("the planted row survived");
+        assert_eq!(
+            row.get::<String, _>("status"),
+            "Prepared",
+            "never attempted stays never attempted"
+        );
+        assert_eq!(row.get::<i64, _>("attempts_started"), 0);
+    }
+}

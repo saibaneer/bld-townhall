@@ -10,13 +10,17 @@
 //!
 //! Every wait in this file is on an event: a protocol line arriving, or the
 //! child process exiting. The reader thread forwards both into one channel, so
-//! "wait for PAUSED or death" is a single blocking `recv()` — a child that dies
+//! "wait for PAUSED or death" is a single `recv` — a child that dies
 //! mid-handshake produces an `EXITED` line rather than a hang (gate M14).
+//! Every recv also carries a deadline: if the harness itself is ever the thing
+//! that stops forwarding, nontermination becomes a NAMED failure here rather
+//! than a CI job that times out an hour later saying nothing.
 
 use std::{
     io::{BufRead as _, Write as _},
     process::{Child, Command, Stdio},
     sync::mpsc,
+    time::Duration,
 };
 
 const KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
@@ -64,7 +68,7 @@ impl Council {
             let _ = exit_sender.send("EXITED".to_owned());
         });
 
-        let ready = lines.recv().expect("a first line");
+        let ready = Self::next(&lines);
         let port = ready
             .strip_prefix("READY ")
             .unwrap_or_else(|| panic!("expected READY, got {ready:?}"))
@@ -74,10 +78,18 @@ impl Council {
         Self { child, lines, port }
     }
 
+    /// One line off the channel, under the runner-level deadline (gate M14):
+    /// a wait that can never be satisfied fails BY NAME instead of hanging.
+    fn next(lines: &mpsc::Receiver<String>) -> String {
+        lines
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a line, EXITED, or the deadline naming the hang")
+    }
+
     /// The next line starting with `prefix`. Panics — with the line — on the
     /// child dying first, unless death is what the test wanted.
     fn expect(&self, prefix: &str) -> String {
-        let line = self.lines.recv().expect("a line or EXITED");
+        let line = Self::next(&self.lines);
         assert!(
             line.starts_with(prefix),
             "expected a {prefix:?} line, got {line:?}"
@@ -155,10 +167,42 @@ fn read_grant(council: &Council) -> String {
     response["grant"].as_str().expect("a grant").to_owned()
 }
 
+/// Count matching effect rows straight from the council's database file, with
+/// the process DEAD. This is what makes a "did the write commit?" test
+/// discriminating: asking the restarted council re-decides the answer, but the
+/// file between kill and restart holds only what actually committed. Opened
+/// read-write so `SQLite` can run WAL recovery — which is exactly what a
+/// restart would do, and recovery discards the uncommitted transaction.
+fn effect_rows_in(db: &std::path::Path, effect_intent_id: &str) -> i64 {
+    let db = db.to_path_buf();
+    let effect_intent_id = effect_intent_id.to_owned();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
+                .await
+                .expect("open the dead council's database");
+            let n: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM effects WHERE effect_intent_id = ?")
+                    .bind(&effect_intent_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count");
+            pool.close().await;
+            n
+        })
+}
+
 // --------------------------------------------------------------- the matrix
 
 /// Test 21 / 2a's second half: killed AFTER the settlement commits and before
-/// anyone hears the answer, the answer must be reproducible after restart.
+/// anyone hears the answer, the answer must be reproducible after restart —
+/// and a LATER CREATE for the same identity must still be refused by the
+/// crash-survived tombstone, not merely reported absent.
 #[test]
 fn an_answer_no_one_heard_survives_a_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -182,10 +226,34 @@ fn an_answer_no_one_heard_survives_a_kill() {
         answer["outcome"], "DefinitivelyAbsent",
         "the tombstone survived the kill, and the retried lookup reports it"
     );
+
+    // Test 21's second leg: the tombstone doesn't just answer lookups — it
+    // REFUSES a create that arrives afterwards, so "definitively absent" can
+    // never quietly become "booked after all".
+    let grant = read_grant(&survivor);
+    let attempted = ureq_post(
+        &survivor.url("/bookings"),
+        &create_body("EFF-K1", NOW - 1, &grant),
+    )
+    .expect("an answer");
+    assert_eq!(
+        attempted["outcome"], "DefinitivelyAbsent",
+        "the crash-survived tombstone refuses the late create"
+    );
+    assert_eq!(
+        effect_rows_in(&db, "EFF-K1"),
+        1,
+        "one determination, no second row"
+    );
 }
 
 /// Test 20: killed BEFORE the settlement commits, nothing is discoverable —
 /// unobserved absence must never become observed absence.
+///
+/// The discriminating assertion is the middle one, read from the FILE while the
+/// process is dead: the retried resolve would answer `DefinitivelyAbsent`
+/// either way (a past-deadline resolve re-decides from scratch), so only the
+/// database itself can tell "the uncommitted write died" from "it leaked".
 #[test]
 fn an_uncommitted_answer_dies_with_the_process() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -198,8 +266,17 @@ fn an_uncommitted_answer_dies_with_the_process() {
     council.expect("PAUSED before_settle_commit EFF-K2");
     council.kill(); // the tombstone was never committed
 
+    // Between the kill and the restart: the file holds NOTHING for this
+    // identity. A council that committed (or leaked) before its armed pause
+    // fails here, where the wire answer below could not catch it.
+    assert_eq!(
+        effect_rows_in(&db, "EFF-K2"),
+        0,
+        "the uncommitted settlement died with the process"
+    );
+
     let survivor = Council::spawn(&db, NOW, &[]);
-    // The registry must hold nothing settled for this identity: a fresh resolve
+    // The registry holds nothing settled for this identity: a fresh resolve
     // decides from scratch (and, past the deadline, reaches the same verdict —
     // by deciding it, not by replaying a phantom).
     let answer = ureq_post(
@@ -277,6 +354,17 @@ fn a_rejection_survives_the_clock_winding_back() {
 /// Test 15's council half: a create ACCEPTED before its deadline, held at the
 /// write while the clock passes it, is refused — a council that judged expiry
 /// on arrival cannot pass this, because its check already succeeded.
+///
+/// Test 15 also names a lookup CONCURRENT with the held write. That leg is
+/// structurally unrunnable against the real process, stated here rather than
+/// silently narrowed: `before_expiry_write` pauses INSIDE the write
+/// transaction, so the paused create holds the database's one writer lock and
+/// a concurrent resolve — a settling write itself — queues behind it (§7.3;
+/// gate M13's own header records the deadlock the first attempt produced).
+/// What the concurrent lookup would prove — nothing is discoverable until the
+/// settlement commits — is proven in-process by slice D's
+/// `nothing_is_discoverable_before_the_settlement_commits`, which reads from a
+/// second connection at the same pause point.
 #[test]
 fn a_create_overtaken_by_its_deadline_while_paused_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -384,12 +472,55 @@ fn a_child_dying_mid_handshake_is_a_signal_not_a_hang() {
     // The child dies. The parent's next wait must resolve — as EXITED — rather
     // than blocking forever on an acknowledgement that can never come.
     council.kill();
-    let line = council.lines.recv().expect("the death is a line");
+    let line = Council::next(&council.lines);
     assert_eq!(line, "EXITED");
 }
 
-/// Test 22's wire half: after a restart, the same signing key still verifies —
-/// the council's answers are attributable across its own death.
+/// Test 22, the whole sequence in one run: a create refused for EXPIRY writes
+/// a tombstone; the council's clock then rolls back below the deadline; and the
+/// same identity's retried create must STILL be refused — by the recorded
+/// determination, never by a time comparison, which would now say yes.
+#[test]
+fn an_expiry_refusal_survives_the_clock_winding_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("council.sqlite");
+
+    {
+        // A council whose clock is already past the deadline: the create is
+        // refused for expiry and tombstoned, durably.
+        let council = Council::spawn(&db, DEADLINE + 1, &[]);
+        let grant = read_grant(&council);
+        let refused = ureq_post(
+            &council.url("/bookings"),
+            &create_body("EFF-K9", DEADLINE, &grant),
+        )
+        .expect("an answer");
+        assert_eq!(refused["outcome"], "DefinitivelyAbsent");
+    }
+
+    // Restart with the clock WOUND BACK below the deadline. A council that
+    // re-judged expiry against its clock would now say "plenty of time" and
+    // book the room — creating the very thing it already determined absent.
+    let rewound = Council::spawn(&db, NOW, &[]);
+    let grant = read_grant(&rewound);
+    let retry = ureq_post(
+        &rewound.url("/bookings"),
+        &create_body("EFF-K9", DEADLINE, &grant),
+    )
+    .expect("an answer");
+    assert_eq!(
+        retry["outcome"], "DefinitivelyAbsent",
+        "the tombstone refuses it; the rewound clock has no say"
+    );
+    assert_eq!(
+        effect_rows_in(&db, "EFF-K9"),
+        1,
+        "one determination — the retry minted nothing"
+    );
+}
+
+/// Test 22's key-continuity half: after a restart, the same signing key still
+/// verifies — the council's answers are attributable across its own death.
 #[test]
 fn answers_verify_across_a_restart_with_the_same_key() {
     let dir = tempfile::tempdir().expect("tempdir");

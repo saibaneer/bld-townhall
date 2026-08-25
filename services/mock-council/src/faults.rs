@@ -17,12 +17,13 @@
 //! producing its misbehaviour is caught by the paired wire assertion (gates
 //! M11/M12).
 //!
-//! # `Outage` is the exception, and cannot be otherwise
+//! # Unavailability is not a fault here, and cannot be
 //!
 //! Refusing a connection happens before any byte of the request is readable, so
-//! there is no route and no identity to scope by. It is process-wide and
-//! time-windowed, armed only by a test holding the council exclusively, and it
-//! lives at the accept loop (`main.rs`) rather than here.
+//! there is no route and no identity to scope an "outage" fault by. The suite
+//! produces unavailability the honest way instead: it kills the council process
+//! and talks to the dead socket (test 7 in
+//! `council-client/tests/reconciliation.rs`).
 
 use serde::{Deserialize, Serialize};
 use std::{

@@ -714,14 +714,19 @@ aggregate, alive in the audit trail.
      rowed**: in-memory counters per `(state, proposal)`, flushed periodically,
      crash-lossy by design.
    - `Denied` — requires a real booking in a real state — gets **durable rows**,
-     deduplicated per `(booking_id, principal, reason)` per window: the first N are
+     deduplicated per `(booking_id, principal, reason)` per window
+     *[superseded by the slice-E amendment above: the key is
+     `(booking_id, driver_kind, driver_detail, reason, principal, window_start_ms)` —
+     the original could not be formed at the fact or system-event doors]*: the first N are
      recorded, further identical refusals increment a suppressed-count. Identical retries
      are compressible precisely because they are identical: the rows carry the *what*, the
      counter carries the *how many*. Nothing forensic is lost.
-   - Denial writes may be **asynchronous and off the request path**. A lost denial record
-     strands nothing — no state changed, no recovery waits on it — so it does not need the
-     commit-grade durability that effect intents need. This is deliberate tiering of
-     durability by consequence, not corner-cutting.
+   - Denial writes may be **asynchronous and off the request path**
+     *[permission declined in the slice-E amendment above: the write is a synchronous
+     upsert against the separate store, after the answer is computed]*. A lost denial
+     record strands nothing — no state changed, no recovery waits on it — so it does not
+     need the commit-grade durability that effect intents need. This is deliberate
+     tiering of durability by consequence, not corner-cutting.
 3. **The boundary's answer is never rate-limited.** Classification is a pure function;
    request 501 receives the same deterministic `Denied` as request 1, at match-arm cost.
    Only the audit trail's appetite for identical rows saturates. A boundary whose answers

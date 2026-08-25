@@ -471,7 +471,7 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
     // Now cancel it — the cancellation is its own effect, and we arm the
     // council to answer its resolve with a signed BookingCreated: wrong kind,
     // right signature.
-    let (reconciliation, repo, clock) = reconciler_over(&world).await;
+    let (_, repo, clock) = reconciler_over(&world).await;
     let booked = repo.load(&id).await.expect("load");
     assert_eq!(booked.state.name(), "Booked");
 
@@ -540,9 +540,28 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
         "the cancel's answer was eaten, so the turn is unresolved: {turn:?}"
     );
 
-    // Reconcile the cancellation: the armed answer arrives — signed, wrong
-    // kind — passes the wire, and the DOMAIN refuses it. Nothing commits, the
-    // intent stays live, and the refusal is in the logbook.
+    // Reconcile the cancellation — through a reconciler whose coordinator
+    // carries the SAME logbook, because "the refusal is in the logbook" is one
+    // of this test's claims and the reconciler is the door it goes through.
+    // (The PR #15 review caught the first draft asserting this from prose: the
+    // attend ran through a log-less reconciler and no row was ever read.)
+    let key2 = CouncilKey::new(
+        council_wire::CouncilSigner::new(council_wire::CouncilSigningKey::from_bytes(&key_bytes()))
+            .verifying_key(),
+    );
+    let reconciliation = Reconciliation::new(
+        Coordinator::new(
+            Arc::clone(&repo),
+            Arc::new(CouncilClient::new(&world.council_url, key2)),
+            Arc::new(CouncilVerifier::new(key2)),
+            Arc::new(CouncilClient::new(&world.council_url, key2)),
+        )
+        .with_denial_log(Arc::clone(&denial_log)),
+        Arc::new(CouncilClient::new(&world.council_url, key2)),
+    );
+
+    // The armed answer arrives — signed, wrong kind — passes the wire, and the
+    // DOMAIN refuses it. Nothing commits, the intent stays live.
     clock.advance(60_000);
     let attended = reconciliation.attend(&cancel_effect).await.expect("attend");
     assert!(
@@ -555,6 +574,16 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
         "CancellingBooking",
         "the cancellation is still in flight; the forged-shape answer moved nothing"
     );
+
+    // And the refusal is in the logbook — read, not narrated: the fact door
+    // said no to a BookingExists, and the principal is the one the signed
+    // answer itself carried.
+    let rows = denial_log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1, "exactly the one refusal: {rows:?}");
+    assert_eq!(rows[0].driver_kind, "Fact");
+    assert_eq!(rows[0].driver_detail, "BookingExists");
+    assert_eq!(rows[0].reason, "EffectKindMismatch");
+    assert_eq!(rows[0].principal, "lucy");
 }
 
 fn driver_authority() -> townhall_domain::VerifiedAuthority {

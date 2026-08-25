@@ -359,8 +359,8 @@ fn a_rejection_survives_the_clock_winding_back() {
 /// structurally unrunnable against the real process, stated here rather than
 /// silently narrowed: `before_expiry_write` pauses INSIDE the write
 /// transaction, so the paused create holds the database's one writer lock and
-/// a concurrent resolve — a settling write itself — queues behind it (§7.3;
-/// gate M13's own header records the deadlock the first attempt produced).
+/// a concurrent resolve — a settling write itself — queues behind it (gate
+/// M13's own header below records the deadlock the first attempt produced).
 /// What the concurrent lookup would prove — nothing is discoverable until the
 /// settlement commits — is proven in-process by slice D's
 /// `nothing_is_discoverable_before_the_settlement_commits`, which reads from a
@@ -410,7 +410,7 @@ fn a_create_overtaken_by_its_deadline_while_paused_is_refused() {
 /// cannot host this test — it fires inside the write transaction, so the first
 /// paused request holds the writer lock and the second never reaches its pause.
 /// (The first draft of this very test deadlocked on exactly that, which is
-/// §7.3's warning coming true in its own suite.)
+/// the plan's own warning coming true in its own suite.)
 #[test]
 fn a_clock_move_with_two_live_pauses_is_refused_and_moves_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");

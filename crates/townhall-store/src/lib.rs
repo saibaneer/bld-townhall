@@ -316,6 +316,15 @@ pub trait BookingRepository: Send + Sync {
     /// — bumped on every claim, carried by every write of the turn — so its late
     /// writes match nothing.
     ///
+    /// Every pursuit write below additionally requires the lease to be **held**
+    /// (`lease_until_ms` not yet cleared): claiming is the gate in the schema,
+    /// not only in this sentence. A never-claimed row refuses its default token,
+    /// and a released turn's token writes nothing further. Between a lease's
+    /// expiry and the next claim, the token's owner may still finish its own
+    /// record — it is the only owner ever issued that token, the counters it
+    /// writes are facts about calls that truly happened, and the fence a
+    /// takeover needs is the bump, which is atomic with every claim.
+    ///
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
     async fn claim_effect(
@@ -330,7 +339,7 @@ pub trait BookingRepository: Send + Sync {
     /// so a crash mid-call still spent budget and `Prepared` keeps meaning
     /// "never attempted" — the row moves to `Unknown` here, before the wire.
     ///
-    /// Returns `false` if the token no longer owns the row.
+    /// Returns `false` if the token does not hold the row's lease.
     ///
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
@@ -341,7 +350,8 @@ pub trait BookingRepository: Send + Sync {
     ) -> Result<bool, StoreError>;
 
     /// Record that the call returned control — answer or not — and when the
-    /// reconciler may ask again. Returns `false` if the token lost the row.
+    /// reconciler may ask again. Returns `false` if the token does not hold the
+    /// row's lease.
     ///
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
@@ -352,7 +362,8 @@ pub trait BookingRepository: Send + Sync {
         next_attempt_after_ms: i64,
     ) -> Result<bool, StoreError>;
 
-    /// Give the row back. A no-op if the token already lost it.
+    /// Give the row back. A no-op if the token does not hold it — including
+    /// when this token already released, so the door closes exactly once.
     ///
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
@@ -1169,6 +1180,12 @@ impl BookingRepository for SqliteBookingRepository {
                    status = CASE WHEN status = 'Prepared' THEN 'Unknown' ELSE status END,
                    updated_at_ms = ?1
              WHERE effect_intent_id = ?2 AND lease_token = ?3
+               -- and the lease must be HELD: a matching token alone would let a
+               -- caller pass the freshly-minted row's default (0) and spend
+               -- budget without ever claiming, and would let a released turn's
+               -- token keep writing after release. Claiming is the gate, and
+               -- this predicate is where the schema says so (review of PR #15).
+               AND lease_until_ms IS NOT NULL
             ",
         )
         .bind(now)
@@ -1193,6 +1210,7 @@ impl BookingRepository for SqliteBookingRepository {
                    next_attempt_after_ms = MIN(?1, ?2 + ?3),
                    updated_at_ms = ?2
              WHERE effect_intent_id = ?4 AND lease_token = ?5
+               AND lease_until_ms IS NOT NULL
             ",
         )
         .bind(next_attempt_after_ms)
@@ -1210,6 +1228,7 @@ impl BookingRepository for SqliteBookingRepository {
             r"
             UPDATE effect_intents SET lease_until_ms = NULL
              WHERE effect_intent_id = ? AND lease_token = ?
+               AND lease_until_ms IS NOT NULL
             ",
         )
         .bind(id.as_str())
@@ -1235,6 +1254,7 @@ impl BookingRepository for SqliteBookingRepository {
                    updated_at_ms = ?1
              WHERE effect_intent_id = ?3
                AND lease_token = ?4
+               AND lease_until_ms IS NOT NULL
                AND escalated_at_ms IS NULL
                AND status IN ('Prepared', 'Unknown')
             ",
@@ -4384,7 +4404,11 @@ mod pursuit {
     /// claimable — the position every test here starts from.
     async fn claimable_world(
         temp: &TempDir,
-    ) -> (SqliteBookingRepository, Arc<RewindableClock>, EffectIntentId) {
+    ) -> (
+        SqliteBookingRepository,
+        Arc<RewindableClock>,
+        EffectIntentId,
+    ) {
         let clock = RewindableClock::starting();
         let repo = SqliteBookingRepository::open_with(
             temp.path().join("townhall.sqlite"),
@@ -4400,7 +4424,9 @@ mod pursuit {
         })
         .await
         .expect("create");
-        repo.prepare_effect(prepare_at(&id, 0)).await.expect("prepare");
+        repo.prepare_effect(prepare_at(&id, 0))
+            .await
+            .expect("prepare");
         let effect = derive_effect_intent_id(&id, OperationKind::Book, 0);
         (repo, clock, effect)
     }
@@ -4446,9 +4472,16 @@ mod pursuit {
             .await
             .expect("claim")
             .expect("a prepared intent is claimable");
-        assert!(repo.note_attempt_started(&effect, first.token).await.expect("note"));
         assert!(
-            repo.claim_effect(&effect, 30_000).await.expect("claim").is_none(),
+            repo.note_attempt_started(&effect, first.token)
+                .await
+                .expect("note")
+        );
+        assert!(
+            repo.claim_effect(&effect, 30_000)
+                .await
+                .expect("claim")
+                .is_none(),
             "a live lease refuses a second claimant"
         );
 
@@ -4463,7 +4496,10 @@ mod pursuit {
 
         // The ghost's late writes, every kind of them: nothing matches.
         assert!(
-            !repo.note_attempt_started(&effect, first.token).await.expect("write"),
+            !repo
+                .note_attempt_started(&effect, first.token)
+                .await
+                .expect("write"),
             "a stale token starts nothing"
         );
         assert!(
@@ -4480,9 +4516,14 @@ mod pursuit {
             EscalationWrite::Noop,
             "a stale token escalates nothing"
         );
-        repo.release_lease(&effect, first.token).await.expect("release");
+        repo.release_lease(&effect, first.token)
+            .await
+            .expect("release");
         assert!(
-            repo.claim_effect(&effect, 30_000).await.expect("claim").is_none(),
+            repo.claim_effect(&effect, 30_000)
+                .await
+                .expect("claim")
+                .is_none(),
             "the stale release did not free the live owner's lease"
         );
 
@@ -4493,6 +4534,145 @@ mod pursuit {
             "only the live owner's writes landed; the ghost's counted for nothing"
         );
         assert!(escalated_at.is_none());
+    }
+
+    /// Claiming is the gate IN THE SCHEMA (PR #15 review, HIGH): a freshly
+    /// prepared row carries the default token `0`, and a caller passing that
+    /// token without ever claiming must write nothing — not spend budget, not
+    /// escalate. An implementation whose writes check only `(id, token)`
+    /// accepts all three of these and fails here.
+    #[tokio::test]
+    async fn nothing_writes_without_claiming_first() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, _clock, effect) = claimable_world(&temp).await;
+
+        assert!(
+            !repo.note_attempt_started(&effect, 0).await.expect("write"),
+            "the unclaimed row's own default token starts nothing"
+        );
+        assert!(
+            !repo
+                .note_attempt_finished(&effect, 0, 5_000)
+                .await
+                .expect("write"),
+            "and finishes nothing"
+        );
+        assert_eq!(
+            repo.mark_escalated(&effect, 0, MAX_CADENCE_MS)
+                .await
+                .expect("write"),
+            EscalationWrite::Noop,
+            "and escalates nothing"
+        );
+        let (started, finished, escalated_at, _) = pursuit_row(&repo, &effect).await;
+        assert_eq!((started, finished, escalated_at), (0, 0, None));
+
+        // The same row, claimed: the same writes now land — the refusals above
+        // were about the missing claim, not about the row.
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert!(
+            repo.note_attempt_started(&effect, claimed.token)
+                .await
+                .expect("note")
+        );
+    }
+
+    /// The turn's own release closes the door behind it: once the owner gives
+    /// the lease back, its token writes nothing further. Without this, a
+    /// replayed finish after release would double-count a conversation.
+    #[tokio::test]
+    async fn a_released_token_writes_nothing_further() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, _clock, effect) = claimable_world(&temp).await;
+
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert!(
+            repo.note_attempt_started(&effect, claimed.token)
+                .await
+                .expect("note")
+        );
+        assert!(
+            repo.note_attempt_finished(&effect, claimed.token, 5_000)
+                .await
+                .expect("note")
+        );
+        repo.release_lease(&effect, claimed.token)
+            .await
+            .expect("release");
+
+        assert!(
+            !repo
+                .note_attempt_finished(&effect, claimed.token, 5_000)
+                .await
+                .expect("write"),
+            "the turn is over; a replayed finish counts nothing"
+        );
+        assert_eq!(
+            repo.mark_escalated(&effect, claimed.token, MAX_CADENCE_MS)
+                .await
+                .expect("write"),
+            EscalationWrite::Noop,
+            "and a post-release escalation writes nothing"
+        );
+        let (started, finished, escalated_at, _) = pursuit_row(&repo, &effect).await;
+        assert_eq!((started, finished, escalated_at), (1, 1, None));
+    }
+
+    /// The decided edge (PR #15 review, HIGH 2's untested leg): between a
+    /// lease's EXPIRY and the next claim, the token's owner may still finish
+    /// its own record. It is the only owner ever issued that token, the write
+    /// records a call that truly happened, and the fence a takeover needs is
+    /// the token bump — atomic with every claim, proven above. Refusing here
+    /// would discard true accounting to defend against nobody.
+    #[tokio::test]
+    async fn an_expired_but_unclaimed_lease_still_records_its_own_finish() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert!(
+            repo.note_attempt_started(&effect, claimed.token)
+                .await
+                .expect("note")
+        );
+
+        // The lease expires with the owner still alive — a slow council call,
+        // not a crash — and NOBODY has claimed the row yet.
+        clock.advance(MAX_LEASE_MS + 1);
+        assert!(
+            repo.note_attempt_finished(&effect, claimed.token, 5_000)
+                .await
+                .expect("write"),
+            "the sole owner's true accounting lands: the call did return"
+        );
+
+        // The moment anyone takes over, that same token is dead — the fence is
+        // the bump, not the clock.
+        let successor = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("expired means claimable");
+        assert!(successor.token > claimed.token);
+        assert!(
+            !repo
+                .note_attempt_finished(&effect, claimed.token, 5_000)
+                .await
+                .expect("write"),
+            "outlived by a successor, the old token writes nothing"
+        );
     }
 
     /// Gate M4's replay half — escalation is written ONCE. A second write with
@@ -4558,7 +4738,9 @@ mod pursuit {
                 .expect("mark"),
             EscalationWrite::Recorded
         );
-        repo.release_lease(&effect, claimed.token).await.expect("release");
+        repo.release_lease(&effect, claimed.token)
+            .await
+            .expect("release");
 
         // Sanity: at the long cadence, not yet due.
         assert!(

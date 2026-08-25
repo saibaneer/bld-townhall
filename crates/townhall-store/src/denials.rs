@@ -136,13 +136,13 @@ impl DenialLog {
     }
 
     /// Write one refusal down. Best-effort: the boundary's answer must never
-    /// depend on this landing, so a failure is swallowed here — the row is an
-    /// audit convenience the moment it fails, and a hard error the moment it
-    /// would block a caller.
+    /// depend on this landing, so a failure is logged and dropped here — the
+    /// row is an audit convenience the moment it fails, and a hard error the
+    /// moment it would block a caller (ADR-017, in as many words).
     pub async fn record_denied(&self, denial: Denial) {
         let now = self.clock.now_ms();
         let window = now - now.rem_euclid(WINDOW_MS);
-        let _ = sqlx::query(
+        let written = sqlx::query(
             r"
             INSERT INTO denials (booking_id, driver_kind, driver_detail, reason,
                                  principal, window_start_ms, occurrences,
@@ -163,6 +163,15 @@ impl DenialLog {
         .bind(now)
         .execute(&self.pool)
         .await;
+        if let Err(error) = written {
+            // "Logged and dropped" means BOTH halves: the caller is never made
+            // to wait, and the loss is not silent.
+            eprintln!(
+                "denial record dropped (ADR-017: the answer never waits on this): \
+                 booking={} reason={} error={error}",
+                denial.booking_id, denial.reason
+            );
+        }
     }
 
     /// Count an `Undefined` — "that behaviour doesn't exist here". Memory only.

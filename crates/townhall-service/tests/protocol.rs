@@ -2803,3 +2803,69 @@ async fn the_facade_carries_the_whole_surface() {
 async fn projection_menu_of(h: &Harness, id: &BookingId) -> &'static [&'static str] {
     h.repo.load(id).await.expect("load").state.proposal_menu()
 }
+
+/// ADR-021's 503/local pair at the protocol level: with the availability
+/// provider unreachable, asking about a slot is refused as `FactsUnavailable`
+/// (the wire's 503 — nothing durable exists yet), while CANCELLING an
+/// in-flight booking still commits — its cell never binds facts, and a dead
+/// provider must not hold Lucy's withdrawal hostage.
+#[tokio::test]
+async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-DEADPROV");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::GoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+
+    let unreachable = Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::unreachable(facts())),
+    );
+
+    // A fresh booking that needs facts: refused as could-not-ask, not as
+    // answered-nothing.
+    let other = BookingId::new("BKG-DEADPROV-2");
+    h.repo
+        .create(NewBooking {
+            id: other.clone(),
+            requirements: requirements(),
+        })
+        .await
+        .expect("create");
+    unreachable
+        .propose(&other, select(), &authority())
+        .await
+        .expect("select commits — selection binds no facts");
+    let refused = unreachable
+        .propose(&other, BookingProposal::VerifySlot, &authority())
+        .await
+        .expect("the turn runs");
+    assert!(
+        matches!(
+            refused,
+            BoundaryOutcome::Denied(BookingError::FactsUnavailable)
+        ),
+        "could-not-ask has its own name: {refused:?}"
+    );
+
+    // Lucy's mid-flight withdrawal needs nothing from the provider.
+    let cancelled = unreachable
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "provider down, mind changed".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("the turn runs");
+    let BoundaryOutcome::Committed(aggregate) = cancelled else {
+        panic!("a dead provider must not hold the withdrawal hostage: {cancelled:?}");
+    };
+    assert_eq!(aggregate.state.name(), "CancellationRequested");
+}

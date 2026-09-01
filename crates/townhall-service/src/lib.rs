@@ -45,8 +45,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use townhall_domain::{
     Booking, BookingAggregate, BookingContext, BookingEffect, BookingError, BookingProposal,
-    FactContext, OperationKind, SystemEvent, TownHallDomain, VerifiedAuthority,
-    VerifiedAvailability, VerifiedProviderFact,
+    FactContext, ObservedAvailability, OperationKind, SystemEvent, TownHallDomain,
+    VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_store::{
     BookingRepository, ClaimedEffect, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError,
@@ -67,15 +67,16 @@ pub mod fake;
 /// coordinator that branched on "does `VerifySlot` need availability?" would hold
 /// a copy of the topology, and topology lives in one place.
 ///
-/// Returns `None` for "no usable answer", which covers both "the provider does
-/// not know this slot" and "the answer could not be verified". Collapsing them is
-/// deliberate: an unverifiable availability response is not a weaker fact, it is
-/// no fact, and the proposal door already treats a missing observation as grounds
-/// to refuse rather than to proceed. Failing towards refusal is the only safe
-/// direction for context that three guards read.
+/// Answers three ways (ADR-021): an ANSWER (with or without facts — an
+/// unverifiable or wrong-slot response is not a weaker fact, it is no fact,
+/// and stays `Answered(None)` only when the provider genuinely answered), or
+/// `Unavailable` — the provider could not be asked at all, which the domain
+/// refuses as its own error and the wire maps to 503 rather than 422. Failing
+/// towards refusal remains the only safe direction for context three guards
+/// read; the three-way shape only keeps the REASON honest.
 #[async_trait]
 pub trait AvailabilitySource: Send + Sync {
-    async fn read(&self, venue: &VenueId, slot: &SlotId) -> Option<Verified<VerifiedAvailability>>;
+    async fn read(&self, venue: &VenueId, slot: &SlotId) -> ObservedAvailability;
 }
 
 /// Asks a provider what became of an effect it may or may not have seen.
@@ -454,7 +455,7 @@ where
                     .read(&selection.venue_id, &selection.slot_id)
                     .await
             }
-            None => None,
+            None => ObservedAvailability::none(),
         };
 
         // The identity is derived with the repository's own function, at the

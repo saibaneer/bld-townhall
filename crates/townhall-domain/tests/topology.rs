@@ -351,12 +351,14 @@ async fn proposal_door() -> Door {
         let mut row = Vec::new();
         for proposal in all_proposals() {
             let context = BookingContext {
-                selected_facts: state.selection().map(|_| {
-                    Verified::assert_verified(VerifiedAvailability {
-                        facts: facts(),
-                        grant: AvailabilityGrant::new("export-grant"),
-                    })
-                }),
+                selected_facts: townhall_domain::ObservedAvailability::Answered(
+                    state.selection().map(|_| {
+                        Verified::assert_verified(VerifiedAvailability {
+                            facts: facts(),
+                            grant: AvailabilityGrant::new("export-grant"),
+                        })
+                    }),
+                ),
                 pending_effect: Some(EffectIntentId::new(BOOK_EFFECT)),
             };
             let proposal_name = proposal.name();

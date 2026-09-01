@@ -1,0 +1,33 @@
+[package]
+name = "townhall-server"
+version = "0.1.0"
+edition = "2024"
+
+# The COMPOSITION-ROOT binary (ADR-021): the one place the concrete world is
+# wired — the SQLite store, the denial log, the council client, the pursuit
+# configuration, the authority resolver — before being handed to the
+# townhall-http adapter as trait objects. No handler logic lives here.
+[dependencies]
+axum.workspace = true
+council-client = { path = "../../crates/council-client" }
+council-wire = { path = "../../crates/council-wire" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+townhall-domain = { path = "../../crates/townhall-domain" }
+townhall-http = { path = "../../crates/townhall-http" }
+townhall-service = { path = "../../crates/townhall-service" }
+townhall-store = { path = "../../crates/townhall-store" }
+bld-types = { path = "../../crates/bld-types" }
+
+[features]
+# The M5 stand-in authority (ADR-021): a fixed two-token allowlist, compiled
+# only when asked for AND armed only by the --dev-authority flag. M7 replaces
+# the resolver here, in the composition root, so no fallback survives it.
+dev-authority = []
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

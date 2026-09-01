@@ -349,9 +349,14 @@ pub trait BookingRepository: Send + Sync {
         token: i64,
     ) -> Result<bool, StoreError>;
 
-    /// Record that the call returned control — answer or not — and when the
-    /// reconciler may ask again. Returns `false` if the token does not hold the
-    /// row's lease.
+    /// Record that the call returned control — answer or not — and how long the
+    /// reconciler must wait before asking again. `cadence_ms` is a DURATION;
+    /// the store schedules `now + min(cadence_ms, MAX_CADENCE_MS)` under its
+    /// own clock. (The first shipped version persisted the duration itself —
+    /// a 1970-epoch timestamp, always past, always due — so the retry cadence
+    /// never gated anything: one parameter, two meanings, the recurring
+    /// defect. ADR-021 records the repair.) Returns `false` if the token does
+    /// not hold the row's lease.
     ///
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
@@ -359,7 +364,7 @@ pub trait BookingRepository: Send + Sync {
         &self,
         id: &EffectIntentId,
         token: i64,
-        next_attempt_after_ms: i64,
+        cadence_ms: i64,
     ) -> Result<bool, StoreError>;
 
     /// Give the row back. A no-op if the token does not hold it — including
@@ -368,6 +373,31 @@ pub trait BookingRepository: Send + Sync {
     /// # Errors
     /// [`StoreError::Sqlx`] on a write failure.
     async fn release_lease(&self, id: &EffectIntentId, token: i64) -> Result<(), StoreError>;
+
+    /// Push the next attempt a cadence away WITHOUT counting anything — the
+    /// back-off for a turn that errored before any call began (PR #18 review):
+    /// counting a start that never reached the wire or a finish for a call
+    /// that never began would both lie in the ledger, and NOT backing off
+    /// leaves the erroring row earliest-due forever, starving the queue.
+    /// Fenced like every pursuit write: the token must hold the lease.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlx`] on a write failure.
+    async fn defer_attempt(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// How long until this live intent's next scheduled attempt, under the
+    /// STORE's clock — the durable schedule an HTTP `Retry-After` projects
+    /// (ADR-021: the service computing `row − now` itself would mint a second
+    /// clock). Non-negative; `None` for a settled or unknown identity.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlx`] on a read failure.
+    async fn retry_hint_ms(&self, id: &EffectIntentId) -> Result<Option<i64>, StoreError>;
 
     /// Record that we gave up chasing at retry cadence (ADR-019).
     ///
@@ -1200,20 +1230,23 @@ impl BookingRepository for SqliteBookingRepository {
         &self,
         id: &EffectIntentId,
         token: i64,
-        next_attempt_after_ms: i64,
+        cadence_ms: i64,
     ) -> Result<bool, StoreError> {
         let now = self.now();
+        // The schedule is now + a clamped DURATION. The shipped first version
+        // wrote MIN(cadence, now + MAX) — the cadence compared as a timestamp,
+        // five seconds after 1970, always due (ADR-021).
         let updated = sqlx::query(
             r"
             UPDATE effect_intents
                SET attempts_finished = attempts_finished + 1,
-                   next_attempt_after_ms = MIN(?1, ?2 + ?3),
+                   next_attempt_after_ms = ?2 + MIN(MAX(?1, 0), ?3),
                    updated_at_ms = ?2
              WHERE effect_intent_id = ?4 AND lease_token = ?5
                AND lease_until_ms IS NOT NULL
             ",
         )
-        .bind(next_attempt_after_ms)
+        .bind(cadence_ms)
         .bind(now)
         .bind(MAX_CADENCE_MS)
         .bind(id.as_str())
@@ -1221,6 +1254,47 @@ impl BookingRepository for SqliteBookingRepository {
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
+    }
+
+    async fn defer_attempt(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let now = self.now();
+        let updated = sqlx::query(
+            r"
+            UPDATE effect_intents
+               SET next_attempt_after_ms = ?2 + MIN(MAX(?1, 0), ?3),
+                   updated_at_ms = ?2
+             WHERE effect_intent_id = ?4 AND lease_token = ?5
+               AND lease_until_ms IS NOT NULL
+            ",
+        )
+        .bind(cadence_ms)
+        .bind(now)
+        .bind(MAX_CADENCE_MS)
+        .bind(id.as_str())
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn retry_hint_ms(&self, id: &EffectIntentId) -> Result<Option<i64>, StoreError> {
+        let now = self.now();
+        let hint: Option<i64> = sqlx::query_scalar(
+            r"
+            SELECT MAX(next_attempt_after_ms - ?1, 0) FROM effect_intents
+             WHERE effect_intent_id = ?2 AND status IN ('Prepared', 'Unknown')
+            ",
+        )
+        .bind(now)
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(hint)
     }
 
     async fn release_lease(&self, id: &EffectIntentId, token: i64) -> Result<(), StoreError> {
@@ -4671,12 +4745,15 @@ mod pursuit {
         );
 
         // The moment anyone takes over, that same token is dead — the fence is
-        // the bump, not the clock.
+        // the bump, not the clock. (The finish above scheduled a REAL cadence
+        // — since ADR-021's repair it actually gates — so the takeover waits
+        // it out like any honest worker.)
+        clock.advance(5_001);
         let successor = repo
             .claim_effect(&effect, 30_000)
             .await
             .expect("claim")
-            .expect("expired means claimable");
+            .expect("expired and past the cadence means claimable");
         assert!(successor.token > claimed.token);
         assert!(
             !repo
@@ -4684,6 +4761,87 @@ mod pursuit {
                 .await
                 .expect("write"),
             "outlived by a successor, the old token writes nothing"
+        );
+    }
+
+    /// The cadence is a DURATION and the schedule is absolute — pinned to the
+    /// clock, both sides of the boundary (ADR-021; the repair of the defect
+    /// that shipped with slice E, where the stored "next attempt" was
+    /// milliseconds after 1970 and every retry was instantly due). This is the
+    /// assertion every earlier test skipped by advancing its clock first.
+    #[tokio::test]
+    async fn a_finished_attempt_schedules_the_next_one_a_cadence_away() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        let claimed = repo
+            .claim_effect(&effect, 30_000)
+            .await
+            .expect("claim")
+            .expect("claimable");
+        assert!(
+            repo.note_attempt_started(&effect, claimed.token)
+                .await
+                .expect("note")
+        );
+        assert!(
+            repo.note_attempt_finished(&effect, claimed.token, 5_000)
+                .await
+                .expect("note")
+        );
+        repo.release_lease(&effect, claimed.token)
+            .await
+            .expect("release");
+
+        // The stored schedule, exactly: now + cadence — never the bare cadence.
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT next_attempt_after_ms FROM effect_intents WHERE effect_intent_id = ?",
+        )
+        .bind(effect.as_str())
+        .fetch_one(repo.pool())
+        .await
+        .expect("row");
+        assert_eq!(stored, T0 + 5_000, "an absolute moment, not a 1970 offset");
+
+        // NOT due one tick before the cadence elapses...
+        clock.set(T0 + 4_999);
+        assert!(
+            repo.due_effects(10).await.expect("due").is_empty(),
+            "the cadence actually gates: not due yet"
+        );
+        assert!(
+            repo.claim_effect(&effect, 30_000)
+                .await
+                .expect("claim")
+                .is_none(),
+            "and the claim's own recheck agrees"
+        );
+        // ...due exactly when it does.
+        clock.set(T0 + 5_000);
+        assert_eq!(
+            repo.due_effects(10).await.expect("due"),
+            vec![effect.clone()]
+        );
+
+        // The retry hint is the same durable schedule, under the store's clock.
+        clock.set(T0 + 1_000);
+        assert_eq!(
+            repo.retry_hint_ms(&effect).await.expect("hint"),
+            Some(4_000),
+            "Retry-After projects the row, not a constant"
+        );
+        clock.set(T0 + 9_000);
+        assert_eq!(
+            repo.retry_hint_ms(&effect).await.expect("hint"),
+            Some(0),
+            "a schedule already passed hints zero, never negative"
+        );
+        assert_eq!(
+            repo.retry_hint_ms(&EffectIntentId::new("EFF-NOBODY"))
+                .await
+                .expect("hint"),
+            None,
+            "no hint for an identity the store does not chase"
         );
     }
 

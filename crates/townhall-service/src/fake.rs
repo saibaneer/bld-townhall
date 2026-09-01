@@ -567,6 +567,9 @@ impl Verifier<RawResponse, VerifiedProviderFact> for CouncilVerifier {
 pub struct FixedAvailability {
     facts: townhall_domain::VenueFacts,
     grant: AvailabilityGrant,
+    /// When false, every read answers `Unavailable` — the fake's honest stand-in
+    /// for a provider that cannot be asked (ADR-021's 503 leg).
+    reachable: bool,
 }
 
 /// The token [`FixedAvailability::new`] issues.
@@ -583,6 +586,16 @@ impl FixedAvailability {
         Self {
             facts,
             grant: AvailabilityGrant::new(FAKE_GRANT),
+            reachable: true,
+        }
+    }
+
+    /// A source that cannot be asked at all.
+    #[must_use]
+    pub fn unreachable(facts: townhall_domain::VenueFacts) -> Self {
+        Self {
+            reachable: false,
+            ..Self::new(facts)
         }
     }
 
@@ -590,7 +603,11 @@ impl FixedAvailability {
     /// token from the availability read all the way to the council call.
     #[must_use]
     pub fn granting(facts: townhall_domain::VenueFacts, grant: AvailabilityGrant) -> Self {
-        Self { facts, grant }
+        Self {
+            facts,
+            grant,
+            reachable: true,
+        }
     }
 }
 
@@ -600,15 +617,44 @@ impl crate::AvailabilitySource for FixedAvailability {
         &self,
         venue: &bld_types::VenueId,
         slot: &bld_types::SlotId,
-    ) -> Option<Verified<townhall_domain::VerifiedAvailability>> {
+    ) -> townhall_domain::ObservedAvailability {
+        if !self.reachable {
+            return townhall_domain::ObservedAvailability::Unavailable;
+        }
         // Answers only for the venue it knows about, so a test cannot accidentally
         // bind facts to a venue nobody selected.
-        (self.facts.venue_id == *venue && self.facts.slot_id == *slot).then(|| {
-            Verified::assert_verified(townhall_domain::VerifiedAvailability {
-                facts: self.facts.clone(),
-                grant: self.grant.clone(),
-            })
-        })
+        townhall_domain::ObservedAvailability::Answered(
+            (self.facts.venue_id == *venue && self.facts.slot_id == *slot).then(|| {
+                Verified::assert_verified(townhall_domain::VerifiedAvailability {
+                    facts: self.facts.clone(),
+                    grant: self.grant.clone(),
+                })
+            }),
+        )
+    }
+}
+
+/// A fixed browse catalogue for tests — the fake counterpart of the council's
+/// `GET /venues`. `None` facts models an unreachable catalogue.
+pub struct FixedCatalogue {
+    rows: Option<Vec<crate::VenueSummary>>,
+}
+
+impl FixedCatalogue {
+    #[must_use]
+    pub fn of(rows: Vec<crate::VenueSummary>) -> Self {
+        Self { rows: Some(rows) }
+    }
+    #[must_use]
+    pub const fn unreachable() -> Self {
+        Self { rows: None }
+    }
+}
+
+#[async_trait]
+impl crate::CatalogueSource for FixedCatalogue {
+    async fn venues(&self) -> Option<Vec<crate::VenueSummary>> {
+        self.rows.clone()
     }
 }
 

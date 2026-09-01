@@ -160,12 +160,12 @@ async fn reconciler_over(
     };
     let client = || CouncilClient::new(&world.council_url, key());
     let reconciliation = Reconciliation::new(
-        Coordinator::new(
+        Arc::new(Coordinator::new(
             Arc::clone(&repo),
             Arc::new(client()),
             Arc::new(CouncilVerifier::new(key())),
             Arc::new(client()),
-        ),
+        )),
         Arc::new(client()),
     );
     (reconciliation, repo, clock)
@@ -574,13 +574,15 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
             .verifying_key(),
     );
     let reconciliation = Reconciliation::new(
-        Coordinator::new(
-            Arc::clone(&repo),
-            Arc::new(CouncilClient::new(&world.council_url, key2)),
-            Arc::new(CouncilVerifier::new(key2)),
-            Arc::new(CouncilClient::new(&world.council_url, key2)),
-        )
-        .with_denial_log(Arc::clone(&denial_log)),
+        Arc::new(
+            Coordinator::new(
+                Arc::clone(&repo),
+                Arc::new(CouncilClient::new(&world.council_url, key2)),
+                Arc::new(CouncilVerifier::new(key2)),
+                Arc::new(CouncilClient::new(&world.council_url, key2)),
+            )
+            .with_denial_log(Arc::clone(&denial_log)),
+        ),
         Arc::new(CouncilClient::new(&world.council_url, key2)),
     );
 
@@ -648,6 +650,10 @@ async fn garbage_and_delay_become_unknown_never_facts() {
     let status = run_driver(&world, "BKG-MANGLE", "never");
     assert!(status.success());
 
+    // One reconciler and ONE movable clock across the legs: each turn's finish
+    // now schedules a REAL cadence (ADR-021's repair), so a fresh clock per leg
+    // would honestly answer NotDue to its own past.
+    let (reconciliation, _repo, clock) = reconciler_over(&world).await;
     for fault in ["garbage", "unsigned"] {
         reqwest::Client::new()
             .post(format!("{}/test/faults", world.council_url))
@@ -659,7 +665,6 @@ async fn garbage_and_delay_become_unknown_never_facts() {
             .send()
             .await
             .expect("arm");
-        let (reconciliation, _repo, clock) = reconciler_over(&world).await;
         clock.advance(600_000);
         let attended = reconciliation.attend(&effect).await.expect("attend");
         assert!(
@@ -1425,7 +1430,9 @@ async fn a_lookup_killed_mid_tombstone_leaves_the_workflow_unknown_and_retrying(
     drop(world);
     let world = spawn_council_at(dir.path(), Some(MovableClock::now() + 600_000));
     let (reconciliation, repo, clock) = reconciler_over(&world).await;
-    clock.advance(60_000);
+    // Past the FIRST attempt's real schedule (its finish booked now+5s on the
+    // earlier clock — ADR-021's repair made that gate genuine), with margin.
+    clock.advance(120_000);
     let attended = reconciliation.attend(&effect).await.expect("attend");
     assert_eq!(attended, Attended::Settled);
     assert_eq!(

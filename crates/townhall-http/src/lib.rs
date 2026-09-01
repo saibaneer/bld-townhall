@@ -1,0 +1,492 @@
+#![forbid(unsafe_code)]
+
+//! The boundary's wire: Axum handlers over [`BookingFacade`], and nothing else.
+//!
+//! This crate is the M5 gate's third clause made structural — *"handlers do
+//! not mutate directly"* is a fact about what this code CAN express, because
+//! its whole world is two object-safe traits from `townhall-service`
+//! ([`BookingFacade`], [`ReconcilerHandle`]) plus the domain's vocabulary. No
+//! store type, no provider client, no SQL is nameable here: the Cargo manifest
+//! is the enforcement (ADR-021), and a source-scan test in the server remains
+//! as a secondary tripwire.
+//!
+//! # The mapping is one function
+//!
+//! Every HTTP status is derived from a typed outcome in [`mapping`], whose
+//! matches are exhaustive — a new outcome or error variant fails to compile
+//! until someone classifies it. Handlers assemble requests and bodies; they
+//! never decide a status.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::{
+    Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use bld_types::{BookingId, BookingRequirements, Money, SlotId, TimeWindow, VenueId};
+use townhall_domain::{BookingProposal, VerifiedAuthority};
+use townhall_service::{BookingFacade, Mutated, Projection, ReconcilerHandle, VenueFilters};
+
+pub mod mapping;
+
+/// Resolves a bearer token to a verified authority — or nothing.
+///
+/// M5's implementation is the composition root's `DevAuthority` (a fixed
+/// allowlist behind a feature gate and a startup flag); M7's approval flow
+/// replaces it IN the composition root, so no fallback survives beside it
+/// (ADR-021).
+pub trait AuthorityResolver: Send + Sync {
+    fn resolve(&self, bearer: &str) -> Option<VerifiedAuthority>;
+}
+
+/// Everything a handler can reach. The completeness of this struct is the
+/// completeness of the wire's power.
+#[derive(Clone)]
+pub struct ServerState {
+    pub api: Arc<dyn BookingFacade>,
+    pub authority: Arc<dyn AuthorityResolver>,
+}
+
+/// The router over one state. The composition root binds it to a listener.
+pub fn router(state: ServerState) -> Router {
+    Router::new()
+        .route("/booking-intents", post(create_booking))
+        .route("/booking-intents/{id}", get(read_booking))
+        .route("/booking-intents/{id}/audit", get(read_audit))
+        .route("/venues", get(browse_venues))
+        .route("/venues/{venue}/slots/{slot}", get(read_slot))
+        .route(
+            "/booking-intents/{id}/behaviours/{behaviour}",
+            post(propose_behaviour),
+        )
+        .layer(axum::middleware::from_fn(request_id))
+        .with_state(state)
+}
+
+/// The reconciler loop: `due` then `attend`, every `interval`, until the
+/// shutdown watch flips. The store is the queue, the cadence is the retry,
+/// escalation is the dead-letter — the loop only supplies the heartbeat.
+pub async fn run_reconciler(
+    reconciler: Arc<dyn ReconcilerHandle>,
+    interval: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let Ok(due) = reconciler.due(16).await else { continue };
+                for effect in due {
+                    // An error on one identity must not starve the rest; the
+                    // row stays due and the next tick returns to it.
+                    let _ = reconciler.attend(&effect).await;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ headers
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Echo `X-Request-ID`, or mint one — one transport attempt, one id.
+async fn request_id(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let incoming = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let id = incoming.unwrap_or_else(|| {
+        format!(
+            "req-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis()),
+            REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+    let mut response = next.run(request).await;
+    if let Ok(value) = header::HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// The auth gate every route passes: a resolvable bearer, and no reserved
+/// headers. `X-BLD-Delegation` is refused loudly until M7's envelope exists
+/// (ADR-021) — silently ignoring a header that claims authority would be
+/// worse than refusing it.
+// The large-Err lint is silenced deliberately on the three header gates: the
+// Err IS a finished HTTP response, produced at most once per request, and
+// boxing it would trade clarity at every call site for bytes nobody counts.
+#[allow(clippy::result_large_err)]
+fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<VerifiedAuthority, Response> {
+    if headers.contains_key("x-bld-delegation") {
+        return Err(mapping::plain_error(
+            StatusCode::BAD_REQUEST,
+            "delegation envelopes arrive with M7; this header is reserved",
+        ));
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = bearer else {
+        return Err(mapping::plain_error(
+            StatusCode::UNAUTHORIZED,
+            "no verified caller identity",
+        ));
+    };
+    state.authority.resolve(token).ok_or_else(|| {
+        mapping::plain_error(StatusCode::UNAUTHORIZED, "no verified caller identity")
+    })
+}
+
+/// What an `If-Match` header amounted to, under spec §9.2's contract: exactly
+/// one strong, quoted (or bare) numeric version. Wildcards would make
+/// staleness unexpressible; weak validators cannot guard a CAS; multiple
+/// values are ambiguous about which precondition the caller means.
+#[allow(clippy::result_large_err)]
+fn expected_version(headers: &HeaderMap) -> Result<u64, Response> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(match headers.get_all(header::IF_MATCH).iter().count() {
+            0 => mapping::plain_error(
+                StatusCode::PRECONDITION_REQUIRED,
+                "mutations require If-Match with the version last observed",
+            ),
+            _ => mapping::plain_error(
+                StatusCode::BAD_REQUEST,
+                "exactly one If-Match value is meaningful here",
+            ),
+        });
+    };
+    let Ok(text) = value.to_str() else {
+        return Err(mapping::plain_error(
+            StatusCode::BAD_REQUEST,
+            "If-Match must be a version ETag",
+        ));
+    };
+    let candidate = text.trim();
+    if candidate == "*" || candidate.starts_with("W/") {
+        return Err(mapping::plain_error(
+            StatusCode::BAD_REQUEST,
+            "If-Match must be one strong version ETag; wildcards and weak validators cannot guard a compare-and-set",
+        ));
+    }
+    candidate.trim_matches('"').parse::<u64>().map_err(|_| {
+        mapping::plain_error(StatusCode::BAD_REQUEST, "If-Match must be a version ETag")
+    })
+}
+
+/// Routes where NO precondition applies refuse a present `If-Match` rather
+/// than ignore it (ADR-021): a precondition the server would not honour is a
+/// caller's false belief, and 400 says so.
+#[allow(clippy::result_large_err)]
+fn refuse_precondition(headers: &HeaderMap, route: &str) -> Result<(), Response> {
+    if headers.contains_key(header::IF_MATCH) {
+        return Err(mapping::plain_error(
+            StatusCode::BAD_REQUEST,
+            &format!("no precondition applies to {route}"),
+        ));
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------- bodies
+
+#[derive(serde::Deserialize)]
+struct CreateBody {
+    id: String,
+    purpose: String,
+    requested_date: String,
+    from: String,
+    to: String,
+    attendees: u16,
+    wheelchair_accessible: bool,
+    max_fee_pence: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct SelectVenueBody {
+    venue_id: String,
+    slot_id: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct UpdateRequirementsBody {
+    attendees: Option<u16>,
+}
+
+#[derive(serde::Deserialize)]
+struct CancelBody {
+    reason: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct VenueQuery {
+    attendees: Option<u16>,
+    accessible: Option<bool>,
+    max_fee_pence: Option<i64>,
+}
+
+// ----------------------------------------------------------------- handlers
+
+async fn create_booking(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<CreateBody>,
+) -> Response {
+    if let Err(refused) = authorize(&state, &headers) {
+        return refused;
+    }
+    if let Err(refused) = refuse_precondition(&headers, "create") {
+        return refused;
+    }
+    let requirements = BookingRequirements {
+        purpose: body.purpose,
+        requested_date: body.requested_date,
+        time_window: TimeWindow {
+            from: body.from,
+            to: body.to,
+        },
+        attendees: body.attendees,
+        wheelchair_accessible: body.wheelchair_accessible,
+        max_fee: Money::from_pence(body.max_fee_pence),
+    };
+    match state
+        .api
+        .create(BookingId::new(body.id), requirements)
+        .await
+    {
+        Ok(projection) => mapping::projection_response(StatusCode::CREATED, &projection),
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+async fn read_booking(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(refused) = authorize(&state, &headers) {
+        return refused;
+    }
+    match state.api.read(&BookingId::new(id)).await {
+        Ok(projection) => mapping::projection_response(StatusCode::OK, &projection),
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+async fn read_audit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(refused) = authorize(&state, &headers) {
+        return refused;
+    }
+    match state.api.audit(&BookingId::new(id)).await {
+        Ok(entries) => {
+            let rows: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "driver_kind": entry.driver_kind,
+                        "driver_detail": entry.driver_detail,
+                        "outcome": entry.outcome,
+                        "from_version": entry.from_version,
+                        "to_version": entry.to_version,
+                        "at_ms": entry.at_ms,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "audit": rows })),
+            )
+                .into_response()
+        }
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+async fn browse_venues(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<VenueQuery>,
+) -> Response {
+    if let Err(refused) = authorize(&state, &headers) {
+        return refused;
+    }
+    let filters = VenueFilters {
+        attendees: query.attendees,
+        accessible: query.accessible,
+        max_fee_pence: query.max_fee_pence,
+    };
+    match state.api.venues(filters).await {
+        Ok(rows) => {
+            let venues: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "venue_id": row.venue_id,
+                        "slot_id": row.slot_id,
+                        "fee_pence": row.fee_pence,
+                        "capacity": row.capacity,
+                        "accessible": row.accessible,
+                        "available": row.available,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "venues": venues, "browse_only": true })),
+            )
+                .into_response()
+        }
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+async fn read_slot(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((venue, slot)): Path<(String, String)>,
+) -> Response {
+    if let Err(refused) = authorize(&state, &headers) {
+        return refused;
+    }
+    match state
+        .api
+        .slot_facts(&VenueId::new(venue), &SlotId::new(slot))
+        .await
+    {
+        Ok(Some(facts)) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "venue_id": facts.venue_id,
+                "slot_id": facts.slot_id,
+                "capacity": facts.capacity,
+                "accessible": facts.accessible,
+                "fee_pence": facts.fee_pence,
+                "available": facts.available,
+            })),
+        )
+            .into_response(),
+        Ok(None) => mapping::plain_error(StatusCode::NOT_FOUND, "no such venue or slot"),
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+async fn propose_behaviour(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((id, behaviour)): Path<(String, String)>,
+    body: Option<axum::Json<serde_json::Value>>,
+) -> Response {
+    let authority = match authorize(&state, &headers) {
+        Ok(authority) => authority,
+        Err(refused) => return refused,
+    };
+    let id = BookingId::new(id);
+    let payload = body.map_or(serde_json::Value::Null, |axum::Json(value)| value);
+
+    // The reconcile trigger: exempt from preconditions by classification
+    // (ADR-021) — it asserts no expected state, so a version tag would be a
+    // false belief, refused like any other.
+    if behaviour == "reconcile" {
+        if let Err(refused) = refuse_precondition(&headers, "reconcile") {
+            return refused;
+        }
+        return match state.api.attend_booking(&id).await {
+            Ok(outcomes) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "attended": outcomes
+                        .iter()
+                        .map(|outcome| format!("{outcome:?}"))
+                        .collect::<Vec<_>>(),
+                })),
+            )
+                .into_response(),
+            Err(error) => mapping::api_error(&error),
+        };
+    }
+
+    let expected = match expected_version(&headers) {
+        Ok(version) => version,
+        Err(refused) => return refused,
+    };
+    let proposal = match parse_proposal(&behaviour, payload) {
+        Ok(proposal) => proposal,
+        Err(refused) => return refused,
+    };
+    match state
+        .api
+        .propose_at(&id, expected, proposal, &authority)
+        .await
+    {
+        Ok(mutated) => turn_response(&state, &id, mutated).await,
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_proposal(
+    behaviour: &str,
+    payload: serde_json::Value,
+) -> Result<BookingProposal, Response> {
+    let bad_body = |detail: &str| mapping::plain_error(StatusCode::UNPROCESSABLE_ENTITY, detail);
+    match behaviour {
+        "select-venue" => {
+            let body: SelectVenueBody = serde_json::from_value(payload)
+                .map_err(|_| bad_body("select-venue needs venue_id and slot_id"))?;
+            Ok(BookingProposal::SelectVenue {
+                venue_id: VenueId::new(body.venue_id),
+                slot_id: SlotId::new(body.slot_id),
+            })
+        }
+        "verify-slot" => Ok(BookingProposal::VerifySlot),
+        "change-venue" => Ok(BookingProposal::ChangeVenue),
+        "update-requirements" => {
+            let body: UpdateRequirementsBody = serde_json::from_value(payload)
+                .map_err(|_| bad_body("update-requirements carries optional attendees"))?;
+            Ok(BookingProposal::UpdateRequirements {
+                attendees: body.attendees,
+            })
+        }
+        "revalidate-venue" => Ok(BookingProposal::RevalidateVenue),
+        // Deliberately empty-bodied: parameters are boundary-derived (spec §10).
+        "book" => Ok(BookingProposal::Book),
+        "cancel" => {
+            let body: CancelBody =
+                serde_json::from_value(payload).map_err(|_| bad_body("cancel needs a reason"))?;
+            Ok(BookingProposal::Cancel {
+                reason: body.reason,
+            })
+        }
+        _ => Err(mapping::plain_error(
+            StatusCode::NOT_FOUND,
+            "no such behaviour route",
+        )),
+    }
+}
+
+/// A turn's response body wants the current projection for the states the
+/// outcome does not carry — assembled here, mapped in [`mapping`].
+async fn turn_response(state: &ServerState, id: &BookingId, mutated: Mutated) -> Response {
+    let menu: Option<Projection> = state.api.read(id).await.ok();
+    mapping::turn(&mutated, menu.as_ref())
+}

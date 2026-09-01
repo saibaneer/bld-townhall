@@ -246,6 +246,42 @@ impl Registry {
     /// # Errors
     /// [`CouncilError::Sqlx`] on a read failure, [`CouncilError::Wire`] if a field
     /// exceeds the wire's limits.
+    /// The whole catalogue, for browsing (spec §11's `GET /venues`).
+    ///
+    /// Deliberately UNSIGNED and never evidence: browse answers exist so a
+    /// caller can choose; every guard that matters consumes the per-slot
+    /// signed answer instead (ADR-021 — the BLD server serves this as
+    /// browse-only for the same reason).
+    ///
+    /// # Errors
+    /// [`CouncilError`] on a read failure.
+    pub async fn venues(&self) -> Result<Vec<CatalogueRow>, CouncilError> {
+        let rows = sqlx::query(
+            r"
+            SELECT venue_id, slot_id, fee_pence, capacity, accessible, available
+              FROM venue_slots ORDER BY venue_id, slot_id
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(CatalogueRow {
+                    venue_id: row.get("venue_id"),
+                    slot_id: row.get("slot_id"),
+                    fee_pence: unsigned(row, "fee_pence")?,
+                    capacity: unsigned(row, "capacity")?,
+                    accessible: row.get("accessible"),
+                    available: row.get("available"),
+                })
+            })
+            .collect()
+    }
+
+    /// One slot's authoritative facts, signed per answer.
+    ///
+    /// # Errors
+    /// [`CouncilError`] on a read failure.
     pub async fn availability(
         &self,
         venue_id: &str,
@@ -896,6 +932,17 @@ enum Settlement {
     Created(String),
     Absent,
     Rejected(String),
+}
+
+/// One catalogue row, for browsing only — never evidence.
+#[derive(Debug, serde::Serialize)]
+pub struct CatalogueRow {
+    pub venue_id: String,
+    pub slot_id: String,
+    pub fee_pence: u64,
+    pub capacity: u64,
+    pub accessible: bool,
+    pub available: bool,
 }
 
 pub struct AvailabilityAnswer {

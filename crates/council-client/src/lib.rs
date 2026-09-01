@@ -52,9 +52,10 @@ use council_wire::{
     },
 };
 use townhall_domain::{
-    BookingEffect, OperationKind, VenueFacts, VerifiedAvailability, VerifiedProviderFact,
+    BookingEffect, ObservedAvailability, OperationKind, VenueFacts, VerifiedAvailability,
+    VerifiedProviderFact,
 };
-use townhall_service::{AvailabilitySource, EffectResolver};
+use townhall_service::{AvailabilitySource, CatalogueSource, EffectResolver, VenueSummary};
 
 pub use council_wire::{CouncilSigner, WireError};
 
@@ -236,9 +237,42 @@ impl EffectResolver<SignedEffectResponse> for CouncilClient {
 }
 
 #[async_trait]
+impl CatalogueSource for CouncilClient {
+    /// The council's browse list (spec §11) — unsigned by both sides' design:
+    /// browsing is choosing, never proving. `None` means the catalogue could
+    /// not be asked, which the wire maps to 503.
+    async fn venues(&self) -> Option<Vec<VenueSummary>> {
+        let body: serde_json::Value = self
+            .http
+            .get(format!("{}/venues", self.base_url))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let rows = body.get("venues")?.as_array()?;
+        rows.iter()
+            .map(|row| {
+                Some(VenueSummary {
+                    venue_id: row.get("venue_id")?.as_str()?.to_owned(),
+                    slot_id: row.get("slot_id")?.as_str()?.to_owned(),
+                    fee_pence: i64::try_from(row.get("fee_pence")?.as_u64()?).ok()?,
+                    capacity: row.get("capacity")?.as_u64()?,
+                    accessible: row.get("accessible")?.as_bool()?,
+                    available: row.get("available")?.as_bool()?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
 impl AvailabilitySource for CouncilClient {
-    async fn read(&self, venue: &VenueId, slot: &SlotId) -> Option<Verified<VerifiedAvailability>> {
-        let body: AvailabilityResponseBody = self
+    async fn read(&self, venue: &VenueId, slot: &SlotId) -> ObservedAvailability {
+        // Could not ASK: dead socket, unreadable reply. Distinct from an
+        // answer, and the wire maps it 503 rather than 422 (ADR-021).
+        let Ok(response) = self
             .http
             .get(format!(
                 "{}/venues/{}/slots/{}",
@@ -248,37 +282,43 @@ impl AvailabilitySource for CouncilClient {
             ))
             .send()
             .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        else {
+            return ObservedAvailability::Unavailable;
+        };
+        let Ok(body) = response.json::<AvailabilityResponseBody>().await else {
+            return ObservedAvailability::Unavailable;
+        };
 
         let response = SignedAvailabilityResponse::from(body);
 
         // Provenance first, and before anything is read out of the payload. These
         // facts decide accessibility, fee and capacity; a substituted response
         // would have the boundary approve from forged context with a clean audit
-        // trail behind it.
-        self.key.check_availability(&response).ok()?;
+        // trail behind it. An unattributable reply is not an answer.
+        if self.key.check_availability(&response).is_err() {
+            return ObservedAvailability::Unavailable;
+        }
 
         // The signature covers the venue and slot, so this comparison is not
         // redundant with it — it stops a genuinely signed answer about a
         // *different* slot being bound to this question.
         if response.venue_id != venue.as_str() || response.slot_id != slot.as_str() {
-            return None;
+            return ObservedAvailability::Unavailable;
         }
 
-        let facts = response.facts?;
-        Some(Verified::assert_verified(VerifiedAvailability {
-            facts: VenueFacts {
-                venue_id: venue.clone(),
-                slot_id: slot.clone(),
-                capacity: facts.capacity,
-                wheelchair_accessible: facts.accessible,
-                fee: Money::from_pence(facts.fee_pence),
-                available: facts.available,
-            },
-            grant: AvailabilityGrant::new(facts.grant),
+        // The council ANSWERED. Facts or no facts, that is an answer.
+        ObservedAvailability::Answered(response.facts.map(|facts| {
+            Verified::assert_verified(VerifiedAvailability {
+                facts: VenueFacts {
+                    venue_id: venue.clone(),
+                    slot_id: slot.clone(),
+                    capacity: facts.capacity,
+                    wheelchair_accessible: facts.accessible,
+                    fee: Money::from_pence(facts.fee_pence),
+                    available: facts.available,
+                },
+                grant: AvailabilityGrant::new(facts.grant),
+            })
         }))
     }
 }

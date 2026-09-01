@@ -1,0 +1,23 @@
+[package]
+name = "townhall-http"
+version = "0.1.0"
+edition = "2024"
+
+# The HTTP ADAPTER library (ADR-021): handlers, DTOs, the status mapping, the
+# reconciler loop driver. It deliberately CANNOT name a store, provider, or
+# other infrastructure crate — that boundary is the crate graph's to keep, the
+# same enforcement ADR-012 uses for evidence types. The composition-root
+# binary (services/townhall-server) wires the concrete world and hands this
+# crate its router state.
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+bld-types = { path = "../bld-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+townhall-domain = { path = "../townhall-domain" }
+townhall-service = { path = "../townhall-service" }
+
+[lints]
+workspace = true

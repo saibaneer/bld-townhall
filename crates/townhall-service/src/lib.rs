@@ -45,8 +45,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use townhall_domain::{
     Booking, BookingAggregate, BookingContext, BookingEffect, BookingError, BookingProposal,
-    FactContext, OperationKind, SystemEvent, TownHallDomain, VerifiedAuthority,
-    VerifiedAvailability, VerifiedProviderFact,
+    FactContext, ObservedAvailability, OperationKind, SystemEvent, TownHallDomain,
+    VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_store::{
     BookingRepository, ClaimedEffect, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError,
@@ -67,15 +67,46 @@ pub mod fake;
 /// coordinator that branched on "does `VerifySlot` need availability?" would hold
 /// a copy of the topology, and topology lives in one place.
 ///
-/// Returns `None` for "no usable answer", which covers both "the provider does
-/// not know this slot" and "the answer could not be verified". Collapsing them is
-/// deliberate: an unverifiable availability response is not a weaker fact, it is
-/// no fact, and the proposal door already treats a missing observation as grounds
-/// to refuse rather than to proceed. Failing towards refusal is the only safe
-/// direction for context that three guards read.
+/// Answers three ways (ADR-021): an ANSWER (with or without facts — an
+/// unverifiable or wrong-slot response is not a weaker fact, it is no fact,
+/// and stays `Answered(None)` only when the provider genuinely answered), or
+/// `Unavailable` — the provider could not be asked at all, which the domain
+/// refuses as its own error and the wire maps to 503 rather than 422. Failing
+/// towards refusal remains the only safe direction for context three guards
+/// read; the three-way shape only keeps the REASON honest.
 #[async_trait]
 pub trait AvailabilitySource: Send + Sync {
-    async fn read(&self, venue: &VenueId, slot: &SlotId) -> Option<Verified<VerifiedAvailability>>;
+    async fn read(&self, venue: &VenueId, slot: &SlotId) -> ObservedAvailability;
+}
+
+/// The browse catalogue (spec §10's `GET /venues` search, served through the
+/// council's own list). BROWSE-ONLY by contract: nothing returned here is
+/// evidence — every guard consumes the per-slot verified answer instead.
+#[async_trait]
+pub trait CatalogueSource: Send + Sync {
+    /// The full list, or `None` when the provider cannot be asked (503).
+    async fn venues(&self) -> Option<Vec<VenueSummary>>;
+}
+
+/// One browse row. Deliberately not `VenueFacts`: same fields, different
+/// authority — a type the guards cannot consume by construction.
+#[derive(Clone, Debug)]
+pub struct VenueSummary {
+    pub venue_id: String,
+    pub slot_id: String,
+    pub fee_pence: i64,
+    pub capacity: u64,
+    pub accessible: bool,
+    pub available: bool,
+}
+
+/// Browse filters for [`CatalogueSource`] results — applied by the facade, so
+/// the wire's query parameters never reach the provider.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VenueFilters {
+    pub attendees: Option<u16>,
+    pub accessible: Option<bool>,
+    pub max_fee_pence: Option<i64>,
 }
 
 /// Asks a provider what became of an effect it may or may not have seen.
@@ -133,6 +164,13 @@ pub enum ServiceError {
     /// fabricated success.
     #[error("gave up re-classifying after {attempts} attempts under contention")]
     Contended { attempts: u32 },
+    /// The caller's expected version is not the current one — either at the
+    /// pre-classification comparison, or because the CAS/replay proved the
+    /// world moved mid-turn. Carries the CURRENT version so a 412 always ships
+    /// the fresh `ETag` (ADR-021). Produced only by [`Coordinator::propose_at`];
+    /// the versionless `propose` keeps M4's contracts.
+    #[error("expected version is stale; the current version is {current}")]
+    PreconditionFailed { current: u64 },
     /// The domain produced a plan this path cannot carry out.
     ///
     /// Unreachable through the current transition graph, and refused rather than
@@ -158,6 +196,67 @@ const RETRY_CADENCE_MS: i64 = 5_000;
 /// happening (ADR-019 §3).
 const ESCALATED_CADENCE_MS: i64 = townhall_store::MAX_CADENCE_MS;
 
+/// One validated configuration for every pursuit knob, shared by the
+/// coordinator and the reconciler so configured behaviour can never diverge
+/// from persisted behaviour (ADR-021). Values are validated against the
+/// store's own clamps at construction; the single sanctioned zero is
+/// `reclassify_attempts`, the deterministic-429 test seam.
+#[derive(Clone, Copy, Debug)]
+pub struct PursuitConfig {
+    pub retry_cadence_ms: i64,
+    pub escalated_cadence_ms: i64,
+    pub lease_ms: i64,
+    pub attempt_budget: u32,
+    pub reclassify_attempts: u32,
+}
+
+impl Default for PursuitConfig {
+    fn default() -> Self {
+        Self {
+            retry_cadence_ms: RETRY_CADENCE_MS,
+            escalated_cadence_ms: ESCALATED_CADENCE_MS,
+            lease_ms: PHASE_B_LEASE_MS,
+            attempt_budget: ATTEMPT_BUDGET,
+            reclassify_attempts: 3,
+        }
+    }
+}
+
+impl PursuitConfig {
+    /// Refuse a configuration the store would silently clamp or the protocol
+    /// would silently break: cadences and the lease must be positive and
+    /// within the store's maxima; the budget must exist.
+    ///
+    /// # Errors
+    /// A human-readable description of the first violated bound.
+    pub fn validated(self) -> Result<Self, String> {
+        if self.retry_cadence_ms <= 0 || self.retry_cadence_ms > townhall_store::MAX_CADENCE_MS {
+            return Err(format!(
+                "retry_cadence_ms must be in 1..={}",
+                townhall_store::MAX_CADENCE_MS
+            ));
+        }
+        if self.escalated_cadence_ms <= 0
+            || self.escalated_cadence_ms > townhall_store::MAX_CADENCE_MS
+        {
+            return Err(format!(
+                "escalated_cadence_ms must be in 1..={}",
+                townhall_store::MAX_CADENCE_MS
+            ));
+        }
+        if self.lease_ms <= 0 || self.lease_ms > townhall_store::MAX_LEASE_MS {
+            return Err(format!(
+                "lease_ms must be in 1..={}",
+                townhall_store::MAX_LEASE_MS
+            ));
+        }
+        if self.attempt_budget == 0 {
+            return Err("attempt_budget must be at least 1".to_owned());
+        }
+        Ok(self)
+    }
+}
+
 /// How many started calls may accumulate before a turn escalates instead of
 /// asking again. Conservative — a call that died mid-flight still counts —
 /// and cheap to be conservative about, because under ADR-019 an early
@@ -176,14 +275,14 @@ pub struct Coordinator<R, C, V, A> {
     /// "wire one door and call ADR-017 done" — the failure review predicted —
     /// is not expressible: either every refusal records, or none do.
     denials: Option<Arc<townhall_store::denials::DenialLog>>,
-    /// How many times Phase C may reload and re-classify after losing a
-    /// compare-and-set.
+    /// Every pursuit knob, in one validated place — cadences, the lease, the
+    /// escalation budget, and the Phase C re-classification budget (ADR-021).
     ///
-    /// Correctness does not depend on this number. What makes the bound safe is
-    /// that the intent is durable and reconciliation owns anything unfinished, so
-    /// exhausting the budget reports the current state rather than inventing an
-    /// outcome. Three is an availability choice, not a correctness argument.
-    attempts: u32,
+    /// Correctness does not depend on any of these numbers. What makes the
+    /// bounds safe is that the intent is durable and reconciliation owns
+    /// anything unfinished, so exhausting a budget reports the current state
+    /// rather than inventing an outcome.
+    config: PursuitConfig,
 }
 
 impl<R, C, V, A> Coordinator<R, C, V, A>
@@ -207,8 +306,17 @@ where
             kernel: Kernel,
             domain: TownHallDomain,
             denials: None,
-            attempts: 3,
+            config: PursuitConfig::default(),
         }
+    }
+
+    /// Replace the pursuit configuration (validated — see
+    /// [`PursuitConfig::validated`]). The reconciler built over this
+    /// coordinator shares it, so the two can never disagree (ADR-021).
+    #[must_use]
+    pub fn with_config(mut self, config: PursuitConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Wire the denial log. Every refusal at every door then leaves a trace:
@@ -219,11 +327,11 @@ where
         self
     }
 
-    /// Override the Phase C attempt budget. For tests that want contention to be
-    /// deterministic rather than lucky.
+    /// Override the Phase C re-classification budget. For tests that want
+    /// contention to be deterministic rather than lucky.
     #[must_use]
     pub const fn with_attempts(mut self, attempts: u32) -> Self {
-        self.attempts = attempts;
+        self.config.reclassify_attempts = attempts;
         self
     }
 
@@ -239,7 +347,54 @@ where
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
     ) -> Result<Turn, ServiceError> {
+        self.run_proposal(id, proposal, authority, None).await
+    }
+
+    /// As [`Self::propose`], with the caller's EXPECTED VERSION bound inside
+    /// the trusted turn (ADR-021; spec §9.2). Refused before classification
+    /// when it does not match the load; enforced by the CAS at exactly that
+    /// version after it; and a replayed Phase A — a rival already performed
+    /// this turn — is refused too, because THIS caller performed no mutation
+    /// and the world already moved. All three refusals are
+    /// [`ServiceError::PreconditionFailed`] carrying the current version, so a
+    /// 412 always ships the fresh `ETag`. A handler-side load/compare/propose
+    /// cannot deliver this: the stale request would be silently rebased
+    /// between the compare and the turn's own load.
+    ///
+    /// # Errors
+    /// As [`Self::propose`], plus [`ServiceError::PreconditionFailed`].
+    pub async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Turn, ServiceError> {
+        self.run_proposal(id, proposal, authority, Some(expected_version))
+            .await
+    }
+
+    /// The current version, for a `PreconditionFailed` that must carry it.
+    async fn stale(&self, id: &BookingId) -> Result<ServiceError, ServiceError> {
+        let current = self.repository.load(id).await?.version;
+        Ok(ServiceError::PreconditionFailed { current })
+    }
+
+    async fn run_proposal(
+        &self,
+        id: &BookingId,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+        expected: Option<u64>,
+    ) -> Result<Turn, ServiceError> {
         let aggregate = self.repository.load(id).await?;
+        if let Some(version) = expected
+            && aggregate.version != version
+        {
+            return Err(ServiceError::PreconditionFailed {
+                current: aggregate.version,
+            });
+        }
         let booking = Booking::from(&aggregate);
 
         // The audit record is built from the proposal itself, before it is
@@ -282,15 +437,23 @@ where
             }
 
             Resolution::Ready(TransitionPlan::Local { next_state }) => {
-                let committed = self
+                match self
                     .repository
                     .commit(id, aggregate.version, next_state, audit)
-                    .await?;
-                Ok(BoundaryOutcome::Committed(committed))
+                    .await
+                {
+                    Ok(committed) => Ok(BoundaryOutcome::Committed(committed)),
+                    // Under an expected version, losing the CAS IS the stale
+                    // precondition — reload so the 412 carries the fresh ETag.
+                    Err(StoreError::StaleVersion { .. }) if expected.is_some() => {
+                        Err(self.stale(id).await?)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
 
             Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) => {
-                self.reach_outside(id, aggregate.version, next_state, effect, audit)
+                self.reach_outside(id, aggregate.version, next_state, effect, audit, expected)
                     .await
             }
         }
@@ -322,7 +485,7 @@ where
                     .read(&selection.venue_id, &selection.slot_id)
                     .await
             }
-            None => None,
+            None => ObservedAvailability::none(),
         };
 
         // The identity is derived with the repository's own function, at the
@@ -346,10 +509,11 @@ where
         next_state: Booking,
         effect: BookingEffect,
         audit: TransitionAudit,
+        expected: Option<u64>,
     ) -> Result<Turn, ServiceError> {
         // PHASE A — the intent becomes durable, and the in-flight state is
         // committed, before anything external happens (ADR-014).
-        let prepared = self
+        let prepared = match self
             .repository
             .prepare_effect(PrepareEffect {
                 booking_id: id.clone(),
@@ -358,12 +522,36 @@ where
                 next: next_state,
                 audit,
             })
-            .await?;
+            .await
+        {
+            Ok(prepared) => prepared,
+            // Under an expected version, BOTH shapes of "another mutation
+            // already won from the version you observed" are stale: the CAS
+            // loss, and a same-key rival whose canonical plan DIFFERS (the
+            // replay-first check refuses it as ConflictingPlan before the CAS
+            // is ever reached). The wire's contract is 412 either way
+            // (ADR-021; PR #18 review). The versionless surface keeps M4's
+            // contract: a conflicting plan is an error, never absorbed.
+            Err(StoreError::StaleVersion { .. } | StoreError::ConflictingPlan { .. })
+                if expected.is_some() =>
+            {
+                return Err(self.stale(id).await?);
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         // A replay means this effect was already prepared and may already have
-        // been executed. Re-running Phase B could double-book, so recovery owns it
-        // from here.
+        // been executed. Re-running Phase B could double-book, so recovery owns
+        // it from here — and under an EXPECTED VERSION a replay is refused as
+        // stale (ADR-021): the rival's prepare bumped the version without this
+        // turn ever reaching the CAS, so `Unresolved` would claim work this
+        // request did not do. The store's replay-first contract (M4's
+        // lost-acknowledgement guarantee) and the versionless surface are
+        // untouched.
         if prepared.replayed {
+            if expected.is_some() {
+                return Err(self.stale(id).await?);
+            }
             return Ok(BoundaryOutcome::Unresolved);
         }
 
@@ -376,7 +564,7 @@ where
         // whose very first call is still in flight (review round 2).
         let Some(claimed) = self
             .repository
-            .claim_effect(&effect_id, PHASE_B_LEASE_MS)
+            .claim_effect(&effect_id, self.config.lease_ms)
             .await?
         else {
             // Someone else already owns this turn. The intent is durable and
@@ -385,7 +573,12 @@ where
         };
 
         let outcome = self
-            .send_claimed(id, &claimed.intent, claimed.token, RETRY_CADENCE_MS)
+            .send_claimed(
+                id,
+                &claimed.intent,
+                claimed.token,
+                self.config.retry_cadence_ms,
+            )
             .await;
 
         // The lease is given back whatever happened, so the reconciler may pick
@@ -481,7 +674,7 @@ where
         id: &BookingId,
         fact: &Verified<VerifiedProviderFact>,
     ) -> Result<Turn, ServiceError> {
-        for _ in 0..self.attempts {
+        for _ in 0..self.config.reclassify_attempts {
             let aggregate = self.repository.load(id).await?;
             let booking = Booking::from(&aggregate);
             let audit = TransitionAudit::driven_by(fact.get());
@@ -595,7 +788,7 @@ where
         }
 
         Err(ServiceError::Contended {
-            attempts: self.attempts,
+            attempts: self.config.reclassify_attempts,
         })
     }
 
@@ -696,7 +889,10 @@ pub fn effect_identity_for(
 /// sees. Per ADR-012, this is a surface guarantee rather than a compiler one —
 /// and it is stated at exactly that strength.
 pub struct Reconciliation<R, C, V, A, L> {
-    coordinator: Coordinator<R, C, V, A>,
+    /// Shared with [`BookingApi`] and the composition root — one coordinator,
+    /// one configuration, so the reconciler and the wire can never disagree
+    /// about cadences or budgets (ADR-021).
+    coordinator: Arc<Coordinator<R, C, V, A>>,
     resolver: Arc<L>,
 }
 
@@ -739,7 +935,7 @@ where
     A: AvailabilitySource,
     L: EffectResolver<C::Raw>,
 {
-    pub fn new(coordinator: Coordinator<R, C, V, A>, resolver: Arc<L>) -> Self {
+    pub fn new(coordinator: Arc<Coordinator<R, C, V, A>>, resolver: Arc<L>) -> Self {
         Self {
             coordinator,
             resolver,
@@ -767,11 +963,26 @@ where
         // The claim IS the eligibility check, atomically — not `due`, which only
         // suggests. `None` covers leased-elsewhere, not-yet-due and settled
         // alike, and none of them advances any count.
-        let Some(claimed) = repository.claim_effect(id, PHASE_B_LEASE_MS).await? else {
+        let Some(claimed) = repository
+            .claim_effect(id, self.coordinator.config.lease_ms)
+            .await?
+        else {
             return Ok(Attended::NotDue);
         };
 
         let turn = self.attend_claimed(id, &claimed).await;
+
+        // An ERROR still backs off: without a cadence push, a row that errors
+        // before its own finish-write stays earliest-due forever and
+        // monopolizes every future batch — starving healthy rows behind it
+        // (PR #18 review). Deferred WITHOUT counting: no call began, so
+        // neither ledger column may move. Best-effort, like every pursuit
+        // write.
+        if turn.is_err() {
+            let _ = repository
+                .defer_attempt(id, claimed.token, self.coordinator.config.retry_cadence_ms)
+                .await;
+        }
 
         // The lease is given back whatever happened — including on an error path,
         // where leaving it to expire would stall the intent for the lease term
@@ -791,14 +1002,15 @@ where
         // fenced: the write is conditional on the token, on `escalated_at_ms IS
         // NULL`, and on the intent still being live, so a replay, a race with a
         // settling fact, and a stale owner all collapse to a no-op.
-        if claimed.attempts_started >= ATTEMPT_BUDGET && !claimed.escalated {
+        if claimed.attempts_started >= self.coordinator.config.attempt_budget && !claimed.escalated
+        {
             return self.escalate(id, claimed).await;
         }
 
         let cadence = if claimed.escalated {
-            ESCALATED_CADENCE_MS
+            self.coordinator.config.escalated_cadence_ms
         } else {
-            RETRY_CADENCE_MS
+            self.coordinator.config.retry_cadence_ms
         };
         let booking_id = claimed.intent.booking_id.clone();
 
@@ -912,7 +1124,11 @@ where
         {
             bld_kernel::SystemEventResolution::Record => {
                 let wrote = repository
-                    .mark_escalated(id, claimed.token, ESCALATED_CADENCE_MS)
+                    .mark_escalated(
+                        id,
+                        claimed.token,
+                        self.coordinator.config.escalated_cadence_ms,
+                    )
                     .await?;
                 Ok(match wrote {
                     townhall_store::EscalationWrite::Recorded => Attended::Escalated,
@@ -943,5 +1159,447 @@ where
                 Ok(Attended::NotDue)
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------- the facade
+
+/// The application boundary the wire talks to (ADR-021).
+///
+/// Handlers hold this and nothing else, so "handlers do not mutate directly"
+/// (the M5 gate's third clause) is a fact about what their code can express:
+/// the complete mutation surface is [`BookingApi::create`] and
+/// [`BookingApi::propose_at`], both of which run the full coordinator turn.
+/// Everything else is a read or the reconcile trigger, which can only ask.
+pub struct BookingApi<R, C, V, A, L> {
+    coordinator: Arc<Coordinator<R, C, V, A>>,
+    reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+    /// The browse catalogue — dyn, because browsing carries no authority worth
+    /// a generic parameter.
+    catalogue: Arc<dyn CatalogueSource>,
+    /// The per-slot verified availability, projected WITHOUT its grant: grants
+    /// live in persisted plans and never in a response body.
+    availability: Arc<dyn AvailabilitySource>,
+}
+
+/// The facade's closed error vocabulary — everything an adapter needs to map,
+/// with no store type on the surface (the crate boundary is the point: the
+/// HTTP crate cannot name `StoreError`, so this enum is its whole world).
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("no such booking")]
+    UnknownBooking,
+    #[error("the booking already exists at version {current}")]
+    AlreadyExists { current: u64 },
+    #[error("expected version is stale; the current version is {current}")]
+    PreconditionFailed { current: u64 },
+    #[error("gave up re-classifying under contention")]
+    Contended,
+    /// An internal invariant failed — never dressed as provider trouble
+    /// (ADR-021: this is a 500, not a 503).
+    #[error("internal invariant failure: {0}")]
+    Internal(String),
+    /// The store or another prerequisite could not answer at all.
+    #[error("infrastructure unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl ApiError {
+    fn from_service(error: ServiceError) -> Self {
+        match error {
+            ServiceError::PreconditionFailed { current } => Self::PreconditionFailed { current },
+            ServiceError::Contended { .. } => Self::Contended,
+            ServiceError::UnexpectedPlan { reason } => Self::Internal(reason.to_owned()),
+            ServiceError::Store(StoreError::NotFound(_) | StoreError::EffectNotFound(_)) => {
+                Self::UnknownBooking
+            }
+            ServiceError::Store(error) => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
+/// What one versioned mutation amounted to, with everything a response needs:
+/// the typed outcome, the version an `ETag` reports, and — when the turn is
+/// `Unresolved` — the STORE's own schedule for the next attempt, which is what
+/// an honest `Retry-After` projects (ADR-021).
+#[derive(Debug)]
+pub struct Mutated {
+    pub outcome: Turn,
+    pub current_version: u64,
+    pub retry_after_ms: Option<i64>,
+}
+
+/// The read projection: the aggregate's client-visible fields plus the
+/// domain's exported behaviour MENU — the same table the topology docs are
+/// generated from, so what the API advertises and what the matrix permits are
+/// one fact (ADR-018's export, consumed).
+#[derive(Clone, Debug)]
+pub struct Projection {
+    pub id: BookingId,
+    pub version: u64,
+    pub state: &'static str,
+    pub requirements: bld_types::BookingRequirements,
+    pub selected_venue: Option<townhall_domain::SelectedVenueRef>,
+    pub booking_ref: Option<bld_types::CouncilBookingRef>,
+    pub available_behaviours: &'static [&'static str],
+}
+
+/// Per-slot verified facts as the wire sees them: everything the council
+/// signed EXCEPT the grant, which lives in persisted plans only.
+#[derive(Clone, Debug)]
+pub struct SlotFacts {
+    pub venue_id: String,
+    pub slot_id: String,
+    pub capacity: u16,
+    pub accessible: bool,
+    pub fee_pence: u64,
+    pub available: bool,
+}
+
+/// One audit row, as the wire may see it — a service-owned projection, not the
+/// store's record (re-exporting a storage type would hide the import, not the
+/// contract).
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub driver_kind: &'static str,
+    pub driver_detail: String,
+    pub outcome: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    pub at_ms: i64,
+}
+
+impl<R, C, V, A, L> BookingApi<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    pub fn new(
+        coordinator: Arc<Coordinator<R, C, V, A>>,
+        reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+        catalogue: Arc<dyn CatalogueSource>,
+        availability: Arc<dyn AvailabilitySource>,
+    ) -> Self {
+        Self {
+            coordinator,
+            reconciliation,
+            catalogue,
+            availability,
+        }
+    }
+
+    /// Browse the catalogue, filtered here so the wire's query never reaches
+    /// the provider. `None` from the source means it could not be asked (503).
+    ///
+    /// # Errors
+    /// [`ApiError::Unavailable`] when the catalogue cannot be asked.
+    pub async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
+        let Some(rows) = self.catalogue.venues().await else {
+            return Err(ApiError::Unavailable(
+                "the catalogue could not be asked".to_owned(),
+            ));
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                filters
+                    .attendees
+                    .is_none_or(|needed| row.capacity >= u64::from(needed))
+                    && filters
+                        .accessible
+                        .is_none_or(|needed| !needed || row.accessible)
+                    && filters
+                        .max_fee_pence
+                        .is_none_or(|ceiling| row.fee_pence <= ceiling)
+            })
+            .collect())
+    }
+
+    /// The per-slot verified facts, grant withheld. `None` facts is an ANSWER;
+    /// an unreachable provider is [`ApiError::Unavailable`] (ADR-021).
+    ///
+    /// # Errors
+    /// [`ApiError::Unavailable`].
+    pub async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError> {
+        match self.availability.read(venue, slot).await {
+            ObservedAvailability::Unavailable => Err(ApiError::Unavailable(
+                "the availability provider could not be asked".to_owned(),
+            )),
+            ObservedAvailability::Answered(observation) => Ok(observation.map(|verified| {
+                let facts = &verified.get().facts;
+                SlotFacts {
+                    venue_id: facts.venue_id.to_string(),
+                    slot_id: facts.slot_id.to_string(),
+                    capacity: facts.capacity,
+                    accessible: facts.wheelchair_accessible,
+                    fee_pence: facts.fee.pence(),
+                    available: facts.available,
+                }
+            })),
+        }
+    }
+
+    /// Create the durable booking intent. No precondition applies — a new
+    /// resource has no version to match (ADR-021).
+    ///
+    /// # Errors
+    /// [`ApiError::AlreadyExists`] with the existing version (a 409 that ships
+    /// the existing `ETag`); [`ApiError::Unavailable`] for store failure.
+    pub async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError> {
+        let repository = self.coordinator.repository();
+        match repository
+            .create(townhall_store::NewBooking {
+                id: id.clone(),
+                requirements,
+            })
+            .await
+        {
+            Ok(aggregate) => Ok(Self::project(&aggregate)),
+            Err(StoreError::AlreadyExists(_)) => {
+                let current = repository
+                    .load(&id)
+                    .await
+                    .map_err(|error| ApiError::Unavailable(error.to_string()))?
+                    .version;
+                Err(ApiError::AlreadyExists { current })
+            }
+            Err(error) => Err(ApiError::Unavailable(error.to_string())),
+        }
+    }
+
+    /// The authoritative projection, with the state's exported menu.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
+        let aggregate = self.load(id).await?;
+        Ok(Self::project(&aggregate))
+    }
+
+    /// One versioned mutation turn — see [`Coordinator::propose_at`].
+    ///
+    /// # Errors
+    /// [`ApiError::PreconditionFailed`] carrying the current version;
+    /// otherwise as [`ApiError::from_service`] maps them.
+    pub async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError> {
+        let outcome = self
+            .coordinator
+            .propose_at(id, expected_version, proposal, authority)
+            .await
+            .map_err(ApiError::from_service)?;
+
+        // The ETag after the turn, and — only for an unresolved turn — the
+        // store's own schedule for the next attempt.
+        let (current_version, retry_after_ms) = match &outcome {
+            BoundaryOutcome::Committed(aggregate) => (aggregate.version, None),
+            BoundaryOutcome::Unresolved => {
+                let aggregate = self.load(id).await?;
+                let hint = match &aggregate.active_effect {
+                    Some(effect) => self
+                        .coordinator
+                        .repository()
+                        .retry_hint_ms(effect)
+                        .await
+                        .map_err(|error| ApiError::Unavailable(error.to_string()))?,
+                    None => None,
+                };
+                (aggregate.version, hint)
+            }
+            _ => (self.load(id).await?.version, None),
+        };
+        Ok(Mutated {
+            outcome,
+            current_version,
+            retry_after_ms,
+        })
+    }
+
+    /// The typed audit trail, projected.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
+        // Reads on an unknown booking answer 404, not an empty trail.
+        self.load(id).await?;
+        let events = self
+            .coordinator
+            .repository()
+            .audit_events(id)
+            .await
+            .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+        Ok(events
+            .into_iter()
+            .map(|event| AuditEntry {
+                driver_kind: event.driver_kind.name(),
+                driver_detail: event.driver_detail,
+                outcome: event.outcome,
+                from_version: event.from_version,
+                to_version: event.to_version,
+                at_ms: event.created_at_ms,
+            })
+            .collect())
+    }
+
+    /// The spec's demo/admin reconcile trigger: drive THIS booking's chase to
+    /// quiescence through the reconciler's own surface — `attend`, never
+    /// `propose` — following handoffs to their successors (bounded). Exempt
+    /// from preconditions by classification (ADR-021): it asserts no expected
+    /// state; the claim is atomic and the facts are version-fenced below.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
+        let mut outcomes = Vec::new();
+        for _ in 0..4 {
+            let Some(effect) = self.load(id).await?.active_effect else {
+                break;
+            };
+            let attended = self
+                .reconciliation
+                .attend(&effect)
+                .await
+                .map_err(ApiError::from_service)?;
+            let done = attended == Attended::NotDue;
+            outcomes.push(attended);
+            if done {
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    async fn load(&self, id: &BookingId) -> Result<BookingAggregate, ApiError> {
+        match self.coordinator.repository().load(id).await {
+            Ok(aggregate) => Ok(aggregate),
+            Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
+            Err(error) => Err(ApiError::Unavailable(error.to_string())),
+        }
+    }
+
+    fn project(aggregate: &BookingAggregate) -> Projection {
+        Projection {
+            id: aggregate.id.clone(),
+            version: aggregate.version,
+            state: aggregate.state.name(),
+            requirements: aggregate.requirements.clone(),
+            selected_venue: aggregate.selected_venue.clone(),
+            booking_ref: aggregate.booking_ref.clone(),
+            available_behaviours: aggregate.state.proposal_menu(),
+        }
+    }
+}
+
+/// The facade, object-safe — the shape `townhall-http` holds, so the adapter
+/// crate never names a store, client, or even the facade's generics.
+#[async_trait]
+pub trait BookingFacade: Send + Sync {
+    async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError>;
+    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError>;
+    async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError>;
+    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError>;
+    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError>;
+    async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError>;
+    async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError>;
+}
+
+#[async_trait]
+impl<R, C, V, A, L> BookingFacade for BookingApi<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError> {
+        Self::create(self, id, requirements).await
+    }
+    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
+        Self::read(self, id).await
+    }
+    async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError> {
+        Self::propose_at(self, id, expected_version, proposal, authority).await
+    }
+    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
+        Self::audit(self, id).await
+    }
+    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
+        Self::attend_booking(self, id).await
+    }
+    async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
+        Self::venues(self, filters).await
+    }
+    async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError> {
+        Self::slot_facts(self, venue, slot).await
+    }
+}
+
+/// The reconciler's loop surface, object-safe — due and attend, nothing else,
+/// exactly as ADR-019 scoped it.
+#[async_trait]
+pub trait ReconcilerHandle: Send + Sync {
+    async fn due(&self, limit: u32) -> Result<Vec<EffectIntentId>, ServiceError>;
+    async fn attend(&self, id: &EffectIntentId) -> Result<Attended, ServiceError>;
+}
+
+#[async_trait]
+impl<R, C, V, A, L> ReconcilerHandle for Reconciliation<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    async fn due(&self, limit: u32) -> Result<Vec<EffectIntentId>, ServiceError> {
+        Self::due(self, limit).await
+    }
+    async fn attend(&self, id: &EffectIntentId) -> Result<Attended, ServiceError> {
+        Self::attend(self, id).await
     }
 }

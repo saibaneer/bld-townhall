@@ -13,6 +13,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+static_assertions.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

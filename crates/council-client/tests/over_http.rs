@@ -100,13 +100,19 @@ impl Harness {
 
     /// Read availability the way the coordinator does, and keep the observation.
     async fn observe(&self, venue: &str, slot: &str) -> Option<(VenueFacts, AvailabilityGrant)> {
-        self.client
+        match self
+            .client
             .read(&VenueId::new(venue), &SlotId::new(slot))
             .await
-            .map(|verified| {
-                let observation = verified.into_inner();
-                (observation.facts, observation.grant)
-            })
+        {
+            townhall_domain::ObservedAvailability::Answered(observation) => {
+                observation.map(|verified| {
+                    let observation = verified.into_inner();
+                    (observation.facts, observation.grant)
+                })
+            }
+            townhall_domain::ObservedAvailability::Unavailable => None,
+        }
     }
 
     async fn book(
@@ -196,21 +202,23 @@ async fn an_unknown_slot_yields_no_answer() {
     assert!(h.observe("TH-NOWHERE", "SLOT-A").await.is_none());
 }
 
-/// A council that cannot be reached is no answer, not a false one.
+/// A council that cannot be reached is no answer, not a false one — and since
+/// ADR-021 it is its own SHAPE of no-answer: `Unavailable` (the wire's 503),
+/// never `Answered(None)` (an answer meaning "nothing there", the wire's 422).
 #[tokio::test]
-async fn an_unreachable_council_yields_no_availability() {
+async fn an_unreachable_council_yields_unavailable_not_an_answer() {
     let client = CouncilClient::new(
         // Port 1 on loopback, which nothing is listening on.
         "http://127.0.0.1:1",
         CouncilKey::new(CouncilSigner::new(SigningKey::from_bytes(&[7u8; 32])).verifying_key()),
     );
 
-    assert!(
+    assert!(matches!(
         client
             .read(&VenueId::new("TH-A"), &SlotId::new("SLOT-A"))
-            .await
-            .is_none()
-    );
+            .await,
+        townhall_domain::ObservedAvailability::Unavailable
+    ));
 }
 
 // ------------------------------------------------------------------ booking

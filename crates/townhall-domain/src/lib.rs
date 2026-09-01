@@ -228,6 +228,36 @@ impl BookingState {
         }
     }
 
+    /// The proposal-door MENU: which behaviours exist at this state, by their
+    /// stable names (ADR-004; ADR-018's exportable fixed table, earning its
+    /// keep on a real consumer — the HTTP projection's `available_behaviours`).
+    ///
+    /// One fact, three witnesses: the resolve match IS the truth, the pinned
+    /// LOCKED table asserts equality with this export, and the topology
+    /// generator's sweep asserts the generated non-empty proposal cells equal
+    /// it per state — so the menu, the matrix, and the docs cannot drift.
+    // `BookingInProgress` and `Booked` both answer ["Cancel"] — for entirely
+    // different reasons (mid-flight withdrawal vs ordinary cancellation), so
+    // the arms stay separate, as `in_flight_kind` establishes above.
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
+    pub const fn proposal_menu(&self) -> &'static [&'static str] {
+        match self {
+            Self::Draft(_) => &["SelectVenue", "Cancel"],
+            Self::VenueSelected(_) => {
+                &["VerifySlot", "ChangeVenue", "UpdateRequirements", "Cancel"]
+            }
+            Self::NeedsRevalidation(_) => &["RevalidateVenue", "ChangeVenue", "Cancel"],
+            Self::AwaitingBooking(_) => &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+            Self::BookingInProgress(_) => &["Cancel"],
+            Self::Booked(_) => &["Cancel"],
+            Self::CancellationRequested(_)
+            | Self::CancellingBooking(_)
+            | Self::Cancelled(_)
+            | Self::NeedsHuman(_) => &[],
+        }
+    }
+
     /// Whether the in-flight effect is still WANTED — may recovery *cause* it,
     /// or only learn its fate? (ADR-020; the compensation protocol.)
     ///
@@ -680,7 +710,7 @@ pub struct BookingContext {
     /// It holds [`VerifiedAvailability`] rather than [`VenueFacts`] so the
     /// council's grant travels with the facts it vouches for. Stripping it here
     /// would leave the booking turn with nothing to hand back.
-    pub selected_facts: Option<Verified<VerifiedAvailability>>,
+    pub selected_facts: ObservedAvailability,
     /// The effect identity the coordinator derived for this turn.
     ///
     /// The domain cannot derive it: the repository owns effect identity because
@@ -791,7 +821,11 @@ pub enum BookingError {
     #[error("venue is not wheelchair accessible")]
     AccessibilityRequired,
     #[error("venue fee exceeds effective maximum")]
-    FeeExceeded,
+    FeeExceeded { ceiling: FeeCeiling },
+    /// The availability provider could not be asked at all — distinct from
+    /// [`Self::VenueFactsMissing`], which is an ANSWER (ADR-021).
+    #[error("the availability provider could not be asked")]
+    FactsUnavailable,
     #[error("no effect identity was supplied for a transition that needs one")]
     EffectIdentityMissing,
     #[error("a state that participates in the fact door was given no intent to bind against")]
@@ -827,7 +861,17 @@ impl BookingError {
             Self::SlotUnavailable => "SlotUnavailable",
             Self::CapacityInsufficient { .. } => "CapacityInsufficient",
             Self::AccessibilityRequired => "AccessibilityRequired",
-            Self::FeeExceeded => "FeeExceeded",
+            // Distinct stable names, deliberately: ADR-017's denial dedup key
+            // includes this name, and merging a grant story (403) with a data
+            // story (422) would lose exactly the provenance the ledger exists
+            // to keep (ADR-021).
+            Self::FeeExceeded {
+                ceiling: FeeCeiling::Authority,
+            } => "FeeExceededAuthority",
+            Self::FeeExceeded {
+                ceiling: FeeCeiling::Requirement,
+            } => "FeeExceededRequirement",
+            Self::FactsUnavailable => "FactsUnavailable",
             Self::EffectIdentityMissing => "EffectIdentityMissing",
             Self::EffectPlanMissing => "EffectPlanMissing",
             Self::EffectMismatch => "EffectMismatch",
@@ -1002,6 +1046,30 @@ impl TransitionDriver for SystemEvent {
 
 /// What the coordinator supplies for fact binding.
 ///
+/// What the availability port OBSERVED, three-way — because a provider that
+/// cannot answer is not a provider that answered "nothing" (ADR-021). The
+/// domain distinguishes two shapes of its INPUT here, never the network: an
+/// `Unavailable` observation refuses as [`BookingError::FactsUnavailable`]
+/// (the wire's 503 — could not ask, before any durable intent), where an
+/// answered-empty observation refuses as [`BookingError::VenueFactsMissing`]
+/// (the wire's 422 — asked, answered, nothing there).
+#[derive(Clone, Debug)]
+pub enum ObservedAvailability {
+    Answered(Option<Verified<VerifiedAvailability>>),
+    Unavailable,
+}
+
+impl ObservedAvailability {
+    #[must_use]
+    pub const fn of(observation: Verified<VerifiedAvailability>) -> Self {
+        Self::Answered(Some(observation))
+    }
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::Answered(None)
+    }
+}
+
 /// Deliberately not [`BookingContext`]: that carries `selected_facts`, loaded
 /// by a capability, and the fact door must never bind against those — it binds
 /// against the *persisted* canonical plan. A context that cannot even name
@@ -1242,10 +1310,30 @@ impl TownHallDomain {
             return Err(BookingError::AccessibilityRequired);
         }
         if facts.fee > Self::effective_max_fee(requirements, authority) {
-            return Err(BookingError::FeeExceeded);
+            // WHICH ceiling refused decides the HTTP class (403 vs 422), so it
+            // is derived here, where both ceilings are in hand — authority wins
+            // when both are exceeded, because the caller's grant is
+            // insufficient regardless of the data (ADR-021).
+            let ceiling = if facts.fee > authority.max_fee {
+                FeeCeiling::Authority
+            } else {
+                FeeCeiling::Requirement
+            };
+            return Err(BookingError::FeeExceeded { ceiling });
         }
         Ok(())
     }
+}
+
+/// Which of the two fee ceilings a [`BookingError::FeeExceeded`] names: the
+/// caller's delegated maximum (an authority matter) or the booking's own
+/// requirement (a data matter). The distinction is load-bearing twice: the
+/// HTTP mapping derives 403 vs 422 from it, and the denial ledger's dedup key
+/// keeps the two stories separate through the distinct stable names (ADR-021).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeCeiling {
+    Authority,
+    Requirement,
 }
 
 /// Where a fact arrived from, for the one judgement that differs by origin.
@@ -1884,11 +1972,12 @@ impl TownHallDomain {
         slot_id: &SlotId,
         authority: &VerifiedAuthority,
     ) -> Result<&'a VerifiedAvailability, BookingError> {
-        let observation = context
-            .selected_facts
-            .as_ref()
-            .ok_or(BookingError::VenueFactsMissing)?
-            .get();
+        let observation = match &context.selected_facts {
+            ObservedAvailability::Unavailable => return Err(BookingError::FactsUnavailable),
+            ObservedAvailability::Answered(None) => return Err(BookingError::VenueFactsMissing),
+            ObservedAvailability::Answered(Some(observation)) => observation,
+        }
+        .get();
         let facts = &observation.facts;
         if facts.venue_id != *venue_id || facts.slot_id != *slot_id {
             return Err(BookingError::VenueFactsMissing);
@@ -2512,7 +2601,7 @@ mod topology {
 
     fn permissive_context() -> BookingContext {
         BookingContext {
-            selected_facts: Some(observed(VenueFacts {
+            selected_facts: ObservedAvailability::of(observed(VenueFacts {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 capacity: 30,
@@ -2537,7 +2626,7 @@ mod topology {
 
     fn hostile_context() -> BookingContext {
         BookingContext {
-            selected_facts: None,
+            selected_facts: ObservedAvailability::none(),
             ..permissive_context()
         }
     }
@@ -2547,6 +2636,26 @@ mod topology {
             || panic!("state {state} missing from LOCKED"),
             |(_, allowed)| allowed.contains(&proposal),
         )
+    }
+
+    /// The exported menu IS the pinned table — witness one of the export's two
+    /// proofs (the topology generator's sweep is the other). A menu that
+    /// drifted from LOCKED would let the HTTP projection advertise a door the
+    /// matrix refuses, or hide one it grants.
+    #[test]
+    fn the_exported_menu_is_the_locked_table() {
+        for state in all_states() {
+            let (_, allowed) = LOCKED
+                .iter()
+                .find(|(name, _)| *name == state.name())
+                .unwrap_or_else(|| panic!("state {} missing from LOCKED", state.name()));
+            assert_eq!(
+                state.proposal_menu(),
+                *allowed,
+                "{}: the export and the pinned table disagree",
+                state.name()
+            );
+        }
     }
 
     async fn sweep(
@@ -2563,6 +2672,11 @@ mod topology {
                 let state_name = state.name();
                 let proposal_name = proposal.name();
                 let want_defined = expected_defined(state_name, proposal_name);
+                assert_eq!(
+                    state.proposal_menu().contains(&proposal_name),
+                    want_defined,
+                    "[{label}] {state_name}: the exported menu disagrees with LOCKED on {proposal_name}"
+                );
                 let booking = booking_of(state.clone(), requirements.clone());
 
                 let got = domain
@@ -2757,7 +2871,7 @@ mod characterization {
 
     fn context() -> BookingContext {
         BookingContext {
-            selected_facts: Some(observed(good_facts())),
+            selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
         }
     }
@@ -2898,7 +3012,7 @@ mod characterization {
             BookingProposal::RevalidateVenue,
             &authority(),
             &BookingContext {
-                selected_facts: Some(observed(too_small)),
+                selected_facts: ObservedAvailability::of(observed(too_small)),
                 ..context()
             },
         )
@@ -3839,7 +3953,7 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_when_no_facts_were_loaded() {
         let mut ctx = context();
-        ctx.selected_facts = None;
+        ctx.selected_facts = ObservedAvailability::none();
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -3853,7 +3967,7 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_facts_for_a_different_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             venue_id: VenueId::new("TH-B"),
             ..good_facts()
         }));
@@ -3870,7 +3984,7 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_an_unavailable_slot() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             available: false,
             ..good_facts()
         }));
@@ -3887,7 +4001,7 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_insufficient_capacity() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             capacity: 12,
             ..good_facts()
         }));
@@ -3910,7 +4024,7 @@ mod characterization {
     #[tokio::test]
     async fn verify_slot_denies_an_inaccessible_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             wheelchair_accessible: false,
             ..good_facts()
         }));
@@ -3924,12 +4038,47 @@ mod characterization {
         assert_eq!(got, Resolution::Denied(BookingError::AccessibilityRequired));
     }
 
+    /// ADR-017 point 4's no-serde half for the domain's own trusted
+    /// vocabulary, due with M5's wire (ADR-021): neither the evidence type
+    /// nor the authority envelope can leak through a generic sink or be
+    /// minted from JSON.
+    #[test]
+    fn evidence_and_authority_cannot_cross_a_wire() {
+        static_assertions::assert_not_impl_any!(
+            VerifiedProviderFact: serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            VerifiedAuthority: serde::Serialize, serde::de::DeserializeOwned
+        );
+    }
+
+    /// A provider that cannot be ASKED is not one that answered "nothing":
+    /// the refusal carries its own name, because the wire maps the two to
+    /// different worlds — 503 versus 422 (ADR-021).
+    #[tokio::test]
+    async fn verify_slot_refuses_when_the_provider_cannot_be_asked() {
+        let mut ctx = context();
+        ctx.selected_facts = ObservedAvailability::Unavailable;
+        let got = turn(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &authority(),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::FactsUnavailable),
+            "could-not-ask is its own refusal, never VenueFactsMissing"
+        );
+    }
+
     /// The £45 / £50 / £90 case from the spec: the effective ceiling is the
     /// tighter of the user's requirement and the delegated authority.
     #[tokio::test]
     async fn verify_slot_denies_a_fee_over_the_ceiling() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             fee: Money::from_pence(9_000),
             ..good_facts()
         }));
@@ -3940,7 +4089,66 @@ mod characterization {
             &ctx,
         )
         .await;
-        assert_eq!(got, Resolution::Denied(BookingError::FeeExceeded));
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::FeeExceeded {
+                // 9,000p exceeds the 5,000p authority ceiling too, and
+                // authority wins when both are exceeded (ADR-021).
+                ceiling: FeeCeiling::Authority,
+            })
+        );
+    }
+
+    /// WHICH ceiling refused is derived, never guessed (ADR-021): the
+    /// authority's when the delegated maximum is exceeded (even when both
+    /// are), the requirement's when only the booking's own budget is.
+    #[tokio::test]
+    async fn the_ceiling_that_refused_is_named() {
+        // Exceeds only the REQUIREMENT: generous authority, tight budget.
+        let mut generous = authority();
+        generous.max_fee = Money::from_pence(20_000);
+        let mut ctx = context();
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
+            fee: Money::from_pence(9_000),
+            ..good_facts()
+        }));
+        let got = turn(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &generous,
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::FeeExceeded {
+                ceiling: FeeCeiling::Requirement,
+            }),
+            "a data story, not a grant story"
+        );
+
+        // Exceeds only the AUTHORITY: generous budget, tight delegation.
+        let mut restricted = authority();
+        restricted.max_fee = Money::from_pence(1_000);
+        let mut wanting = requirements();
+        wanting.max_fee = Money::from_pence(20_000);
+        let mut ctx = context();
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
+            fee: Money::from_pence(9_000),
+            ..good_facts()
+        }));
+        let booking = Booking {
+            requirements: wanting,
+            ..venue_selected()
+        };
+        let got = turn(booking, BookingProposal::VerifySlot, &restricted, &ctx).await;
+        assert_eq!(
+            got,
+            Resolution::Denied(BookingError::FeeExceeded {
+                ceiling: FeeCeiling::Authority,
+            }),
+            "the grant refused, regardless of the data"
+        );
     }
 
     /// A legacy row decoded with no selection cannot revalidate — fail closed
@@ -3964,7 +4172,7 @@ mod characterization {
     #[tokio::test]
     async fn revalidate_denies_facts_for_a_different_venue() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             venue_id: VenueId::new("TH-B"),
             ..good_facts()
         }));
@@ -3999,7 +4207,7 @@ mod characterization {
     #[tokio::test]
     async fn book_denies_when_the_fee_moved_since_verification() {
         let mut ctx = context();
-        ctx.selected_facts = Some(observed(VenueFacts {
+        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             fee: Money::from_pence(4_600),
             ..good_facts()
         }));
@@ -4417,7 +4625,13 @@ mod fact_topology {
             BookingError::SlotUnavailable => "SlotUnavailable",
             BookingError::CapacityInsufficient { .. } => "CapacityInsufficient",
             BookingError::AccessibilityRequired => "AccessibilityRequired",
-            BookingError::FeeExceeded => "FeeExceeded",
+            BookingError::FeeExceeded {
+                ceiling: FeeCeiling::Authority,
+            } => "FeeExceededAuthority",
+            BookingError::FeeExceeded {
+                ceiling: FeeCeiling::Requirement,
+            } => "FeeExceededRequirement",
+            BookingError::FactsUnavailable => "FactsUnavailable",
             BookingError::EffectIdentityMissing => "EffectIdentityMissing",
             BookingError::EffectPlanMissing => "EffectPlanMissing",
             BookingError::EffectMismatch => "EffectMismatch",
@@ -5734,7 +5948,7 @@ mod fact_topology {
             may_cancel: true,
         };
         let proposal_context = BookingContext {
-            selected_facts: Some(observed(good_facts())),
+            selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),
         };
         let proposals = || {

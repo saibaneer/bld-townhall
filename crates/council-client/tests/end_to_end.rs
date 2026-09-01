@@ -316,7 +316,14 @@ async fn th_c_fails_the_fee_ceiling() {
         .await
         .expect_err("verification must refuse a room over the ceiling");
 
-    assert_eq!(denial, BookingError::FeeExceeded);
+    assert_eq!(
+        denial,
+        BookingError::FeeExceeded {
+            // TH-C's £90 exceeds Lucy's £50 authority ceiling too — authority
+            // wins when both are exceeded (ADR-021).
+            ceiling: townhall_domain::FeeCeiling::Authority,
+        }
+    );
     assert_eq!(h.effect_count().await, 0);
     assert_eq!(h.booking_count().await, 0);
 }

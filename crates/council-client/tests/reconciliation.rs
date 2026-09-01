@@ -908,10 +908,18 @@ async fn a_cancellation_requested_for_a_booking_nobody_received_fails_closed() {
         "Cancelled"
     );
     assert_eq!(council_bookings(&world).await, 0);
+    // "Never minted" is read from the table itself, not inferred from an empty
+    // due-list — a wrong implementation could mint a dormant or terminal cancel
+    // successor that due() would never surface (map audit, row 9).
+    let intents: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM effect_intents WHERE booking_id = ?")
+            .bind(id.to_string())
+            .fetch_one(repo.pool())
+            .await
+            .expect("count");
     assert_eq!(
-        reconciliation.due(10).await.expect("due"),
-        Vec::<EffectIntentId>::new(),
-        "no cancellation intent was ever minted"
+        intents, 1,
+        "exactly the booking intent: no cancellation effect ever existed"
     );
 }
 
@@ -1283,4 +1291,146 @@ async fn a_signed_not_yet_for_someone_else_authorizes_nothing() {
         repo.load(&id).await.expect("load").state.name(),
         "BookingInProgress"
     );
+}
+
+/// As [`spawn_council_at`], with a pause point armed and the stdout protocol
+/// kept alive on a channel — the reader thread forwards every line, and the
+/// child's death arrives as `EXITED` on the same channel, so no wait can hang.
+fn spawn_council_paused(
+    dir: &std::path::Path,
+    clock_ms: i64,
+    pause_at: &str,
+) -> (World, std::sync::mpsc::Receiver<String>) {
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "mock-council", "--features", "test-faults"])
+        .status()
+        .expect("cargo build mock-council");
+    assert!(status.success(), "the council must build");
+
+    let binary =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mock-council");
+    let council_db = dir.join("council.sqlite");
+    let mut child = Command::new(binary)
+        .arg("--db")
+        .arg(&council_db)
+        .args(["--key-hex", KEY_HEX, "--port", "0"])
+        .args(["--clock", &clock_ms.to_string()])
+        .args(["--pause-at", pause_at])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the council");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+        let _ = sender.send("EXITED".to_owned());
+    });
+
+    let ready = lines
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("a first line");
+    let port: u16 = ready
+        .strip_prefix("READY ")
+        .unwrap_or_else(|| panic!("expected READY, got {ready:?}"))
+        .parse()
+        .expect("a port");
+
+    (
+        World {
+            _dir: tempfile::TempDir::new().expect("unused"),
+            council_url: format!("http://127.0.0.1:{port}"),
+            bld_db: dir.join("townhall.sqlite"),
+            council_db,
+            council: child,
+        },
+        lines,
+    )
+}
+
+/// Test 20's BLD-side leg (map audit): the council dies mid-tombstone-write
+/// DURING OUR OWN LOOKUP — the uncommitted absence must reach us as no answer
+/// at all, the workflow stays `Unknown` and retries, and the absence that
+/// finally settles it is a fresh determination by a live council, never the
+/// phantom of the one that died.
+#[tokio::test]
+async fn a_lookup_killed_mid_tombstone_leaves_the_workflow_unknown_and_retrying() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let world = spawn_council(dir.path());
+        let status = run_driver(&world, "BKG-K20", "before-call");
+        assert!(!status.success(), "the create never left the process");
+    }
+    let id = BookingId::new("BKG-K20");
+    let effect =
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+
+    // A council past the deadline, pausing INSIDE the tombstone settlement our
+    // own lookup is about to trigger.
+    let (mut world, lines) = spawn_council_paused(
+        dir.path(),
+        MovableClock::now() + 600_000,
+        "before_settle_commit",
+    );
+    let (reconciliation, repo, clock) = reconciler_over(&world).await;
+    clock.advance(60_000);
+    let attend = {
+        let effect = effect.clone();
+        tokio::spawn(async move { reconciliation.attend(&effect).await })
+    };
+
+    // The council announces the pause — our lookup is being answered by a
+    // tombstone whose write has NOT committed. Kill it there.
+    let paused = tokio::task::spawn_blocking(move || {
+        loop {
+            let line = lines
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a line or EXITED");
+            if line.starts_with("PAUSED before_settle_commit") || line == "EXITED" {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("the watcher ran");
+    assert!(
+        paused.starts_with("PAUSED before_settle_commit"),
+        "the lookup reached the settlement: {paused}"
+    );
+    let _ = world.council.kill();
+    let _ = world.council.wait();
+
+    // Our side observed NO absence answer: still unknown, still in flight —
+    // an implementation mapping the dead lookup to local absence dies here.
+    let attended = attend.await.expect("the task ran").expect("the turn ran");
+    assert!(
+        matches!(attended, Attended::StillUnknown { .. }),
+        "an uncommitted tombstone is no answer: {attended:?}"
+    );
+    assert_eq!(
+        repo.load(&id).await.expect("load").state.name(),
+        "BookingInProgress"
+    );
+
+    // And RETRIES: against a live council, the retried lookup obtains a real,
+    // freshly decided absence — unobserved absence never became observed
+    // absence, and the observed one is the council's own determination.
+    drop(world);
+    let world = spawn_council_at(dir.path(), Some(MovableClock::now() + 600_000));
+    let (reconciliation, repo, clock) = reconciler_over(&world).await;
+    clock.advance(60_000);
+    let attended = reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(attended, Attended::Settled);
+    assert_eq!(
+        repo.load(&id).await.expect("load").state.name(),
+        "AwaitingBooking"
+    );
+    assert_eq!(council_bookings(&world).await, 0);
 }

@@ -174,8 +174,35 @@ fn read_grant(council: &Council) -> String {
 /// read-write so `SQLite` can run WAL recovery — which is exactly what a
 /// restart would do, and recovery discards the uncommitted transaction.
 fn effect_rows_in(db: &std::path::Path, effect_intent_id: &str) -> i64 {
+    count_in(
+        db,
+        "SELECT COUNT(*) FROM effects WHERE effect_intent_id = ?",
+        effect_intent_id,
+    )
+}
+
+/// Bookings created by this identity — the create-path visibility witness.
+fn booking_rows_in(db: &std::path::Path, effect_intent_id: &str) -> i64 {
+    count_in(
+        db,
+        "SELECT COUNT(*) FROM bookings WHERE created_by = ?",
+        effect_intent_id,
+    )
+}
+
+/// Settled outcomes for this identity: anything past `Open` — a decided
+/// create, a tombstone, a rejection. Pre-commit, all of them must be zero.
+fn settled_effect_rows_in(db: &std::path::Path, effect_intent_id: &str) -> i64 {
+    count_in(
+        db,
+        "SELECT COUNT(*) FROM effects WHERE effect_intent_id = ? AND state <> 'Open'",
+        effect_intent_id,
+    )
+}
+
+fn count_in(db: &std::path::Path, sql: &'static str, bind: &str) -> i64 {
     let db = db.to_path_buf();
-    let effect_intent_id = effect_intent_id.to_owned();
+    let bind = bind.to_owned();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -185,13 +212,12 @@ fn effect_rows_in(db: &std::path::Path, effect_intent_id: &str) -> i64 {
                 .max_connections(1)
                 .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
                 .await
-                .expect("open the dead council's database");
-            let n: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM effects WHERE effect_intent_id = ?")
-                    .bind(&effect_intent_id)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("count");
+                .expect("open the council's database");
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(&bind)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
             pool.close().await;
             n
         })
@@ -355,16 +381,18 @@ fn a_rejection_survives_the_clock_winding_back() {
 /// write while the clock passes it, is refused — a council that judged expiry
 /// on arrival cannot pass this, because its check already succeeded.
 ///
-/// Test 15 also names a lookup CONCURRENT with the held write. That leg is
-/// structurally unrunnable against the real process, stated here rather than
-/// silently narrowed: `before_expiry_write` pauses INSIDE the write
-/// transaction, so the paused create holds the database's one writer lock and
-/// a concurrent resolve — a settling write itself — queues behind it (gate
+/// Test 15 also names a lookup CONCURRENT with the held write. A concurrent
+/// RESOLVE is structurally unrunnable against the real process, stated here
+/// rather than silently narrowed: `before_expiry_write` pauses INSIDE the
+/// write transaction, so the paused create holds the database's one writer
+/// lock and a resolve — a settling write itself — queues behind it (gate
 /// M13's own header below records the deadlock the first attempt produced).
-/// What the concurrent lookup would prove — nothing is discoverable until the
-/// settlement commits — is proven in-process by slice D's
-/// `nothing_is_discoverable_before_the_settlement_commits`, which reads from a
-/// second connection at the same pause point.
+/// What the concurrent lookup would OBSERVE is testable anyway, and tested
+/// below: WAL readers do not queue behind the writer, so the council's file is
+/// read mid-pause from this test — nothing about the held create is committed
+/// or visible. That is the create-path visibility witness the map audit asked
+/// for; the resolve-path twin is slice D's
+/// `nothing_is_discoverable_before_the_settlement_commits`.
 #[test]
 fn a_create_overtaken_by_its_deadline_while_paused_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -379,6 +407,22 @@ fn a_create_overtaken_by_its_deadline_while_paused_is_refused() {
 
     let paused = council.expect("PAUSED before_expiry_write EFF-K5");
     let occurrence = paused.split_whitespace().last().expect("occurrence");
+
+    // The concurrent-visibility witness: while the create sits paused inside
+    // its own write transaction, a reader of the FILE sees no booking and no
+    // settled outcome for the identity. A council that leaks create rows
+    // before its commit fails here — and only here, because a wire lookup
+    // would queue behind the held writer lock.
+    assert_eq!(
+        booking_rows_in(&db, "EFF-K5"),
+        0,
+        "nothing about the held create is visible before its commit"
+    );
+    assert_eq!(
+        settled_effect_rows_in(&db, "EFF-K5"),
+        0,
+        "no settled outcome exists before the commit decides one"
+    );
 
     // Move the ONE clock past the deadline while the request waits inside the
     // write transaction, then let it proceed.

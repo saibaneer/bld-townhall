@@ -2874,3 +2874,64 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
     };
     assert_eq!(aggregate.state.name(), "CancellationRequested");
 }
+
+/// The carried finding (deepseek, slice-F round): the booking Lucy is
+/// cancelling turns out to be REJECTED by the council — and that ends the
+/// story as `Cancelled` through the existing arm, with the intent terminal as
+/// `Rejected`, nothing external ever caused, and no cancellation effect ever
+/// minted (there was never anything to cancel). Interleaved genuinely:
+/// the answer is lost first, the withdrawal commits second, the rejection
+/// arrives third.
+#[tokio::test]
+async fn a_rejected_booking_under_cancellation_ends_cancelled_with_nothing_caused() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-REJ-CXL");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::GoQuiet("answer lost")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "waited long enough".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("cancel");
+
+    // The council finally answers the chase: an authoritative, permanent NO.
+    h.council
+        .script([Script::RefusePermanently("the hall is closed that week")]);
+    h.clock.advance(10_000);
+    let attended = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(attended, Attended::Settled);
+
+    let ended = h.repo.load(&id).await.expect("load");
+    assert_eq!(
+        ended.state.name(),
+        "Cancelled",
+        "a rejected booking under cancellation is everything the withdrawal wanted"
+    );
+    assert_eq!(ended.active_effect, None);
+    assert_eq!(
+        h.repo.load_effect(&effect).await.expect("intent").status,
+        EffectStatus::Rejected,
+        "the intent keeps the council's terminal answer"
+    );
+    assert_eq!(h.council.booking_count(), 0, "nothing was ever created");
+    let intents: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM effect_intents WHERE booking_id = ?")
+            .bind(id.to_string())
+            .fetch_one(h.repo.pool())
+            .await
+            .expect("count");
+    assert_eq!(
+        intents, 1,
+        "no cancellation effect was ever minted — there was nothing to cancel"
+    );
+}

@@ -4038,6 +4038,20 @@ mod characterization {
         assert_eq!(got, Resolution::Denied(BookingError::AccessibilityRequired));
     }
 
+    /// ADR-017 point 4's no-serde half for the domain's own trusted
+    /// vocabulary, due with M5's wire (ADR-021): neither the evidence type
+    /// nor the authority envelope can leak through a generic sink or be
+    /// minted from JSON.
+    #[test]
+    fn evidence_and_authority_cannot_cross_a_wire() {
+        static_assertions::assert_not_impl_any!(
+            VerifiedProviderFact: serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            VerifiedAuthority: serde::Serialize, serde::de::DeserializeOwned
+        );
+    }
+
     /// A provider that cannot be ASKED is not one that answered "nothing":
     /// the refusal carries its own name, because the wire maps the two to
     /// different worlds — 503 versus 422 (ADR-021).

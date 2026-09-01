@@ -1921,6 +1921,7 @@ dependencies = [
  "bld-types",
  "serde",
  "serde_json",
+ "static_assertions",
  "thiserror",
  "tokio",
 ]

@@ -704,6 +704,18 @@ mod tests {
         );
     }
 
+    /// ADR-017 point 4's no-serde half, due now that M5's wire exists: a
+    /// VERDICT can neither leak outward through a generic sink nor be minted
+    /// from JSON. (The private-field half is amended away in ADR-021 — the
+    /// crate graph, these assertions, and the facade already make the forgery
+    /// unrepresentable.)
+    #[test]
+    fn a_verdict_cannot_cross_a_wire() {
+        static_assertions::assert_not_impl_any!(
+            BoundaryOutcome<String, String>: serde::Serialize, serde::de::DeserializeOwned
+        );
+    }
+
     /// `Verified<T>` hands its inner value out but never absorbs one from a
     /// wire format — construction is `assert_verified`, greppably, or nothing.
     #[test]

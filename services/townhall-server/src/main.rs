@@ -36,6 +36,9 @@ struct Args {
     dev_authority: bool,
     retry_cadence_ms: i64,
     reconcile_interval_ms: u64,
+    /// The deterministic-429 test seam (ADR-021): the one config zero
+    /// `PursuitConfig` sanctions.
+    reclassify_attempts: Option<u32>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -44,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dev_authority = false;
     let mut retry_cadence_ms = 5_000;
     let mut reconcile_interval_ms = 1_000;
+    let mut reclassify_attempts = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -69,6 +73,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<u64>()
                     .map_err(|_| "--reconcile-interval-ms needs milliseconds".to_owned())?;
             }
+            "--reclassify-attempts" => {
+                reclassify_attempts = Some(
+                    value()?
+                        .parse::<u32>()
+                        .map_err(|_| "--reclassify-attempts needs a count".to_owned())?,
+                );
+            }
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -81,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
         dev_authority,
         retry_cadence_ms,
         reconcile_interval_ms,
+        reclassify_attempts,
     })
 }
 
@@ -175,12 +187,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = match (PursuitConfig {
+    let mut config = PursuitConfig {
         retry_cadence_ms: args.retry_cadence_ms,
         ..PursuitConfig::default()
-    })
-    .validated()
-    {
+    };
+    if let Some(attempts) = args.reclassify_attempts {
+        config.reclassify_attempts = attempts;
+    }
+    let config = match config.validated() {
         Ok(config) => config,
         Err(problem) => {
             eprintln!("townhall-server: {problem}");

@@ -8,12 +8,17 @@ The repository is intentionally built **dependency-first**. The deterministic ke
 
 ## Current scope
 
-This foundation implements the first four specification milestones:
+Implemented, milestone by milestone (each gated on the previous — spec §21):
 
-- **M0 — Workspace and quality harness**
-- **M1 — Pure BLD kernel**
-- **M2 — Town-hall domain in memory**
-- **M3 — Durable aggregate + optimistic concurrency**
+- [x] **M0 — Workspace and quality harness**
+- [x] **M1 — Pure BLD kernel**
+- [x] **M2 — Town-hall domain in memory**
+- [x] **M3 — Durable aggregate + optimistic concurrency**
+- [x] **M4 — External effect protocol** (the real mock council, crash matrix, pursuit/reconciliation, in-flight cancellation; all 25 required failure-injection tests mapped and audited in [`docs/m4-acceptance.md`](docs/m4-acceptance.md))
+- [x] **M5 — Axum BLD service** (ETag/If-Match preconditions bound inside the trusted turn, spec §10.2 status mapping, the reconciler loop, the whole journey possible with curl alone)
+- [ ] **M6 — HumanChannel core + SMS simulator**
+- [ ] **M7 — Approval + VerifiedAuthority**
+- [ ] **M8–M13** — usage metering, discovery, payment handoff, Rig, real SMS, hardening
 
 Later milestones are deliberately represented in the repository roadmap but are **not** scaffolded as fake implementations. New crates should be added only when their dependency milestone is accepted.
 
@@ -23,9 +28,16 @@ Later milestones are deliberately represented in the repository roadmap but are 
 bld-townhall/
 ├── crates/
 │   ├── bld-types/          # shared bounded/domain-neutral types
-│   ├── bld-kernel/         # deterministic sequencing core
+│   ├── bld-kernel/         # deterministic sequencing core (the three doors)
 │   ├── townhall-domain/    # town-hall state machine + durable aggregate shape
-│   └── townhall-store/     # SQLite/SQLx repository, CAS + audit
+│   ├── townhall-store/     # SQLite/SQLx repository, CAS + audit + pursuit axis
+│   ├── townhall-service/   # the coordinator, the reconciler, the BookingApi facade
+│   ├── townhall-http/      # the Axum adapter — can name no store or provider crate
+│   ├── council-wire/       # one signed encoder, shared by both sides
+│   └── council-client/     # the council over HTTP, wearing the boundary's traits
+├── services/
+│   ├── mock-council/       # the authoritative external world, built to be killed
+│   └── townhall-server/    # the composition root: wiring, DevAuthority, READY <port>
 ├── docs/
 │   ├── technical-spec-v0.4.2.md
 │   ├── architecture.md
@@ -79,7 +91,9 @@ The execution contract is [`docs/technical-spec-v0.4.2.md`](docs/technical-spec-
 
 ## Status
 
-M0–M3 implemented. The next milestone is M4 external effects: stable effect identity, persist-before-effect coordination, provider idempotency, fault injection and reconciliation. Axum, HumanChannel/SMS, full VerifiedAuthority issuance, usage metering, Stripe, Rig, and real SMS remain later milestones.
+M0–M5 implemented. The next milestone is M6: the channel-agnostic HumanChannel with the local SMS simulator — the first consumer of the escalated-question queue ADR-019 left waiting for a human who can actually act. Approval/VerifiedAuthority issuance (M7, replacing the dev-authority stand-in in the composition root), usage metering, discovery, Stripe, Rig, and real SMS remain later milestones.
+
+The decision record is [`docs/decisions.md`](docs/decisions.md) (ADR-001–021): the spec is never edited, and the ADRs are the amendment trail against it.
 
 
 ## M3 / M4 engineering notes

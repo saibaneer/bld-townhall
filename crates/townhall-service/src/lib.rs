@@ -133,6 +133,13 @@ pub enum ServiceError {
     /// fabricated success.
     #[error("gave up re-classifying after {attempts} attempts under contention")]
     Contended { attempts: u32 },
+    /// The caller's expected version is not the current one — either at the
+    /// pre-classification comparison, or because the CAS/replay proved the
+    /// world moved mid-turn. Carries the CURRENT version so a 412 always ships
+    /// the fresh `ETag` (ADR-021). Produced only by [`Coordinator::propose_at`];
+    /// the versionless `propose` keeps M4's contracts.
+    #[error("expected version is stale; the current version is {current}")]
+    PreconditionFailed { current: u64 },
     /// The domain produced a plan this path cannot carry out.
     ///
     /// Unreachable through the current transition graph, and refused rather than
@@ -158,6 +165,67 @@ const RETRY_CADENCE_MS: i64 = 5_000;
 /// happening (ADR-019 §3).
 const ESCALATED_CADENCE_MS: i64 = townhall_store::MAX_CADENCE_MS;
 
+/// One validated configuration for every pursuit knob, shared by the
+/// coordinator and the reconciler so configured behaviour can never diverge
+/// from persisted behaviour (ADR-021). Values are validated against the
+/// store's own clamps at construction; the single sanctioned zero is
+/// `reclassify_attempts`, the deterministic-429 test seam.
+#[derive(Clone, Copy, Debug)]
+pub struct PursuitConfig {
+    pub retry_cadence_ms: i64,
+    pub escalated_cadence_ms: i64,
+    pub lease_ms: i64,
+    pub attempt_budget: u32,
+    pub reclassify_attempts: u32,
+}
+
+impl Default for PursuitConfig {
+    fn default() -> Self {
+        Self {
+            retry_cadence_ms: RETRY_CADENCE_MS,
+            escalated_cadence_ms: ESCALATED_CADENCE_MS,
+            lease_ms: PHASE_B_LEASE_MS,
+            attempt_budget: ATTEMPT_BUDGET,
+            reclassify_attempts: 3,
+        }
+    }
+}
+
+impl PursuitConfig {
+    /// Refuse a configuration the store would silently clamp or the protocol
+    /// would silently break: cadences and the lease must be positive and
+    /// within the store's maxima; the budget must exist.
+    ///
+    /// # Errors
+    /// A human-readable description of the first violated bound.
+    pub fn validated(self) -> Result<Self, String> {
+        if self.retry_cadence_ms <= 0 || self.retry_cadence_ms > townhall_store::MAX_CADENCE_MS {
+            return Err(format!(
+                "retry_cadence_ms must be in 1..={}",
+                townhall_store::MAX_CADENCE_MS
+            ));
+        }
+        if self.escalated_cadence_ms <= 0
+            || self.escalated_cadence_ms > townhall_store::MAX_CADENCE_MS
+        {
+            return Err(format!(
+                "escalated_cadence_ms must be in 1..={}",
+                townhall_store::MAX_CADENCE_MS
+            ));
+        }
+        if self.lease_ms <= 0 || self.lease_ms > townhall_store::MAX_LEASE_MS {
+            return Err(format!(
+                "lease_ms must be in 1..={}",
+                townhall_store::MAX_LEASE_MS
+            ));
+        }
+        if self.attempt_budget == 0 {
+            return Err("attempt_budget must be at least 1".to_owned());
+        }
+        Ok(self)
+    }
+}
+
 /// How many started calls may accumulate before a turn escalates instead of
 /// asking again. Conservative — a call that died mid-flight still counts —
 /// and cheap to be conservative about, because under ADR-019 an early
@@ -176,14 +244,14 @@ pub struct Coordinator<R, C, V, A> {
     /// "wire one door and call ADR-017 done" — the failure review predicted —
     /// is not expressible: either every refusal records, or none do.
     denials: Option<Arc<townhall_store::denials::DenialLog>>,
-    /// How many times Phase C may reload and re-classify after losing a
-    /// compare-and-set.
+    /// Every pursuit knob, in one validated place — cadences, the lease, the
+    /// escalation budget, and the Phase C re-classification budget (ADR-021).
     ///
-    /// Correctness does not depend on this number. What makes the bound safe is
-    /// that the intent is durable and reconciliation owns anything unfinished, so
-    /// exhausting the budget reports the current state rather than inventing an
-    /// outcome. Three is an availability choice, not a correctness argument.
-    attempts: u32,
+    /// Correctness does not depend on any of these numbers. What makes the
+    /// bounds safe is that the intent is durable and reconciliation owns
+    /// anything unfinished, so exhausting a budget reports the current state
+    /// rather than inventing an outcome.
+    config: PursuitConfig,
 }
 
 impl<R, C, V, A> Coordinator<R, C, V, A>
@@ -207,8 +275,17 @@ where
             kernel: Kernel,
             domain: TownHallDomain,
             denials: None,
-            attempts: 3,
+            config: PursuitConfig::default(),
         }
+    }
+
+    /// Replace the pursuit configuration (validated — see
+    /// [`PursuitConfig::validated`]). The reconciler built over this
+    /// coordinator shares it, so the two can never disagree (ADR-021).
+    #[must_use]
+    pub fn with_config(mut self, config: PursuitConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Wire the denial log. Every refusal at every door then leaves a trace:
@@ -219,11 +296,11 @@ where
         self
     }
 
-    /// Override the Phase C attempt budget. For tests that want contention to be
-    /// deterministic rather than lucky.
+    /// Override the Phase C re-classification budget. For tests that want
+    /// contention to be deterministic rather than lucky.
     #[must_use]
     pub const fn with_attempts(mut self, attempts: u32) -> Self {
-        self.attempts = attempts;
+        self.config.reclassify_attempts = attempts;
         self
     }
 
@@ -239,7 +316,54 @@ where
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
     ) -> Result<Turn, ServiceError> {
+        self.run_proposal(id, proposal, authority, None).await
+    }
+
+    /// As [`Self::propose`], with the caller's EXPECTED VERSION bound inside
+    /// the trusted turn (ADR-021; spec §9.2). Refused before classification
+    /// when it does not match the load; enforced by the CAS at exactly that
+    /// version after it; and a replayed Phase A — a rival already performed
+    /// this turn — is refused too, because THIS caller performed no mutation
+    /// and the world already moved. All three refusals are
+    /// [`ServiceError::PreconditionFailed`] carrying the current version, so a
+    /// 412 always ships the fresh `ETag`. A handler-side load/compare/propose
+    /// cannot deliver this: the stale request would be silently rebased
+    /// between the compare and the turn's own load.
+    ///
+    /// # Errors
+    /// As [`Self::propose`], plus [`ServiceError::PreconditionFailed`].
+    pub async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Turn, ServiceError> {
+        self.run_proposal(id, proposal, authority, Some(expected_version))
+            .await
+    }
+
+    /// The current version, for a `PreconditionFailed` that must carry it.
+    async fn stale(&self, id: &BookingId) -> Result<ServiceError, ServiceError> {
+        let current = self.repository.load(id).await?.version;
+        Ok(ServiceError::PreconditionFailed { current })
+    }
+
+    async fn run_proposal(
+        &self,
+        id: &BookingId,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+        expected: Option<u64>,
+    ) -> Result<Turn, ServiceError> {
         let aggregate = self.repository.load(id).await?;
+        if let Some(version) = expected
+            && aggregate.version != version
+        {
+            return Err(ServiceError::PreconditionFailed {
+                current: aggregate.version,
+            });
+        }
         let booking = Booking::from(&aggregate);
 
         // The audit record is built from the proposal itself, before it is
@@ -282,15 +406,23 @@ where
             }
 
             Resolution::Ready(TransitionPlan::Local { next_state }) => {
-                let committed = self
+                match self
                     .repository
                     .commit(id, aggregate.version, next_state, audit)
-                    .await?;
-                Ok(BoundaryOutcome::Committed(committed))
+                    .await
+                {
+                    Ok(committed) => Ok(BoundaryOutcome::Committed(committed)),
+                    // Under an expected version, losing the CAS IS the stale
+                    // precondition — reload so the 412 carries the fresh ETag.
+                    Err(StoreError::StaleVersion { .. }) if expected.is_some() => {
+                        Err(self.stale(id).await?)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
 
             Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) => {
-                self.reach_outside(id, aggregate.version, next_state, effect, audit)
+                self.reach_outside(id, aggregate.version, next_state, effect, audit, expected)
                     .await
             }
         }
@@ -346,10 +478,11 @@ where
         next_state: Booking,
         effect: BookingEffect,
         audit: TransitionAudit,
+        expected: Option<u64>,
     ) -> Result<Turn, ServiceError> {
         // PHASE A — the intent becomes durable, and the in-flight state is
         // committed, before anything external happens (ADR-014).
-        let prepared = self
+        let prepared = match self
             .repository
             .prepare_effect(PrepareEffect {
                 booking_id: id.clone(),
@@ -358,12 +491,27 @@ where
                 next: next_state,
                 audit,
             })
-            .await?;
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(StoreError::StaleVersion { .. }) if expected.is_some() => {
+                return Err(self.stale(id).await?);
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         // A replay means this effect was already prepared and may already have
-        // been executed. Re-running Phase B could double-book, so recovery owns it
-        // from here.
+        // been executed. Re-running Phase B could double-book, so recovery owns
+        // it from here — and under an EXPECTED VERSION a replay is refused as
+        // stale (ADR-021): the rival's prepare bumped the version without this
+        // turn ever reaching the CAS, so `Unresolved` would claim work this
+        // request did not do. The store's replay-first contract (M4's
+        // lost-acknowledgement guarantee) and the versionless surface are
+        // untouched.
         if prepared.replayed {
+            if expected.is_some() {
+                return Err(self.stale(id).await?);
+            }
             return Ok(BoundaryOutcome::Unresolved);
         }
 
@@ -376,7 +524,7 @@ where
         // whose very first call is still in flight (review round 2).
         let Some(claimed) = self
             .repository
-            .claim_effect(&effect_id, PHASE_B_LEASE_MS)
+            .claim_effect(&effect_id, self.config.lease_ms)
             .await?
         else {
             // Someone else already owns this turn. The intent is durable and
@@ -385,7 +533,12 @@ where
         };
 
         let outcome = self
-            .send_claimed(id, &claimed.intent, claimed.token, RETRY_CADENCE_MS)
+            .send_claimed(
+                id,
+                &claimed.intent,
+                claimed.token,
+                self.config.retry_cadence_ms,
+            )
             .await;
 
         // The lease is given back whatever happened, so the reconciler may pick
@@ -481,7 +634,7 @@ where
         id: &BookingId,
         fact: &Verified<VerifiedProviderFact>,
     ) -> Result<Turn, ServiceError> {
-        for _ in 0..self.attempts {
+        for _ in 0..self.config.reclassify_attempts {
             let aggregate = self.repository.load(id).await?;
             let booking = Booking::from(&aggregate);
             let audit = TransitionAudit::driven_by(fact.get());
@@ -595,7 +748,7 @@ where
         }
 
         Err(ServiceError::Contended {
-            attempts: self.attempts,
+            attempts: self.config.reclassify_attempts,
         })
     }
 
@@ -696,7 +849,10 @@ pub fn effect_identity_for(
 /// sees. Per ADR-012, this is a surface guarantee rather than a compiler one —
 /// and it is stated at exactly that strength.
 pub struct Reconciliation<R, C, V, A, L> {
-    coordinator: Coordinator<R, C, V, A>,
+    /// Shared with [`BookingApi`] and the composition root — one coordinator,
+    /// one configuration, so the reconciler and the wire can never disagree
+    /// about cadences or budgets (ADR-021).
+    coordinator: Arc<Coordinator<R, C, V, A>>,
     resolver: Arc<L>,
 }
 
@@ -739,7 +895,7 @@ where
     A: AvailabilitySource,
     L: EffectResolver<C::Raw>,
 {
-    pub fn new(coordinator: Coordinator<R, C, V, A>, resolver: Arc<L>) -> Self {
+    pub fn new(coordinator: Arc<Coordinator<R, C, V, A>>, resolver: Arc<L>) -> Self {
         Self {
             coordinator,
             resolver,
@@ -767,7 +923,10 @@ where
         // The claim IS the eligibility check, atomically — not `due`, which only
         // suggests. `None` covers leased-elsewhere, not-yet-due and settled
         // alike, and none of them advances any count.
-        let Some(claimed) = repository.claim_effect(id, PHASE_B_LEASE_MS).await? else {
+        let Some(claimed) = repository
+            .claim_effect(id, self.coordinator.config.lease_ms)
+            .await?
+        else {
             return Ok(Attended::NotDue);
         };
 
@@ -791,14 +950,15 @@ where
         // fenced: the write is conditional on the token, on `escalated_at_ms IS
         // NULL`, and on the intent still being live, so a replay, a race with a
         // settling fact, and a stale owner all collapse to a no-op.
-        if claimed.attempts_started >= ATTEMPT_BUDGET && !claimed.escalated {
+        if claimed.attempts_started >= self.coordinator.config.attempt_budget && !claimed.escalated
+        {
             return self.escalate(id, claimed).await;
         }
 
         let cadence = if claimed.escalated {
-            ESCALATED_CADENCE_MS
+            self.coordinator.config.escalated_cadence_ms
         } else {
-            RETRY_CADENCE_MS
+            self.coordinator.config.retry_cadence_ms
         };
         let booking_id = claimed.intent.booking_id.clone();
 
@@ -912,7 +1072,11 @@ where
         {
             bld_kernel::SystemEventResolution::Record => {
                 let wrote = repository
-                    .mark_escalated(id, claimed.token, ESCALATED_CADENCE_MS)
+                    .mark_escalated(
+                        id,
+                        claimed.token,
+                        self.coordinator.config.escalated_cadence_ms,
+                    )
                     .await?;
                 Ok(match wrote {
                     townhall_store::EscalationWrite::Recorded => Attended::Escalated,
@@ -942,6 +1106,273 @@ where
                 }
                 Ok(Attended::NotDue)
             }
+        }
+    }
+}
+
+// ------------------------------------------------------------------- the facade
+
+/// The application boundary the wire talks to (ADR-021).
+///
+/// Handlers hold this and nothing else, so "handlers do not mutate directly"
+/// (the M5 gate's third clause) is a fact about what their code can express:
+/// the complete mutation surface is [`BookingApi::create`] and
+/// [`BookingApi::propose_at`], both of which run the full coordinator turn.
+/// Everything else is a read or the reconcile trigger, which can only ask.
+pub struct BookingApi<R, C, V, A, L> {
+    coordinator: Arc<Coordinator<R, C, V, A>>,
+    reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+}
+
+/// The facade's closed error vocabulary — everything an adapter needs to map,
+/// with no store type on the surface (the crate boundary is the point: the
+/// HTTP crate cannot name `StoreError`, so this enum is its whole world).
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("no such booking")]
+    UnknownBooking,
+    #[error("the booking already exists at version {current}")]
+    AlreadyExists { current: u64 },
+    #[error("expected version is stale; the current version is {current}")]
+    PreconditionFailed { current: u64 },
+    #[error("gave up re-classifying under contention")]
+    Contended,
+    /// An internal invariant failed — never dressed as provider trouble
+    /// (ADR-021: this is a 500, not a 503).
+    #[error("internal invariant failure: {0}")]
+    Internal(String),
+    /// The store or another prerequisite could not answer at all.
+    #[error("infrastructure unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl ApiError {
+    fn from_service(error: ServiceError) -> Self {
+        match error {
+            ServiceError::PreconditionFailed { current } => Self::PreconditionFailed { current },
+            ServiceError::Contended { .. } => Self::Contended,
+            ServiceError::UnexpectedPlan { reason } => Self::Internal(reason.to_owned()),
+            ServiceError::Store(StoreError::NotFound(_) | StoreError::EffectNotFound(_)) => {
+                Self::UnknownBooking
+            }
+            ServiceError::Store(error) => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
+/// What one versioned mutation amounted to, with everything a response needs:
+/// the typed outcome, the version an `ETag` reports, and — when the turn is
+/// `Unresolved` — the STORE's own schedule for the next attempt, which is what
+/// an honest `Retry-After` projects (ADR-021).
+#[derive(Debug)]
+pub struct Mutated {
+    pub outcome: Turn,
+    pub current_version: u64,
+    pub retry_after_ms: Option<i64>,
+}
+
+/// The read projection: the aggregate's client-visible fields plus the
+/// domain's exported behaviour MENU — the same table the topology docs are
+/// generated from, so what the API advertises and what the matrix permits are
+/// one fact (ADR-018's export, consumed).
+#[derive(Clone, Debug)]
+pub struct Projection {
+    pub id: BookingId,
+    pub version: u64,
+    pub state: &'static str,
+    pub requirements: bld_types::BookingRequirements,
+    pub selected_venue: Option<townhall_domain::SelectedVenueRef>,
+    pub booking_ref: Option<bld_types::CouncilBookingRef>,
+    pub available_behaviours: &'static [&'static str],
+}
+
+/// One audit row, as the wire may see it — a service-owned projection, not the
+/// store's record (re-exporting a storage type would hide the import, not the
+/// contract).
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub driver_kind: &'static str,
+    pub driver_detail: String,
+    pub outcome: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    pub at_ms: i64,
+}
+
+impl<R, C, V, A, L> BookingApi<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    pub fn new(
+        coordinator: Arc<Coordinator<R, C, V, A>>,
+        reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+    ) -> Self {
+        Self {
+            coordinator,
+            reconciliation,
+        }
+    }
+
+    /// Create the durable booking intent. No precondition applies — a new
+    /// resource has no version to match (ADR-021).
+    ///
+    /// # Errors
+    /// [`ApiError::AlreadyExists`] with the existing version (a 409 that ships
+    /// the existing `ETag`); [`ApiError::Unavailable`] for store failure.
+    pub async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError> {
+        let repository = self.coordinator.repository();
+        match repository
+            .create(townhall_store::NewBooking {
+                id: id.clone(),
+                requirements,
+            })
+            .await
+        {
+            Ok(aggregate) => Ok(Self::project(&aggregate)),
+            Err(StoreError::AlreadyExists(_)) => {
+                let current = repository
+                    .load(&id)
+                    .await
+                    .map_err(|error| ApiError::Unavailable(error.to_string()))?
+                    .version;
+                Err(ApiError::AlreadyExists { current })
+            }
+            Err(error) => Err(ApiError::Unavailable(error.to_string())),
+        }
+    }
+
+    /// The authoritative projection, with the state's exported menu.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
+        let aggregate = self.load(id).await?;
+        Ok(Self::project(&aggregate))
+    }
+
+    /// One versioned mutation turn — see [`Coordinator::propose_at`].
+    ///
+    /// # Errors
+    /// [`ApiError::PreconditionFailed`] carrying the current version;
+    /// otherwise as [`ApiError::from_service`] maps them.
+    pub async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError> {
+        let outcome = self
+            .coordinator
+            .propose_at(id, expected_version, proposal, authority)
+            .await
+            .map_err(ApiError::from_service)?;
+
+        // The ETag after the turn, and — only for an unresolved turn — the
+        // store's own schedule for the next attempt.
+        let (current_version, retry_after_ms) = match &outcome {
+            BoundaryOutcome::Committed(aggregate) => (aggregate.version, None),
+            BoundaryOutcome::Unresolved => {
+                let aggregate = self.load(id).await?;
+                let hint = match &aggregate.active_effect {
+                    Some(effect) => self
+                        .coordinator
+                        .repository()
+                        .retry_hint_ms(effect)
+                        .await
+                        .map_err(|error| ApiError::Unavailable(error.to_string()))?,
+                    None => None,
+                };
+                (aggregate.version, hint)
+            }
+            _ => (self.load(id).await?.version, None),
+        };
+        Ok(Mutated {
+            outcome,
+            current_version,
+            retry_after_ms,
+        })
+    }
+
+    /// The typed audit trail, projected.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
+        // Reads on an unknown booking answer 404, not an empty trail.
+        self.load(id).await?;
+        let events = self
+            .coordinator
+            .repository()
+            .audit_events(id)
+            .await
+            .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+        Ok(events
+            .into_iter()
+            .map(|event| AuditEntry {
+                driver_kind: event.driver_kind.name(),
+                driver_detail: event.driver_detail,
+                outcome: event.outcome,
+                from_version: event.from_version,
+                to_version: event.to_version,
+                at_ms: event.created_at_ms,
+            })
+            .collect())
+    }
+
+    /// The spec's demo/admin reconcile trigger: drive THIS booking's chase to
+    /// quiescence through the reconciler's own surface — `attend`, never
+    /// `propose` — following handoffs to their successors (bounded). Exempt
+    /// from preconditions by classification (ADR-021): it asserts no expected
+    /// state; the claim is atomic and the facts are version-fenced below.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
+    pub async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
+        let mut outcomes = Vec::new();
+        for _ in 0..4 {
+            let Some(effect) = self.load(id).await?.active_effect else {
+                break;
+            };
+            let attended = self
+                .reconciliation
+                .attend(&effect)
+                .await
+                .map_err(ApiError::from_service)?;
+            let done = attended == Attended::NotDue;
+            outcomes.push(attended);
+            if done {
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    async fn load(&self, id: &BookingId) -> Result<BookingAggregate, ApiError> {
+        match self.coordinator.repository().load(id).await {
+            Ok(aggregate) => Ok(aggregate),
+            Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
+            Err(error) => Err(ApiError::Unavailable(error.to_string())),
+        }
+    }
+
+    fn project(aggregate: &BookingAggregate) -> Projection {
+        Projection {
+            id: aggregate.id.clone(),
+            version: aggregate.version,
+            state: aggregate.state.name(),
+            requirements: aggregate.requirements.clone(),
+            selected_venue: aggregate.selected_venue.clone(),
+            booking_ref: aggregate.booking_ref.clone(),
+            available_behaviours: aggregate.state.proposal_menu(),
         }
     }
 }

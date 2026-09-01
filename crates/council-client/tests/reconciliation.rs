@@ -160,12 +160,12 @@ async fn reconciler_over(
     };
     let client = || CouncilClient::new(&world.council_url, key());
     let reconciliation = Reconciliation::new(
-        Coordinator::new(
+        Arc::new(Coordinator::new(
             Arc::clone(&repo),
             Arc::new(client()),
             Arc::new(CouncilVerifier::new(key())),
             Arc::new(client()),
-        ),
+        )),
         Arc::new(client()),
     );
     (reconciliation, repo, clock)
@@ -574,13 +574,15 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
             .verifying_key(),
     );
     let reconciliation = Reconciliation::new(
-        Coordinator::new(
-            Arc::clone(&repo),
-            Arc::new(CouncilClient::new(&world.council_url, key2)),
-            Arc::new(CouncilVerifier::new(key2)),
-            Arc::new(CouncilClient::new(&world.council_url, key2)),
-        )
-        .with_denial_log(Arc::clone(&denial_log)),
+        Arc::new(
+            Coordinator::new(
+                Arc::clone(&repo),
+                Arc::new(CouncilClient::new(&world.council_url, key2)),
+                Arc::new(CouncilVerifier::new(key2)),
+                Arc::new(CouncilClient::new(&world.council_url, key2)),
+            )
+            .with_denial_log(Arc::clone(&denial_log)),
+        ),
         Arc::new(CouncilClient::new(&world.council_url, key2)),
     );
 

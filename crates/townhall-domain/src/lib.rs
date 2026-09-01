@@ -228,6 +228,36 @@ impl BookingState {
         }
     }
 
+    /// The proposal-door MENU: which behaviours exist at this state, by their
+    /// stable names (ADR-004; ADR-018's exportable fixed table, earning its
+    /// keep on a real consumer — the HTTP projection's `available_behaviours`).
+    ///
+    /// One fact, three witnesses: the resolve match IS the truth, the pinned
+    /// LOCKED table asserts equality with this export, and the topology
+    /// generator's sweep asserts the generated non-empty proposal cells equal
+    /// it per state — so the menu, the matrix, and the docs cannot drift.
+    // `BookingInProgress` and `Booked` both answer ["Cancel"] — for entirely
+    // different reasons (mid-flight withdrawal vs ordinary cancellation), so
+    // the arms stay separate, as `in_flight_kind` establishes above.
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
+    pub const fn proposal_menu(&self) -> &'static [&'static str] {
+        match self {
+            Self::Draft(_) => &["SelectVenue", "Cancel"],
+            Self::VenueSelected(_) => {
+                &["VerifySlot", "ChangeVenue", "UpdateRequirements", "Cancel"]
+            }
+            Self::NeedsRevalidation(_) => &["RevalidateVenue", "ChangeVenue", "Cancel"],
+            Self::AwaitingBooking(_) => &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+            Self::BookingInProgress(_) => &["Cancel"],
+            Self::Booked(_) => &["Cancel"],
+            Self::CancellationRequested(_)
+            | Self::CancellingBooking(_)
+            | Self::Cancelled(_)
+            | Self::NeedsHuman(_) => &[],
+        }
+    }
+
     /// Whether the in-flight effect is still WANTED — may recovery *cause* it,
     /// or only learn its fate? (ADR-020; the compensation protocol.)
     ///
@@ -2549,6 +2579,26 @@ mod topology {
         )
     }
 
+    /// The exported menu IS the pinned table — witness one of the export's two
+    /// proofs (the topology generator's sweep is the other). A menu that
+    /// drifted from LOCKED would let the HTTP projection advertise a door the
+    /// matrix refuses, or hide one it grants.
+    #[test]
+    fn the_exported_menu_is_the_locked_table() {
+        for state in all_states() {
+            let (_, allowed) = LOCKED
+                .iter()
+                .find(|(name, _)| *name == state.name())
+                .unwrap_or_else(|| panic!("state {} missing from LOCKED", state.name()));
+            assert_eq!(
+                state.proposal_menu(),
+                *allowed,
+                "{}: the export and the pinned table disagree",
+                state.name()
+            );
+        }
+    }
+
     async fn sweep(
         label: &str,
         authority: &VerifiedAuthority,
@@ -2563,6 +2613,11 @@ mod topology {
                 let state_name = state.name();
                 let proposal_name = proposal.name();
                 let want_defined = expected_defined(state_name, proposal_name);
+                assert_eq!(
+                    state.proposal_menu().contains(&proposal_name),
+                    want_defined,
+                    "[{label}] {state_name}: the exported menu disagrees with LOCKED on {proposal_name}"
+                );
                 let booking = booking_of(state.clone(), requirements.clone());
 
                 let got = domain

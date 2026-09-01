@@ -228,7 +228,7 @@ async fn main() -> ExitCode {
         // Recovery, as a process: rounds of due/attend until quiescent —
         // bounded, because a chase that spins is a bug the harness should see.
         let reconciliation = Reconciliation::new(
-            coordinator,
+            Arc::new(coordinator),
             Arc::new(CouncilClient::new(
                 &args.council_url,
                 CouncilKey::new(public),

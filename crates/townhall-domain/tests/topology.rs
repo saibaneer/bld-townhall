@@ -359,9 +359,19 @@ async fn proposal_door() -> Door {
                 }),
                 pending_effect: Some(EffectIntentId::new(BOOK_EFFECT)),
             };
+            let proposal_name = proposal.name();
             let resolved = TownHallDomain
                 .resolve_proposal(&booking, proposal, &authority(), &context)
                 .await;
+            // The export's second witness (the LOCKED-table test is the
+            // first): the menu the domain EXPORTS must equal what the domain
+            // DOES, cell by cell, in the same run that generates the docs.
+            assert_eq!(
+                state.proposal_menu().contains(&proposal_name),
+                !matches!(resolved, Resolution::Undefined),
+                "{} + {proposal_name}: the exported menu disagrees with the resolved topology",
+                state.name()
+            );
             row.push(match resolved {
                 Resolution::Undefined => Cell::NoEdge,
                 Resolution::Denied(error) => Cell::Guarded {

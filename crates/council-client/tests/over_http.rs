@@ -380,6 +380,7 @@ async fn a_cancellation_travels_under_its_own_identity() {
         .execute(
             &BookingEffect::CancelBooking {
                 booking_ref: booking_ref.clone(),
+                principal: bld_types::PrincipalId::new("lucy"),
             },
             &Harness::attempt("EFF-CANCEL"),
         )

@@ -1,0 +1,41 @@
+diff --git a/crates/bld-kernel/src/lib.rs b/crates/bld-kernel/src/lib.rs
+index 4c8f21e..9b3d67a 100644
+--- a/crates/bld-kernel/src/lib.rs
++++ b/crates/bld-kernel/src/lib.rs
+@@ -680,6 +680,27 @@
+         assert!(nowhere.is_undefined());
+     }
+ 
++    /// A system event at a state with no in-flight effect resolves to
++    /// `Undefined`, not `Denied`. The door's only binding is "is this the
+the
++    /// effect this state is waiting on" (ADR-019), and a state waiting
+waiting on
++    /// nothing has no edge to guard: no guard was consulted, and nothing 
+is
++    /// recorded. `Start` never reached out; `Done` waits on nothing eithe
+either —
++    /// different histories, one answer.
++    #[tokio::test]
++    async fn a_system_event_at_a_state_with_no_in_flight_effect_is_undefin
+a_system_event_at_a_state_with_no_in_flight_effect_is_undefined() {
++        let never_launched = Kernel
++            .resolve_system_event(&Domain, &State::Start, Event::GaveUp)
++            .await;
++        assert_eq!(never_launched, SystemEventResolution::Undefined);
++        assert!(!never_launched.is_record(), "Undefined must never record 
+anything");
++
++        let already_settled = Kernel
++            .resolve_system_event(&Domain, &State::Done, Event::GaveUp)
++            .await;
++        assert_eq!(already_settled, SystemEventResolution::Undefined);
++        assert!(!already_settled.is_record(), "Undefined must never record
+record anything");
++    }
++
+     /// The load-bearing negative: `Verified<T>` implements neither `Seria
+`Serialize`
+     /// nor `Deserialize`. Deserialising verified evidence from a wire for
+format is
+     /// precisely the forgery the type exists to prevent.

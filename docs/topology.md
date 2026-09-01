@@ -35,6 +35,7 @@ stateDiagram-v2
     AwaitingBooking --> NeedsRevalidation : UpdateRequirements
     AwaitingBooking --> BookingInProgress : Book ⇗
     AwaitingBooking --> Cancelled : Cancel
+    BookingInProgress --> CancellationRequested : Cancel
     Booked --> CancellingBooking : Cancel ⇗
     BookingInProgress -.-> Booked : BookingExists · intent Book Prepared
     BookingInProgress -.-> AwaitingBooking : EffectAbsent · intent Book Prepared
@@ -70,7 +71,7 @@ stateDiagram-v2
 | **VenueSelected** | — | → AwaitingBooking | → Draft | → NeedsRevalidation | — | — | → Cancelled |
 | **NeedsRevalidation** | — | — | → Draft | — | → VenueSelected | — | → Cancelled |
 | **AwaitingBooking** | — | — | → Draft | → NeedsRevalidation | — | → BookingInProgress ⇗ Book | → Cancelled |
-| **BookingInProgress** | — | — | — | — | — | — | — |
+| **BookingInProgress** | — | — | — | — | — | — | → CancellationRequested |
 | **CancellationRequested** | — | — | — | — | — | — | — |
 | **Booked** | — | — | — | — | — | — | → CancellingBooking ⇗ CancelBooking |
 | **CancellingBooking** | — | — | — | — | — | — | — |

@@ -329,7 +329,7 @@ impl Capability<BookingEffect> for FakeCouncil {
                         fee: facts.fee,
                     }
                 }
-                BookingEffect::CancelBooking { booking_ref } => {
+                BookingEffect::CancelBooking { booking_ref, .. } => {
                     inner
                         .cancelled
                         .entry(id.as_str().to_owned())

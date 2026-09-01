@@ -171,7 +171,7 @@ impl Capability<BookingEffect> for CouncilClient {
                     // facts the plan no longer reflects.
                     grant: grant.on_the_wire().to_owned(),
                 }),
-            BookingEffect::CancelBooking { booking_ref } => self
+            BookingEffect::CancelBooking { booking_ref, .. } => self
                 .http
                 .post(format!(
                     "{}/bookings/{}/cancel",

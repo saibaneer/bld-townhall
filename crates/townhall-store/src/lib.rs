@@ -3135,6 +3135,7 @@ mod effect_identity {
         let mut request = prepare_at(&id, 0, "TH-A");
         request.canonical_plan = BookingEffect::CancelBooking {
             booking_ref: CouncilBookingRef::new("TH-92718"),
+            principal: PrincipalId::new("lucy"),
         };
 
         let error = repo
@@ -3173,6 +3174,7 @@ mod effect_identity {
                 source_version: 0,
                 canonical_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
+                    principal: PrincipalId::new("lucy"),
                 },
                 next: Booking {
                     id: id.clone(),
@@ -3952,6 +3954,7 @@ mod phase_c {
                     &id,
                     BookingState::CancellationRequested(CancellationRequested {
                         effect_intent_id: book_effect.clone(),
+                        cancelled_by: PrincipalId::new("lucy"),
                     }),
                     None,
                     Some(&book_effect),
@@ -3975,6 +3978,7 @@ mod phase_c {
                 finalising_detail: None,
                 successor_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new(REF),
+                    principal: PrincipalId::new("lucy"),
                 },
                 next: booking_at(
                     &id,
@@ -4006,7 +4010,8 @@ mod phase_c {
         assert_eq!(
             handed.successor.canonical_plan,
             BookingEffect::CancelBooking {
-                booking_ref: CouncilBookingRef::new(REF)
+                booking_ref: CouncilBookingRef::new(REF),
+                principal: PrincipalId::new("lucy"),
             }
         );
         // And the audit row attributes it to the fact, not to Lucy.
@@ -4041,6 +4046,7 @@ mod phase_c {
                     &id,
                     BookingState::CancellationRequested(CancellationRequested {
                         effect_intent_id: book_effect.clone(),
+                        cancelled_by: PrincipalId::new("lucy"),
                     }),
                     None,
                     Some(&book_effect),
@@ -4071,6 +4077,7 @@ mod phase_c {
             finalising_detail: None,
             successor_plan: BookingEffect::CancelBooking {
                 booking_ref: CouncilBookingRef::new(REF),
+                principal: PrincipalId::new("lucy"),
             },
             next: coherent_next.clone(),
             audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
@@ -4111,6 +4118,7 @@ mod phase_c {
             .handoff_effect(HandoffEffect {
                 successor_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-00000"),
+                    principal: PrincipalId::new("lucy"),
                 },
                 ..base()
             })
@@ -4169,6 +4177,7 @@ mod phase_c {
                     &id,
                     BookingState::CancellationRequested(CancellationRequested {
                         effect_intent_id: book_effect.clone(),
+                        cancelled_by: PrincipalId::new("lucy"),
                     }),
                     None,
                     Some(&book_effect),
@@ -4198,6 +4207,7 @@ mod phase_c {
             finalising_detail: None,
             successor_plan: BookingEffect::CancelBooking {
                 booking_ref: CouncilBookingRef::new(REF),
+                principal: PrincipalId::new("lucy"),
             },
             next,
             audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),
@@ -4264,6 +4274,7 @@ mod phase_c {
                     &id,
                     BookingState::CancellationRequested(CancellationRequested {
                         effect_intent_id: book_effect.clone(),
+                        cancelled_by: PrincipalId::new("lucy"),
                     }),
                     None,
                     Some(&book_effect),
@@ -4286,6 +4297,7 @@ mod phase_c {
                 finalising_detail: None,
                 successor_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new(REF),
+                    principal: PrincipalId::new("lucy"),
                 },
                 next: booked(&id),
                 audit: TransitionAudit::driven_by(&confirmed_fact(&book_effect)),

@@ -2276,6 +2276,9 @@ impl BookingRepository for RacingRepo {
     async fn escalated_unresolved(&self, limit: u32) -> Result<Vec<EffectIntentId>, StoreError> {
         self.inner.escalated_unresolved(limit).await
     }
+    async fn retry_hint_ms(&self, id: &EffectIntentId) -> Result<Option<i64>, StoreError> {
+        self.inner.retry_hint_ms(id).await
+    }
 }
 
 /// Test 17: a post-expiry `EffectAbsent` loses its CAS to a competing Cancel

@@ -17,10 +17,15 @@ use townhall_domain::{
 };
 use townhall_service::{
     Attended, Coordinator, Reconciliation, ServiceError,
-    fake::{CouncilVerifier, FAKE_GRANT, FakeCouncil, FixedAvailability, ObservedCouncil, Script},
+    fake::{
+        CouncilVerifier, ExecuteGate, FAKE_GRANT, FakeCouncil, FixedAvailability, ObservedCouncil,
+        Script, WireOp,
+    },
 };
 use townhall_store::{
-    BookingRepository, NewBooking, SqliteBookingRepository, derive_effect_intent_id,
+    AuditEvent, BookingRepository, ClaimedEffect, EscalationWrite, FinalizeEffect, FinalizedEffect,
+    HandedOffEffect, HandoffEffect, NewBooking, PrepareEffect, PreparedEffect,
+    SqliteBookingRepository, StoreError, TransitionAudit, derive_effect_intent_id,
 };
 
 // --------------------------------------------------------------- fixtures
@@ -1589,4 +1594,905 @@ async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
             .await
             .expect("the intent row");
     assert_eq!(released, None, "the lease does not outlive the turn");
+}
+
+// ------------------------------------ slice F: in-flight cancellation (ADR-020)
+
+/// Test 9's shape: Lucy says "stop" while her booking's outcome is unknown.
+/// The move is LOCAL — the state records who asked and nothing touches the
+/// wire, because you cannot cancel what may not exist. An implementation that
+/// refuses Cancel mid-flight fails the propose; one that sends anything fails
+/// the wire log.
+#[tokio::test]
+async fn a_cancel_mid_flight_commits_locally_and_touches_no_wire() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-MIDFLIGHT");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    let wire_before = h.council.wire_log().len();
+    let before = h.repo.load(&id).await.expect("load");
+
+    let outcome = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "changed my mind".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("the turn runs");
+    let BoundaryOutcome::Committed(aggregate) = outcome else {
+        panic!("Cancel mid-flight must commit locally, got {outcome:?}");
+    };
+
+    assert_eq!(aggregate.state.name(), "CancellationRequested");
+    let townhall_domain::BookingState::CancellationRequested(requested) = &aggregate.state else {
+        panic!("wrong state shape");
+    };
+    assert_eq!(
+        requested.effect_intent_id, effect,
+        "still waiting on the SAME booking intent"
+    );
+    assert_eq!(
+        requested.cancelled_by,
+        PrincipalId::new("lucy"),
+        "the state remembers who asked — the handoff will need it"
+    );
+    assert_eq!(aggregate.active_effect, Some(effect));
+    assert_eq!(aggregate.version, before.version + 1);
+    assert_eq!(
+        h.council.wire_log().len(),
+        wire_before,
+        "nothing was sent and nothing was asked: the move is local"
+    );
+}
+
+/// The guard on the new edge, and its logbook row: cancelling mid-flight
+/// without cancellation authority is refused and recorded.
+#[tokio::test]
+async fn a_mid_flight_cancel_without_authority_is_denied_and_rowed() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-MIDDENY");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+
+    let mut no_authority = authority();
+    no_authority.may_cancel = false;
+    let outcome = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "not allowed to".to_owned(),
+            },
+            &no_authority,
+        )
+        .await
+        .expect("turn");
+    assert!(matches!(
+        outcome,
+        BoundaryOutcome::Denied(BookingError::CancellationAuthorityRequired)
+    ));
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].driver_detail, "Cancel");
+    assert_eq!(rows[0].reason, "CancellationAuthorityRequired");
+    assert_eq!(rows[0].principal, "lucy");
+}
+
+/// ADR-019's inheritance, as a test: escalation changes no menu, so Cancel is
+/// proposable on an ESCALATED booking — and the escalation marker survives the
+/// move untouched.
+#[tokio::test]
+async fn cancel_is_proposable_on_an_escalated_booking() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-ESCCANCEL");
+    awaiting(&h, &id, requirements()).await;
+    h.council
+        .script([Script::SucceedThenGoQuiet("response eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+
+    h.council.script([
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+        Script::GoQuiet("still nothing"),
+    ]);
+    for turn in 0..5 {
+        h.clock.advance(10_000);
+        let attended = h.reconciliation.attend(&effect).await.expect("attend");
+        if turn == 4 {
+            assert_eq!(attended, Attended::Escalated);
+        }
+    }
+
+    let outcome = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "took too long".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("turn");
+    let BoundaryOutcome::Committed(aggregate) = outcome else {
+        panic!("Cancel must exist on an escalated booking, got {outcome:?}");
+    };
+    assert_eq!(aggregate.state.name(), "CancellationRequested");
+    assert_eq!(
+        h.repo.escalated_unresolved(10).await.expect("queue"),
+        vec![effect],
+        "the question is still open — the marker is the intent's, not the state's"
+    );
+}
+
+/// Test 14: pre-deadline "not found" is `Unknown`, never absence — and under
+/// `CancellationRequested` the reconciler may ONLY ask (the pursuit table's
+/// resolve-only row). Kills mapping not-yet to absence, and kills a resend
+/// rule that ignores the wanted table — either sends the create here, booking
+/// the room Lucy is cancelling.
+#[tokio::test]
+async fn a_requested_cancellation_only_asks_and_never_sends() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-ASKONLY");
+    awaiting(&h, &id, requirements()).await;
+    // The create is CALLED and answers nothing — the council did no work, so
+    // the honest lookup answer below is "not yet visible".
+    h.council.script([Script::GoQuiet("nothing")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "stop".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("cancel");
+
+    for expected_attempts in [2, 3] {
+        h.clock.advance(10_000);
+        let attended = h.reconciliation.attend(&effect).await.expect("attend");
+        assert_eq!(
+            attended,
+            Attended::StillUnknown {
+                attempts_started: expected_attempts
+            },
+            "the intent could still be committed, so nothing may conclude"
+        );
+    }
+
+    let executes = h
+        .council
+        .wire_log()
+        .iter()
+        .filter(|(op, _)| *op == WireOp::Execute)
+        .count();
+    assert_eq!(
+        executes, 1,
+        "exactly the original send — recovery asked twice and sent NOTHING"
+    );
+    let still = h.repo.load(&id).await.expect("load");
+    assert_eq!(still.state.name(), "CancellationRequested");
+    assert_eq!(
+        h.repo.load_effect(&effect).await.expect("intent").status,
+        EffectStatus::Unknown
+    );
+}
+
+/// The pursuit table's other clause for resolve-only: an intent that was never
+/// even ATTEMPTED (`Prepared` — the crash window between Phase A's commit and
+/// Phase B's mark) is still only asked about once the desire is withdrawn.
+/// Kills a first-send leg that dispatches on status alone.
+#[tokio::test]
+async fn a_never_attempted_create_is_not_sent_after_cancellation_is_requested() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-NEVERSENT");
+    awaiting(&h, &id, requirements()).await;
+
+    // The crash state, built by the same committed operation a crash would
+    // leave behind: Phase A done (intent durable, in-flight state committed),
+    // Phase B never reached — `Prepared`, 0/0.
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, AT_BOOK);
+    let loaded = h.repo.load(&id).await.expect("load");
+    let booking = townhall_domain::Booking::from(&loaded);
+    h.repo
+        .prepare_effect(PrepareEffect {
+            booking_id: id.clone(),
+            source_version: loaded.version,
+            canonical_plan: book_plan(),
+            next: townhall_domain::Booking {
+                state: townhall_domain::BookingState::BookingInProgress(
+                    townhall_domain::BookingInProgress {
+                        effect_intent_id: effect.clone(),
+                    },
+                ),
+                active_effect: Some(effect.clone()),
+                ..booking
+            },
+            audit: TransitionAudit::driven_by(&BookingProposal::Book),
+        })
+        .await
+        .expect("phase A");
+
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "never mind".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("cancel");
+
+    h.clock.advance(10_000);
+    let attended = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(
+        attended,
+        Attended::StillUnknown {
+            attempts_started: 1
+        }
+    );
+    assert_eq!(
+        h.council.call_count(),
+        0,
+        "the create was NEVER sent: withdrawn means withdrawn, even for Prepared"
+    );
+    assert_eq!(
+        h.council
+            .wire_log()
+            .iter()
+            .filter(|(op, _)| *op == WireOp::Resolve)
+            .count(),
+        1,
+        "recovery asked — asking is all it may do here"
+    );
+}
+
+/// Per-call accounting, pinned directly (plan review round 3): one uncontended
+/// query-then-resend turn moves the pursuit row by exactly two on BOTH
+/// columns, and the wire shows the ask strictly before the send.
+///
+/// (The plan sketched this from a crashed 1/0 start; a real crash start
+/// belongs to test 12's process-level fixture. The honest protocol-level
+/// start is 1/1 — the property pinned is identical: +2 started, +2 finished,
+/// with DISTINCT finishes per call, killing an implementation that folds two
+/// returns into one finish or two departures into one start.)
+#[tokio::test]
+async fn a_query_and_resend_turn_counts_both_attempts_and_asks_first() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-TWOCALLS");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::GoQuiet("nothing happened")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    let (started, finished) = pursuit_counts(&h, &effect).await;
+    assert_eq!((started, finished), (1, 1), "the failed first send");
+
+    // One turn: ask (the council's authenticated "nothing yet"), then — the
+    // booking is still wanted — send the same identity. The fake books it.
+    h.clock.advance(10_000);
+    let attended = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(attended, Attended::Settled);
+    assert_eq!(h.repo.load(&id).await.expect("load").state.name(), "Booked");
+
+    let (started, finished) = pursuit_counts(&h, &effect).await;
+    assert_eq!(
+        (started, finished),
+        (3, 3),
+        "two wire calls, two marks each side — ADR-019's contract verbatim"
+    );
+    let log = h.council.wire_log();
+    let ops: Vec<WireOp> = log
+        .iter()
+        .filter(|(_, logged)| *logged == effect.as_str())
+        .map(|(op, _)| *op)
+        .collect();
+    assert_eq!(
+        ops,
+        vec![WireOp::Execute, WireOp::Resolve, WireOp::Execute],
+        "the resend ASKED first — a blind resend is what idempotency would hide"
+    );
+    assert_eq!(h.council.booking_count(), 1);
+}
+
+async fn pursuit_counts(h: &Harness, effect: &EffectIntentId) -> (i64, i64) {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT attempts_started, attempts_finished FROM effect_intents \
+         WHERE effect_intent_id = ?",
+    )
+    .bind(effect.as_str())
+    .fetch_one(h.repo.pool())
+    .await
+    .expect("the intent row")
+}
+
+/// Gate M16, end to end: the distinction `NeedsHuman` destroyed, driven through
+/// the doors. Exhaustion at `CancellationRequested`, then the late answer
+/// arrives — and lands as "now cancel it", never as "Booked": the handoff
+/// fires, the cancel effect is minted and SENT, and the story ends `Cancelled`.
+#[tokio::test]
+async fn an_escalated_cancellation_is_finished_by_the_late_fact() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-M16");
+    awaiting(&h, &id, requirements()).await;
+    // The council BOOKS the room and the answer is eaten: the late fact will
+    // be real.
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "waited too long".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("cancel");
+
+    // Spend the budget asking (resolve-only: no send can happen here), then
+    // the sixth claim escalates.
+    h.council.script([
+        Script::GoQuiet("nothing"),
+        Script::GoQuiet("nothing"),
+        Script::GoQuiet("nothing"),
+        Script::GoQuiet("nothing"),
+    ]);
+    for turn in 0..5 {
+        h.clock.advance(10_000);
+        let attended = h.reconciliation.attend(&effect).await.expect("attend");
+        if turn == 4 {
+            assert_eq!(attended, Attended::Escalated, "the budget is spent");
+        }
+    }
+    assert_eq!(
+        h.repo.escalated_unresolved(10).await.expect("queue"),
+        vec![effect.clone()]
+    );
+
+    // The late answer: the council held the booking all along. The handoff —
+    // finalise the book intent, mint the cancel successor, move to
+    // CancellingBooking — is exactly what NeedsHuman could not express.
+    h.clock.advance(townhall_store::MAX_CADENCE_MS + 1);
+    let attended = h.reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(attended, Attended::Settled);
+    let handed = h.repo.load(&id).await.expect("load");
+    assert_eq!(handed.state.name(), "CancellingBooking");
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "the question was answered — the queue is a predicate, and it is false now"
+    );
+
+    // The minted cancel intent is due, wanted, never attempted: recovery's
+    // first-send leg executes it, carrying the canceller the STATE remembered.
+    let due = h.reconciliation.due(10).await.expect("due");
+    assert_eq!(due.len(), 1, "the cancel successor is recovery's next job");
+    let cancel_effect = due[0].clone();
+    let attended = h
+        .reconciliation
+        .attend(&cancel_effect)
+        .await
+        .expect("attend");
+    assert_eq!(attended, Attended::Settled);
+    assert_eq!(
+        h.repo.load(&id).await.expect("load").state.name(),
+        "Cancelled"
+    );
+    let sent = h.council.calls();
+    let last = sent.last().expect("the cancel was sent");
+    assert!(
+        matches!(
+            &last.plan,
+            BookingEffect::CancelBooking { principal, .. }
+                if *principal == PrincipalId::new("lucy")
+        ),
+        "the plan carries WHO asked to cancel, across the whole ambiguous window"
+    );
+    assert_eq!(
+        h.repo
+            .load_effect(&cancel_effect)
+            .await
+            .expect("intent")
+            .status,
+        EffectStatus::Confirmed
+    );
+}
+
+/// Gate M3, the composed race: a cancel send held past its lease's expiry, a
+/// second worker escalating the intent meanwhile, and the held call's answer
+/// landing LATE — the stale owner's pursuit writes are fenced to nothing, and
+/// the verified fact still settles through the version-fenced fact door.
+#[tokio::test]
+async fn an_escalation_during_a_held_call_is_fenced_and_the_fact_still_lands() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-M3");
+    awaiting(&h, &id, requirements()).await;
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book to Booked");
+    // The ordinary cancellation's send answers nothing: intent Unknown, 1/1.
+    h.council.script([Script::GoQuiet("answer lost")]);
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "plans changed".to_owned(),
+            },
+            &authority(),
+        )
+        .await
+        .expect("cancel");
+    let cancel_effect = in_flight_effect(&h, &id).await;
+
+    // Three quiet queries: marks 2-4.
+    h.council.script([
+        Script::GoQuiet("nothing"),
+        Script::GoQuiet("nothing"),
+        Script::GoQuiet("nothing"),
+    ]);
+    for _ in 0..3 {
+        h.clock.advance(10_000);
+        let attended = h
+            .reconciliation
+            .attend(&cancel_effect)
+            .await
+            .expect("attend");
+        assert!(matches!(attended, Attended::StillUnknown { .. }));
+    }
+
+    // Turn five: claims at 4 < 5, queries (mark 5, the honest not-yet),
+    // resends (mark 6) — and the send is HELD at the gate.
+    let gate = Arc::new(ExecuteGate::default());
+    h.council.gate_executes(Arc::clone(&gate));
+    h.clock.advance(10_000);
+    let worker_one = {
+        let reconciliation = Reconciliation::new(
+            Coordinator::new(
+                Arc::clone(&h.repo),
+                Arc::clone(&h.council),
+                Arc::new(CouncilVerifier),
+                Arc::new(FixedAvailability::new(facts())),
+            ),
+            Arc::clone(&h.council),
+        );
+        let effect = cancel_effect.clone();
+        tokio::spawn(async move { reconciliation.attend(&effect).await })
+    };
+    // The call is genuinely on the wire — witnessed, never slept for.
+    gate.arrived
+        .acquire()
+        .await
+        .expect("the held call arrives")
+        .forget();
+
+    // The lease expires under the held call; worker two takes over and finds
+    // the budget spent: escalation, under ITS token.
+    h.clock.advance(30_001);
+    let attended = h
+        .reconciliation
+        .attend(&cancel_effect)
+        .await
+        .expect("attend");
+    assert_eq!(attended, Attended::Escalated, "worker two gave up honestly");
+
+    // The council finally answers worker one's held send. The stale owner's
+    // pursuit writes match nothing — but the FACT is version-fenced, not
+    // lease-fenced, and it lands.
+    gate.release.add_permits(1);
+    let attended = worker_one
+        .await
+        .expect("the task ran")
+        .expect("the turn ran");
+    assert_eq!(
+        attended,
+        Attended::Settled,
+        "the answer outlives the lease: the cancellation is real"
+    );
+
+    assert_eq!(
+        h.repo.load(&id).await.expect("load").state.name(),
+        "Cancelled"
+    );
+    assert!(
+        h.repo
+            .escalated_unresolved(10)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "settled means answered: the escalated question leaves the queue"
+    );
+    let (started, finished, escalated_at, escalation_attempts) =
+        sqlx::query_as::<_, (i64, i64, Option<i64>, Option<i64>)>(
+            "SELECT attempts_started, attempts_finished, escalated_at_ms, \
+             escalation_attempts FROM effect_intents WHERE effect_intent_id = ?",
+        )
+        .bind(cancel_effect.as_str())
+        .fetch_one(h.repo.pool())
+        .await
+        .expect("row");
+    assert!(escalated_at.is_some(), "exactly one marker was written");
+    assert_eq!(escalation_attempts, Some(6), "derived IN the write");
+    assert_eq!(
+        (started, finished),
+        (6, 5),
+        "the fence ate exactly the stale owner's finish — nothing else"
+    );
+}
+
+// --------------------------------------------- test 17: the re-apply path
+
+/// A repository that loses the FIRST finalize on purpose: before delegating
+/// it, a competing Cancel commits through the inner handle — so the settle
+/// under test genuinely receives `StaleVersion` and must re-apply the same
+/// verified fact against the state that beat it. Everything else delegates.
+struct RacingRepo {
+    inner: Arc<SqliteBookingRepository>,
+    finalize_attempts: std::sync::atomic::AtomicUsize,
+    inject: std::sync::Mutex<Option<InjectedCancel>>,
+}
+
+struct InjectedCancel {
+    id: BookingId,
+    version: u64,
+    next: townhall_domain::Booking,
+    audit: TransitionAudit,
+}
+
+#[async_trait::async_trait]
+impl BookingRepository for RacingRepo {
+    async fn create(
+        &self,
+        booking: NewBooking,
+    ) -> Result<townhall_domain::BookingAggregate, StoreError> {
+        self.inner.create(booking).await
+    }
+    async fn load(&self, id: &BookingId) -> Result<townhall_domain::BookingAggregate, StoreError> {
+        self.inner.load(id).await
+    }
+    async fn commit(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        next: townhall_domain::Booking,
+        audit: TransitionAudit,
+    ) -> Result<townhall_domain::BookingAggregate, StoreError> {
+        self.inner.commit(id, expected_version, next, audit).await
+    }
+    async fn audit_events(&self, id: &BookingId) -> Result<Vec<AuditEvent>, StoreError> {
+        self.inner.audit_events(id).await
+    }
+    async fn prepare_effect(&self, request: PrepareEffect) -> Result<PreparedEffect, StoreError> {
+        self.inner.prepare_effect(request).await
+    }
+    async fn finalize_effect(
+        &self,
+        request: FinalizeEffect,
+    ) -> Result<FinalizedEffect, StoreError> {
+        let first = self
+            .finalize_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        if first {
+            let injected = self
+                .inject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cancel) = injected {
+                // The competing writer wins the CAS between this settle's
+                // classification and its commit.
+                self.inner
+                    .commit(&cancel.id, cancel.version, cancel.next, cancel.audit)
+                    .await
+                    .expect("the competing Cancel commits first");
+            }
+        }
+        self.inner.finalize_effect(request).await
+    }
+    async fn handoff_effect(&self, request: HandoffEffect) -> Result<HandedOffEffect, StoreError> {
+        self.inner.handoff_effect(request).await
+    }
+    async fn load_effect(
+        &self,
+        id: &EffectIntentId,
+    ) -> Result<townhall_domain::EffectIntent, StoreError> {
+        self.inner.load_effect(id).await
+    }
+    async fn due_effects(&self, limit: u32) -> Result<Vec<EffectIntentId>, StoreError> {
+        self.inner.due_effects(limit).await
+    }
+    async fn claim_effect(
+        &self,
+        id: &EffectIntentId,
+        lease_ms: i64,
+    ) -> Result<Option<ClaimedEffect>, StoreError> {
+        self.inner.claim_effect(id, lease_ms).await
+    }
+    async fn note_attempt_started(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+    ) -> Result<bool, StoreError> {
+        self.inner.note_attempt_started(id, token).await
+    }
+    async fn note_attempt_finished(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        next_attempt_after_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .note_attempt_finished(id, token, next_attempt_after_ms)
+            .await
+    }
+    async fn release_lease(&self, id: &EffectIntentId, token: i64) -> Result<(), StoreError> {
+        self.inner.release_lease(id, token).await
+    }
+    async fn mark_escalated(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        long_cadence_ms: i64,
+    ) -> Result<EscalationWrite, StoreError> {
+        self.inner.mark_escalated(id, token, long_cadence_ms).await
+    }
+    async fn escalated_unresolved(&self, limit: u32) -> Result<Vec<EffectIntentId>, StoreError> {
+        self.inner.escalated_unresolved(limit).await
+    }
+}
+
+/// Test 17: a post-expiry `EffectAbsent` loses its CAS to a competing Cancel
+/// and is RE-APPLIED against the state that won — the original ADR-016 race,
+/// through the full re-apply path, with the loss forced deterministically.
+/// The witnesses are the audit trail's ORDER and the finalize count; the final
+/// state alone would prove nothing.
+#[tokio::test]
+async fn a_lost_cas_reapplies_the_same_verified_absence() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-REAPPLY");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::GoQuiet("never arrived")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    let in_flight = h.repo.load(&id).await.expect("load");
+    assert_eq!(in_flight.state.name(), "BookingInProgress");
+
+    // The competing writer's commit, primed: BookingInProgress →
+    // CancellationRequested at the version the settle will load.
+    let booking = townhall_domain::Booking::from(&in_flight);
+    let competing = InjectedCancel {
+        id: id.clone(),
+        version: in_flight.version,
+        next: townhall_domain::Booking {
+            state: townhall_domain::BookingState::CancellationRequested(
+                townhall_domain::CancellationRequested {
+                    effect_intent_id: effect.clone(),
+                    cancelled_by: PrincipalId::new("lucy"),
+                },
+            ),
+            active_effect: Some(effect.clone()),
+            ..booking
+        },
+        audit: TransitionAudit::driven_by(&BookingProposal::Cancel {
+            reason: "race".to_owned(),
+        }),
+    };
+    let racing = Arc::new(RacingRepo {
+        inner: Arc::clone(&h.repo),
+        finalize_attempts: std::sync::atomic::AtomicUsize::new(0),
+        inject: std::sync::Mutex::new(Some(competing)),
+    });
+    let coordinator = Coordinator::new(
+        Arc::clone(&racing),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    // The verified post-expiry absence — monotonic by ADR-016's construction,
+    // which is exactly what makes re-applying it safe.
+    let fact = Verified::assert_verified(VerifiedProviderFact::EffectAbsent {
+        effect_intent_id: effect.clone(),
+    });
+    let outcome = coordinator.observe(&id, fact).await.expect("the turn runs");
+    let BoundaryOutcome::Committed(aggregate) = outcome else {
+        panic!("the re-applied fact must commit, got {outcome:?}");
+    };
+    assert_eq!(
+        aggregate.state.name(),
+        "Cancelled",
+        "absence under CancellationRequested means: nothing to cancel — done"
+    );
+
+    assert_eq!(
+        racing
+            .finalize_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the first finalize was refused; the second carried the re-application"
+    );
+    let audit = h.repo.audit_events(&id).await.expect("audit");
+    let tail: Vec<(String, String, u64, u64)> = audit
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .map(|row| {
+            (
+                row.driver_kind.name().to_owned(),
+                row.driver_detail.clone(),
+                row.from_version,
+                row.to_version,
+            )
+        })
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            (
+                "Proposal".to_owned(),
+                "Cancel".to_owned(),
+                in_flight.version,
+                in_flight.version + 1
+            ),
+            (
+                "Fact".to_owned(),
+                "EffectAbsent".to_owned(),
+                in_flight.version + 1,
+                in_flight.version + 2
+            ),
+        ],
+        "the Cancel won first, and the SAME fact then moved the winner's state"
+    );
+    assert_eq!(
+        h.repo.load_effect(&effect).await.expect("intent").status,
+        EffectStatus::Absent
+    );
+}
+
+/// The attribution payoff of the `CancelBooking` storage break, at BOTH remaining
+/// doors (PR #16 review, HIGH): a refusal on a cancellation intent is
+/// attributed to the CANCELLER from the persisted plan — asserted with a
+/// canceller who is not the booker, so a fallback to the booking's principal
+/// (or to the pre-F empty string) fails by name.
+#[tokio::test]
+async fn a_refusal_on_a_cancellation_intent_is_attributed_to_the_canceller() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-CXLBLAME");
+    awaiting(&h, &id, requirements()).await;
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book to Booked");
+
+    // Marco — not Lucy — asks to cancel, and the cancel's answer goes quiet:
+    // the persisted CancelBooking plan carries HIS name.
+    let mut marco = authority();
+    marco.principal = PrincipalId::new("marco");
+    h.council.script([Script::GoQuiet("answer lost")]);
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "marco's call".to_owned(),
+            },
+            &marco,
+        )
+        .await
+        .expect("cancel");
+    let cancel_effect = in_flight_effect(&h, &id).await;
+
+    // Fact door: a CancellationExists naming the WRONG reference is refused by
+    // the plan binding — and the row names marco, from the plan, because the
+    // fact itself carries no principal.
+    let wrong_ref = Verified::assert_verified(VerifiedProviderFact::CancellationExists {
+        effect_intent_id: cancel_effect.clone(),
+        booking_ref: CouncilBookingRef::new("TH-00000"),
+    });
+    let outcome = h.coordinator.observe(&id, wrong_ref).await.expect("turn");
+    assert!(
+        matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::EffectPlanMismatch {
+                field: "booking_ref"
+            })
+        ),
+        "a reference the plan never named: {outcome:?}"
+    );
+
+    // System-event door: a stale CANCEL-plan intent (planted raw — no current
+    // door can mint it, and the reconciler must survive rows history wrote)
+    // whose exhausted chase names an effect the booking is not waiting on. The
+    // plan is the live cancel's own persisted JSON — CancelBooking, carrying
+    // marco — copied rather than re-serialized, so the fixture cannot drift
+    // from what the store actually writes.
+    let stale_plan: String = sqlx::query_scalar(
+        "SELECT canonical_plan_json FROM effect_intents WHERE effect_intent_id = ?",
+    )
+    .bind(cancel_effect.as_str())
+    .fetch_one(h.repo.pool())
+    .await
+    .expect("the live cancel plan");
+    sqlx::query(
+        r"
+        INSERT INTO effect_intents (effect_intent_id, booking_id, operation_kind,
+                                    source_version, canonical_plan_json, status,
+                                    expires_at_ms, created_at_ms, updated_at_ms,
+                                    attempts_started, attempts_finished)
+        VALUES (?, ?, 'Cancel', 99, ?, 'Unknown', ?, 0, 0, 1000, 1000)
+        ",
+    )
+    .bind("EFF-STALE-CANCEL")
+    .bind(id.to_string())
+    .bind(&stale_plan)
+    .bind(i64::MAX / 2)
+    .execute(h.repo.pool())
+    .await
+    .expect("plant");
+    let attended = h
+        .reconciliation
+        .attend(&EffectIntentId::new("EFF-STALE-CANCEL"))
+        .await
+        .expect("attend");
+    assert_eq!(attended, Attended::NotDue);
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one refusal per door: {rows:?}");
+    let fact_row = rows
+        .iter()
+        .find(|row| row.driver_kind == "Fact")
+        .expect("the fact-door row");
+    assert_eq!(fact_row.driver_detail, "CancellationExists");
+    assert_eq!(fact_row.reason, "EffectPlanMismatch");
+    assert_eq!(
+        fact_row.principal, "marco",
+        "attributed to the CANCELLER, from the persisted plan"
+    );
+    let event_row = rows
+        .iter()
+        .find(|row| row.driver_kind == "SystemEvent")
+        .expect("the system-event row");
+    assert_eq!(event_row.driver_detail, "ReconciliationExhausted");
+    assert_eq!(event_row.reason, "EffectMismatch");
+    assert_eq!(event_row.principal, "marco");
 }

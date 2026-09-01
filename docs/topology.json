@@ -43,7 +43,7 @@
         {"from": "BookingInProgress", "input": "UpdateRequirements", "edge": "no_edge"},
         {"from": "BookingInProgress", "input": "RevalidateVenue", "edge": "no_edge"},
         {"from": "BookingInProgress", "input": "Book", "edge": "no_edge"},
-        {"from": "BookingInProgress", "input": "Cancel", "edge": "no_edge"},
+        {"from": "BookingInProgress", "input": "Cancel", "edge": "local", "to": "CancellationRequested"},
         {"from": "CancellationRequested", "input": "SelectVenue", "edge": "no_edge"},
         {"from": "CancellationRequested", "input": "VerifySlot", "edge": "no_edge"},
         {"from": "CancellationRequested", "input": "ChangeVenue", "edge": "no_edge"},

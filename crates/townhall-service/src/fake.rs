@@ -97,6 +97,18 @@ pub enum RawBody {
     },
 }
 
+/// Which wire the council was reached over — an ask or a cause.
+///
+/// The interleaved log exists for one discriminating witness (ADR-020): on a
+/// resend path, the resolve must strictly precede the execute, because a blind
+/// resend that never asks is exactly what same-identity idempotency would
+/// otherwise hide in every happy-path test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireOp {
+    Resolve,
+    Execute,
+}
+
 /// A council that keeps one booking per effect identity.
 #[derive(Debug, Default)]
 pub struct FakeCouncil {
@@ -111,6 +123,63 @@ struct Inner {
     calls: Vec<Call>,
     script: Vec<Script>,
     next_reference: u32,
+    /// First-seen binding, exactly as the real council binds (slice D): kind
+    /// and deadline are recorded on first sight — execute or resolve alike —
+    /// and immutable after. A later envelope that contradicts the binding is
+    /// answered as unusable, the same protocol history the real council
+    /// refuses with `ProtocolConflict`. Without this, the fake would accept
+    /// histories the real council rejects, and every reply became
+    /// consequential the moment `NotYetVisible` could authorize a resend.
+    bound: HashMap<String, (townhall_domain::OperationKind, i64)>,
+    /// Every wire arrival, in order, both kinds — see [`WireOp`].
+    wire_log: Vec<(WireOp, String)>,
+    /// When armed, every execute waits here before doing its work — the
+    /// blocking fake gate M3's composed race needs: a call held past its
+    /// lease's expiry while a second worker moves.
+    execute_gate: Option<std::sync::Arc<ExecuteGate>>,
+}
+
+/// The blocking fake's synchronisation, both directions signalled — a test
+/// AWAITS `arrived` (the call is genuinely on the wire) and PERMITS `release`
+/// (the council finally answers), so no participant ever sleeps.
+#[derive(Debug)]
+pub struct ExecuteGate {
+    pub arrived: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
+}
+
+impl Default for ExecuteGate {
+    fn default() -> Self {
+        Self {
+            arrived: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl Inner {
+    /// Enforce the first-seen binding for one arriving envelope.
+    fn bind(
+        &mut self,
+        id: &str,
+        kind: townhall_domain::OperationKind,
+        expires_at_ms: i64,
+    ) -> Result<(), Unknown> {
+        match self.bound.get(id) {
+            None => {
+                self.bound.insert(id.to_owned(), (kind, expires_at_ms));
+                Ok(())
+            }
+            Some((bound_kind, bound_expiry))
+                if *bound_kind == kind && *bound_expiry == expires_at_ms =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(Unknown::new(BoundedString::truncating(
+                "the envelope contradicts what the council already bound",
+            ))),
+        }
+    }
 }
 
 impl FakeCouncil {
@@ -144,6 +213,21 @@ impl FakeCouncil {
     #[must_use]
     pub fn booking_count(&self) -> usize {
         self.lock().created.len()
+    }
+
+    /// Every wire arrival in order — asks and causes interleaved. The witness
+    /// for "the resolve strictly precedes the execute" on a resend path.
+    #[must_use]
+    pub fn wire_log(&self) -> Vec<(WireOp, String)> {
+        self.lock().wire_log.clone()
+    }
+
+    /// Arm the execute gate: every subsequent `execute` announces its arrival
+    /// on `gate.arrived` (one permit per call, for the test to await — never a
+    /// sleep) and then waits for a permit on `gate.release` before doing its
+    /// work. This is how a test holds a call past its lease's expiry.
+    pub fn gate_executes(&self, gate: std::sync::Arc<ExecuteGate>) {
+        self.lock().execute_gate = Some(gate);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -189,25 +273,60 @@ impl Capability<BookingEffect> for ObservedCouncil {
 #[async_trait]
 impl crate::EffectResolver<RawResponse> for FakeCouncil {
     /// Ask what became of an identity. The fake's honest answers only: a created
-    /// booking or cancellation is returned; anything else is `Unknown`, because
-    /// this fake deliberately does not enforce expiry and therefore can never
-    /// determine absence (see the module header). The script is consulted first,
-    /// so a test can make the lookup itself misbehave.
+    /// booking or cancellation is returned, and an identity it holds nothing
+    /// settled for is `NotYetVisible` — honest, because that claims nothing
+    /// about absence, which this fake deliberately cannot determine (no expiry;
+    /// see the module header). The fake IS the council in-process, so its
+    /// not-yet is authentic and identity-bound by construction — the bar the
+    /// trait states is met trivially rather than cryptographically. The script
+    /// is consulted first, so a test can make the lookup itself misbehave; a
+    /// turn that queries and then resends consumes TWO script operations from
+    /// this one shared queue.
     async fn resolve(
         &self,
         attempt: &EffectAttempt,
-        _kind: townhall_domain::OperationKind,
-    ) -> Result<RawResponse, Unknown> {
+        kind: townhall_domain::OperationKind,
+    ) -> Result<crate::Resolved<RawResponse>, Unknown> {
         let mut inner = self.lock();
+        let id = &attempt.id;
+        inner
+            .wire_log
+            .push((WireOp::Resolve, id.as_str().to_owned()));
+        inner.bind(id.as_str(), kind, attempt.expires_at_ms)?;
 
         let step = if inner.script.is_empty() {
-            Script::Succeed
+            // No script: answer honestly, including the honest "nothing yet".
+            if let Some(reference) = inner.cancelled.get(id.as_str()) {
+                return Ok(crate::Resolved::Answer(RawResponse {
+                    effect_intent_id: id.clone(),
+                    body: RawBody::Cancelled {
+                        booking_ref: reference.clone(),
+                    },
+                    attested: true,
+                }));
+            }
+            if let Some(reference) = inner.created.get(id.as_str()) {
+                // The fake keeps no catalogue, so the canonical facts echo
+                // the fixture's; the real council derives them (slice D).
+                return Ok(crate::Resolved::Answer(RawResponse {
+                    effect_intent_id: id.clone(),
+                    body: RawBody::Created {
+                        booking_ref: reference.clone(),
+                        principal: PrincipalId::new("lucy"),
+                        venue_id: "TH-A".to_owned(),
+                        slot_id: "SLOT-A".to_owned(),
+                        attendees: 20,
+                        fee: Money::from_pence(4_500),
+                    },
+                    attested: true,
+                }));
+            }
+            return Ok(crate::Resolved::NotYetVisible);
         } else {
             inner.script.remove(0)
         };
 
         let attested = step != Script::Forge;
-        let id = &attempt.id;
         let body = match step {
             Script::GoQuiet(detail) | Script::SucceedThenGoQuiet(detail) => {
                 return Err(Unknown::new(BoundedString::truncating(detail)));
@@ -220,8 +339,6 @@ impl crate::EffectResolver<RawResponse> for FakeCouncil {
                         booking_ref: reference.clone(),
                     }
                 } else if let Some(reference) = inner.created.get(id.as_str()) {
-                    // The fake keeps no catalogue, so the canonical facts echo
-                    // the fixture's; the real council derives them (slice D).
                     RawBody::Created {
                         booking_ref: reference.clone(),
                         principal: PrincipalId::new("lucy"),
@@ -231,8 +348,9 @@ impl crate::EffectResolver<RawResponse> for FakeCouncil {
                         fee: Money::from_pence(4_500),
                     }
                 } else {
-                    // Never seen, deadline unenforced: the only honest answer is
-                    // no answer.
+                    // An explicit "succeed" scripted for an identity holding
+                    // nothing: the script asked for the impossible, and the
+                    // only honest answer is no answer.
                     return Err(Unknown::new(BoundedString::truncating(
                         "the fake council has nothing for this identity",
                     )));
@@ -240,11 +358,11 @@ impl crate::EffectResolver<RawResponse> for FakeCouncil {
             }
         };
 
-        Ok(RawResponse {
+        Ok(crate::Resolved::Answer(RawResponse {
             effect_intent_id: id.clone(),
             body,
             attested,
-        })
+        }))
     }
 }
 
@@ -257,8 +375,32 @@ impl Capability<BookingEffect> for FakeCouncil {
         effect: &BookingEffect,
         attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
+        // The arrival is logged and announced BEFORE the gate, because arrival
+        // is what happened. The gate, when armed, then holds the call HERE —
+        // after the caller's durable attempt mark, before any work — which is
+        // where a slow council lives from the boundary's point of view.
+        // Awaited outside the state lock, or the held call would block every
+        // other wire.
+        let gate = {
+            let mut inner = self.lock();
+            inner
+                .wire_log
+                .push((WireOp::Execute, attempt.id.as_str().to_owned()));
+            inner.execute_gate.clone()
+        };
+        if let Some(gate) = gate {
+            gate.arrived.add_permits(1);
+            let permit = gate
+                .release
+                .acquire()
+                .await
+                .map_err(|_| Unknown::new(BoundedString::truncating("the gate was closed")))?;
+            permit.forget();
+        }
+
         let id = &attempt.id;
         let mut inner = self.lock();
+        inner.bind(id.as_str(), effect.operation_kind(), attempt.expires_at_ms)?;
         inner.calls.push(Call {
             effect_intent_id: id.clone(),
             expires_at_ms: attempt.expires_at_ms,
@@ -329,7 +471,7 @@ impl Capability<BookingEffect> for FakeCouncil {
                         fee: facts.fee,
                     }
                 }
-                BookingEffect::CancelBooking { booking_ref } => {
+                BookingEffect::CancelBooking { booking_ref, .. } => {
                     inner
                         .cancelled
                         .entry(id.as_str().to_owned())
@@ -467,5 +609,154 @@ impl crate::AvailabilitySource for FixedAvailability {
                 grant: self.grant.clone(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bld_types::{SlotId, VenueId};
+    use townhall_domain::{OperationKind, VenueFacts};
+
+    fn attempt(id: &str, expires_at_ms: i64) -> EffectAttempt {
+        EffectAttempt {
+            id: EffectIntentId::new(id),
+            expires_at_ms,
+        }
+    }
+
+    fn book_plan() -> BookingEffect {
+        BookingEffect::Book {
+            principal: PrincipalId::new("lucy"),
+            attendees: 20,
+            facts: VenueFacts {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                capacity: 30,
+                wheelchair_accessible: true,
+                fee: Money::from_pence(4_500),
+                available: true,
+            },
+            grant: AvailabilityGrant::new(FAKE_GRANT),
+        }
+    }
+
+    fn cancel_plan() -> BookingEffect {
+        BookingEffect::CancelBooking {
+            booking_ref: CouncilBookingRef::new("TH-90001"),
+            principal: PrincipalId::new("lucy"),
+        }
+    }
+
+    fn contradicts(reply: &Unknown) -> bool {
+        format!("{reply:?}").contains("contradicts")
+    }
+
+    /// The four first-seen-binding cases (ADR-020, plan review round 3): both
+    /// first-seen directions, with the KIND conflict and the DEADLINE conflict
+    /// varied independently. Every conflicting envelope is unusable and the
+    /// first-seen record survives — the same protocol histories the real
+    /// council refuses with `ProtocolConflict`, so a protocol test passing
+    /// against this fake means something.
+    #[tokio::test]
+    async fn a_resolve_first_binding_refuses_a_conflicting_execute_kind() {
+        let council = FakeCouncil::new();
+        let seen = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-1", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("first sight binds");
+        assert_eq!(seen, crate::Resolved::NotYetVisible);
+
+        let refused = council
+            .execute(&cancel_plan(), &attempt("EFF-BIND-1", 1_000))
+            .await
+            .expect_err("a Cancel envelope against a Book binding is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+
+        // The first-seen record survives the refused envelope.
+        let still = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-1", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("the binding is intact");
+        assert_eq!(still, crate::Resolved::NotYetVisible);
+    }
+
+    #[tokio::test]
+    async fn a_resolve_first_binding_refuses_a_conflicting_execute_deadline() {
+        let council = FakeCouncil::new();
+        crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-2", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("first sight binds");
+
+        let refused = council
+            .execute(&book_plan(), &attempt("EFF-BIND-2", 2_000))
+            .await
+            .expect_err("a different deadline for a bound identity is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn an_execute_first_binding_refuses_a_conflicting_resolve_kind() {
+        let council = FakeCouncil::new();
+        council
+            .execute(&cancel_plan(), &attempt("EFF-BIND-3", 1_000))
+            .await
+            .expect("first sight binds and cancels");
+
+        let refused = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-3", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect_err("asking about it as a Book is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+
+        // A MATCHING ask still answers: the settled cancellation.
+        let answered = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-3", 1_000),
+            OperationKind::Cancel,
+        )
+        .await
+        .expect("the binding is intact");
+        assert!(
+            matches!(
+                answered,
+                crate::Resolved::Answer(RawResponse {
+                    body: RawBody::Cancelled { .. },
+                    ..
+                })
+            ),
+            "{answered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execute_first_binding_refuses_a_conflicting_resolve_deadline() {
+        let council = FakeCouncil::new();
+        council
+            .execute(&book_plan(), &attempt("EFF-BIND-4", 1_000))
+            .await
+            .expect("first sight binds and books");
+
+        let refused = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-4", 9_999),
+            OperationKind::Book,
+        )
+        .await
+        .expect_err("a different deadline for a bound identity is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
     }
 }

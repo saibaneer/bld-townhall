@@ -207,6 +207,7 @@ fn all_states() -> Vec<BookingState> {
         }),
         BookingState::CancellationRequested(CancellationRequested {
             effect_intent_id: EffectIntentId::new(BOOK_EFFECT),
+            cancelled_by: PrincipalId::new("lucy"),
         }),
         BookingState::Booked(Booked {
             booking_ref: CouncilBookingRef::new(REFERENCE),
@@ -313,6 +314,7 @@ fn intent_for(
             },
             OperationKind::Cancel => BookingEffect::CancelBooking {
                 booking_ref: CouncilBookingRef::new(REFERENCE),
+                principal: PrincipalId::new("lucy"),
             },
         },
         status,

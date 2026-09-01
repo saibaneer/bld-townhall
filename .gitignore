@@ -12,6 +12,7 @@
 # Working review artifact, not a repo document. Regenerated per milestone and
 # read by the external plan reviewer; the decisions it records land in ADRs.
 /PLAN-REVIEW.md
+/PLAN-F.md
 
 # Loose copies of the specification at the repo root. The tracked, authoritative
 # copy is docs/technical-spec-v0.4.2.md; these are byte-identical duplicates left
@@ -19,3 +20,5 @@
 # a second copy that then drifts from the real one.
 /BLD-Town-Hall-Vertical-Slice-Technical-Specification-*.md
 /BLD-Town-Hall-Vertical-Slice-Technical-Specification-*.docx
+/orchestrate.sh
+/.orchestration/

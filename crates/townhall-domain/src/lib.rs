@@ -71,14 +71,19 @@ pub struct BookingInProgress {
 /// crash here would find a booking whose council request is outstanding and no
 /// record of which effect to reconcile.
 ///
-/// Not yet *enterable* — `BookingInProgress + Cancel` lands in slice F with its
-/// compensation protocol — but as of B3b its outbound fact edges are live:
-/// `BookingExists` moves it to `CancellingBooking`, and absence or rejection of
-/// the booking resolves it to `Cancelled`, because there was never anything to
-/// cancel.
+/// Entered through `BookingInProgress + Cancel` (slice F). Its outbound fact
+/// edges are live since B3b: `BookingExists` moves it to `CancellingBooking`,
+/// and absence or rejection of the booking resolves it to `Cancelled`, because
+/// there was never anything to cancel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellationRequested {
     pub effect_intent_id: EffectIntentId,
+    /// Who asked to cancel. Carried in the STATE because the cancellation
+    /// effect is minted later, by the handoff, when the booking turns out to
+    /// exist — and the cancelling authority is only in hand at the proposal.
+    /// Never reconstructed from the booking's principal: booker and canceller
+    /// need not be the same person (ADR-020).
+    pub cancelled_by: PrincipalId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +227,39 @@ impl BookingState {
             _ => None,
         }
     }
+
+    /// Whether the in-flight effect is still WANTED — may recovery *cause* it,
+    /// or only learn its fate? (ADR-020; the compensation protocol.)
+    ///
+    /// A fixed, total, per-state table in ADR-018's sense: it changes which
+    /// pursuit behaviour exists, so it is state, never a guard. The reconciler
+    /// consults it and never decides it. `CancellationRequested` is the row the
+    /// table exists for: Lucy withdrew the desire, so recovery must never
+    /// *create* the booking she is cancelling — it may only ask what became of
+    /// it. Withdrawal is best-effort and deadline-bounded: a send decided
+    /// against a stale load can still land, and the fact-door handoff exists to
+    /// cancel exactly what then exists.
+    #[must_use]
+    pub const fn pursuit(&self) -> Option<Pursuit> {
+        match self {
+            Self::BookingInProgress(_) | Self::CancellingBooking(_) => {
+                Some(Pursuit::SendAndResolve)
+            }
+            Self::CancellationRequested(_) => Some(Pursuit::ResolveOnly),
+            _ => None,
+        }
+    }
+}
+
+/// What recovery may do with an in-flight state's effect (ADR-020).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pursuit {
+    /// The effect is still wanted: recovery may send the persisted plan under
+    /// the same identity when the council verifiably holds nothing yet.
+    SendAndResolve,
+    /// The desire was withdrawn: recovery may only ask what became of the
+    /// effect, never cause it.
+    ResolveOnly,
 }
 
 impl BookingProposal {
@@ -695,7 +733,17 @@ pub enum BookingEffect {
         grant: AvailabilityGrant,
     },
     /// Cancel a council booking that is known to exist.
-    CancelBooking { booking_ref: CouncilBookingRef },
+    CancelBooking {
+        booking_ref: CouncilBookingRef,
+        /// Who asked for the cancellation. Attribution for the denial logbook
+        /// (ADR-017: the principal is derived per door, the persisted plan's
+        /// where nothing closer exists) — without it every refusal on a
+        /// cancellation intent is the explicitly-unattributed empty string.
+        /// A deliberate stored-plan format break (ADR-020): a pre-F
+        /// `CancelBooking` row fails to decode rather than decoding to an
+        /// unattributable plan. The council's wire body is unchanged.
+        principal: PrincipalId,
+    },
 }
 
 impl BookingEffect {
@@ -713,7 +761,7 @@ impl BookingEffect {
     pub const fn acts_on(&self) -> Option<&CouncilBookingRef> {
         match self {
             Self::Book { .. } => None,
-            Self::CancelBooking { booking_ref } => Some(booking_ref),
+            Self::CancelBooking { booking_ref, .. } => Some(booking_ref),
         }
     }
 
@@ -1334,6 +1382,7 @@ impl TownHallDomain {
                 VerifiedProviderFact::CancellationExists { booking_ref, .. },
                 BookingEffect::CancelBooking {
                     booking_ref: plan_ref,
+                    ..
                 },
             ) => {
                 if booking_ref != plan_ref {
@@ -1456,6 +1505,7 @@ impl TownHallDomain {
                 | VerifiedProviderFact::ProviderRejected { .. },
                 BookingEffect::CancelBooking {
                     booking_ref: plan_ref,
+                    ..
                 },
             ) => {
                 if !terminal_in_direction {
@@ -1600,7 +1650,7 @@ impl TownHallDomain {
             // targets an in-flight state, so ADR-014 applies and it consumes a
             // FRESH identity from the coordinator.
             (
-                BookingState::CancellationRequested(_),
+                BookingState::CancellationRequested(requested),
                 VerifiedProviderFact::BookingExists { booking_ref, .. },
             ) => {
                 let Some(cancel_id) = context.pending_effect.clone() else {
@@ -1624,6 +1674,10 @@ impl TownHallDomain {
                     },
                     effect: BookingEffect::CancelBooking {
                         booking_ref: booking_ref.clone(),
+                        // The canceller, carried across the ambiguous window by
+                        // the state — the authority that asked is long out of
+                        // scope by the time the booking is found (ADR-020).
+                        principal: requested.cancelled_by.clone(),
                     },
                 })
             }
@@ -1787,6 +1841,9 @@ impl TownHallDomain {
                 attendees,
             ),
             (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::BookingInProgress(in_progress), BookingProposal::Cancel { .. }) => {
+                Self::resolve_cancel_in_progress(booking, in_progress, authority)
+            }
             (BookingState::Booked(booked), BookingProposal::Cancel { .. }) => {
                 Self::resolve_cancel_booked(booking, booked, authority, context)
             }
@@ -1965,7 +2022,36 @@ impl TownHallDomain {
             },
             effect: BookingEffect::CancelBooking {
                 booking_ref: booked.booking_ref.clone(),
+                principal: authority.principal.clone(),
             },
+        })
+    }
+
+    /// Cancelling a booking whose own outcome is still unknown — the pending
+    /// cell since PR #3, landed by slice F (ADR-020).
+    ///
+    /// Deliberately **local**: nothing is sent and no effect is minted, because
+    /// you cannot cancel what may not exist. The state records who asked and
+    /// keeps waiting on the SAME booking intent — the cancellation effect is
+    /// minted by the fact-door handoff if and only if the booking is found.
+    /// What the move changes is the pursuit: from here on, recovery may only
+    /// LEARN the booking's fate, never cause it (see [`BookingState::pursuit`]).
+    fn resolve_cancel_in_progress(
+        booking: &Booking,
+        in_progress: &BookingInProgress,
+        authority: &VerifiedAuthority,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        if !authority.may_cancel {
+            return Resolution::Denied(BookingError::CancellationAuthorityRequired);
+        }
+        local(Booking {
+            state: BookingState::CancellationRequested(CancellationRequested {
+                effect_intent_id: in_progress.effect_intent_id.clone(),
+                cancelled_by: authority.principal.clone(),
+            }),
+            // Still waiting on the same booking intent; nothing external moved.
+            active_effect: Some(in_progress.effect_intent_id.clone()),
+            ..booking.clone()
         })
     }
 }
@@ -2286,6 +2372,7 @@ mod topology {
             }),
             BookingState::CancellationRequested(CancellationRequested {
                 effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
+                cancelled_by: PrincipalId::new("lucy"),
             }),
             BookingState::Booked(Booked {
                 booking_ref: CouncilBookingRef::new("TH-92718"),
@@ -2359,7 +2446,12 @@ mod topology {
             "AwaitingBooking",
             &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
         ),
-        ("BookingInProgress", &[]),
+        // The one cell PENDING held from PR #3 to slice F. Landed with the
+        // compensation protocol that can actually consume it (ADR-020):
+        // committing an accepted cancellation the system could not fulfil
+        // would have been worse than refusing honestly, and until F nothing
+        // could fulfil it.
+        ("BookingInProgress", &["Cancel"]),
         ("CancellationRequested", &[]),
         ("Booked", &["Cancel"]),
         ("CancellingBooking", &[]),
@@ -2369,15 +2461,10 @@ mod topology {
 
     /// Cells the spec draws that this code deliberately does not implement yet.
     ///
-    /// Editing this table during M4 is *expected*; editing [`LOCKED`] is not.
-    const PENDING: &[(&str, &str, &str)] = &[(
-        "BookingInProgress",
-        "Cancel",
-        "Spec §7 L364 draws this and `Cancel` is a real proposal, so it is a genuine gap. \
-         Deferred because `CancellationRequested` has zero outbound behaviours and no \
-         reconciliation ingress: committing an accepted cancellation the system cannot \
-         fulfil is worse than refusing honestly. Lands with the M4 slice that can consume it.",
-    )];
+    /// Empty since slice F: `BookingInProgress + Cancel` — PENDING's one
+    /// occupant from PR #3 — moved into [`LOCKED`] with ADR-020 as its
+    /// justification. Editing [`LOCKED`] remains a review stop-sign.
+    const PENDING: &[(&str, &str, &str)] = &[];
 
     fn permissive_authority() -> VerifiedAuthority {
         VerifiedAuthority {
@@ -3008,6 +3095,7 @@ mod characterization {
         let awaiting_the_council = Booking {
             state: BookingState::CancellationRequested(CancellationRequested {
                 effect_intent_id: effect.clone(),
+                cancelled_by: PrincipalId::new("lucy"),
             }),
             active_effect: Some(effect),
             ..awaiting_booking()
@@ -4051,6 +4139,7 @@ mod characterization {
                 },
                 effect: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-92718"),
+                    principal: PrincipalId::new("lucy"),
                 },
             }),
             "Booked + Cancel must be an ExternalEffect stopping at CancellingBooking, \
@@ -4143,6 +4232,7 @@ mod fact_topology {
     fn cancel_plan() -> BookingEffect {
         BookingEffect::CancelBooking {
             booking_ref: CouncilBookingRef::new(REF),
+            principal: PrincipalId::new("lucy"),
         }
     }
 
@@ -4211,6 +4301,7 @@ mod fact_topology {
         booking_at(
             BookingState::CancellationRequested(CancellationRequested {
                 effect_intent_id: EffectIntentId::new(BOOK_ID),
+                cancelled_by: PrincipalId::new("lucy"),
             }),
             None,
             Some(BOOK_ID),
@@ -4797,6 +4888,7 @@ mod fact_topology {
                 },
                 effect: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new(REF),
+                    principal: PrincipalId::new("lucy"),
                 },
             }
         );
@@ -5482,6 +5574,7 @@ mod fact_topology {
             if let Some(stored) = context.intent.as_mut() {
                 stored.canonical_plan = BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new("TH-00000"),
+                    principal: PrincipalId::new("lucy"),
                 };
             }
             let got = classify(&booking, fact, &context).await;
@@ -5800,6 +5893,7 @@ mod system_event_topology {
             booking_of(
                 BookingState::CancellationRequested(CancellationRequested {
                     effect_intent_id: EffectIntentId::new(BOOK_ID),
+                    cancelled_by: PrincipalId::new("lucy"),
                 }),
                 None,
                 Some(BOOK_ID),

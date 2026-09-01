@@ -32,8 +32,21 @@ use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::CouncilKey;
 use std::{process::ExitCode, sync::Arc};
 use townhall_domain::{BookingEffect, BookingProposal, VerifiedAuthority};
-use townhall_service::Coordinator;
-use townhall_store::{BookingRepository as _, NewBooking, SqliteBookingRepository};
+use townhall_service::{Coordinator, Reconciliation};
+use townhall_store::{
+    BookingRepository as _, NewBooking, SqliteBookingRepository, StoreClock, SystemStoreClock,
+};
+
+/// The system clock, shifted — so a reconcile run can be "later" than the
+/// cadence the dying process wrote, without a harness ever sleeping.
+#[derive(Debug)]
+struct OffsetClock(i64);
+
+impl StoreClock for OffsetClock {
+    fn now_ms(&self) -> i64 {
+        SystemStoreClock.now_ms() + self.0
+    }
+}
 
 enum Die {
     BeforeCall,
@@ -96,9 +109,30 @@ fn requirements() -> BookingRequirements {
     }
 }
 
-fn parse_args() -> Result<(String, String, String, String, Die), String> {
+struct Args {
+    db: String,
+    council_url: String,
+    key_hex: String,
+    /// `Some` runs one booking turn for that id; `None` with `reconcile` runs
+    /// recovery only.
+    booking_id: Option<String>,
+    die: Die,
+    /// Milliseconds our store clock runs AHEAD of the system clock. Cadences
+    /// are real times; this is how a reconcile run is "later" without sleeping.
+    clock_ahead_ms: i64,
+    /// Run `due`/`attend` rounds until quiescent instead of a booking turn —
+    /// the recovery process, as a process (test 12). With `--die before-call`
+    /// the abort lands at the first CAPABILITY entry of the run, which in a
+    /// reconcile run is the first SEND recovery decides on: exactly the window
+    /// between a handoff's commit and the cancellation call.
+    reconcile: bool,
+}
+
+fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let (mut db, mut council, mut key, mut booking, mut die) = (None, None, None, None, None);
+    let mut reconcile = false;
+    let mut clock_ahead_ms = 0;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -106,6 +140,12 @@ fn parse_args() -> Result<(String, String, String, String, Die), String> {
             "--council-url" => council = Some(value()?),
             "--key-hex" => key = Some(value()?),
             "--booking-id" => booking = Some(value()?),
+            "--reconcile" => reconcile = true,
+            "--clock-ahead-ms" => {
+                clock_ahead_ms = value()?
+                    .parse::<i64>()
+                    .map_err(|_| "--clock-ahead-ms needs milliseconds".to_owned())?;
+            }
             "--die" => {
                 die = Some(match value()?.as_str() {
                     "before-call" => Die::BeforeCall,
@@ -117,13 +157,18 @@ fn parse_args() -> Result<(String, String, String, String, Die), String> {
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
-    Ok((
-        db.ok_or("--db required")?,
-        council.ok_or("--council-url required")?,
-        key.ok_or("--key-hex required")?,
-        booking.ok_or("--booking-id required")?,
-        die.ok_or("--die required")?,
-    ))
+    if booking.is_none() && !reconcile {
+        return Err("--booking-id required unless --reconcile".to_owned());
+    }
+    Ok(Args {
+        db: db.ok_or("--db required")?,
+        council_url: council.ok_or("--council-url required")?,
+        key_hex: key.ok_or("--key-hex required")?,
+        booking_id: booking,
+        die: die.ok_or("--die required")?,
+        clock_ahead_ms,
+        reconcile,
+    })
 }
 
 fn parse_key(hex: &str) -> Option<[u8; 32]> {
@@ -139,14 +184,14 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let (db, council_url, key_hex, booking_id, die) = match parse_args() {
+    let args = match parse_args() {
         Ok(parsed) => parsed,
         Err(problem) => {
             eprintln!("bld-driver: {problem}");
             return ExitCode::from(2);
         }
     };
-    let Some(key_bytes) = parse_key(&key_hex) else {
+    let Some(key_bytes) = parse_key(&args.key_hex) else {
         eprintln!("bld-driver: --key-hex must be 64 hex characters");
         return ExitCode::from(2);
     };
@@ -155,13 +200,23 @@ async fn main() -> ExitCode {
             .verifying_key();
 
     let repo = Arc::new(
-        SqliteBookingRepository::open(&db)
-            .await
-            .expect("open the repository"),
+        SqliteBookingRepository::open_with(
+            &args.db,
+            townhall_store::DEFAULT_EFFECT_TTL_MS,
+            Arc::new(OffsetClock(args.clock_ahead_ms)),
+        )
+        .await
+        .expect("open the repository"),
     );
-    let client = CouncilClient::new(&council_url, CouncilKey::new(public));
-    let capability = Arc::new(DiesOnCue { inner: client, die });
-    let availability = Arc::new(CouncilClient::new(&council_url, CouncilKey::new(public)));
+    let client = CouncilClient::new(&args.council_url, CouncilKey::new(public));
+    let capability = Arc::new(DiesOnCue {
+        inner: client,
+        die: args.die,
+    });
+    let availability = Arc::new(CouncilClient::new(
+        &args.council_url,
+        CouncilKey::new(public),
+    ));
     let coordinator = Coordinator::new(
         Arc::clone(&repo),
         capability,
@@ -169,7 +224,30 @@ async fn main() -> ExitCode {
         availability,
     );
 
-    let id = BookingId::new(booking_id);
+    if args.reconcile {
+        // Recovery, as a process: rounds of due/attend until quiescent —
+        // bounded, because a chase that spins is a bug the harness should see.
+        let reconciliation = Reconciliation::new(
+            coordinator,
+            Arc::new(CouncilClient::new(
+                &args.council_url,
+                CouncilKey::new(public),
+            )),
+        );
+        for _round in 0..5 {
+            let due = reconciliation.due(10).await.expect("due");
+            if due.is_empty() {
+                break;
+            }
+            for effect in due {
+                let attended = reconciliation.attend(&effect).await.expect("attend");
+                println!("ATTENDED {} {attended:?}", effect.as_str());
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let id = BookingId::new(args.booking_id.expect("checked in parse_args"));
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),

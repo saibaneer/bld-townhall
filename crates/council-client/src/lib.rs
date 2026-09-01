@@ -171,7 +171,7 @@ impl Capability<BookingEffect> for CouncilClient {
                     // facts the plan no longer reflects.
                     grant: grant.on_the_wire().to_owned(),
                 }),
-            BookingEffect::CancelBooking { booking_ref } => self
+            BookingEffect::CancelBooking { booking_ref, .. } => self
                 .http
                 .post(format!(
                     "{}/bookings/{}/cancel",
@@ -194,7 +194,7 @@ impl EffectResolver<SignedEffectResponse> for CouncilClient {
         &self,
         attempt: &EffectAttempt,
         kind: OperationKind,
-    ) -> Result<SignedEffectResponse, Unknown> {
+    ) -> Result<townhall_service::Resolved<SignedEffectResponse>, Unknown> {
         // POST, because answering this writes: past its deadline the council
         // tombstones the identity before replying (ADR-016 §§3-4).
         let request = self
@@ -209,7 +209,29 @@ impl EffectResolver<SignedEffectResponse> for CouncilClient {
                 operation_kind: kind.name().to_owned(),
             });
 
-        self.effect_call(request).await
+        let raw = self.effect_call(request).await?;
+
+        // `NotYetVisible` is the one reply that can authorize a RESEND
+        // (ADR-020), so it earns its type here and nowhere lower: only after
+        // the signature verifies against the pinned key, and only when the
+        // reply names exactly the attempt that was asked. A signed not-yet for
+        // identity A must never authorize resending identity B; an unsigned
+        // one is anyone's bytes. Every other outcome travels to the verifier
+        // unexamined, exactly as before.
+        if matches!(raw.outcome, EffectOutcome::NotYetVisible) {
+            self.key.check_effect(&raw).map_err(|error| {
+                Unknown::new(BoundedString::truncating(format!(
+                    "an unattributable 'not yet' authorizes nothing: {error}"
+                )))
+            })?;
+            if raw.effect_intent_id != attempt.id.as_str() {
+                return Err(Unknown::new(BoundedString::truncating(
+                    "a 'not yet' naming a different identity authorizes nothing here",
+                )));
+            }
+            return Ok(townhall_service::Resolved::NotYetVisible);
+        }
+        Ok(townhall_service::Resolved::Answer(raw))
     }
 }
 

@@ -1138,3 +1138,98 @@ contradiction check depends on.
 
 **Stop asking after giving up.** Rejected: the exit and the stop condition become the same
 query, and the design's only exit is an event it has just guaranteed will never be produced.
+
+## ADR-020 — In-flight cancellation, and recovery that finishes what is still wanted
+
+Decided 2026-08-25 with the project owner, during slice F planning (four review rounds:
+redesign → fix → fix → build as planned). Closes M4's last topology cell and gives recovery
+the execution leg the pursuit axis was built to fence.
+
+### The edge: `BookingInProgress + Cancel → CancellationRequested`
+
+The one PENDING cell since PR #3, now in LOCKED. The transition is **local**: nothing is
+sent and no effect is minted, because you cannot cancel what may not exist. The state keeps
+waiting on the SAME booking intent and records **who asked to cancel**
+(`CancellationRequested.cancelled_by`) — the cancelling authority is only in hand at this
+proposal, and the cancellation effect is minted later, by the existing fact-door handoff, if
+and only if the booking is found. The canceller is never reconstructed from the booking's
+principal: booker and canceller need not be the same person.
+
+`BookingEffect::CancelBooking` gains `principal`, copied from the state by the handoff arm
+and supplied directly by the `Booked + Cancel` arm. This is a deliberate stored-plan format
+break in B3b's precedent: a pre-F `CancelBooking` row fails to decode rather than decoding
+to an unattributable plan (the gap ADR-017's attribution rule left flagged in the code). The
+council's wire body is unchanged — attribution is a local record. The proposal's `reason`
+remains **discarded**, exactly as on the `Booked` arm: `TransitionAudit` records the
+driver's name, not its payload, and this slice makes no audit-schema change. Recorded as an
+accepted gap, not an oversight.
+
+### The pursuit table: what recovery may still cause
+
+Whether an in-flight effect is still *wanted* is a fixed, total, per-state answer — ADR-018
+promotion applied: it changes which pursuit behaviour exists, so it is state, never a guard.
+
+| state | in-flight intent | pursuit |
+|---|---|---|
+| `BookingInProgress` | Book | send and resolve — the booking is wanted |
+| `CancellationRequested` | Book | **resolve only** — the desire was withdrawn; recovery must never *cause* the booking, only learn its fate |
+| `CancellingBooking` | Cancel | send and resolve — the cancellation is wanted |
+
+Proposing `Cancel` mid-flight therefore *withdraws the booking's wantedness* the moment
+`CancellationRequested` commits. Withdrawal is best-effort and deadline-bounded: a send
+decided against a stale load can still land, and the handoff arms exist to cancel exactly
+what then exists.
+
+### The dispatch rule: query first, resend what is still wanted
+
+A claimed `Prepared` intent (never attempted) is **sent** — the mark
+(`note_attempt_started`, before the wire) then the call, as Phase B always worked. A claimed
+`Unknown` intent is **queried first**; then:
+
+- a definitive, verifier-passing answer settles through the unmodified fact door;
+- an **authenticated `NotYetVisible` bound to this attempt** — signature verified against
+  the pinned council key AND `reply.effect_intent_id == attempt.id` — while the state's
+  pursuit says the effect is still wanted → **resend the persisted plan under the same
+  identity and expiry**. Provider idempotency (slice D) converges the delayed-first-request
+  race; ADR-016's deadline bounds the window;
+- everything else — bad or missing signature, wrong identity, `ProtocolConflict`,
+  `Unavailable`, garbage, timeout, a dead socket — is an unusable reply and drives nothing.
+
+`NotYetVisible` deliberately does not enter the fact door: it is a pursuit signal, not a
+fact, and no `VerifiedProviderFact` variant exists for it. The resend privilege rests on the
+council's signed, identity-bound word — never on the loop's opinion — and the classification
+lives where the pinned key already lives.
+
+**Why the rule is not "execute iff `Prepared`":** the attempt mark is durable before the
+wire (ADR-014 one level in), so a crash between the mark and the send leaves an `Unknown`
+intent the council never heard of. An ask-only `Unknown` path rides that intent to its
+deadline and — for a cancellation — `CancellingBooking + EffectAbsent → Booked`: the
+cancellation silently lost. The mark-before-send gap cannot be closed by moving the mark;
+recovery must be able to resend. (Slice F plan review, round 1, CRITICAL.)
+
+**Accounting:** each wire call is an attempt. A turn that queries and then resends records
+two `attempts_started` and two `attempts_finished` — ADR-019's "calls begun / calls that
+returned control" contract holds verbatim; two externally fallible calls are two durable
+marks and two crash windows.
+
+### The owner's product decision: recovery finishes the job
+
+Asked 2026-08-25: a booking that crashed before the call — durable intent, council
+verifiably holding nothing — is **completed** by recovery (query → authenticated not-yet →
+resend → `Booked`). The intent is the owner-authorized durable record, and recovery
+completes whatever the current state still wants. This is sound under and compatible with
+ADR-014/016/019 but **not compelled by them**; it replaces slice E's recorded rule that an
+undelivered booking expires and returns to re-proposable, and it narrows the reconciler's
+former self-description from "asks without causing" to "causes only what the state still
+wants, on the council's signed word". The deadline-passed variant is preserved: a create
+that outlives its deadline before recovery runs still fails closed to `AwaitingBooking`.
+
+### Alternatives rejected
+
+**Execute iff `Prepared`, ask iff `Unknown`.** Rejected — the stranded-cancellation window
+above. **Resend on any failed query.** Rejected: resending on silence acts on nothing;
+the privilege requires the council's signed, identity-bound statement. **An unsigned or
+wrong-identity `NotYetVisible` as authorization.** Rejected and negatively tested: a signed
+not-yet for identity A must never authorize resending identity B. **Carrying the canceller
+on the successor only.** Rejected: by handoff time the cancelling authority is out of
+scope; the state is the only honest carrier across the ambiguous window.

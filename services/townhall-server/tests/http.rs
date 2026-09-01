@@ -400,7 +400,15 @@ fn the_whole_journey_is_possible_with_curl_alone() {
 /// converges it, and polling GET reaches Booked with exactly one booking.
 #[test]
 fn a_dropped_response_answers_202_and_the_loop_converges_it() {
-    let world = world();
+    let mut world = world();
+    // A DISTINCTIVE cadence, so "derived from the store's schedule" is
+    // witnessed at the wire: 7 300 ms must ceiling to exactly 8 seconds — a
+    // constant Retry-After: 1 dies here (battery audit).
+    if let Some(mut server) = world.server.take() {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+    spawn_server(&mut world, &["--retry-cadence-ms", "7300"]);
     let etag = awaiting(&world, "BKG-202");
     // The book effect departs from version 2 — the identity is derivable, so
     // the fault is armed exactly (E's discipline).
@@ -420,7 +428,10 @@ fn a_dropped_response_answers_202_and_the_loop_converges_it() {
         .expect("202 carries Retry-After")
         .parse()
         .expect("seconds");
-    assert!(retry_after >= 1, "ceiling-rounded with a 1s floor");
+    assert_eq!(
+        retry_after, 8,
+        "the store's 7300ms schedule, ceiling-rounded — never a constant"
+    );
 
     let consumed: serde_json::Value = http()
         .get(format!("{}/test/faults/{fault}", world.council_url))
@@ -506,8 +517,39 @@ fn a_stale_if_match_is_refused_with_the_fresh_etag() {
     );
 }
 
+/// A booking's inertness witness: the `ETag` and the audit length, snapshotted.
+fn snapshot(world: &World, id: &str) -> (String, usize) {
+    let read = call(
+        world,
+        "GET",
+        &format!("/booking-intents/{id}"),
+        LUCY,
+        None,
+        None,
+    );
+    let audit = call(
+        world,
+        "GET",
+        &format!("/booking-intents/{id}/audit"),
+        LUCY,
+        None,
+        None,
+    );
+    (
+        etag_version(&read),
+        audit.body["audit"].as_array().expect("rows").len(),
+    )
+}
+
+fn assert_inert(world: &World, id: &str, before: &(String, usize), when: &str) {
+    let after = snapshot(world, id);
+    assert_eq!(after.0, before.0, "{when}: the version moved");
+    assert_eq!(after.1, before.1, "{when}: an audit row appeared");
+}
+
 /// Every refusal class in one sweep, each asserted INERT: no version movement,
-/// no audit row, no council booking.
+/// no audit row, no council booking — snapshotted around EVERY refusal, not
+/// inferred from a final count (battery audit).
 // One long sweep, deliberately: the refusal classes are one table in the spec
 // (§10.2), and this test IS that table read left to right.
 #[allow(clippy::too_many_lines)]
@@ -538,6 +580,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
     assert_eq!(reply.status().as_u16(), 400);
 
     // 403: restricted principal proposing a booking.
+    let refuse_before = snapshot(&world, "BKG-REFUSE");
     let reply = call(
         &world,
         "POST",
@@ -548,6 +591,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
     );
     assert_eq!(reply.status, 403, "{:?}", reply.body);
     assert_eq!(reply.body["error"], "BookingAuthorityRequired");
+    assert_inert(&world, "BKG-REFUSE", &refuse_before, "403");
 
     // 404: unknown booking, read and audit alike.
     for path in [
@@ -568,6 +612,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         Some(&create_body("BKG-DRAFT")),
     );
     let draft_etag = etag_version(&created);
+    let draft_before = snapshot(&world, "BKG-DRAFT");
     let reply = call(
         &world,
         "POST",
@@ -582,6 +627,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         serde_json::json!(["SelectVenue", "Cancel"]),
         "the 409 teaches the menu"
     );
+    assert_inert(&world, "BKG-DRAFT", &draft_before, "409 Undefined");
 
     // 409 duplicate create, carrying the existing ETag.
     let duplicate = call(
@@ -616,6 +662,12 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         );
         assert_eq!(reply.status, 400, "If-Match {bad}");
     }
+    assert_inert(
+        &world,
+        "BKG-REFUSE",
+        &refuse_before,
+        "428/400 header refusals",
+    );
     let reply = http()
         .post(format!(
             "{}/booking-intents/BKG-REFUSE/behaviours/book",
@@ -652,6 +704,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         Some(&serde_json::json!({"venue_id": "TH-D", "slot_id": "SLOT-A"})),
     );
     cap_etag = etag_version(&reply);
+    let cap_before = snapshot(&world, "BKG-CAP");
     let reply = call(
         &world,
         "POST",
@@ -662,6 +715,7 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
     );
     assert_eq!(reply.status, 422, "{:?}", reply.body);
     assert_eq!(reply.body["error"], "CapacityInsufficient");
+    assert_inert(&world, "BKG-CAP", &cap_before, "422 capacity");
 
     // 403 vs 422 on the fee, split by WHICH ceiling refused (ADR-021):
     // TH-C's £90 exceeds lucy's £50 authority → 403 …
@@ -797,9 +851,57 @@ fn a_zero_reclassification_budget_answers_429_with_retry_after() {
     assert_eq!(reply.retry_after.as_deref(), Some("1"));
 }
 
-/// The reconcile trigger: exempt from If-Match by classification, converges a
-/// dropped answer without waiting for the loop — and racing the loop causes
-/// no duplicate council arrival.
+/// The trigger genuinely RACING the running loop (battery audit): the loop is
+/// live at a 50ms interval while the trigger is spammed through the same
+/// convergence — the store's claims arbitrate, and the council's file holds
+/// exactly one booking.
+#[test]
+fn the_trigger_racing_the_live_loop_duplicates_nothing() {
+    let world = world();
+    let etag = awaiting(&world, "BKG-RACE");
+    arm_fault(&world, "EFF-BKG-RACE-BOOK-2", "create", "drop_response");
+    let reply = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-RACE/behaviours/book",
+        LUCY,
+        Some(&etag),
+        None,
+    );
+    assert_eq!(reply.status, 202);
+
+    // Spam the trigger while the loop chases the same intent.
+    let start = std::time::Instant::now();
+    loop {
+        let reply = call(
+            &world,
+            "POST",
+            "/booking-intents/BKG-RACE/behaviours/reconcile",
+            LUCY,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 200, "{:?}", reply.body);
+        let read = call(&world, "GET", "/booking-intents/BKG-RACE", LUCY, None, None);
+        if read.body["state"] == "Booked" {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "never converged: {:?}",
+            read.body
+        );
+    }
+    assert_eq!(
+        council_count(&world, "SELECT COUNT(*) FROM bookings"),
+        1,
+        "loop and trigger raced; the claims let exactly one arrival happen"
+    );
+}
+
+/// The reconcile trigger alone: exempt from If-Match by classification,
+/// converges a dropped answer WITHOUT the loop (parked at an hour) — and on a
+/// settled booking it attends nothing and changes nothing.
 #[test]
 fn the_reconcile_trigger_converges_and_races_the_loop_safely() {
     let mut world = world();
@@ -867,6 +969,26 @@ fn the_reconcile_trigger_converges_and_races_the_loop_safely() {
         council_count(&world, "SELECT COUNT(*) FROM bookings"),
         1,
         "spamming the trigger duplicated nothing — the claims arbitrate"
+    );
+
+    // Settled means nothing to attend: the trigger reports an empty turn and
+    // moves nothing (battery audit — over the wire, not only at the facade).
+    let settled = snapshot(&world, "BKG-TRIGGER");
+    let reply = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-TRIGGER/behaviours/reconcile",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["attended"], serde_json::json!([]));
+    assert_inert(
+        &world,
+        "BKG-TRIGGER",
+        &settled,
+        "reconcile on a settled booking",
     );
 }
 
@@ -1090,15 +1212,31 @@ fn headers_and_browse_behave() {
     let reply = call(&world, "GET", "/venues", LUCY, None, None);
     assert!(reply.request_id.expect("minted").starts_with("req-"));
 
-    // Idempotency-Key accepted, inert (recorded as such in ADR-021).
-    let reply = http()
-        .post(format!("{}/booking-intents", world.server_url))
-        .header("authorization", LUCY)
-        .header("idempotency-key", "key-1")
-        .json(&create_body("BKG-IDEM"))
-        .send()
-        .expect("answer");
-    assert_eq!(reply.status().as_u16(), 201);
+    // Idempotency-Key accepted and INERT — proven, not narrated (battery
+    // audit): the same key does not dedupe a different id, and a different
+    // key grants no replay of the same id.
+    let with_key = |key: &str, body: &serde_json::Value| {
+        http()
+            .post(format!("{}/booking-intents", world.server_url))
+            .header("authorization", LUCY)
+            .header("idempotency-key", key)
+            .json(body)
+            .send()
+            .expect("answer")
+            .status()
+            .as_u16()
+    };
+    assert_eq!(with_key("key-1", &create_body("BKG-IDEM")), 201);
+    assert_eq!(
+        with_key("key-1", &create_body("BKG-IDEM-2")),
+        201,
+        "the same key deduplicates nothing — a second id is a second booking"
+    );
+    assert_eq!(
+        with_key("key-2", &create_body("BKG-IDEM")),
+        409,
+        "a fresh key replays nothing — the duplicate id is still a duplicate"
+    );
 
     // Browse filters: TH-D (capacity 12) drops out for 20 attendees; TH-B
     // (inaccessible) drops out for accessible=true; TH-C (£90) drops out

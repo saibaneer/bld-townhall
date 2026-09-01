@@ -301,10 +301,7 @@ type Reg = State<AppState>;
 /// never proving — the guards consume the per-slot signed answer.
 async fn list_venues(State(state): Reg) -> (StatusCode, Json<serde_json::Value>) {
     match state.registry.venues().await {
-        Ok(rows) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "venues": rows })),
-        ),
+        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "venues": rows }))),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": error.to_string() })),

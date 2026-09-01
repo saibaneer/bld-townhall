@@ -8,7 +8,9 @@ members = [
   "crates/townhall-service",
   "crates/council-wire",
   "crates/council-client",
+  "crates/townhall-http",
   "services/mock-council",
+  "services/townhall-server",
 ]
 
 [workspace.package]

@@ -1485,7 +1485,6 @@ where
     }
 }
 
-
 /// The facade, object-safe — the shape `townhall-http` holds, so the adapter
 /// crate never names a store, client, or even the facade's generics.
 #[async_trait]

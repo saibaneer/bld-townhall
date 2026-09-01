@@ -278,6 +278,10 @@ impl Registry {
             .collect()
     }
 
+    /// One slot's authoritative facts, signed per answer.
+    ///
+    /// # Errors
+    /// [`CouncilError`] on a read failure.
     pub async fn availability(
         &self,
         venue_id: &str,

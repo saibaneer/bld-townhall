@@ -55,7 +55,7 @@ use townhall_domain::{
     BookingEffect, ObservedAvailability, OperationKind, VenueFacts, VerifiedAvailability,
     VerifiedProviderFact,
 };
-use townhall_service::{AvailabilitySource, EffectResolver};
+use townhall_service::{AvailabilitySource, CatalogueSource, EffectResolver, VenueSummary};
 
 pub use council_wire::{CouncilSigner, WireError};
 
@@ -233,6 +233,37 @@ impl EffectResolver<SignedEffectResponse> for CouncilClient {
             return Ok(townhall_service::Resolved::NotYetVisible);
         }
         Ok(townhall_service::Resolved::Answer(raw))
+    }
+}
+
+#[async_trait]
+impl CatalogueSource for CouncilClient {
+    /// The council's browse list (spec §11) — unsigned by both sides' design:
+    /// browsing is choosing, never proving. `None` means the catalogue could
+    /// not be asked, which the wire maps to 503.
+    async fn venues(&self) -> Option<Vec<VenueSummary>> {
+        let body: serde_json::Value = self
+            .http
+            .get(format!("{}/venues", self.base_url))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let rows = body.get("venues")?.as_array()?;
+        rows.iter()
+            .map(|row| {
+                Some(VenueSummary {
+                    venue_id: row.get("venue_id")?.as_str()?.to_owned(),
+                    slot_id: row.get("slot_id")?.as_str()?.to_owned(),
+                    fee_pence: i64::try_from(row.get("fee_pence")?.as_u64()?).ok()?,
+                    capacity: row.get("capacity")?.as_u64()?,
+                    accessible: row.get("accessible")?.as_bool()?,
+                    available: row.get("available")?.as_bool()?,
+                })
+            })
+            .collect()
     }
 }
 

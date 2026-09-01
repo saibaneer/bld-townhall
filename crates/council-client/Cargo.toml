@@ -17,6 +17,8 @@ townhall-domain = { path = "../townhall-domain" }
 townhall-service = { path = "../townhall-service" }
 townhall-store = { path = "../townhall-store" }
 
+serde_json.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }

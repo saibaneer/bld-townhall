@@ -79,6 +79,36 @@ pub trait AvailabilitySource: Send + Sync {
     async fn read(&self, venue: &VenueId, slot: &SlotId) -> ObservedAvailability;
 }
 
+/// The browse catalogue (spec §10's `GET /venues` search, served through the
+/// council's own list). BROWSE-ONLY by contract: nothing returned here is
+/// evidence — every guard consumes the per-slot verified answer instead.
+#[async_trait]
+pub trait CatalogueSource: Send + Sync {
+    /// The full list, or `None` when the provider cannot be asked (503).
+    async fn venues(&self) -> Option<Vec<VenueSummary>>;
+}
+
+/// One browse row. Deliberately not `VenueFacts`: same fields, different
+/// authority — a type the guards cannot consume by construction.
+#[derive(Clone, Debug)]
+pub struct VenueSummary {
+    pub venue_id: String,
+    pub slot_id: String,
+    pub fee_pence: i64,
+    pub capacity: u64,
+    pub accessible: bool,
+    pub available: bool,
+}
+
+/// Browse filters for [`CatalogueSource`] results — applied by the facade, so
+/// the wire's query parameters never reach the provider.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VenueFilters {
+    pub attendees: Option<u16>,
+    pub accessible: Option<bool>,
+    pub max_fee_pence: Option<i64>,
+}
+
 /// Asks a provider what became of an effect it may or may not have seen.
 ///
 /// [`Capability`] *causes* an effect; this only asks about one, and that
@@ -1123,6 +1153,12 @@ where
 pub struct BookingApi<R, C, V, A, L> {
     coordinator: Arc<Coordinator<R, C, V, A>>,
     reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+    /// The browse catalogue — dyn, because browsing carries no authority worth
+    /// a generic parameter.
+    catalogue: Arc<dyn CatalogueSource>,
+    /// The per-slot verified availability, projected WITHOUT its grant: grants
+    /// live in persisted plans and never in a response body.
+    availability: Arc<dyn AvailabilitySource>,
 }
 
 /// The facade's closed error vocabulary — everything an adapter needs to map,
@@ -1187,6 +1223,18 @@ pub struct Projection {
     pub available_behaviours: &'static [&'static str],
 }
 
+/// Per-slot verified facts as the wire sees them: everything the council
+/// signed EXCEPT the grant, which lives in persisted plans only.
+#[derive(Clone, Debug)]
+pub struct SlotFacts {
+    pub venue_id: String,
+    pub slot_id: String,
+    pub capacity: u16,
+    pub accessible: bool,
+    pub fee_pence: u64,
+    pub available: bool,
+}
+
 /// One audit row, as the wire may see it — a service-owned projection, not the
 /// store's record (re-exporting a storage type would hide the import, not the
 /// contract).
@@ -1211,10 +1259,69 @@ where
     pub fn new(
         coordinator: Arc<Coordinator<R, C, V, A>>,
         reconciliation: Arc<Reconciliation<R, C, V, A, L>>,
+        catalogue: Arc<dyn CatalogueSource>,
+        availability: Arc<dyn AvailabilitySource>,
     ) -> Self {
         Self {
             coordinator,
             reconciliation,
+            catalogue,
+            availability,
+        }
+    }
+
+    /// Browse the catalogue, filtered here so the wire's query never reaches
+    /// the provider. `None` from the source means it could not be asked (503).
+    ///
+    /// # Errors
+    /// [`ApiError::Unavailable`] when the catalogue cannot be asked.
+    pub async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
+        let Some(rows) = self.catalogue.venues().await else {
+            return Err(ApiError::Unavailable(
+                "the catalogue could not be asked".to_owned(),
+            ));
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                filters
+                    .attendees
+                    .is_none_or(|needed| row.capacity >= u64::from(needed))
+                    && filters
+                        .accessible
+                        .is_none_or(|needed| !needed || row.accessible)
+                    && filters
+                        .max_fee_pence
+                        .is_none_or(|ceiling| row.fee_pence <= ceiling)
+            })
+            .collect())
+    }
+
+    /// The per-slot verified facts, grant withheld. `None` facts is an ANSWER;
+    /// an unreachable provider is [`ApiError::Unavailable`] (ADR-021).
+    ///
+    /// # Errors
+    /// [`ApiError::Unavailable`].
+    pub async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError> {
+        match self.availability.read(venue, slot).await {
+            ObservedAvailability::Unavailable => Err(ApiError::Unavailable(
+                "the availability provider could not be asked".to_owned(),
+            )),
+            ObservedAvailability::Answered(observation) => Ok(observation.map(|verified| {
+                let facts = &verified.get().facts;
+                SlotFacts {
+                    venue_id: facts.venue_id.to_string(),
+                    slot_id: facts.slot_id.to_string(),
+                    capacity: facts.capacity,
+                    accessible: facts.wheelchair_accessible,
+                    fee_pence: facts.fee.pence(),
+                    available: facts.available,
+                }
+            })),
         }
     }
 
@@ -1375,5 +1482,104 @@ where
             booking_ref: aggregate.booking_ref.clone(),
             available_behaviours: aggregate.state.proposal_menu(),
         }
+    }
+}
+
+
+/// The facade, object-safe — the shape `townhall-http` holds, so the adapter
+/// crate never names a store, client, or even the facade's generics.
+#[async_trait]
+pub trait BookingFacade: Send + Sync {
+    async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError>;
+    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError>;
+    async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError>;
+    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError>;
+    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError>;
+    async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError>;
+    async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError>;
+}
+
+#[async_trait]
+impl<R, C, V, A, L> BookingFacade for BookingApi<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    async fn create(
+        &self,
+        id: BookingId,
+        requirements: bld_types::BookingRequirements,
+    ) -> Result<Projection, ApiError> {
+        Self::create(self, id, requirements).await
+    }
+    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
+        Self::read(self, id).await
+    }
+    async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+    ) -> Result<Mutated, ApiError> {
+        Self::propose_at(self, id, expected_version, proposal, authority).await
+    }
+    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
+        Self::audit(self, id).await
+    }
+    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
+        Self::attend_booking(self, id).await
+    }
+    async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
+        Self::venues(self, filters).await
+    }
+    async fn slot_facts(
+        &self,
+        venue: &VenueId,
+        slot: &SlotId,
+    ) -> Result<Option<SlotFacts>, ApiError> {
+        Self::slot_facts(self, venue, slot).await
+    }
+}
+
+/// The reconciler's loop surface, object-safe — due and attend, nothing else,
+/// exactly as ADR-019 scoped it.
+#[async_trait]
+pub trait ReconcilerHandle: Send + Sync {
+    async fn due(&self, limit: u32) -> Result<Vec<EffectIntentId>, ServiceError>;
+    async fn attend(&self, id: &EffectIntentId) -> Result<Attended, ServiceError>;
+}
+
+#[async_trait]
+impl<R, C, V, A, L> ReconcilerHandle for Reconciliation<R, C, V, A, L>
+where
+    R: BookingRepository,
+    C: Capability<BookingEffect>,
+    V: Verifier<C::Raw, VerifiedProviderFact>,
+    A: AvailabilitySource,
+    L: EffectResolver<C::Raw>,
+{
+    async fn due(&self, limit: u32) -> Result<Vec<EffectIntentId>, ServiceError> {
+        Self::due(self, limit).await
+    }
+    async fn attend(&self, id: &EffectIntentId) -> Result<Attended, ServiceError> {
+        Self::attend(self, id).await
     }
 }

@@ -217,6 +217,7 @@ impl Council {
 
     fn router_with(state: AppState) -> Router {
         let router = Router::new()
+            .route("/venues", get(list_venues))
             .route("/venues/{venue_id}/slots/{slot_id}", get(get_availability))
             .route("/bookings", post(create_booking))
             .route("/bookings/{booking_reference}/cancel", post(cancel_booking))
@@ -295,6 +296,21 @@ async fn fault_status(
 // ------------------------------------------------------------------- handlers
 
 type Reg = State<AppState>;
+
+/// The browse catalogue (spec §11). Unsigned by design: browsing is choosing,
+/// never proving — the guards consume the per-slot signed answer.
+async fn list_venues(State(state): Reg) -> (StatusCode, Json<serde_json::Value>) {
+    match state.registry.venues().await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "venues": rows })),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+    }
+}
 
 async fn get_availability(
     State(state): Reg,

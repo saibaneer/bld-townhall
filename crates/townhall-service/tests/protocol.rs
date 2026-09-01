@@ -2732,7 +2732,12 @@ async fn the_facade_carries_the_whole_surface() {
         Arc::clone(&coordinator),
         Arc::clone(&h.council),
     ));
-    let api = townhall_service::BookingApi::new(coordinator, reconciliation);
+    let api = townhall_service::BookingApi::new(
+        coordinator,
+        reconciliation,
+        Arc::new(townhall_service::fake::FixedCatalogue::of(Vec::new())),
+        Arc::new(FixedAvailability::new(facts())),
+    );
 
     let id = BookingId::new("BKG-FACADE");
     let created = api

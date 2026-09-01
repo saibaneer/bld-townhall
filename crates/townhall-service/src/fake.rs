@@ -634,6 +634,30 @@ impl crate::AvailabilitySource for FixedAvailability {
     }
 }
 
+/// A fixed browse catalogue for tests — the fake counterpart of the council's
+/// `GET /venues`. `None` facts models an unreachable catalogue.
+pub struct FixedCatalogue {
+    rows: Option<Vec<crate::VenueSummary>>,
+}
+
+impl FixedCatalogue {
+    #[must_use]
+    pub fn of(rows: Vec<crate::VenueSummary>) -> Self {
+        Self { rows: Some(rows) }
+    }
+    #[must_use]
+    pub const fn unreachable() -> Self {
+        Self { rows: None }
+    }
+}
+
+#[async_trait]
+impl crate::CatalogueSource for FixedCatalogue {
+    async fn venues(&self) -> Option<Vec<crate::VenueSummary>> {
+        self.rows.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,3 +20,5 @@
 # a second copy that then drifts from the real one.
 /BLD-Town-Hall-Vertical-Slice-Technical-Specification-*.md
 /BLD-Town-Hall-Vertical-Slice-Technical-Specification-*.docx
+/orchestrate.sh
+/.orchestration/

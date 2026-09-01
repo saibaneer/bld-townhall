@@ -2389,3 +2389,110 @@ async fn a_lost_cas_reapplies_the_same_verified_absence() {
         EffectStatus::Absent
     );
 }
+
+/// The attribution payoff of the `CancelBooking` storage break, at BOTH remaining
+/// doors (PR #16 review, HIGH): a refusal on a cancellation intent is
+/// attributed to the CANCELLER from the persisted plan — asserted with a
+/// canceller who is not the booker, so a fallback to the booking's principal
+/// (or to the pre-F empty string) fails by name.
+#[tokio::test]
+async fn a_refusal_on_a_cancellation_intent_is_attributed_to_the_canceller() {
+    let (h, log) = harness_with_denials().await;
+    let id = BookingId::new("BKG-CXLBLAME");
+    awaiting(&h, &id, requirements()).await;
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book to Booked");
+
+    // Marco — not Lucy — asks to cancel, and the cancel's answer goes quiet:
+    // the persisted CancelBooking plan carries HIS name.
+    let mut marco = authority();
+    marco.principal = PrincipalId::new("marco");
+    h.council.script([Script::GoQuiet("answer lost")]);
+    h.coordinator
+        .propose(
+            &id,
+            BookingProposal::Cancel {
+                reason: "marco's call".to_owned(),
+            },
+            &marco,
+        )
+        .await
+        .expect("cancel");
+    let cancel_effect = in_flight_effect(&h, &id).await;
+
+    // Fact door: a CancellationExists naming the WRONG reference is refused by
+    // the plan binding — and the row names marco, from the plan, because the
+    // fact itself carries no principal.
+    let wrong_ref = Verified::assert_verified(VerifiedProviderFact::CancellationExists {
+        effect_intent_id: cancel_effect.clone(),
+        booking_ref: CouncilBookingRef::new("TH-00000"),
+    });
+    let outcome = h.coordinator.observe(&id, wrong_ref).await.expect("turn");
+    assert!(
+        matches!(
+            outcome,
+            BoundaryOutcome::Denied(BookingError::EffectPlanMismatch {
+                field: "booking_ref"
+            })
+        ),
+        "a reference the plan never named: {outcome:?}"
+    );
+
+    // System-event door: a stale CANCEL-plan intent (planted raw — no current
+    // door can mint it, and the reconciler must survive rows history wrote)
+    // whose exhausted chase names an effect the booking is not waiting on. The
+    // plan is the live cancel's own persisted JSON — CancelBooking, carrying
+    // marco — copied rather than re-serialized, so the fixture cannot drift
+    // from what the store actually writes.
+    let stale_plan: String = sqlx::query_scalar(
+        "SELECT canonical_plan_json FROM effect_intents WHERE effect_intent_id = ?",
+    )
+    .bind(cancel_effect.as_str())
+    .fetch_one(h.repo.pool())
+    .await
+    .expect("the live cancel plan");
+    sqlx::query(
+        r"
+        INSERT INTO effect_intents (effect_intent_id, booking_id, operation_kind,
+                                    source_version, canonical_plan_json, status,
+                                    expires_at_ms, created_at_ms, updated_at_ms,
+                                    attempts_started, attempts_finished)
+        VALUES (?, ?, 'Cancel', 99, ?, 'Unknown', ?, 0, 0, 1000, 1000)
+        ",
+    )
+    .bind("EFF-STALE-CANCEL")
+    .bind(id.to_string())
+    .bind(&stale_plan)
+    .bind(i64::MAX / 2)
+    .execute(h.repo.pool())
+    .await
+    .expect("plant");
+    let attended = h
+        .reconciliation
+        .attend(&EffectIntentId::new("EFF-STALE-CANCEL"))
+        .await
+        .expect("attend");
+    assert_eq!(attended, Attended::NotDue);
+
+    let rows = log.rows().await.expect("rows");
+    assert_eq!(rows.len(), 2, "one refusal per door: {rows:?}");
+    let fact_row = rows
+        .iter()
+        .find(|row| row.driver_kind == "Fact")
+        .expect("the fact-door row");
+    assert_eq!(fact_row.driver_detail, "CancellationExists");
+    assert_eq!(fact_row.reason, "EffectPlanMismatch");
+    assert_eq!(
+        fact_row.principal, "marco",
+        "attributed to the CANCELLER, from the persisted plan"
+    );
+    let event_row = rows
+        .iter()
+        .find(|row| row.driver_kind == "SystemEvent")
+        .expect("the system-event row");
+    assert_eq!(event_row.driver_detail, "ReconciliationExhausted");
+    assert_eq!(event_row.reason, "EffectMismatch");
+    assert_eq!(event_row.principal, "marco");
+}

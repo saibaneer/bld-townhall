@@ -639,18 +639,26 @@ impl Committed {
 /// Who was refused at the fact or system-event door, where anyone knows.
 ///
 /// The fact's own principal where it carries one (`BookingExists` does), else
-/// the persisted plan's (`Book` carries one), else the empty string — which the
-/// amended ADR-017 defines as **explicitly unattributed**: "someone was refused
-/// and no principal is recoverable", not "unknown". A cancellation plan carries
-/// no principal today; persisting the cancelling authority is slice F's.
+/// the persisted plan's — and since slice F closed the attribution debt, EVERY
+/// plan carries one: `Book` its booker, `CancelBooking` its canceller
+/// (ADR-020). The amended ADR-017's empty string ("explicitly unattributed")
+/// is no longer producible from a persisted plan, which was the point of the
+/// stored-plan break.
 fn principal_of_fact(fact: &VerifiedProviderFact, plan: &BookingEffect) -> String {
     if let VerifiedProviderFact::BookingExists { principal, .. } = fact {
         return principal.to_string();
     }
-    if let BookingEffect::Book { principal, .. } = plan {
-        return principal.to_string();
+    principal_of_plan(plan)
+}
+
+/// The persisted plan's own principal — the attribution every denial on an
+/// effect intent falls back to (ADR-017 as amended; ADR-020).
+fn principal_of_plan(plan: &BookingEffect) -> String {
+    match plan {
+        BookingEffect::Book { principal, .. } | BookingEffect::CancelBooking { principal, .. } => {
+            principal.to_string()
+        }
     }
-    String::new()
 }
 
 /// The effect identity a coordinator would derive for a booking at `version`.
@@ -922,10 +930,7 @@ where
                         driver_kind: bld_types::Provenance::SystemEvent,
                         driver_detail: "ReconciliationExhausted",
                         reason: error.name(),
-                        principal: match &claimed.intent.canonical_plan {
-                            BookingEffect::Book { principal, .. } => principal.to_string(),
-                            BookingEffect::CancelBooking { .. } => String::new(),
-                        },
+                        principal: principal_of_plan(&claimed.intent.canonical_plan),
                     })
                     .await;
                 }

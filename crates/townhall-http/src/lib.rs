@@ -29,7 +29,9 @@ use axum::{
 };
 use bld_types::{BookingId, BookingRequirements, Money, SlotId, TimeWindow, VenueId};
 use townhall_domain::{BookingProposal, VerifiedAuthority};
-use townhall_service::{BookingFacade, Mutated, Projection, ReconcilerHandle, VenueFilters};
+use townhall_service::{
+    BookingFacade, LookupQuery, Mutated, Projection, ReconcilerHandle, VenueFilters,
+};
 
 pub mod mapping;
 
@@ -54,7 +56,10 @@ pub struct ServerState {
 /// The router over one state. The composition root binds it to a listener.
 pub fn router(state: ServerState) -> Router {
     Router::new()
-        .route("/booking-intents", post(create_booking))
+        .route(
+            "/booking-intents",
+            get(lookup_bookings).post(create_booking),
+        )
         .route("/booking-intents/{id}", get(read_booking))
         .route("/booking-intents/{id}/audit", get(read_audit))
         .route("/venues", get(browse_venues))
@@ -243,14 +248,87 @@ struct VenueQuery {
 
 // ----------------------------------------------------------------- handlers
 
+/// The two supported collection queries, and nothing else.
+///
+/// # Where each 400 comes from, because they are two different mechanisms
+///
+/// Axum rejects a *malformed* value itself — `?cancellable=maybe` never reaches
+/// this function. What it accepts perfectly happily is no filter, both filters,
+/// and `cancellable=false`: all three are well-formed `Option`s. So those are
+/// refused here, by hand, because they are unrepresentable in [`LookupQuery`]
+/// rather than merely empty results.
+///
+/// An unfiltered "every booking you own" listing is not a surface this milestone
+/// offers, and refusing it in the type is cheaper than remembering to.
+#[derive(serde::Deserialize, Default)]
+struct LookupParams {
+    booking_ref: Option<String>,
+    cancellable: Option<bool>,
+}
+
+async fn lookup_bookings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(params): Query<LookupParams>,
+) -> Response {
+    let authority = match authorize(&state, &headers) {
+        Ok(authority) => authority,
+        Err(refused) => return refused,
+    };
+
+    let query = match (params.booking_ref, params.cancellable) {
+        (Some(_), Some(_)) => {
+            return mapping::plain_error(
+                StatusCode::BAD_REQUEST,
+                "booking_ref and cancellable are alternatives, not a conjunction",
+            );
+        }
+        (Some(reference), None) => {
+            LookupQuery::ByBookingRef(bld_types::CouncilBookingRef::new(reference))
+        }
+        (None, Some(true)) => LookupQuery::Cancellable,
+        (None, Some(false)) => {
+            return mapping::plain_error(
+                StatusCode::BAD_REQUEST,
+                "cancellable=false has no meaning here; omit the filter or ask for true",
+            );
+        }
+        (None, None) => {
+            return mapping::plain_error(
+                StatusCode::BAD_REQUEST,
+                "one of booking_ref or cancellable=true is required",
+            );
+        }
+    };
+
+    match state.api.lookup(&query, &authority).await {
+        // No collection ETag: a list has no single version, and emitting one
+        // would invite a caller to use it as a precondition for a mutation on
+        // one of its members. Each projection still carries its own.
+        Ok(rows) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "bookings": rows.iter().map(mapping::projection_body).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Err(error) => mapping::api_error(&error),
+    }
+}
+
 async fn create_booking(
     State(state): State<ServerState>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<CreateBody>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &headers) {
-        return refused;
-    }
+    // The resolved authority is KEPT now, not discarded. It names the owner the
+    // new row records, which is the whole of M5.1: before this, `authorize` was
+    // a turnstile that proved someone was a caller and then threw away which
+    // caller they were.
+    let authority = match authorize(&state, &headers) {
+        Ok(authority) => authority,
+        Err(refused) => return refused,
+    };
     if let Err(refused) = refuse_precondition(&headers, "create") {
         return refused;
     }
@@ -267,7 +345,7 @@ async fn create_booking(
     };
     match state
         .api
-        .create(BookingId::new(body.id), requirements)
+        .create(BookingId::new(body.id), requirements, &authority)
         .await
     {
         Ok(projection) => mapping::projection_response(StatusCode::CREATED, &projection),
@@ -280,10 +358,11 @@ async fn read_booking(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &headers) {
-        return refused;
-    }
-    match state.api.read(&BookingId::new(id)).await {
+    let authority = match authorize(&state, &headers) {
+        Ok(authority) => authority,
+        Err(refused) => return refused,
+    };
+    match state.api.read(&BookingId::new(id), &authority).await {
         Ok(projection) => mapping::projection_response(StatusCode::OK, &projection),
         Err(error) => mapping::api_error(&error),
     }
@@ -294,10 +373,11 @@ async fn read_audit(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &headers) {
-        return refused;
-    }
-    match state.api.audit(&BookingId::new(id)).await {
+    let authority = match authorize(&state, &headers) {
+        Ok(authority) => authority,
+        Err(refused) => return refused,
+    };
+    match state.api.audit(&BookingId::new(id), &authority).await {
         Ok(entries) => {
             let rows: Vec<serde_json::Value> = entries
                 .iter()
@@ -403,14 +483,30 @@ async fn propose_behaviour(
     let id = BookingId::new(id);
     let payload = body.map_or(serde_json::Value::Null, |axum::Json(value)| value);
 
+    // Admission FIRST — before either header gate, and before the behaviour
+    // name is even looked at.
+    //
+    // The header gates below answer 400 for a malformed `If-Match` and 428 for a
+    // missing one. Both are statements about a resource, so a caller who cannot
+    // see this booking would learn it exists by being told its precondition was
+    // wrong. Whether the caller is entitled to an answer has to be settled
+    // before any answer is composed.
+    //
+    // Side-effect-free: one scoped load, nothing written, nothing chased.
+    if let Err(refused) = state.api.ensure_visible(&id, &authority).await {
+        return mapping::api_error(&refused);
+    }
+
     // The reconcile trigger: exempt from preconditions by classification
     // (ADR-021) — it asserts no expected state, so a version tag would be a
-    // false belief, refused like any other.
+    // false belief, refused like any other. That exemption covers preconditions
+    // only; the visibility check above still applies, or this route would be an
+    // authenticated existence oracle.
     if behaviour == "reconcile" {
         if let Err(refused) = refuse_precondition(&headers, "reconcile") {
             return refused;
         }
-        return match state.api.attend_booking(&id).await {
+        return match state.api.attend_booking(&id, &authority).await {
             Ok(outcomes) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
@@ -438,7 +534,7 @@ async fn propose_behaviour(
         .propose_at(&id, expected, proposal, &authority)
         .await
     {
-        Ok(mutated) => turn_response(&state, &id, mutated).await,
+        Ok(mutated) => turn_response(&state, &id, mutated, &authority).await,
         Err(error) => mapping::api_error(&error),
     }
 }
@@ -486,7 +582,16 @@ fn parse_proposal(
 
 /// A turn's response body wants the current projection for the states the
 /// outcome does not carry — assembled here, mapped in [`mapping`].
-async fn turn_response(state: &ServerState, id: &BookingId, mutated: Mutated) -> Response {
-    let menu: Option<Projection> = state.api.read(id).await.ok();
+async fn turn_response(
+    state: &ServerState,
+    id: &BookingId,
+    mutated: Mutated,
+    authority: &VerifiedAuthority,
+) -> Response {
+    // Scoped like every other external read. The caller has already been
+    // admitted to reach here, so this cannot fail for visibility — but reading
+    // unscoped would leave a path that does not care who is asking, and those
+    // are exactly the paths that get reused later by something that should.
+    let menu: Option<Projection> = state.api.read(id, authority).await.ok();
     mapping::turn(&mutated, menu.as_ref())
 }

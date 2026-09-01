@@ -1191,6 +1191,10 @@ pub enum ApiError {
     UnknownBooking,
     #[error("the booking already exists at version {current}")]
     AlreadyExists { current: u64 },
+    /// The id is taken, by someone else. Deliberately carries no version and no
+    /// owner: the caller learns only that the identifier is unavailable.
+    #[error("that identifier is unavailable")]
+    IdentifierUnavailable,
     #[error("expected version is stale; the current version is {current}")]
     PreconditionFailed { current: u64 },
     #[error("gave up re-classifying under contention")]
@@ -1242,6 +1246,25 @@ pub struct Projection {
     pub selected_venue: Option<townhall_domain::SelectedVenueRef>,
     pub booking_ref: Option<bld_types::CouncilBookingRef>,
     pub available_behaviours: &'static [&'static str],
+}
+
+/// The closed set of collection queries.
+///
+/// An enum rather than a struct of options, so "no filter" and "two filters" are
+/// not representable rather than merely rejected — an unfiltered list of every
+/// booking a principal owns is not a surface this milestone offers, and the type
+/// is where that is easiest to guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LookupQuery {
+    /// The caller's booking carrying this council reference — what a person
+    /// actually has in hand, because it is what the confirmation SMS quotes.
+    ByBookingRef(bld_types::CouncilBookingRef),
+    /// The caller's bookings that currently offer `Cancel`.
+    ///
+    /// Not "not yet cancelled", which is a different and wronger question: a
+    /// booking mid-cancellation is not yet cancelled and must not be offered
+    /// again.
+    Cancellable,
 }
 
 /// Per-slot verified facts as the wire sees them: everything the council
@@ -1356,23 +1379,39 @@ where
         &self,
         id: BookingId,
         requirements: bld_types::BookingRequirements,
+        access: &VerifiedAuthority,
     ) -> Result<Projection, ApiError> {
         let repository = self.coordinator.repository();
         match repository
             .create(townhall_store::NewBooking {
                 id: id.clone(),
                 requirements,
+                owner: access.principal.clone(),
             })
             .await
         {
             Ok(aggregate) => Ok(Self::project(&aggregate)),
+            // The id is taken. WHOSE it is decides what the caller learns.
+            //
+            // A scoped load answers that without a second question: the owner
+            // gets their version back so a retry can carry an `ETag`, and
+            // everyone else gets a generic refusal. Because the load is scoped,
+            // a foreign row is never decoded — so a corrupt one cannot surface
+            // as a 503 and become an existence oracle wearing a different
+            // number.
+            //
+            // What still leaks is one bit: taken, or free. That is unavoidable
+            // under a caller-chosen primary key, and answering 404 would leak
+            // the same bit while misdescribing a collection POST. ADR-022
+            // records it as an accepted residual.
             Err(StoreError::AlreadyExists(_)) => {
-                let current = repository
-                    .load(&id)
-                    .await
-                    .map_err(|error| ApiError::Unavailable(error.to_string()))?
-                    .version;
-                Err(ApiError::AlreadyExists { current })
+                match repository.load_visible(&access.principal, &id).await {
+                    Ok(existing) => Err(ApiError::AlreadyExists {
+                        current: existing.version,
+                    }),
+                    Err(StoreError::NotFound(_)) => Err(ApiError::IdentifierUnavailable),
+                    Err(error) => Err(ApiError::Unavailable(error.to_string())),
+                }
             }
             Err(error) => Err(ApiError::Unavailable(error.to_string())),
         }
@@ -1382,9 +1421,59 @@ where
     ///
     /// # Errors
     /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
-    pub async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
-        let aggregate = self.load(id).await?;
+    pub async fn read(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Projection, ApiError> {
+        let aggregate = self.load_visible(id, access).await?;
         Ok(Self::project(&aggregate))
+    }
+
+    /// Establish that this caller may see this booking, and nothing else.
+    ///
+    /// # Why the handlers need this as a separate call
+    ///
+    /// `expected_version` and `refuse_precondition` run in the HTTP handler,
+    /// *before* any facade method is reached. Without a preflight, a caller who
+    /// cannot see a booking still learns it exists: a malformed `If-Match`
+    /// answers 400 and a missing one answers 428, both of which are answers
+    /// about a resource the caller was never entitled to know about.
+    ///
+    /// So the handler asks this first. It is side-effect-free by construction —
+    /// one scoped load, nothing written, nothing chased.
+    ///
+    /// # Errors
+    /// [`ApiError::UnknownBooking`] for absent AND for invisible, which is the
+    /// point; [`ApiError::Unavailable`].
+    pub async fn ensure_visible(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<(), ApiError> {
+        self.load_visible(id, access).await.map(|_| ())
+    }
+
+    /// The caller's bookings matching one closed query.
+    ///
+    /// # Errors
+    /// [`ApiError::Unavailable`].
+    pub async fn lookup(
+        &self,
+        query: &LookupQuery,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Projection>, ApiError> {
+        let repository = self.coordinator.repository();
+        let rows = match query {
+            LookupQuery::ByBookingRef(booking_ref) => {
+                repository
+                    .lookup_by_ref(&access.principal, booking_ref)
+                    .await
+            }
+            LookupQuery::Cancellable => repository.lookup_cancellable(&access.principal).await,
+        }
+        .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+        Ok(rows.iter().map(Self::project).collect())
     }
 
     /// One versioned mutation turn — see [`Coordinator::propose_at`].
@@ -1399,6 +1488,13 @@ where
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
     ) -> Result<Mutated, ApiError> {
+        // Admission BEFORE the version is compared. Reversing these two lines
+        // would answer 412 to a caller who cannot see the booking, handing them
+        // its current version — the resource's state, leaked by the guard meant
+        // to protect it. A foreign caller must not be able to tell a stale
+        // precondition from a fictional booking.
+        self.ensure_visible(id, authority).await?;
+
         let outcome = self
             .coordinator
             .propose_at(id, expected_version, proposal, authority)
@@ -1435,9 +1531,16 @@ where
     ///
     /// # Errors
     /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
-    pub async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
-        // Reads on an unknown booking answer 404, not an empty trail.
-        self.load(id).await?;
+    pub async fn audit(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<AuditEntry>, ApiError> {
+        // Reads on an unknown OR invisible booking answer 404, not an empty
+        // trail. Admission is settled here; `audit_events` may then read by id
+        // alone, because ownership is immutable — a row cannot change hands
+        // between these two lines.
+        self.load_visible(id, access).await?;
         let events = self
             .coordinator
             .repository()
@@ -1463,12 +1566,28 @@ where
     /// from preconditions by classification (ADR-021): it asserts no expected
     /// state; the claim is atomic and the facts are version-fenced below.
     ///
+    /// # The precondition exemption is not a visibility exemption
+    ///
+    /// ADR-021 exempted this route from `If-Match`, and that stands. Ownership
+    /// is a different question, and leaving it out made this an authenticated
+    /// existence oracle: a caller who could see nothing could still learn
+    /// whether a booking existed by whether a reconcile answered. So the loop
+    /// loads *visibly*.
+    ///
+    /// The internal reconciler loop is unaffected — it never comes through here,
+    /// having no principal to scope by.
+    ///
     /// # Errors
-    /// [`ApiError::UnknownBooking`]; [`ApiError::Unavailable`].
-    pub async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
+    /// [`ApiError::UnknownBooking`] for absent and for invisible alike;
+    /// [`ApiError::Unavailable`].
+    pub async fn attend_booking(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Attended>, ApiError> {
         let mut outcomes = Vec::new();
         for _ in 0..4 {
-            let Some(effect) = self.load(id).await?.active_effect else {
+            let Some(effect) = self.load_visible(id, access).await?.active_effect else {
                 break;
             };
             let attended = self
@@ -1487,6 +1606,31 @@ where
 
     async fn load(&self, id: &BookingId) -> Result<BookingAggregate, ApiError> {
         match self.coordinator.repository().load(id).await {
+            Ok(aggregate) => Ok(aggregate),
+            Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
+            Err(error) => Err(ApiError::Unavailable(error.to_string())),
+        }
+    }
+
+    /// The load every externally visible operation uses.
+    ///
+    /// Note what is absent: there is no `if aggregate.owner == access.principal`
+    /// anywhere. A booking belonging to someone else does not come back from the
+    /// store at all, and `NotFound` is already the 404 path — so concealment is
+    /// the query's default behaviour rather than a comparison a later edit can
+    /// drop, invert, or short-circuit past. That failure would have been silent:
+    /// a missing check looks exactly like a passing one.
+    async fn load_visible(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<BookingAggregate, ApiError> {
+        match self
+            .coordinator
+            .repository()
+            .load_visible(&access.principal, id)
+            .await
+        {
             Ok(aggregate) => Ok(aggregate),
             Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
             Err(error) => Err(ApiError::Unavailable(error.to_string())),
@@ -1514,8 +1658,13 @@ pub trait BookingFacade: Send + Sync {
         &self,
         id: BookingId,
         requirements: bld_types::BookingRequirements,
+        access: &VerifiedAuthority,
     ) -> Result<Projection, ApiError>;
-    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError>;
+    async fn read(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Projection, ApiError>;
     async fn propose_at(
         &self,
         id: &BookingId,
@@ -1523,8 +1672,28 @@ pub trait BookingFacade: Send + Sync {
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
     ) -> Result<Mutated, ApiError>;
-    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError>;
-    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError>;
+    async fn audit(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<AuditEntry>, ApiError>;
+    async fn attend_booking(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Attended>, ApiError>;
+    /// Side-effect-free admission check, for handlers that must decide
+    /// visibility before they parse preconditions.
+    async fn ensure_visible(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<(), ApiError>;
+    async fn lookup(
+        &self,
+        query: &LookupQuery,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Projection>, ApiError>;
     async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError>;
     async fn slot_facts(
         &self,
@@ -1546,11 +1715,30 @@ where
         &self,
         id: BookingId,
         requirements: bld_types::BookingRequirements,
+        access: &VerifiedAuthority,
     ) -> Result<Projection, ApiError> {
-        Self::create(self, id, requirements).await
+        Self::create(self, id, requirements, access).await
     }
-    async fn read(&self, id: &BookingId) -> Result<Projection, ApiError> {
-        Self::read(self, id).await
+    async fn read(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Projection, ApiError> {
+        Self::read(self, id, access).await
+    }
+    async fn ensure_visible(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<(), ApiError> {
+        Self::ensure_visible(self, id, access).await
+    }
+    async fn lookup(
+        &self,
+        query: &LookupQuery,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Projection>, ApiError> {
+        Self::lookup(self, query, access).await
     }
     async fn propose_at(
         &self,
@@ -1561,11 +1749,19 @@ where
     ) -> Result<Mutated, ApiError> {
         Self::propose_at(self, id, expected_version, proposal, authority).await
     }
-    async fn audit(&self, id: &BookingId) -> Result<Vec<AuditEntry>, ApiError> {
-        Self::audit(self, id).await
+    async fn audit(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<AuditEntry>, ApiError> {
+        Self::audit(self, id, access).await
     }
-    async fn attend_booking(&self, id: &BookingId) -> Result<Vec<Attended>, ApiError> {
-        Self::attend_booking(self, id).await
+    async fn attend_booking(
+        &self,
+        id: &BookingId,
+        access: &VerifiedAuthority,
+    ) -> Result<Vec<Attended>, ApiError> {
+        Self::attend_booking(self, id, access).await
     }
     async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
         Self::venues(self, filters).await

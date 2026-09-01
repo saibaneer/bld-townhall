@@ -1,0 +1,51 @@
+-- Who owns a booking, for visibility.
+--
+-- Until now a booking had no owner at all: `create_booking` resolved an
+-- authority purely as a gate and discarded it, and `may_cancel` was a capability
+-- flag, never a comparison against a resource. So any principal holding
+-- `may_cancel` could cancel any booking whose id they could name. That was
+-- tolerable while one person drove the system with curl; it stops being
+-- tolerable the moment a channel exists that anyone can text.
+--
+-- # Why the column is NULLABLE, which is the security property
+--
+-- Two earlier designs used `NOT NULL DEFAULT '@orphan'` and argued the sentinel
+-- could never be bound. Both arguments were wrong in instructive ways.
+--
+-- The first claimed `PrincipalId::new` rejects a leading `@`. It does not — the
+-- type is a macro-generated newtype that validates nothing, and its
+-- `#[serde(transparent)]` derive bypasses every constructor on deserialisation
+-- anyway, so no constructor-level guard could hold.
+--
+-- The second argued from the server's fixed token allowlist: no resolver arm
+-- emits `@orphan`, so no request could carry it. That is true today and the
+-- wrong kind of true — it depends on a configuration list, so widening the
+-- allowlist later would silently un-conceal every legacy row.
+--
+-- NULL needs no argument. `owner_principal = ?` never matches NULL whatever the
+-- parameter, and no `PrincipalId` — however constructed — can serialise to it.
+-- Concealment becomes a property of the column rather than of a string somebody
+-- might one day type.
+--
+-- # The rule this column imposes on every query that reads it
+--
+-- The NULL guarantee does not generalise. `NULL NOT IN (…)` is unknown;
+-- `NOT EXISTS (… WHERE owner_principal = ?)` is TRUE for an orphan row and would
+-- include it; a LEFT JOIN whose ownership condition sits in `ON` still returns
+-- the base row. So:
+--
+--   Every externally visible query selects from `bookings` under a POSITIVE
+--   base-row predicate — `WHERE owner_principal = ?` — never a negation, never
+--   a subquery, never a join whose ownership condition sits in ON.
+--
+-- Legacy rows keep NULL. They stay readable through the unscoped `load` that
+-- reconciliation uses, because a recovery pass has no principal and must still
+-- be able to finish an in-flight effect; they are unreachable through
+-- `load_visible` for every possible principal.
+ALTER TABLE bookings ADD COLUMN owner_principal TEXT;
+
+-- The lookup surface added alongside this column filters by owner and then by
+-- the domain's own menu, so the only index worth having is on the predicate
+-- every visible query shares.
+CREATE INDEX IF NOT EXISTS idx_bookings_owner
+    ON bookings(owner_principal);

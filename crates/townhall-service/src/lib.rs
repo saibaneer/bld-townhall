@@ -525,7 +525,16 @@ where
             .await
         {
             Ok(prepared) => prepared,
-            Err(StoreError::StaleVersion { .. }) if expected.is_some() => {
+            // Under an expected version, BOTH shapes of "another mutation
+            // already won from the version you observed" are stale: the CAS
+            // loss, and a same-key rival whose canonical plan DIFFERS (the
+            // replay-first check refuses it as ConflictingPlan before the CAS
+            // is ever reached). The wire's contract is 412 either way
+            // (ADR-021; PR #18 review). The versionless surface keeps M4's
+            // contract: a conflicting plan is an error, never absorbed.
+            Err(StoreError::StaleVersion { .. } | StoreError::ConflictingPlan { .. })
+                if expected.is_some() =>
+            {
                 return Err(self.stale(id).await?);
             }
             Err(error) => return Err(error.into()),
@@ -962,6 +971,18 @@ where
         };
 
         let turn = self.attend_claimed(id, &claimed).await;
+
+        // An ERROR still backs off: without a cadence push, a row that errors
+        // before its own finish-write stays earliest-due forever and
+        // monopolizes every future batch — starving healthy rows behind it
+        // (PR #18 review). Deferred WITHOUT counting: no call began, so
+        // neither ledger column may move. Best-effort, like every pursuit
+        // write.
+        if turn.is_err() {
+            let _ = repository
+                .defer_attempt(id, claimed.token, self.coordinator.config.retry_cadence_ms)
+                .await;
+        }
 
         // The lease is given back whatever happened — including on an error path,
         // where leaving it to expire would stall the intent for the lease term

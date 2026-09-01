@@ -72,6 +72,9 @@ fn parse_args() -> Result<Args, String> {
                 reconcile_interval_ms = value()?
                     .parse::<u64>()
                     .map_err(|_| "--reconcile-interval-ms needs milliseconds".to_owned())?;
+                if reconcile_interval_ms == 0 {
+                    return Err("--reconcile-interval-ms must be positive".to_owned());
+                }
             }
             "--reclassify-attempts" => {
                 reclassify_attempts = Some(

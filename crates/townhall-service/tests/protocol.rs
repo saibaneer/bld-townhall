@@ -2176,6 +2176,9 @@ struct RacingRepo {
     /// first `prepare_effect` delegation — the schedule where the caller's
     /// prepare finds the rival's intent and comes back `replayed`.
     prepare_inject: std::sync::Mutex<Option<PrepareEffect>>,
+    /// When set, the next `load` fails once — the injected mid-turn error the
+    /// backoff test needs.
+    fail_next_load: std::sync::atomic::AtomicBool,
 }
 
 impl RacingRepo {
@@ -2186,6 +2189,7 @@ impl RacingRepo {
             inject: std::sync::Mutex::new(None),
             commit_inject: std::sync::Mutex::new(None),
             prepare_inject: std::sync::Mutex::new(None),
+            fail_next_load: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2206,6 +2210,14 @@ impl BookingRepository for RacingRepo {
         self.inner.create(booking).await
     }
     async fn load(&self, id: &BookingId) -> Result<townhall_domain::BookingAggregate, StoreError> {
+        if self
+            .fail_next_load
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::CorruptRow(
+                "injected mid-turn failure".to_owned(),
+            ));
+        }
         self.inner.load(id).await
     }
     async fn commit(
@@ -2319,6 +2331,14 @@ impl BookingRepository for RacingRepo {
     }
     async fn escalated_unresolved(&self, limit: u32) -> Result<Vec<EffectIntentId>, StoreError> {
         self.inner.escalated_unresolved(limit).await
+    }
+    async fn defer_attempt(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.inner.defer_attempt(id, token, cadence_ms).await
     }
     async fn retry_hint_ms(&self, id: &EffectIntentId) -> Result<Option<i64>, StoreError> {
         self.inner.retry_hint_ms(id).await
@@ -2933,5 +2953,129 @@ async fn a_rejected_booking_under_cancellation_ends_cancelled_with_nothing_cause
     assert_eq!(
         intents, 1,
         "no cancellation effect was ever minted — there was nothing to cancel"
+    );
+}
+
+/// PR #18's HIGH: a same-key rival whose canonical plan DIFFERS is refused by
+/// the store as a conflicting plan before the CAS is ever reached — and under
+/// an expected version that is still "another mutation already won from the
+/// version you observed": 412, never a 503 masquerade.
+#[tokio::test]
+async fn a_conflicting_plan_under_an_expected_version_is_stale_not_unavailable() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-CONFLICT");
+    awaiting(&h, &id, requirements()).await;
+    let loaded = h.repo.load(&id).await.expect("load");
+    let effect = derive_effect_intent_id(&id, OperationKind::Book, loaded.version);
+
+    // The rival's Phase A with a DIFFERENT plan: same key, different grant.
+    let rival_plan = BookingEffect::Book {
+        principal: PrincipalId::new("lucy"),
+        attendees: 20,
+        facts: facts(),
+        grant: AvailabilityGrant::new("a-grant-from-another-read"),
+    };
+    let rival = PrepareEffect {
+        booking_id: id.clone(),
+        source_version: loaded.version,
+        canonical_plan: rival_plan,
+        next: townhall_domain::Booking {
+            state: townhall_domain::BookingState::BookingInProgress(
+                townhall_domain::BookingInProgress {
+                    effect_intent_id: effect.clone(),
+                },
+            ),
+            active_effect: Some(effect),
+            ..townhall_domain::Booking::from(&loaded)
+        },
+        audit: TransitionAudit::driven_by(&BookingProposal::Book),
+    };
+    let racing = Arc::new(RacingRepo {
+        prepare_inject: std::sync::Mutex::new(Some(rival)),
+        ..RacingRepo::passthrough(Arc::clone(&h.repo))
+    });
+    let coordinator = Coordinator::new(
+        Arc::clone(&racing),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    let refused = coordinator
+        .propose_at(&id, loaded.version, BookingProposal::Book, &authority())
+        .await;
+    let Err(ServiceError::PreconditionFailed { current }) = refused else {
+        panic!("a conflicting-plan rival means the world moved: {refused:?}");
+    };
+    assert_eq!(current, loaded.version + 1);
+    assert_eq!(
+        h.council.call_count(),
+        0,
+        "the loser never reached the wire"
+    );
+}
+
+/// PR #18's MEDIUM: a claimed turn that ERRORS still backs off — without the
+/// cadence push, the erroring row stays earliest-due forever and monopolizes
+/// every batch, starving healthy rows behind it.
+#[tokio::test]
+async fn an_erroring_attend_backs_off_instead_of_monopolizing_the_queue() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-BACKOFF");
+    awaiting(&h, &id, requirements()).await;
+    h.council.script([Script::GoQuiet("nothing")]);
+    h.coordinator
+        .propose(&id, BookingProposal::Book, &authority())
+        .await
+        .expect("book");
+    let effect = in_flight_effect(&h, &id).await;
+    h.clock.advance(10_000);
+
+    let racing = Arc::new(RacingRepo::passthrough(Arc::clone(&h.repo)));
+    racing
+        .fail_next_load
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reconciliation = Reconciliation::new(
+        Arc::new(Coordinator::new(
+            Arc::clone(&racing),
+            Arc::clone(&h.council),
+            Arc::new(CouncilVerifier),
+            Arc::new(FixedAvailability::new(facts())),
+        )),
+        Arc::clone(&h.council),
+    );
+
+    // The claim succeeds; the turn then errors on the injected load failure.
+    let errored = reconciliation.attend(&effect).await;
+    assert!(
+        errored.is_err(),
+        "the injected failure surfaced: {errored:?}"
+    );
+
+    // The row backed off: no longer due, until the cadence elapses.
+    assert!(
+        h.repo.due_effects(10).await.expect("due").is_empty(),
+        "an erroring row must not stay earliest-due forever"
+    );
+    // And the ledger did not lie about the errored turn: no call began, so
+    // neither column moved (the deferral is schedule-only).
+    let (started, finished) = pursuit_counts(&h, &effect).await;
+    assert_eq!(
+        (started, finished),
+        (1, 1),
+        "the errored turn counted nothing"
+    );
+
+    h.clock.advance(10_000);
+    assert_eq!(
+        h.repo.due_effects(10).await.expect("due"),
+        vec![effect.clone()],
+        "backed off, not buried: the cadence returns it"
+    );
+    let attended = reconciliation.attend(&effect).await.expect("attend");
+    assert_eq!(
+        attended,
+        Attended::Settled,
+        "the healthy retry proceeds normally — query, honest not-yet, resend"
     );
 }

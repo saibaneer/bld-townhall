@@ -374,6 +374,22 @@ pub trait BookingRepository: Send + Sync {
     /// [`StoreError::Sqlx`] on a write failure.
     async fn release_lease(&self, id: &EffectIntentId, token: i64) -> Result<(), StoreError>;
 
+    /// Push the next attempt a cadence away WITHOUT counting anything — the
+    /// back-off for a turn that errored before any call began (PR #18 review):
+    /// counting a start that never reached the wire or a finish for a call
+    /// that never began would both lie in the ledger, and NOT backing off
+    /// leaves the erroring row earliest-due forever, starving the queue.
+    /// Fenced like every pursuit write: the token must hold the lease.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlx`] on a write failure.
+    async fn defer_attempt(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<bool, StoreError>;
+
     /// How long until this live intent's next scheduled attempt, under the
     /// STORE's clock — the durable schedule an HTTP `Retry-After` projects
     /// (ADR-021: the service computing `row − now` itself would mint a second
@@ -1225,6 +1241,32 @@ impl BookingRepository for SqliteBookingRepository {
             UPDATE effect_intents
                SET attempts_finished = attempts_finished + 1,
                    next_attempt_after_ms = ?2 + MIN(MAX(?1, 0), ?3),
+                   updated_at_ms = ?2
+             WHERE effect_intent_id = ?4 AND lease_token = ?5
+               AND lease_until_ms IS NOT NULL
+            ",
+        )
+        .bind(cadence_ms)
+        .bind(now)
+        .bind(MAX_CADENCE_MS)
+        .bind(id.as_str())
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn defer_attempt(
+        &self,
+        id: &EffectIntentId,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let now = self.now();
+        let updated = sqlx::query(
+            r"
+            UPDATE effect_intents
+               SET next_attempt_after_ms = ?2 + MIN(MAX(?1, 0), ?3),
                    updated_at_ms = ?2
              WHERE effect_intent_id = ?4 AND lease_token = ?5
                AND lease_until_ms IS NOT NULL

@@ -790,6 +790,26 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
 fn a_dead_council_answers_503_for_asks_but_cancel_still_commits() {
     let mut world = world();
     let etag = awaiting(&world, "BKG-DEAD");
+    // A second booking parked at VenueSelected — the fact-NEEDING proposal's
+    // fixture for after the council dies.
+    let created = call(
+        &world,
+        "POST",
+        "/booking-intents",
+        LUCY,
+        None,
+        Some(&create_body("BKG-DEAD-ASK")),
+    );
+    let ask_etag = etag_version(&created);
+    let reply = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-DEAD-ASK/behaviours/select-venue",
+        LUCY,
+        Some(&ask_etag),
+        Some(&serde_json::json!({"venue_id": "TH-A", "slot_id": "SLOT-A"})),
+    );
+    let ask_etag = etag_version(&reply);
     // Book with the answer eaten so the booking is genuinely in flight.
     let effect = "EFF-BKG-DEAD-BOOK-2";
     arm_fault(&world, effect, "create", "drop_response");
@@ -808,11 +828,23 @@ fn a_dead_council_answers_503_for_asks_but_cancel_still_commits() {
     let _ = world.council.kill();
     let _ = world.council.wait();
 
-    // Asks: 503 — the catalogue, the slot, and the fact-needing proposal.
+    // Asks: 503 — the catalogue, the slot, AND the fact-needing proposal
+    // (verify-slot binds facts, and could-not-ask is FactsUnavailable → 503,
+    // never a 422 masquerade).
     let reply = call(&world, "GET", "/venues", LUCY, None, None);
     assert_eq!(reply.status, 503);
     let reply = call(&world, "GET", "/venues/TH-A/slots/SLOT-A", LUCY, None, None);
     assert_eq!(reply.status, 503);
+    let reply = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-DEAD-ASK/behaviours/verify-slot",
+        LUCY,
+        Some(&ask_etag),
+        None,
+    );
+    assert_eq!(reply.status, 503, "{:?}", reply.body);
+    assert_eq!(reply.body["error"], "FactsUnavailable");
 
     // The withdrawal: local, committed, provider not consulted.
     let reply = call(

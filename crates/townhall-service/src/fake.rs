@@ -136,7 +136,25 @@ struct Inner {
     /// When armed, every execute waits here before doing its work — the
     /// blocking fake gate M3's composed race needs: a call held past its
     /// lease's expiry while a second worker moves.
-    execute_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    execute_gate: Option<std::sync::Arc<ExecuteGate>>,
+}
+
+/// The blocking fake's synchronisation, both directions signalled — a test
+/// AWAITS `arrived` (the call is genuinely on the wire) and PERMITS `release`
+/// (the council finally answers), so no participant ever sleeps.
+#[derive(Debug)]
+pub struct ExecuteGate {
+    pub arrived: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
+}
+
+impl Default for ExecuteGate {
+    fn default() -> Self {
+        Self {
+            arrived: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 impl Inner {
@@ -204,10 +222,11 @@ impl FakeCouncil {
         self.lock().wire_log.clone()
     }
 
-    /// Arm the execute gate: every subsequent `execute` waits for a permit
-    /// before doing its work. `add_permits` releases them one call at a time —
-    /// this is how a test holds a call past its lease's expiry without a sleep.
-    pub fn gate_executes(&self, gate: std::sync::Arc<tokio::sync::Semaphore>) {
+    /// Arm the execute gate: every subsequent `execute` announces its arrival
+    /// on `gate.arrived` (one permit per call, for the test to await — never a
+    /// sleep) and then waits for a permit on `gate.release` before doing its
+    /// work. This is how a test holds a call past its lease's expiry.
+    pub fn gate_executes(&self, gate: std::sync::Arc<ExecuteGate>) {
         self.lock().execute_gate = Some(gate);
     }
 
@@ -356,13 +375,23 @@ impl Capability<BookingEffect> for FakeCouncil {
         effect: &BookingEffect,
         attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
-        // The gate, when armed, holds the call HERE — after the caller's
-        // durable attempt mark, before any work — which is where a slow
-        // council lives from the boundary's point of view. Acquired outside
-        // the state lock, or the held call would block every other wire.
-        let gate = self.lock().execute_gate.clone();
+        // The arrival is logged and announced BEFORE the gate, because arrival
+        // is what happened. The gate, when armed, then holds the call HERE —
+        // after the caller's durable attempt mark, before any work — which is
+        // where a slow council lives from the boundary's point of view.
+        // Awaited outside the state lock, or the held call would block every
+        // other wire.
+        let gate = {
+            let mut inner = self.lock();
+            inner
+                .wire_log
+                .push((WireOp::Execute, attempt.id.as_str().to_owned()));
+            inner.execute_gate.clone()
+        };
         if let Some(gate) = gate {
+            gate.arrived.add_permits(1);
             let permit = gate
+                .release
                 .acquire()
                 .await
                 .map_err(|_| Unknown::new(BoundedString::truncating("the gate was closed")))?;
@@ -371,9 +400,6 @@ impl Capability<BookingEffect> for FakeCouncil {
 
         let id = &attempt.id;
         let mut inner = self.lock();
-        inner
-            .wire_log
-            .push((WireOp::Execute, id.as_str().to_owned()));
         inner.bind(id.as_str(), effect.operation_kind(), attempt.expires_at_ms)?;
         inner.calls.push(Call {
             effect_intent_id: id.clone(),
@@ -583,5 +609,154 @@ impl crate::AvailabilitySource for FixedAvailability {
                 grant: self.grant.clone(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bld_types::{SlotId, VenueId};
+    use townhall_domain::{OperationKind, VenueFacts};
+
+    fn attempt(id: &str, expires_at_ms: i64) -> EffectAttempt {
+        EffectAttempt {
+            id: EffectIntentId::new(id),
+            expires_at_ms,
+        }
+    }
+
+    fn book_plan() -> BookingEffect {
+        BookingEffect::Book {
+            principal: PrincipalId::new("lucy"),
+            attendees: 20,
+            facts: VenueFacts {
+                venue_id: VenueId::new("TH-A"),
+                slot_id: SlotId::new("SLOT-A"),
+                capacity: 30,
+                wheelchair_accessible: true,
+                fee: Money::from_pence(4_500),
+                available: true,
+            },
+            grant: AvailabilityGrant::new(FAKE_GRANT),
+        }
+    }
+
+    fn cancel_plan() -> BookingEffect {
+        BookingEffect::CancelBooking {
+            booking_ref: CouncilBookingRef::new("TH-90001"),
+            principal: PrincipalId::new("lucy"),
+        }
+    }
+
+    fn contradicts(reply: &Unknown) -> bool {
+        format!("{reply:?}").contains("contradicts")
+    }
+
+    /// The four first-seen-binding cases (ADR-020, plan review round 3): both
+    /// first-seen directions, with the KIND conflict and the DEADLINE conflict
+    /// varied independently. Every conflicting envelope is unusable and the
+    /// first-seen record survives — the same protocol histories the real
+    /// council refuses with `ProtocolConflict`, so a protocol test passing
+    /// against this fake means something.
+    #[tokio::test]
+    async fn a_resolve_first_binding_refuses_a_conflicting_execute_kind() {
+        let council = FakeCouncil::new();
+        let seen = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-1", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("first sight binds");
+        assert_eq!(seen, crate::Resolved::NotYetVisible);
+
+        let refused = council
+            .execute(&cancel_plan(), &attempt("EFF-BIND-1", 1_000))
+            .await
+            .expect_err("a Cancel envelope against a Book binding is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+
+        // The first-seen record survives the refused envelope.
+        let still = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-1", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("the binding is intact");
+        assert_eq!(still, crate::Resolved::NotYetVisible);
+    }
+
+    #[tokio::test]
+    async fn a_resolve_first_binding_refuses_a_conflicting_execute_deadline() {
+        let council = FakeCouncil::new();
+        crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-2", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect("first sight binds");
+
+        let refused = council
+            .execute(&book_plan(), &attempt("EFF-BIND-2", 2_000))
+            .await
+            .expect_err("a different deadline for a bound identity is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn an_execute_first_binding_refuses_a_conflicting_resolve_kind() {
+        let council = FakeCouncil::new();
+        council
+            .execute(&cancel_plan(), &attempt("EFF-BIND-3", 1_000))
+            .await
+            .expect("first sight binds and cancels");
+
+        let refused = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-3", 1_000),
+            OperationKind::Book,
+        )
+        .await
+        .expect_err("asking about it as a Book is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
+
+        // A MATCHING ask still answers: the settled cancellation.
+        let answered = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-3", 1_000),
+            OperationKind::Cancel,
+        )
+        .await
+        .expect("the binding is intact");
+        assert!(
+            matches!(
+                answered,
+                crate::Resolved::Answer(RawResponse {
+                    body: RawBody::Cancelled { .. },
+                    ..
+                })
+            ),
+            "{answered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execute_first_binding_refuses_a_conflicting_resolve_deadline() {
+        let council = FakeCouncil::new();
+        council
+            .execute(&book_plan(), &attempt("EFF-BIND-4", 1_000))
+            .await
+            .expect("first sight binds and books");
+
+        let refused = crate::EffectResolver::resolve(
+            &council,
+            &attempt("EFF-BIND-4", 9_999),
+            OperationKind::Book,
+        )
+        .await
+        .expect_err("a different deadline for a bound identity is unusable");
+        assert!(contradicts(&refused), "{refused:?}");
     }
 }

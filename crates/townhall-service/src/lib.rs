@@ -692,6 +692,16 @@ pub struct Reconciliation<R, C, V, A, L> {
     resolver: Arc<L>,
 }
 
+/// What a send amounted to, from the reconciler's doorway.
+fn attended_from(sent: Option<&Turn>, attempts_started: u32) -> Attended {
+    match sent {
+        // The token lost the row: someone else owns this turn now.
+        None => Attended::NotDue,
+        Some(BoundaryOutcome::Committed(_) | BoundaryOutcome::Converged) => Attended::Settled,
+        Some(_) => Attended::StillUnknown { attempts_started },
+    }
+}
+
 /// What one reconciliation turn amounted to.
 ///
 /// Deliberately coarse. `Settled` carries no aggregate, no fact and no state
@@ -803,10 +813,11 @@ where
         // the crash window between a handoff's commit and its successor's
         // mark, resumed under the same identity (test 12's sentence).
         if claimed.intent.status == townhall_domain::EffectStatus::Prepared && wanted {
-            return Ok(self.turn_to_attended(
+            return Ok(attended_from(
                 self.coordinator
                     .send_claimed(&booking_id, &claimed.intent, claimed.token, cadence)
-                    .await?,
+                    .await?
+                    .as_ref(),
                 claimed.attempts_started + 1,
             ));
         }
@@ -852,30 +863,19 @@ where
             // the state still wants the effect: RESEND the persisted plan under
             // the same identity (ADR-020). A second wire call, so a second
             // attempt on the books.
-            Ok(Resolved::NotYetVisible) if wanted => Ok(self.turn_to_attended(
+            Ok(Resolved::NotYetVisible) if wanted => Ok(attended_from(
                 self.coordinator
                     .send_claimed(&booking_id, &claimed.intent, claimed.token, cadence)
-                    .await?,
+                    .await?
+                    .as_ref(),
                 claimed.attempts_started + 2,
             )),
-            // "Nothing yet" for an effect nobody wants caused: the deadline
-            // will end this story (ADR-016); until then, honestly unknown.
-            Ok(Resolved::NotYetVisible) => Ok(Attended::StillUnknown {
+            // "Nothing yet" for an effect nobody wants caused (the deadline
+            // will end that story — ADR-016), or no usable reply at all:
+            // honestly unknown either way, and nothing is sent.
+            Ok(Resolved::NotYetVisible) | Err(Unknown { .. }) => Ok(Attended::StillUnknown {
                 attempts_started: claimed.attempts_started + 1,
             }),
-            Err(Unknown { .. }) => Ok(Attended::StillUnknown {
-                attempts_started: claimed.attempts_started + 1,
-            }),
-        }
-    }
-
-    /// What a send amounted to, from the reconciler's doorway.
-    fn turn_to_attended(&self, sent: Option<Turn>, attempts_started: u32) -> Attended {
-        match sent {
-            // The token lost the row: someone else owns this turn now.
-            None => Attended::NotDue,
-            Some(BoundaryOutcome::Committed(_) | BoundaryOutcome::Converged) => Attended::Settled,
-            Some(_) => Attended::StillUnknown { attempts_started },
         }
     }
 

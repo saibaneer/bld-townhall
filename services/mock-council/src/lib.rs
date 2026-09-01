@@ -227,7 +227,11 @@ impl Council {
         #[cfg(feature = "test-faults")]
         let router = router
             .route("/test/faults", post(arm_fault))
-            .route("/test/faults/{fault_id}", get(fault_status));
+            .route("/test/faults/{fault_id}", get(fault_status))
+            .route(
+                "/test/requests/{route}/{effect_intent_id}",
+                get(request_count),
+            );
 
         router.with_state(state)
     }
@@ -249,6 +253,26 @@ async fn arm_fault(
 ) -> Json<serde_json::Value> {
     let id = state.faults.arm(request);
     Json(serde_json::json!({ "fault_id": id }))
+}
+
+#[cfg(feature = "test-faults")]
+async fn request_count(
+    State(state): State<AppState>,
+    Path((route, effect_intent_id)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let route = match route.as_str() {
+        "create" => faults::Route::Create,
+        "cancel" => faults::Route::Cancel,
+        "resolve" => faults::Route::Resolve,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no such route" })),
+            );
+        }
+    };
+    let count = state.faults.requests(route, &effect_intent_id);
+    (StatusCode::OK, Json(serde_json::json!({ "count": count })))
 }
 
 #[cfg(feature = "test-faults")]
@@ -450,6 +474,19 @@ async fn effect_reply(
     use axum::response::IntoResponse as _;
     let _ = route; // read only by fault-injection builds
 
+    // The arrival is counted FIRST — before pauses and before faults — because
+    // arrival is what the counter witnesses (test 13: two server-side
+    // arrivals, the council's own number).
+    #[cfg(feature = "test-faults")]
+    {
+        let wire_route = match route {
+            EffectRoute::Create => faults::Route::Create,
+            EffectRoute::Cancel => faults::Route::Cancel,
+            EffectRoute::Resolve => faults::Route::Resolve,
+        };
+        state.faults.note_request(wire_route, &effect_intent_id);
+    }
+
     // Reached on EVERY effect path — replays and NotYetVisible included, which
     // never touch a settlement commit and would otherwise be unpositionable by
     // a harness.
@@ -534,6 +571,24 @@ async fn misbehave(
             let (status, Json(mut body)) = honest_reply(state, effect_intent_id, outcome);
             body.signature = None;
             (status, Json(body)).into_response()
+        }
+        // A correctly SIGNED `NotYetVisible` naming a DIFFERENT identity:
+        // genuinely council-originated bytes, so only the resend rule's
+        // identity binding can refuse it (ADR-020) — a signed not-yet for
+        // identity A must never authorize resending identity B.
+        faults::Fault::WrongIdNotYet => {
+            let other = format!("{effect_intent_id}-SOMEBODY-ELSE");
+            let signature = state
+                .registry
+                .signer()
+                .sign_effect(&other, &EffectOutcome::NotYetVisible)
+                .ok();
+            let response = SignedEffectResponse {
+                effect_intent_id: other,
+                outcome: EffectOutcome::NotYetVisible,
+                signature,
+            };
+            (StatusCode::OK, Json(EffectResponseBody::from(response))).into_response()
         }
         // A signed answer of the wrong KIND: genuinely council-originated, so it
         // passes the verifier correctly — and must then be refused by the

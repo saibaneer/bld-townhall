@@ -35,7 +35,7 @@ use std::{
 };
 
 /// Which request path a fault is armed against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Route {
     Create,
@@ -65,6 +65,11 @@ pub enum Fault {
     /// protocol because the real council refuses kind mismatches before
     /// answering.
     WrongKind,
+    /// Answer a resolve with a correctly signed `NotYetVisible` naming a
+    /// DIFFERENT effect identity. Unreachable over the honest protocol; exists
+    /// to prove the resend rule's identity binding (ADR-020) — the signature
+    /// alone must never be enough.
+    WrongIdNotYet,
 }
 
 #[derive(Debug)]
@@ -81,6 +86,11 @@ struct Armed {
 pub struct FaultBank {
     next_id: AtomicU64,
     armed: Mutex<HashMap<u64, Armed>>,
+    /// Server-side arrivals per (route, effect id) — the witness test 13
+    /// needs: "the second call crossed the wire" as the council's own number,
+    /// never an inference from one durable row (a locally caching adapter
+    /// would pass that inference).
+    requests: Mutex<HashMap<(Route, String), u64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +151,28 @@ impl FaultBank {
         matched.remaining -= 1;
         matched.consumed += 1;
         Some(matched.fault.clone())
+    }
+
+    /// Count one server-side arrival.
+    pub fn note_request(&self, route: Route, effect_intent_id: &str) {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *requests
+            .entry((route, effect_intent_id.to_owned()))
+            .or_insert(0) += 1;
+    }
+
+    /// How many requests for this (route, identity) actually arrived.
+    #[must_use]
+    pub fn requests(&self, route: Route, effect_intent_id: &str) -> u64 {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(route, effect_intent_id.to_owned()))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Armed>> {

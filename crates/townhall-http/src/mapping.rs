@@ -120,6 +120,18 @@ pub fn api_error(error: &ApiError) -> Response {
             })),
         )
             .into_response(),
+        // The same 409 number, deliberately without the state.
+        //
+        // The owner's duplicate ships a version and an `ETag` so a retry can
+        // carry a precondition. A stranger's ships neither: they learn the
+        // identifier is taken and nothing else — not the version, not the state,
+        // not who holds it. The one remaining bit (taken or free) is unavoidable
+        // under a caller-chosen primary key, and a 404 here would leak the same
+        // bit while misdescribing a POST to a collection that does exist
+        // (ADR-022's accepted residual).
+        ApiError::IdentifierUnavailable => {
+            plain_error(StatusCode::CONFLICT, "that identifier is unavailable")
+        }
         ApiError::PreconditionFailed { current } => (
             StatusCode::PRECONDITION_FAILED,
             [etag_header(*current)],
@@ -146,7 +158,18 @@ pub fn api_error(error: &ApiError) -> Response {
 /// A projection, as a response: the `ETag` is the version, quoted.
 #[must_use]
 pub fn projection_response(status: StatusCode, projection: &Projection) -> Response {
-    let body = serde_json::json!({
+    let body = projection_body(projection);
+    (status, [etag_header(projection.version)], axum::Json(body)).into_response()
+}
+
+/// One booking's JSON, without status or headers.
+///
+/// Shared by the single read and the collection listing so the two cannot
+/// describe the same resource differently — a client that learned a shape from
+/// a list should be able to re-read one member and recognise it.
+#[must_use]
+pub fn projection_body(projection: &Projection) -> serde_json::Value {
+    serde_json::json!({
         "id": projection.id.to_string(),
         "version": projection.version,
         "state": projection.state,
@@ -167,8 +190,7 @@ pub fn projection_response(status: StatusCode, projection: &Projection) -> Respo
         }),
         "booking_ref": projection.booking_ref.as_ref().map(ToString::to_string),
         "available_behaviours": projection.available_behaviours,
-    });
-    (status, [etag_header(projection.version)], axum::Json(body)).into_response()
+    })
 }
 
 #[must_use]

@@ -110,8 +110,9 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
     Some(key)
 }
 
-/// The M5 stand-in resolver (ADR-021): a FIXED two-token allowlist — nothing
-/// pattern-derived, so "unknown bearer" is a real 401. Compiled only with the
+/// The M5 stand-in resolver (ADR-021, amended by ADR-022): a FIXED three-token
+/// allowlist — nothing pattern-derived, so "unknown bearer" is a real 401.
+/// Compiled only with the
 /// `dev-authority` feature AND armed only by the `--dev-authority` flag;
 /// without both, the server refuses to start, because no other resolver
 /// exists until M7 replaces this one here in the composition root.
@@ -137,6 +138,30 @@ impl AuthorityResolver for DevAuthority {
                 may_book: false,
                 may_cancel: false,
             }),
+            // Restricted in EXACTLY ONE way, and that is the point.
+            //
+            // Marco is restricted twice over — a £10 ceiling and no booking
+            // capability — so "Marco is refused" never said which guard refused
+            // him. Worse, once bookings have owners he cannot reach
+            // `AwaitingBooking` on his own booking at all: every seeded slot
+            // costs £45, so `verify-slot` stops him at the fee ceiling long
+            // before `book` could test his capability.
+            //
+            // Priya carries Lucy's ceiling and lacks only `may_book`, so a
+            // refusal on her own booking can only be
+            // `BookingAuthorityRequired`. Without her, the capability guard has
+            // no test that isolates it — and today's assertion only lands on
+            // the right error because `resolve_book` happens to check
+            // `may_book` before it binds the facts. Reorder those two lines and
+            // a Marco-based test would keep passing while asserting a different
+            // guard entirely.
+            "dev-priya-nobook" => Some(townhall_domain::VerifiedAuthority {
+                principal: PrincipalId::new("priya"),
+                actor: ActorId::new("dev-terminal"),
+                max_fee: Money::from_pence(5_000),
+                may_book: false,
+                may_cancel: true,
+            }),
             _ => None,
         }
     }
@@ -149,7 +174,8 @@ fn resolver(args: &Args) -> Result<Arc<dyn AuthorityResolver>, String> {
             eprintln!(
                 "==============================================================\n\
                  townhall-server: DEV AUTHORITY IS ACTIVE (ADR-021).\n\
-                 Two fixed tokens exist: dev-lucy, dev-marco-restricted.\n\
+                 Three fixed tokens exist: dev-lucy, dev-marco-restricted,\n\
+                 dev-priya-nobook.\n\
                  This resolver is a stand-in until M7 and must never ship.\n\
                  =============================================================="
             );

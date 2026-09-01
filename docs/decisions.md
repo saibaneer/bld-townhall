@@ -1345,3 +1345,182 @@ two-crate split adds a crate whose whole job is wiring. 412-on-replay is stricte
 202 for a client retrying its own request with a stale tag — the client re-reads and
 sees the in-flight truth, which is the point of preconditions. The reconcile exemption
 is a documented hole in a blanket rule, chosen over a meaningless precondition.
+
+## ADR-022 — Bookings acquire an owner, and the wire acquires a lookup
+
+Decided 2026-09-01 with the project owner, during M6 planning (eight review rounds:
+revise ×7, then build as planned). Not a spec milestone — M5.1, split out of M6 on the
+owner's word after both plan reviewers independently found the second half of it.
+
+### What planning M6 found
+
+Bookings had no owner. `create_booking` resolved a `VerifiedAuthority` purely as a
+turnstile and discarded it; `NewBooking` had nowhere to put one; `may_cancel` was a
+*capability flag*, never a comparison against a resource. The principal was recorded
+into cancellation plans and never read back for admission, because there was nothing to
+compare it to.
+
+So **any principal holding `may_cancel` could cancel any booking whose id they could
+name.** That was tolerable while one person drove the system with curl, and stops being
+tolerable the moment M6 opens a channel anyone can text.
+
+Second finding, reached independently by both reviewers: spec §14.1 requires
+cancellation to follow an *"authoritative resource lookup"* and §15.2 cancels by
+**council** reference (`CANCEL TH-92718`), but the router indexed only by internal
+`BookingId`. Conversation memory cannot substitute — §3.1 makes it a routing aid, and
+M6's session state is deliberately non-durable, so after a restart there would be no
+candidates at all.
+
+### Ownership is admission; ADR-020 is attribution
+
+The first draft of this proposed a single `principal_id`, checked as "only the owner may
+act". That contradicts ADR-020, which says outright that *"booker and canceller need not
+be the same person"* — and would have hollowed
+`a_refusal_on_a_cancellation_intent_is_attributed_to_the_canceller`, the test PR #16's
+HIGH finding demanded, which deliberately has Marco cancel Lucy's booking.
+
+The two answer different questions:
+
+| Question | Answer | Where |
+|---|---|---|
+| Who is *recorded* as having asked? | never assume the booker; read the authority | domain / persisted plan. **ADR-020, unchanged** |
+| Who may *see* it? | its owner | facade |
+| Who may *ask* for a transition? | its owner, or a delegate | facade |
+
+A delegate cancelling on Lucy's behalf is precisely the canceller-who-is-not-the-booker
+ADR-020 requires recorded correctly, so ownership supplies its real use case rather than
+removing it. M5.1's rule is the degenerate case — `requesting == owner` — because with no
+delegation type there is no other honest route.
+
+**Enforcement is the facade.** Not the handlers (bypassable by the next in-process
+caller — M6's orchestrator is exactly that) and not the store (too late to distinguish
+invisible from absent). The coordinator and domain are untouched, which is what keeps
+ADR-020's test green *and meaningful*.
+
+### Nullable ownership, and why two earlier arguments were wrong
+
+`ALTER TABLE bookings ADD COLUMN owner_principal TEXT` — nullable, and that is the
+security property.
+
+Two drafts used `NOT NULL DEFAULT '@orphan'`. The first claimed `PrincipalId::new`
+rejects a leading `@`; it does not — the type is a macro-generated newtype that validates
+nothing, and `#[serde(transparent)]` bypasses every constructor anyway. The second argued
+unreachability from the server's fixed token allowlist: true today, and the wrong kind of
+true, because it depends on a configuration list that widening would silently un-conceal.
+
+`NULL` needs no argument. `owner_principal = ?` never matches it whatever the parameter,
+and no `PrincipalId` can serialise to it. The guarantee does not generalise, so the query
+form is a rule: **every externally visible query selects from `bookings` under a positive
+base-row predicate**, never a negation, never a subquery, never a join whose ownership
+condition sits in `ON`. (`NULL NOT IN (…)` is unknown; `NOT EXISTS (… WHERE
+owner_principal = ?)` is *true* for an orphan and would include it.)
+
+Legacy rows keep `NULL`: unreachable through `load_visible` for every principal, still
+readable through the unscoped `load` that recovery needs, since a reconcile pass has no
+principal and must still finish an in-flight effect.
+
+### Scoped load rather than comparison
+
+`load_visible(owner, id)` puts the ownership predicate beside the id in one `WHERE`.
+There is deliberately no `if aggregate.owner == access.principal` anywhere on a visible
+path: a foreign row does not come back, and `NotFound` was already the 404 path. The bug
+where someone forgets *the comparison* therefore cannot exist, because there is no
+comparison — and that failure would have been silent, since a missing check looks exactly
+like a passing one.
+
+**What this does claim, exactly.** The facade has *no* unscoped read left — scoping every
+visible path turned its private unscoped helper into dead code, and the compiler said so,
+so it is gone. The repository still exposes an unscoped `load`, deliberately, because
+recovery needs it: a timer-driven reconcile pass has no principal to scope by, and a
+migrated NULL-owned row must still be attendable.
+
+So the remaining mistake is "reach past the facade to the repository", which is visible at
+the call site and blocked by the crate graph for the wire, rather than "forget a comparison
+several lines below the load", which is invisible. A smaller target, not an empty one.
+
+### 404, not 403 — and where the concealment stops
+
+Visibility failures answer **404**; 403 confirms the resource exists, which is the oracle
+someone guessing council references wants. `ensure_visible` runs in the handler **before**
+both header gates, because 400-on-malformed-`If-Match` and 428-on-missing are statements
+about a resource too. Reconcile keeps ADR-021's precondition exemption and loses its
+visibility exemption — a precondition exemption is not a licence to be an authenticated
+existence oracle.
+
+**Accepted residual:** a duplicate `create` on a foreign id still reveals that the id is
+taken (409 `identifier unavailable`, no version, no `ETag`, no owner). Under a
+caller-chosen globally unique primary key that bit is unavoidable, and 404 would leak the
+same bit while misdescribing a `POST` to a collection that does exist. Removing the oracle
+needs a different identity allocation (server-generated ids, or owner-scoped uniqueness),
+not a different status code. A reviewer proposed the 404 and, on re-review, upheld the 409.
+
+### The lookup surface (a spec §10 amendment)
+
+`GET /booking-intents?booking_ref=…` and `?cancellable=true`, both principal-scoped in
+SQL. Neither filter, both, or `cancellable=false` is **400** — an unfiltered listing is not
+a surface this milestone offers, and `LookupQuery` is a closed enum so it is not
+representable rather than merely rejected. A foreign reference returns an **empty list**,
+not 403. Rows order by `created_at_ms`, then `id`. No collection `ETag`: a list has no one
+version, and shipping one invites its use as a precondition.
+
+`cancellable` means *"currently offers `Cancel`"*, from the domain's own `proposal_menu()`
+— not "not yet cancelled", which is a different and wronger question, since a booking
+mid-cancellation is not yet cancelled and must not be offered again. The filter runs after
+decode: filtering in SQL would hardcode state names in the store, drifting the moment the
+menu changed. Cost accepted: a principal's bookings are all decoded per lookup.
+
+### A third dev token (amending ADR-021's two-token allowlist)
+
+`dev-priya-nobook` — Lucy's £50 ceiling, `may_book: false`, `may_cancel: true`.
+
+Needed because ownership broke the existing 403 test, and the obvious repair does not
+work: Marco's £10 ceiling means `verify-slot` refuses *his own* booking with
+`FeeExceededAuthority` before `book` could ever ask about his capability, since every
+seeded slot costs £45. Priya is restricted in exactly one way, so a refusal on her booking
+can only be `BookingAuthorityRequired`.
+
+This makes the suite stronger than it was. Marco is restricted twice over, so the old
+assertion only landed on the right error because `resolve_book` happens to check
+`may_book` before it binds the facts — reorder those two lines and the test kept passing
+while asserting a different guard. The fee-ceiling assertion is kept as its own test, so
+splitting the principals lost no coverage.
+
+Priya is also the foreign caller in every visibility test, deliberately: Marco cannot
+cancel anything at all, so an implementation that mapped "lacks the capability" to 404 —
+checking ownership nowhere — would have satisfied a Marco-based suite.
+
+### Two things the build found that the plan had not
+
+**The facade layer was untested.** Deleting the facade's own ownership check left the
+entire wire suite green, because every witness reached it through the handler's preflight.
+`the_facade_conceals_a_foreign_booking_without_help_from_a_handler` drives `BookingApi`
+directly with no HTTP — the position M6's orchestrator will occupy — and does catch it.
+
+**A witness was vacuous.** A foreign-cancel assertion named `cancelled_at_ms`, a column
+that does not exist (it is `cancelled_by`), and passed anyway because the test harness's
+SQLite shim ended `.unwrap_or(0)`, turning any malformed query into `0 == 0`. The shim now
+panics on a failed query. A witness that cannot fail is worse than none, because it
+occupies the space where a real one would go.
+
+### Costs accepted
+
+Every externally visible facade method grows an authority parameter — 23 `NewBooking`
+initializers and both `BookingRepository` implementations changed. `audit_events` still
+reads by id alone after admission, which is safe because ownership is immutable **through
+the repository's commit API** — the aggregate `UPDATE` never names `owner_principal`, so no
+committed transition can change hands.
+
+That is an application-level guarantee, not a database constraint, and the distinction is
+worth recording rather than blurring: the pool is public, so anything holding it could
+rewrite the column directly, and a caller doing so between `audit`'s admission check and
+its unscoped `audit_events` query would deliver the trail to a principal who no longer owns
+the row. Nothing in this workspace does that, and the tests that orphan rows on purpose
+rely on being able to. Enforcing it at the database boundary — a trigger refusing any
+change to a non-NULL `owner_principal` — is the fix if ownership ever becomes transferable
+by anything other than a migration. The
+duplicate-create bit above. And M7 inherits a named debt: ADR-020's attribution now has no
+public path exercising it, so M7 owes a **facade-level** delegated-cancellation test in
+which Lucy owns the booking, Marco requests it under a verified delegation naming that
+booking, his agent is the actor, and the persisted plan records **Marco** — plus the
+delegation type itself (grantor, beneficiary, actor, audience, exact resource, permitted
+behaviours, constraints, expiry, revocation).

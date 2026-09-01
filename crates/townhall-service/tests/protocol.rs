@@ -173,6 +173,7 @@ async fn awaiting(h: &Harness, id: &BookingId, requirements: BookingRequirements
         .create(NewBooking {
             id: id.clone(),
             requirements,
+            owner: authority().principal,
         })
         .await
         .expect("create");
@@ -485,6 +486,7 @@ async fn the_intent_is_durable_before_the_council_is_asked() {
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
+        owner: authority().principal,
     })
     .await
     .expect("create");
@@ -905,6 +907,7 @@ async fn undefined_and_denied_reach_the_caller_as_different_answers() {
         .create(NewBooking {
             id: absent.clone(),
             requirements: requirements(),
+            owner: authority().principal,
         })
         .await
         .expect("create");
@@ -928,6 +931,7 @@ async fn undefined_and_denied_reach_the_caller_as_different_answers() {
                 attendees: 999,
                 ..requirements()
             },
+            owner: authority().principal,
         })
         .await
         .expect("create");
@@ -1297,6 +1301,7 @@ async fn asking_for_a_nonexistent_behaviour_is_counted_not_rowed() {
         .create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: authority().principal,
         })
         .await
         .expect("create");
@@ -1561,6 +1566,7 @@ async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
+        owner: authority().principal,
     })
     .await
     .expect("create");
@@ -2220,6 +2226,37 @@ impl BookingRepository for RacingRepo {
         }
         self.inner.load(id).await
     }
+    async fn load_visible(
+        &self,
+        owner: &bld_types::PrincipalId,
+        id: &BookingId,
+    ) -> Result<townhall_domain::BookingAggregate, StoreError> {
+        // The injected failure applies here too: a visibility preflight is a
+        // load, and a test that made it the one infallible path would be
+        // rehearsing a system that does not exist.
+        if self
+            .fail_next_load
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::CorruptRow(
+                "injected mid-turn failure".to_owned(),
+            ));
+        }
+        self.inner.load_visible(owner, id).await
+    }
+    async fn lookup_by_ref(
+        &self,
+        owner: &bld_types::PrincipalId,
+        booking_ref: &bld_types::CouncilBookingRef,
+    ) -> Result<Vec<townhall_domain::BookingAggregate>, StoreError> {
+        self.inner.lookup_by_ref(owner, booking_ref).await
+    }
+    async fn lookup_cancellable(
+        &self,
+        owner: &bld_types::PrincipalId,
+    ) -> Result<Vec<townhall_domain::BookingAggregate>, StoreError> {
+        self.inner.lookup_cancellable(owner).await
+    }
     async fn commit(
         &self,
         id: &BookingId,
@@ -2761,13 +2798,13 @@ async fn the_facade_carries_the_whole_surface() {
 
     let id = BookingId::new("BKG-FACADE");
     let created = api
-        .create(id.clone(), requirements())
+        .create(id.clone(), requirements(), &authority())
         .await
         .expect("created");
     assert_eq!(created.version, 0);
     assert_eq!(created.available_behaviours, &["SelectVenue", "Cancel"]);
 
-    let duplicate = api.create(id.clone(), requirements()).await;
+    let duplicate = api.create(id.clone(), requirements(), &authority()).await;
     let Err(townhall_service::ApiError::AlreadyExists { current }) = duplicate else {
         panic!("a duplicate create carries the existing version: {duplicate:?}");
     };
@@ -2782,7 +2819,7 @@ async fn the_facade_carries_the_whole_surface() {
             .expect("committed");
         version = mutated.current_version;
     }
-    let projection = api.read(&id).await.expect("read");
+    let projection = api.read(&id, &authority()).await.expect("read");
     assert_eq!(projection.state, "AwaitingBooking");
     assert_eq!(
         projection.available_behaviours,
@@ -2806,19 +2843,25 @@ async fn the_facade_carries_the_whole_surface() {
 
     // The reconcile trigger drives the chase to done — attend, never propose.
     h.clock.advance(10_000);
-    let outcomes = api.attend_booking(&id).await.expect("attend");
+    let outcomes = api.attend_booking(&id, &authority()).await.expect("attend");
     assert_eq!(outcomes, vec![Attended::Settled]);
-    assert_eq!(api.read(&id).await.expect("read").state, "Booked");
+    assert_eq!(
+        api.read(&id, &authority()).await.expect("read").state,
+        "Booked"
+    );
     assert!(
-        api.attend_booking(&id).await.expect("attend").is_empty(),
+        api.attend_booking(&id, &authority())
+            .await
+            .expect("attend")
+            .is_empty(),
         "nothing in flight, nothing to attend"
     );
 
-    let audit = api.audit(&id).await.expect("audit");
+    let audit = api.audit(&id, &authority()).await.expect("audit");
     let last = audit.last().expect("rows");
     assert_eq!(last.driver_kind, "Fact");
     assert_eq!(last.driver_detail, "BookingExists");
-    let missing = api.audit(&BookingId::new("BKG-NOBODY")).await;
+    let missing = api.audit(&BookingId::new("BKG-NOBODY"), &authority()).await;
     assert!(matches!(
         missing,
         Err(townhall_service::ApiError::UnknownBooking)
@@ -2859,6 +2902,7 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
         .create(NewBooking {
             id: other.clone(),
             requirements: requirements(),
+            owner: authority().principal,
         })
         .await
         .expect("create");
@@ -3077,5 +3121,257 @@ async fn an_erroring_attend_backs_off_instead_of_monopolizing_the_queue() {
         attended,
         Attended::Settled,
         "the healthy retry proceeds normally — query, honest not-yet, resend"
+    );
+}
+
+/// The FACADE is the boundary — not the handlers.
+///
+/// # Why this test is load-bearing
+///
+/// Every other visibility witness in this milestone arrives over HTTP, where the
+/// handler runs a visibility preflight before it parses anything. That makes all
+/// of them satisfiable by an implementation that checks ownership *only in the
+/// handlers* — and this was not a hypothetical: deleting the facade's own check
+/// while keeping the handler's left the entire wire suite green.
+///
+/// So this drives `BookingApi` directly, with no HTTP anywhere, which is the
+/// position any future in-process caller occupies: the SMS orchestrator M6 adds,
+/// a background job, a test harness. If the facade only conceals things when
+/// something above it remembered to ask, it does not conceal anything.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
+    let h = harness().await;
+    let coordinator = Arc::new(Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    ));
+    let reconciliation = Arc::new(Reconciliation::new(
+        Arc::clone(&coordinator),
+        Arc::clone(&h.council),
+    ));
+    let api = townhall_service::BookingApi::new(
+        coordinator,
+        reconciliation,
+        Arc::new(townhall_service::fake::FixedCatalogue::of(Vec::new())),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    // Priya can cancel — `may_cancel: true` — so nothing she is refused below
+    // can be blamed on a missing capability. Only ownership is left.
+    let mut priya = authority();
+    priya.principal = PrincipalId::new("priya");
+    assert!(priya.may_cancel, "the refusals must isolate visibility");
+
+    let id = BookingId::new("BKG-FACADE-VIS");
+    let created = api
+        .create(id.clone(), requirements(), &authority())
+        .await
+        .expect("Lucy creates it");
+    assert_eq!(created.version, 0);
+
+    // Drive it to an IN-FLIGHT effect before any of the foreign probes below.
+    //
+    // This is not scene-setting. The first version of this test left the
+    // booking in `Draft`, where there is no active effect at all — so the
+    // council-call-count witness on the foreign reconcile could not move no
+    // matter what the implementation did, and a facade that attended first and
+    // checked ownership afterwards would have passed it. A `Draft` has nothing
+    // to chase; only an in-flight booking tells the two orderings apart.
+    let mut version = created.version;
+    for proposal in [select(), BookingProposal::VerifySlot] {
+        version = api
+            .propose_at(&id, version, proposal, &authority())
+            .await
+            .expect("committed")
+            .current_version;
+    }
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    let booked = api
+        .propose_at(&id, version, BookingProposal::Book, &authority())
+        .await
+        .expect("the turn runs");
+    assert!(
+        matches!(booked.outcome, BoundaryOutcome::Unresolved),
+        "the fixture needs a live chase to witness, got {:?}",
+        booked.outcome
+    );
+    let in_flight_version = booked.current_version;
+    assert!(
+        h.repo
+            .load(&id)
+            .await
+            .expect("load")
+            .active_effect
+            .is_some(),
+        "there must be an effect a wrong implementation could reach for"
+    );
+    // Past the cadence, so the effect really is DUE — otherwise `attend` would
+    // decline for a reason that has nothing to do with ownership.
+    h.clock.advance(10_000);
+
+    // Read.
+    assert!(
+        matches!(
+            api.read(&id, &priya).await,
+            Err(townhall_service::ApiError::UnknownBooking)
+        ),
+        "a foreign read reached the projection"
+    );
+    // Audit.
+    assert!(
+        matches!(
+            api.audit(&id, &priya).await,
+            Err(townhall_service::ApiError::UnknownBooking)
+        ),
+        "a foreign audit reached the trail"
+    );
+    // Visibility preflight, asked directly.
+    assert!(
+        matches!(
+            api.ensure_visible(&id, &priya).await,
+            Err(townhall_service::ApiError::UnknownBooking)
+        ),
+        "ensure_visible admitted a stranger"
+    );
+    // Reconcile trigger — refused, AND the chase never ran.
+    //
+    // The status alone cannot prove the second half: a facade that attended
+    // first and refused afterwards returns the very same error, having already
+    // resolved the effect. The witness is the booking's own state — a chase
+    // that ran would have SETTLED this effect and moved the booking on, so
+    // finding it still in flight afterwards is what proves nothing happened.
+    //
+    // (An earlier version counted council calls on a `Draft` booking, which has
+    // no effect at all: the count could not move whatever the implementation
+    // did. That witness was incapable of failing.)
+    assert!(
+        matches!(
+            api.attend_booking(&id, &priya).await,
+            Err(townhall_service::ApiError::UnknownBooking)
+        ),
+        "a foreign reconcile reached the chase"
+    );
+    let after_foreign = h.repo.load(&id).await.expect("load");
+    assert!(
+        after_foreign.active_effect.is_some(),
+        "a refused reconcile resolved the effect anyway: state is {}",
+        after_foreign.state.name()
+    );
+    assert_eq!(
+        after_foreign.version, in_flight_version,
+        "a refused reconcile advanced the booking"
+    );
+
+    // Mutation, at the correct version — so a refusal cannot be a precondition
+    // failure wearing ownership's clothes.
+    let refused = api
+        .propose_at(
+            &id,
+            in_flight_version,
+            BookingProposal::Cancel {
+                reason: "not mine".to_owned(),
+            },
+            &priya,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(townhall_service::ApiError::UnknownBooking)),
+        "a foreign mutation reached the coordinator: {refused:?}"
+    );
+
+    // Nothing moved: same version, same trail length as before the probes.
+    let trail_before_owner = h.repo.audit_events(&id).await.expect("audit").len();
+    let mine = api
+        .read(&id, &authority())
+        .await
+        .expect("the owner reads it");
+    assert_eq!(
+        mine.version, in_flight_version,
+        "a refused turn must not advance a version"
+    );
+
+    // And the same operations succeed for the owner, so none of the above
+    // passed by refusing everyone. The owner's attend DOES reach the council,
+    // which is what makes the foreign call-count assertion meaningful: the
+    // chase was reachable from here, and only ownership stopped it.
+    assert!(api.ensure_visible(&id, &authority()).await.is_ok());
+    assert!(api.audit(&id, &authority()).await.is_ok());
+    let outcomes = api
+        .attend_booking(&id, &authority())
+        .await
+        .expect("the owner may attend");
+    assert_eq!(
+        outcomes,
+        vec![Attended::Settled],
+        "the owner's reconcile must actually run the chase — otherwise the \
+         foreign case above proves nothing, since an unreachable chase cannot \
+         run for anybody"
+    );
+    let settled = h.repo.load(&id).await.expect("load");
+    assert!(
+        settled.active_effect.is_none(),
+        "the owner's chase left the effect in flight"
+    );
+    assert!(
+        h.repo.audit_events(&id).await.expect("audit").len() > trail_before_owner,
+        "settling the chase advances the trail; the stranger's attempt did not"
+    );
+}
+
+/// The lookup surface is principal-scoped, and `cancellable` follows the menu.
+#[tokio::test]
+async fn lookups_are_scoped_to_the_asking_principal() {
+    let h = harness().await;
+    let coordinator = Arc::new(Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    ));
+    let reconciliation = Arc::new(Reconciliation::new(
+        Arc::clone(&coordinator),
+        Arc::clone(&h.council),
+    ));
+    let api = townhall_service::BookingApi::new(
+        coordinator,
+        reconciliation,
+        Arc::new(townhall_service::fake::FixedCatalogue::of(Vec::new())),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    let mut priya = authority();
+    priya.principal = PrincipalId::new("priya");
+
+    let hers = BookingId::new("BKG-LOOKUP-LUCY");
+    let his = BookingId::new("BKG-LOOKUP-PRIYA");
+    api.create(hers.clone(), requirements(), &authority())
+        .await
+        .expect("Lucy's");
+    api.create(his.clone(), requirements(), &priya)
+        .await
+        .expect("Priya's");
+
+    // Each principal sees exactly their own — a Draft offers Cancel, so both
+    // qualify, and only scoping separates them.
+    let lucys = api
+        .lookup(&townhall_service::LookupQuery::Cancellable, &authority())
+        .await
+        .expect("lookup");
+    let priyas = api
+        .lookup(&townhall_service::LookupQuery::Cancellable, &priya)
+        .await
+        .expect("lookup");
+    assert_eq!(
+        lucys.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["BKG-LOOKUP-LUCY"],
+        "Lucy's listing leaked or lost a row"
+    );
+    assert_eq!(
+        priyas.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["BKG-LOOKUP-PRIYA"],
+        "Priya's listing leaked or lost a row"
     );
 }

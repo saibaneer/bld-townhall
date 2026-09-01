@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use bld_types::{
-    BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId, Provenance,
-    TransitionDriver,
+    BookingId, BookingRequirements, BoundedString, CouncilBookingRef, EffectIntentId, PrincipalId,
+    Provenance, TransitionDriver,
 };
 use sqlx::{
     Row, SqlitePool,
@@ -33,10 +33,42 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// is better than an enum pretending otherwise.
 const COMMITTED_OUTCOME: &str = "Committed";
 
+/// The menu entry `lookup_cancellable` filters on.
+///
+/// `proposal_menu()` exports names, not proposals, so matching one means naming
+/// it as a string here. That is a drift risk — rename the variant and this
+/// silently matches nothing, and every booking becomes uncancellable through the
+/// lookup while every test that only checks *exclusion* still passes. Pinned by
+/// `the_cancel_menu_name_matches_the_proposal` so the rename fails loudly
+/// instead.
+const CANCEL_PROPOSAL: &str = "Cancel";
+
+/// The owner every store test's fixture booking belongs to.
+///
+/// Named rather than inlined so a test that cares about ownership has an obvious
+/// second principal to contrast with, and so the fixtures cannot drift apart.
+#[cfg(test)]
+fn test_owner() -> PrincipalId {
+    PrincipalId::new("lucy")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewBooking {
     pub id: BookingId,
     pub requirements: BookingRequirements,
+    /// Who the booking belongs to, for visibility.
+    ///
+    /// Required, not optional, and that is the point: the only way to reach a
+    /// NULL `owner_principal` is the migration's backfill of rows that predate
+    /// ownership. New rows cannot be written without an owner because this
+    /// struct cannot be built without one, so "someone forgot to set it" is not
+    /// a reachable state rather than a bug waiting to be found.
+    ///
+    /// This is the OWNER, which is a different question from the principal an
+    /// action is attributed to (ADR-020: booker and canceller need not be the
+    /// same person). Nothing here narrows that; attribution still comes from the
+    /// authority presented at the proposal.
+    pub owner: PrincipalId,
 }
 
 /// One committed transition's audit record.
@@ -222,7 +254,66 @@ pub enum StoreError {
 pub trait BookingRepository: Send + Sync {
     async fn create(&self, booking: NewBooking) -> Result<BookingAggregate, StoreError>;
 
+    /// Load without regard to ownership.
+    ///
+    /// For INTERNAL callers only — the reconciler, which runs on a timer and has
+    /// no principal to scope by, and the coordinator's own workflow loads, which
+    /// happen after admission has already been decided one layer up. Anything
+    /// answering an external request wants [`Self::load_visible`].
     async fn load(&self, id: &BookingId) -> Result<BookingAggregate, StoreError>;
+
+    /// Load only if `owner` owns it; otherwise indistinguishable from absent.
+    ///
+    /// # Why a scoped load rather than a comparison
+    ///
+    /// The obvious alternative is to `load` and then compare owners at the
+    /// facade. That works, and it puts a security decision somewhere a future
+    /// edit can forget it, invert it, or short-circuit past it — and the failure
+    /// is silent, because a missing check looks exactly like a passing one.
+    ///
+    /// Here there is no comparison to omit. A row belonging to someone else does
+    /// not come back at all, and [`StoreError::NotFound`] already maps to 404 —
+    /// so concealment is the default behaviour of the query rather than a step
+    /// layered on top of it. Removing the capability beats guarding it.
+    ///
+    /// The predicate is deliberately positive (`owner_principal = ?`): NULL
+    /// legacy rows never match it, for any principal, without needing a
+    /// negation that SQL's three-valued logic would quietly get wrong.
+    async fn load_visible(
+        &self,
+        owner: &PrincipalId,
+        id: &BookingId,
+    ) -> Result<BookingAggregate, StoreError>;
+
+    /// The owner's bookings carrying this council reference.
+    ///
+    /// Spec §14.1 requires a cancellation to follow an *authoritative resource
+    /// lookup*, and the council reference is what a person actually has: it is
+    /// the value the confirmation SMS quotes. Conversation memory cannot stand
+    /// in for this — it is a routing aid, and it does not survive a restart.
+    async fn lookup_by_ref(
+        &self,
+        owner: &PrincipalId,
+        booking_ref: &CouncilBookingRef,
+    ) -> Result<Vec<BookingAggregate>, StoreError>;
+
+    /// The owner's bookings that currently offer `Cancel`.
+    ///
+    /// "Currently offers Cancel" is the authoritative predicate for cancellation
+    /// routing — not "is not yet cancelled", which is a different and wronger
+    /// question (a booking mid-cancellation is not yet cancelled and must not be
+    /// offered again).
+    ///
+    /// Filtering happens after decode, against the domain's own
+    /// `proposal_menu()`. Doing it in SQL would mean hardcoding a list of state
+    /// names in the store, which drifts silently the moment the menu changes —
+    /// the duplication ADR-018's discipline exists to prevent. The cost is that
+    /// every one of a principal's bookings is decoded per lookup, which is
+    /// acceptable at the scale a person's own bookings reach.
+    async fn lookup_cancellable(
+        &self,
+        owner: &PrincipalId,
+    ) -> Result<Vec<BookingAggregate>, StoreError>;
 
     async fn commit(
         &self,
@@ -593,8 +684,8 @@ impl BookingRepository for SqliteBookingRepository {
             INSERT OR IGNORE INTO bookings (
                 id, version, state_name, state_json, requirements_json,
                 selected_venue_json, availability_json, booking_ref, active_effect,
-                created_at_ms, updated_at_ms
-            ) VALUES (?, 0, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                created_at_ms, updated_at_ms, owner_principal
+            ) VALUES (?, 0, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)
             ",
         )
         .bind(booking.id.as_str())
@@ -603,6 +694,7 @@ impl BookingRepository for SqliteBookingRepository {
         .bind(requirements_json)
         .bind(now)
         .bind(now)
+        .bind(booking.owner.as_str())
         .execute(&self.pool)
         .await?;
 
@@ -640,6 +732,89 @@ impl BookingRepository for SqliteBookingRepository {
         .ok_or_else(|| StoreError::NotFound(id.clone()))?;
 
         decode_booking_row(&row)
+    }
+
+    async fn load_visible(
+        &self,
+        owner: &PrincipalId,
+        id: &BookingId,
+    ) -> Result<BookingAggregate, StoreError> {
+        // The ownership predicate sits beside the id in the same WHERE, so a
+        // foreign row is not fetched, not decoded, and not distinguishable from
+        // an absent one. A corrupt foreign row therefore cannot surface as a
+        // decode error either — which would have been an existence oracle
+        // wearing a 503.
+        let row = sqlx::query(
+            r"
+            SELECT id, version, state_name, state_json, requirements_json,
+                   selected_venue_json, availability_json, booking_ref, active_effect,
+                   created_at_ms, updated_at_ms
+            FROM bookings
+            WHERE id = ? AND owner_principal = ?
+            ",
+        )
+        .bind(id.as_str())
+        .bind(owner.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+
+        decode_booking_row(&row)
+    }
+
+    async fn lookup_by_ref(
+        &self,
+        owner: &PrincipalId,
+        booking_ref: &CouncilBookingRef,
+    ) -> Result<Vec<BookingAggregate>, StoreError> {
+        let rows = sqlx::query(
+            r"
+            SELECT id, version, state_name, state_json, requirements_json,
+                   selected_venue_json, availability_json, booking_ref, active_effect,
+                   created_at_ms, updated_at_ms
+            FROM bookings
+            WHERE owner_principal = ? AND booking_ref = ?
+            ORDER BY created_at_ms, id
+            ",
+        )
+        .bind(owner.as_str())
+        .bind(booking_ref.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(decode_booking_row).collect()
+    }
+
+    async fn lookup_cancellable(
+        &self,
+        owner: &PrincipalId,
+    ) -> Result<Vec<BookingAggregate>, StoreError> {
+        let rows = sqlx::query(
+            r"
+            SELECT id, version, state_name, state_json, requirements_json,
+                   selected_venue_json, availability_json, booking_ref, active_effect,
+                   created_at_ms, updated_at_ms
+            FROM bookings
+            WHERE owner_principal = ?
+            ORDER BY created_at_ms, id
+            ",
+        )
+        .bind(owner.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        // The domain decides what "cancellable" means, here and nowhere else.
+        rows.iter()
+            .map(decode_booking_row)
+            .filter_map(|decoded| match decoded {
+                Ok(aggregate) => aggregate
+                    .state
+                    .proposal_menu()
+                    .contains(&CANCEL_PROPOSAL)
+                    .then_some(Ok(aggregate)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     async fn commit(
@@ -1668,7 +1843,8 @@ mod tests {
     };
     use tempfile::TempDir;
     use townhall_domain::{
-        BookingProposal, BookingState, SelectedVenueRef, VenueFacts, VenueSelected,
+        Booked, BookingProposal, BookingState, Cancelled, SelectedVenueRef, VenueFacts,
+        VenueSelected,
     };
 
     fn requirements() -> BookingRequirements {
@@ -1691,6 +1867,288 @@ mod tests {
             .expect("repository should open")
     }
 
+    /// Someone who is not [`test_owner`].
+    fn other_principal() -> PrincipalId {
+        PrincipalId::new("priya")
+    }
+
+    /// The magic string in `lookup_cancellable`, pinned to the proposal it means.
+    ///
+    /// `proposal_menu()` exports names, so the filter has to match one as text.
+    /// Rename the variant and the filter silently matches nothing — every
+    /// booking becomes uncancellable through the lookup, and every test that
+    /// only asserts *exclusion* keeps passing. This is the test that fails
+    /// instead.
+    #[test]
+    fn the_cancel_menu_name_matches_the_proposal() {
+        let cancel = BookingProposal::Cancel {
+            reason: "any".to_owned(),
+        };
+        assert_eq!(
+            cancel.name(),
+            CANCEL_PROPOSAL,
+            "the lookup filter's string drifted from the proposal it means"
+        );
+        // And it really is what Draft's menu advertises, so the filter matches
+        // the same vocabulary the domain exports.
+        assert!(
+            BookingState::Draft(Draft)
+                .proposal_menu()
+                .contains(&CANCEL_PROPOSAL),
+            "Draft's menu no longer spells Cancel the way the filter expects"
+        );
+    }
+
+    /// A foreign row is not merely refused — it is not fetched.
+    ///
+    /// Paired with the owner's own load succeeding, so an implementation that
+    /// concealed everything from everyone fails the second half.
+    #[tokio::test]
+    async fn load_visible_conceals_another_principals_booking() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-OWNED");
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+            owner: test_owner(),
+        })
+        .await
+        .expect("create");
+
+        let mine = repo.load_visible(&test_owner(), &id).await;
+        assert!(mine.is_ok(), "the owner must see their own booking");
+
+        let theirs = repo.load_visible(&other_principal(), &id).await;
+        assert!(
+            matches!(&theirs, Err(StoreError::NotFound(missing)) if *missing == id),
+            "a foreign load must be indistinguishable from absent, got {theirs:?}"
+        );
+    }
+
+    /// The migration's legacy rows are unreachable for EVERY principal, not just
+    /// for one — and they remain readable through the unscoped `load` that
+    /// reconciliation depends on.
+    #[tokio::test]
+    async fn a_null_owner_row_is_concealed_from_everyone_yet_still_decodes() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-LEGACY");
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+            owner: test_owner(),
+        })
+        .await
+        .expect("create");
+
+        // Backdate it into the pre-ownership world the migration inherits.
+        sqlx::query("UPDATE bookings SET owner_principal = NULL WHERE id = ?")
+            .bind(id.as_str())
+            .execute(&repo.pool)
+            .await
+            .expect("orphan the row");
+
+        for principal in [
+            test_owner(),
+            other_principal(),
+            PrincipalId::new(""),
+            PrincipalId::new("@orphan"),
+        ] {
+            let seen = repo.load_visible(&principal, &id).await;
+            assert!(
+                matches!(seen, Err(StoreError::NotFound(_))),
+                "a NULL-owned row leaked to {principal}: {seen:?}"
+            );
+        }
+
+        // Concealment must not break recovery: the reconciler has no principal
+        // and still has to be able to finish an in-flight effect.
+        assert!(
+            repo.load(&id).await.is_ok(),
+            "an orphaned row must still decode through the unscoped load"
+        );
+
+        // And it is absent from the COLLECTION surfaces too, not just the
+        // direct read. A listing that scanned without the ownership predicate
+        // would hand every legacy row to whoever asked first.
+        assert!(
+            repo.lookup_cancellable(&test_owner())
+                .await
+                .expect("lookup")
+                .is_empty(),
+            "a NULL-owned row appeared in a cancellable listing"
+        );
+        sqlx::query("UPDATE bookings SET booking_ref = 'TH-ORPHAN' WHERE id = ?")
+            .bind(id.as_str())
+            .execute(&repo.pool)
+            .await
+            .expect("give the orphan a reference to be found by");
+        assert!(
+            repo.lookup_by_ref(&test_owner(), &CouncilBookingRef::new("TH-ORPHAN"))
+                .await
+                .expect("lookup")
+                .is_empty(),
+            "a NULL-owned row was findable by its council reference"
+        );
+    }
+
+    /// Ordering is genuinely sorted, in both dimensions, against a fixture that
+    /// opposes it.
+    ///
+    /// A "returns rows in order" assertion passes by accident whenever insertion
+    /// order already matches the sort. So rows go in newest-first while the
+    /// expectation is oldest-first, and the two rows sharing a `created_at_ms`
+    /// go in with their ids DESCENDING — so neither the timestamp sort nor the
+    /// id tie-break can be satisfied by returning rows as they were written.
+    #[tokio::test]
+    async fn lookup_orders_by_creation_then_id_against_an_opposed_fixture() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let reference = CouncilBookingRef::new("TH-ORDER");
+
+        // Written newest-first; within the tie, id-descending.
+        //
+        // Each row is advanced to `Booked`, because that is the state a council
+        // reference belongs to — the store's coherence check rejects a `Draft`
+        // carrying one, and rightly so.
+        let written = [("BKG-C", 3_000_i64), ("BKG-B", 1_000), ("BKG-A", 1_000)];
+        for (id, created) in written {
+            let booking_id = BookingId::new(id);
+            repo.create(NewBooking {
+                id: booking_id.clone(),
+                requirements: requirements(),
+                owner: test_owner(),
+            })
+            .await
+            .expect("create");
+            repo.commit(
+                &booking_id,
+                0,
+                Booking {
+                    id: booking_id.clone(),
+                    state: BookingState::Booked(Booked {
+                        booking_ref: reference.clone(),
+                    }),
+                    requirements: requirements(),
+                    selected_venue: None,
+                    availability: None,
+                    booking_ref: Some(reference.clone()),
+                    active_effect: None,
+                },
+                TransitionAudit::driven_by(&BookingProposal::Book),
+            )
+            .await
+            .expect("advance to Booked");
+            sqlx::query("UPDATE bookings SET created_at_ms = ? WHERE id = ?")
+                .bind(created)
+                .bind(id)
+                .execute(&repo.pool)
+                .await
+                .expect("backdate the row");
+        }
+
+        let found = repo
+            .lookup_by_ref(&test_owner(), &reference)
+            .await
+            .expect("lookup");
+        let order: Vec<&str> = found.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["BKG-A", "BKG-B", "BKG-C"],
+            "rows must come back oldest-first with the id breaking the 1000ms tie"
+        );
+    }
+
+    /// The filter asks the DOMAIN what cancellable means, rather than knowing.
+    ///
+    /// The complete state × menu partition is already pinned where it belongs —
+    /// `the_exported_menu_is_the_locked_table` in `townhall-domain` sweeps every
+    /// state against `LOCKED`. Restating that list here would put it in a second
+    /// place to drift. What this test owes is narrower and is the thing the
+    /// domain cannot check: that `lookup_cancellable` consults the menu at all.
+    ///
+    /// So it persists two states that are cancellable but NOT the same shape —
+    /// `Draft` and `VenueSelected` — plus one that is not (`Cancelled`). A
+    /// filter hardcoded to any single state name fails on the other cancellable
+    /// row; one that skips filtering fails on the excluded row.
+    #[tokio::test]
+    async fn lookup_cancellable_asks_the_domain_rather_than_hardcoding_a_state() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+
+        let draft = BookingId::new("BKG-DRAFT");
+        let selected = BookingId::new("BKG-SELECTED");
+        let cancelled = BookingId::new("BKG-CANCELLED");
+        for id in [&draft, &selected, &cancelled] {
+            repo.create(NewBooking {
+                id: id.clone(),
+                requirements: requirements(),
+                owner: test_owner(),
+            })
+            .await
+            .expect("create");
+        }
+
+        let venue = SelectedVenueRef {
+            venue_id: VenueId::new("TH-A"),
+            slot_id: SlotId::new("SLOT-A"),
+        };
+        repo.commit(
+            &selected,
+            0,
+            Booking {
+                id: selected.clone(),
+                state: BookingState::VenueSelected(VenueSelected {
+                    venue_id: venue.venue_id.clone(),
+                    slot_id: venue.slot_id.clone(),
+                }),
+                requirements: requirements(),
+                selected_venue: Some(venue.clone()),
+                availability: None,
+                booking_ref: None,
+                active_effect: None,
+            },
+            TransitionAudit::driven_by(&BookingProposal::SelectVenue {
+                venue_id: venue.venue_id.clone(),
+                slot_id: venue.slot_id.clone(),
+            }),
+        )
+        .await
+        .expect("advance to VenueSelected");
+
+        repo.commit(
+            &cancelled,
+            0,
+            Booking {
+                id: cancelled.clone(),
+                state: BookingState::Cancelled(Cancelled),
+                requirements: requirements(),
+                selected_venue: None,
+                availability: None,
+                booking_ref: None,
+                active_effect: None,
+            },
+            TransitionAudit::driven_by(&BookingProposal::Cancel {
+                reason: "done".to_owned(),
+            }),
+        )
+        .await
+        .expect("advance to Cancelled");
+
+        let found = repo
+            .lookup_cancellable(&test_owner())
+            .await
+            .expect("lookup");
+        let ids: Vec<&str> = found.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["BKG-DRAFT", "BKG-SELECTED"],
+            "cancellable must follow the menu: both offering states in, the \
+             empty-menu one out"
+        );
+    }
+
     #[tokio::test]
     async fn create_and_reload_survives_repository_restart() {
         let temp = TempDir::new().expect("temp dir");
@@ -1702,6 +2160,7 @@ mod tests {
                 .create(NewBooking {
                     id: id.clone(),
                     requirements: requirements(),
+                    owner: test_owner(),
                 })
                 .await
                 .expect("create should succeed");
@@ -1727,6 +2186,7 @@ mod tests {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect("create should succeed");
@@ -1799,6 +2259,7 @@ mod tests {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect("create should succeed");
@@ -1857,6 +2318,7 @@ mod tests {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect("create should succeed");
@@ -1922,6 +2384,7 @@ mod tests {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect("create should succeed");
@@ -1970,6 +2433,7 @@ mod tests {
         repo.create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: test_owner(),
         })
         .await
         .expect("create should succeed");
@@ -2058,6 +2522,7 @@ mod tests {
         repo.create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: test_owner(),
         })
         .await
         .expect("first create");
@@ -2066,6 +2531,7 @@ mod tests {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect_err("duplicate create must fail");
@@ -2145,6 +2611,7 @@ mod concurrency {
                 .create(NewBooking {
                     id: id.clone(),
                     requirements: requirements(),
+                    owner: test_owner(),
                 })
                 .await
                 .expect("create should succeed");
@@ -2259,6 +2726,7 @@ mod concurrency {
             repo.create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: test_owner(),
             })
             .await
             .expect("create should succeed");
@@ -2885,6 +3353,7 @@ mod effect_identity {
         repo.create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: test_owner(),
         })
         .await
         .expect("create");
@@ -3437,6 +3906,7 @@ mod phase_c {
         repo.create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: test_owner(),
         })
         .await
         .expect("create");
@@ -4507,6 +4977,7 @@ mod pursuit {
         repo.create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
+            owner: test_owner(),
         })
         .await
         .expect("create");
@@ -4515,6 +4986,64 @@ mod pursuit {
             .expect("prepare");
         let effect = derive_effect_intent_id(&id, OperationKind::Book, 0);
         (repo, clock, effect)
+    }
+
+    /// A migrated legacy row's IN-FLIGHT EFFECT is still recoverable.
+    ///
+    /// # Why the earlier witness was not enough
+    ///
+    /// `a_null_owner_row_is_concealed_from_everyone_yet_still_decodes` asserts
+    /// that an orphan row decodes through the unscoped `load`, and concluded
+    /// from that that recovery still works. It does not follow. Recovery is a
+    /// pipeline — `due_effects`, then `claim_effect`, then the aggregate load —
+    /// and only the last step was witnessed.
+    ///
+    /// The failure that slips through: join `due_effects` against `bookings`
+    /// and require a non-NULL owner. Every fixture in this suite has an owner,
+    /// so every existing test stays green, while every migrated in-flight
+    /// intent in a real database is stranded forever — the effect never comes
+    /// back as due, so the chase never resumes and a booking that may exist at
+    /// the council is never reconciled.
+    ///
+    /// This drives the pipeline itself, on a row whose owner is NULL.
+    #[tokio::test]
+    async fn a_migrated_row_can_still_be_discovered_and_claimed_for_recovery() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        // Migrate the booking into the pre-ownership world, effect and all.
+        sqlx::query("UPDATE bookings SET owner_principal = NULL WHERE id = ?")
+            .bind("BKG-PURSUIT")
+            .execute(&repo.pool)
+            .await
+            .expect("orphan the row");
+
+        // It is invisible to every principal...
+        assert!(
+            matches!(
+                repo.load_visible(&test_owner(), &BookingId::new("BKG-PURSUIT"))
+                    .await,
+                Err(StoreError::NotFound(_))
+            ),
+            "the orphan must still be concealed"
+        );
+
+        // ...and still fully recoverable.
+        clock.advance(10_000);
+        let due = repo.due_effects(16).await.expect("due");
+        assert!(
+            due.contains(&effect),
+            "a migrated in-flight effect vanished from the recovery queue: {due:?}"
+        );
+        let claimed = repo.claim_effect(&effect, 30_000).await.expect("claim");
+        assert!(
+            claimed.is_some(),
+            "a migrated in-flight effect could not be claimed for recovery"
+        );
+        assert!(
+            repo.load(&BookingId::new("BKG-PURSUIT")).await.is_ok(),
+            "and the reconciler must still be able to load its aggregate"
+        );
     }
 
     /// The pursuit columns, read raw — these tests are ABOUT the writes, so

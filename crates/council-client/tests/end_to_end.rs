@@ -140,6 +140,7 @@ impl Harness {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
+                owner: authority().principal,
             })
             .await
             .expect("create");

@@ -19,7 +19,8 @@ townhall-store = { path = "../../crates/townhall-store" }
 bld-types = { path = "../../crates/bld-types" }
 
 [features]
-# The M5 stand-in authority (ADR-021): a fixed two-token allowlist, compiled
+# The M5 stand-in authority (ADR-021, amended by ADR-022): a fixed three-token
+# allowlist, compiled
 # only when asked for AND armed only by the --dev-authority flag. M7 replaces
 # the resolver here, in the composition root, so no fallback survives it.
 dev-authority = []

@@ -251,6 +251,7 @@ async fn main() -> ExitCode {
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
+        owner: authority().principal,
     })
     .await
     .expect("create");

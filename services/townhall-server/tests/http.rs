@@ -15,6 +15,8 @@ use std::process::{Child, Command, Stdio};
 const KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
 const LUCY: &str = "Bearer dev-lucy";
 const MARCO: &str = "Bearer dev-marco-restricted";
+/// Restricted in exactly one way: Lucy's fee ceiling, no `may_book`.
+const PRIYA: &str = "Bearer dev-priya-nobook";
 
 struct World {
     dir: tempfile::TempDir,
@@ -190,12 +192,21 @@ fn etag_version(reply: &Reply) -> String {
 }
 
 /// Drive one booking to `AwaitingBooking` over HTTP; returns the current `ETag`.
+///
+/// Bookings have owners now, so who drives this matters: the caller that creates
+/// the booking is the only one that can advance it. Tests that then assert a
+/// refusal must decide deliberately whether they are testing *visibility* (a
+/// different principal) or a *capability* (the same principal, lacking a flag).
 fn awaiting(world: &World, id: &str) -> String {
+    awaiting_as(world, LUCY, id)
+}
+
+fn awaiting_as(world: &World, bearer: &str, id: &str) -> String {
     let created = call(
         world,
         "POST",
         "/booking-intents",
-        LUCY,
+        bearer,
         None,
         Some(&create_body(id)),
     );
@@ -212,7 +223,7 @@ fn awaiting(world: &World, id: &str) -> String {
             world,
             "POST",
             &format!("/booking-intents/{id}/behaviours/{behaviour}"),
-            LUCY,
+            bearer,
             Some(&etag),
             body.as_ref(),
         );
@@ -238,10 +249,26 @@ fn rusqlite_shim(db: &std::path::Path, sql: &str) -> i64 {
         .arg(sql)
         .output()
         .expect("sqlite3 available");
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
+
+    // Strict, deliberately. This used to end `.unwrap_or(0)`, which turned any
+    // malformed query into the answer `0` — and since most callers compare a
+    // count before and after an operation that should change nothing, a typo in
+    // a column name produced `0 == 0` and a confidently passing test that
+    // asserted nothing at all. One such assertion was written in this very
+    // milestone (a witness naming `cancelled_at_ms`, a column that does not
+    // exist; the column is `cancelled_by`) and it passed.
+    //
+    // A test witness that cannot fail is worse than no witness, because it
+    // occupies the space where a real one would go.
+    assert!(
+        output.status.success(),
+        "sqlite3 rejected {sql:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
         .parse::<i64>()
-        .unwrap_or(0)
+        .unwrap_or_else(|_| panic!("{sql:?} did not return a count, got {text:?}"))
 }
 
 fn arm_fault(world: &World, effect: &str, route: &str, fault: &str) -> u64 {
@@ -519,11 +546,21 @@ fn a_stale_if_match_is_refused_with_the_fresh_etag() {
 
 /// A booking's inertness witness: the `ETag` and the audit length, snapshotted.
 fn snapshot(world: &World, id: &str) -> (String, usize) {
+    snapshot_as(world, LUCY, id)
+}
+
+/// The same witness, read by whoever OWNS the booking.
+///
+/// The bearer is a parameter because reads are now scoped: snapshotting a
+/// booking as someone who cannot see it returns 404 with no `ETag`, which is the
+/// ownership rule working — but it makes for a baffling test failure if the
+/// helper quietly assumes one principal owns everything.
+fn snapshot_as(world: &World, bearer: &str, id: &str) -> (String, usize) {
     let read = call(
         world,
         "GET",
         &format!("/booking-intents/{id}"),
-        LUCY,
+        bearer,
         None,
         None,
     );
@@ -531,7 +568,7 @@ fn snapshot(world: &World, id: &str) -> (String, usize) {
         world,
         "GET",
         &format!("/booking-intents/{id}/audit"),
-        LUCY,
+        bearer,
         None,
         None,
     );
@@ -542,7 +579,11 @@ fn snapshot(world: &World, id: &str) -> (String, usize) {
 }
 
 fn assert_inert(world: &World, id: &str, before: &(String, usize), when: &str) {
-    let after = snapshot(world, id);
+    assert_inert_as(world, LUCY, id, before, when);
+}
+
+fn assert_inert_as(world: &World, bearer: &str, id: &str, before: &(String, usize), when: &str) {
+    let after = snapshot_as(world, bearer, id);
     assert_eq!(after.0, before.0, "{when}: the version moved");
     assert_eq!(after.1, before.1, "{when}: an audit row appeared");
 }
@@ -556,7 +597,10 @@ fn assert_inert(world: &World, id: &str, before: &(String, usize), when: &str) {
 #[test]
 fn refusals_answer_their_spec_status_and_change_nothing() {
     let world = world();
-    let etag = awaiting(&world, "BKG-REFUSE");
+    // The tag itself is no longer needed here: the 403 cases moved to bookings
+    // their own principals own (below), and the remaining refusals on this
+    // booking are about missing or malformed tags rather than valid stale ones.
+    let _etag = awaiting(&world, "BKG-REFUSE");
 
     // 401: no bearer, unknown bearer.
     for bearer in ["", "Bearer nobody"] {
@@ -579,19 +623,75 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         .expect("answer");
     assert_eq!(reply.status().as_u16(), 400);
 
-    // 403: restricted principal proposing a booking.
+    // Snapshotted here and asserted after the header-refusal sweep below: those
+    // refusals happen on Lucy's own booking, so inertness is about the header
+    // gates changing nothing, not about visibility.
     let refuse_before = snapshot(&world, "BKG-REFUSE");
+
+    // 403: a principal lacking `may_book`, on a booking THEY OWN.
+    //
+    // This case used to drive Lucy's booking and then ask Marco to book it.
+    // Once bookings have owners that is a 404, not a 403 — and the test would
+    // have kept passing in spirit ("Marco is refused") while
+    // `BookingAuthorityRequired` stopped being exercised anywhere at all.
+    //
+    // Marco cannot replace Lucy here either: his £10 ceiling means `verify-slot`
+    // refuses his own booking with FeeExceededAuthority long before `book` could
+    // ask about his capability (asserted just below, so that coverage survives
+    // too). Priya carries Lucy's ceiling and lacks only `may_book`, so this
+    // refusal can only be the capability guard.
+    let priya_etag = awaiting_as(&world, PRIYA, "BKG-PRIYA");
+    let priya_before = snapshot_as(&world, PRIYA, "BKG-PRIYA");
     let reply = call(
         &world,
         "POST",
-        "/booking-intents/BKG-REFUSE/behaviours/book",
-        MARCO,
-        Some(&etag),
+        "/booking-intents/BKG-PRIYA/behaviours/book",
+        PRIYA,
+        Some(&priya_etag),
         None,
     );
     assert_eq!(reply.status, 403, "{:?}", reply.body);
     assert_eq!(reply.body["error"], "BookingAuthorityRequired");
-    assert_inert(&world, "BKG-REFUSE", &refuse_before, "403");
+    assert_inert_as(&world, PRIYA, "BKG-PRIYA", &priya_before, "403 capability");
+
+    // 403 again, a DIFFERENT guard: Marco's own booking, refused at the fee
+    // ceiling. This is the assertion the Priya split gave up, kept — and it is
+    // why the two principals exist rather than one restricted in two ways.
+    let marco_created = call(
+        &world,
+        "POST",
+        "/booking-intents",
+        MARCO,
+        None,
+        Some(&create_body("BKG-MARCO")),
+    );
+    assert_eq!(marco_created.status, 201, "{:?}", marco_created.body);
+    let mut marco_etag = etag_version(&marco_created);
+    let selected = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-MARCO/behaviours/select-venue",
+        MARCO,
+        Some(&marco_etag),
+        Some(&serde_json::json!({"venue_id": "TH-A", "slot_id": "SLOT-A"})),
+    );
+    assert_eq!(selected.status, 200, "{:?}", selected.body);
+    marco_etag = etag_version(&selected);
+    let marco_before = snapshot_as(&world, MARCO, "BKG-MARCO");
+    let reply = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-MARCO/behaviours/verify-slot",
+        MARCO,
+        Some(&marco_etag),
+        None,
+    );
+    assert_eq!(reply.status, 403, "{:?}", reply.body);
+    assert_eq!(
+        reply.body["error"], "FeeExceededAuthority",
+        "the £45 slot must exceed Marco's £10 grant"
+    );
+    assert_inert_as(&world, MARCO, "BKG-MARCO", &marco_before, "403 fee ceiling");
 
     // 404: unknown booking, read and audit alike.
     for path in [
@@ -1364,4 +1464,518 @@ fn a_booking_mid_escalation_reads_as_its_inflight_truth() {
         etag_before,
         "escalation never touches the aggregate: same version, same ETag"
     );
+}
+
+// ---------------------------------------------------------------- visibility
+//
+// M5.1: a booking belongs to the principal who created it, and a principal who
+// does not own one cannot tell it from a booking that was never created.
+//
+// The foreign caller in every test below is PRIYA, deliberately, and it matters
+// which restricted principal is used. Marco cannot cancel anything at all
+// (`may_cancel: false`), so an implementation that mapped "lacks the capability"
+// to 404 — checking ownership nowhere — would satisfy a Marco-based version of
+// these tests while leaving the hole wide open. Priya holds `may_cancel: true`,
+// so her 404 can only be visibility.
+
+/// Read: a foreign booking is 404, the owner's is 200.
+///
+/// Paired on purpose — an implementation that refused everyone would pass the
+/// first assertion alone.
+#[test]
+fn a_foreign_read_is_indistinguishable_from_a_missing_booking() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-VIS-READ");
+
+    let mine = call(
+        &world,
+        "GET",
+        "/booking-intents/BKG-VIS-READ",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(mine.status, 200, "the owner must see it: {:?}", mine.body);
+
+    let theirs = call(
+        &world,
+        "GET",
+        "/booking-intents/BKG-VIS-READ",
+        PRIYA,
+        None,
+        None,
+    );
+    assert_eq!(theirs.status, 404, "{:?}", theirs.body);
+    assert_eq!(theirs.body["error"], "no such booking");
+    assert!(
+        theirs.etag.is_none(),
+        "a concealed booking must not ship its version"
+    );
+
+    // And the same shape as a booking that genuinely does not exist.
+    let absent = call(
+        &world,
+        "GET",
+        "/booking-intents/BKG-NEVER-EXISTED",
+        PRIYA,
+        None,
+        None,
+    );
+    assert_eq!(absent.status, theirs.status);
+    assert_eq!(absent.body["error"], theirs.body["error"]);
+}
+
+/// Audit: concealed too, and not as an empty trail.
+#[test]
+fn a_foreign_audit_is_concealed_rather_than_empty() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-VIS-AUDIT");
+
+    let mine = call(
+        &world,
+        "GET",
+        "/booking-intents/BKG-VIS-AUDIT/audit",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(mine.status, 200);
+    assert!(
+        !mine.body["audit"].as_array().expect("rows").is_empty(),
+        "the owner's trail has the two transitions awaiting() made"
+    );
+
+    let theirs = call(
+        &world,
+        "GET",
+        "/booking-intents/BKG-VIS-AUDIT/audit",
+        PRIYA,
+        None,
+        None,
+    );
+    assert_eq!(theirs.status, 404, "{:?}", theirs.body);
+    assert!(
+        theirs.body.get("audit").is_none(),
+        "an empty trail would confirm the booking exists"
+    );
+}
+
+/// Cancel: refused, and the booking is untouched — version, audit AND council.
+///
+/// The witness is deliberately not just `state == "Booked"`: a wrong
+/// implementation could advance a version or add an audit row while leaving the
+/// state name alone.
+#[test]
+fn a_foreign_cancel_changes_nothing_anywhere() {
+    let world = world();
+    let etag = awaiting(&world, "BKG-VIS-CANCEL");
+    let booked = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-CANCEL/behaviours/book",
+        LUCY,
+        Some(&etag),
+        None,
+    );
+    assert_eq!(booked.status, 200, "{:?}", booked.body);
+    let booked_etag = etag_version(&booked);
+    let before = snapshot(&world, "BKG-VIS-CANCEL");
+    let councils_before = council_count(
+        &world,
+        "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NULL",
+    );
+
+    let refused = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-CANCEL/behaviours/cancel",
+        PRIYA,
+        Some(&booked_etag),
+        Some(&serde_json::json!({"reason": "not mine to cancel"})),
+    );
+    assert_eq!(refused.status, 404, "{:?}", refused.body);
+    assert!(refused.etag.is_none(), "no version may leak");
+
+    assert_inert(&world, "BKG-VIS-CANCEL", &before, "foreign cancel");
+    assert_eq!(
+        council_count(
+            &world,
+            "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NULL"
+        ),
+        councils_before,
+        "the council must not have been asked to cancel anything"
+    );
+
+    // The owner can still cancel it, so the refusal above was about WHO asked.
+    let mine = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-CANCEL/behaviours/cancel",
+        LUCY,
+        Some(&booked_etag),
+        Some(&serde_json::json!({"reason": "mine to cancel"})),
+    );
+    assert!(
+        mine.status == 200 || mine.status == 202,
+        "the owner's cancel runs: {} {:?}",
+        mine.status,
+        mine.body
+    );
+}
+
+/// Visibility is decided BEFORE the version is compared.
+///
+/// A foreign caller holding a stale tag must not be told 412 — that answer
+/// carries the current version, which is the resource's state leaked by the
+/// guard meant to protect it.
+#[test]
+fn a_foreign_stale_precondition_answers_404_not_412() {
+    let world = world();
+    let stale = awaiting(&world, "BKG-VIS-STALE");
+    // Move the booking on, so `stale` really is stale.
+    let moved = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-STALE/behaviours/book",
+        LUCY,
+        Some(&stale),
+        None,
+    );
+    assert_eq!(moved.status, 200, "{:?}", moved.body);
+
+    // Lucy, stale: 412 WITH the current version — the honest answer to someone
+    // entitled to it.
+    let hers = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-STALE/behaviours/cancel",
+        LUCY,
+        Some(&stale),
+        Some(&serde_json::json!({"reason": "stale"})),
+    );
+    assert_eq!(hers.status, 412, "{:?}", hers.body);
+    assert!(hers.etag.is_some(), "the owner learns the current version");
+
+    // Priya, same stale tag: 404, and no version.
+    let theirs = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-STALE/behaviours/cancel",
+        PRIYA,
+        Some(&stale),
+        Some(&serde_json::json!({"reason": "stale"})),
+    );
+    assert_eq!(
+        theirs.status, 404,
+        "checking the precondition first leaks existence: {:?}",
+        theirs.body
+    );
+    assert!(theirs.etag.is_none(), "and it leaks the version too");
+}
+
+/// Visibility is decided before the precondition is even PARSED.
+///
+/// A malformed `If-Match` answers 400 and a missing one answers 428. Both are
+/// statements about a resource, so a foreign caller must reach neither.
+#[test]
+fn a_foreign_caller_cannot_learn_existence_from_a_header_refusal() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-VIS-HEADER");
+
+    // Missing If-Match: the owner gets 428, the stranger gets 404.
+    let owner_missing = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-HEADER/behaviours/cancel",
+        LUCY,
+        None,
+        Some(&serde_json::json!({"reason": "no tag"})),
+    );
+    assert_eq!(owner_missing.status, 428, "{:?}", owner_missing.body);
+
+    let foreign_missing = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-HEADER/behaviours/cancel",
+        PRIYA,
+        None,
+        Some(&serde_json::json!({"reason": "no tag"})),
+    );
+    assert_eq!(
+        foreign_missing.status, 404,
+        "428 confirms the booking exists: {:?}",
+        foreign_missing.body
+    );
+
+    // Malformed and multiple If-Match: 400 for the owner, 404 for the stranger.
+    for bad in ["*", "W/\"2\""] {
+        let owner_bad = call(
+            &world,
+            "POST",
+            "/booking-intents/BKG-VIS-HEADER/behaviours/cancel",
+            LUCY,
+            Some(bad),
+            Some(&serde_json::json!({"reason": "bad tag"})),
+        );
+        assert_eq!(owner_bad.status, 400, "owner, If-Match {bad}");
+
+        let foreign_bad = call(
+            &world,
+            "POST",
+            "/booking-intents/BKG-VIS-HEADER/behaviours/cancel",
+            PRIYA,
+            Some(bad),
+            Some(&serde_json::json!({"reason": "bad tag"})),
+        );
+        assert_eq!(
+            foreign_bad.status, 404,
+            "400 confirms the booking exists, If-Match {bad}: {:?}",
+            foreign_bad.body
+        );
+    }
+}
+
+/// Reconcile keeps its `If-Match` exemption (ADR-021) and loses its visibility
+/// exemption — otherwise it is an authenticated existence oracle.
+#[test]
+fn reconcile_is_exempt_from_preconditions_but_not_from_ownership() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-VIS-RECON");
+
+    // Foreign: 404, whether or not a tag is present. Both matter — a route that
+    // refused the header first would answer 400 and confirm existence.
+    for tag in [None, Some("\"1\"")] {
+        let theirs = call(
+            &world,
+            "POST",
+            "/booking-intents/BKG-VIS-RECON/behaviours/reconcile",
+            PRIYA,
+            tag,
+            None,
+        );
+        assert_eq!(
+            theirs.status, 404,
+            "foreign reconcile with tag {tag:?}: {:?}",
+            theirs.body
+        );
+    }
+
+    // The owner still gets ADR-021's precondition refusal when they send a tag,
+    // and a real answer when they do not.
+    let owner_tagged = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-RECON/behaviours/reconcile",
+        LUCY,
+        Some("\"1\""),
+        None,
+    );
+    assert_eq!(
+        owner_tagged.status, 400,
+        "the If-Match exemption survives: {:?}",
+        owner_tagged.body
+    );
+
+    let owner_plain = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-VIS-RECON/behaviours/reconcile",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(owner_plain.status, 200, "{:?}", owner_plain.body);
+}
+
+/// A duplicate create by a stranger says only that the identifier is taken.
+///
+/// Paired with the owner's own duplicate, which DOES carry the version and an
+/// `ETag` so a retry can send a precondition — so this cannot pass by stripping
+/// state from every duplicate.
+#[test]
+fn a_foreign_duplicate_create_carries_no_state() {
+    let world = world();
+    let created = call(
+        &world,
+        "POST",
+        "/booking-intents",
+        LUCY,
+        None,
+        Some(&create_body("BKG-VIS-DUP")),
+    );
+    assert_eq!(created.status, 201, "{:?}", created.body);
+
+    let owners = call(
+        &world,
+        "POST",
+        "/booking-intents",
+        LUCY,
+        None,
+        Some(&create_body("BKG-VIS-DUP")),
+    );
+    assert_eq!(owners.status, 409, "{:?}", owners.body);
+    assert_eq!(owners.body["version"], 0, "the owner learns the version");
+    assert!(owners.etag.is_some(), "and gets an ETag to retry with");
+
+    let strangers = call(
+        &world,
+        "POST",
+        "/booking-intents",
+        PRIYA,
+        None,
+        Some(&create_body("BKG-VIS-DUP")),
+    );
+    assert_eq!(strangers.status, 409, "{:?}", strangers.body);
+    assert!(
+        strangers.body.get("version").is_none(),
+        "a stranger must not learn the version: {:?}",
+        strangers.body
+    );
+    assert!(
+        strangers.etag.is_none(),
+        "nor receive it as an ETag: {:?}",
+        strangers.etag
+    );
+}
+
+/// The collection query: exactly one filter, or 400.
+///
+/// Axum rejects a malformed value on its own; what it accepts happily is no
+/// filter, both filters, and `cancellable=false` — all well-formed `Option`s.
+/// Those are refused by hand, because an unfiltered "every booking you own"
+/// listing is not a surface this milestone offers.
+#[test]
+fn the_collection_query_admits_exactly_one_filter() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-Q");
+
+    for (query, why) in [
+        ("", "no filter at all"),
+        ("?cancellable=false", "cancellable=false has no meaning"),
+        (
+            "?booking_ref=TH-1&cancellable=true",
+            "the two filters are alternatives",
+        ),
+    ] {
+        let reply = call(
+            &world,
+            "GET",
+            &format!("/booking-intents{query}"),
+            LUCY,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 400, "{why}: {:?}", reply.body);
+    }
+
+    // A malformed boolean is Axum's to refuse, before the handler runs.
+    let malformed = call(
+        &world,
+        "GET",
+        "/booking-intents?cancellable=maybe",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(malformed.status, 400, "{:?}", malformed.body);
+
+    // And the accepted form works, with no collection ETag: a list has no one
+    // version, and shipping one would invite it to be used as a precondition.
+    let ok = call(
+        &world,
+        "GET",
+        "/booking-intents?cancellable=true",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert!(ok.etag.is_none(), "a collection must not carry an ETag");
+    assert_eq!(
+        ok.body["bookings"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["id"].as_str().expect("id"))
+            .collect::<Vec<_>>(),
+        ["BKG-Q"]
+    );
+}
+
+/// Lookups answer about the ASKER's bookings, and a foreign reference is an
+/// empty list rather than a refusal — a 403 would confirm the reference exists.
+#[test]
+fn lookups_are_scoped_and_a_foreign_reference_is_simply_empty() {
+    let world = world();
+    let etag = awaiting(&world, "BKG-REF");
+    let booked = call(
+        &world,
+        "POST",
+        "/booking-intents/BKG-REF/behaviours/book",
+        LUCY,
+        Some(&etag),
+        None,
+    );
+    assert_eq!(booked.status, 200, "{:?}", booked.body);
+
+    let reference =
+        call(&world, "GET", "/booking-intents/BKG-REF", LUCY, None, None).body["booking_ref"]
+            .as_str()
+            .expect("a council reference")
+            .to_owned();
+
+    let hers = call(
+        &world,
+        "GET",
+        &format!("/booking-intents?booking_ref={reference}"),
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(hers.status, 200, "{:?}", hers.body);
+    assert_eq!(
+        hers.body["bookings"].as_array().expect("rows").len(),
+        1,
+        "the owner finds her own booking by its council reference"
+    );
+
+    let theirs = call(
+        &world,
+        "GET",
+        &format!("/booking-intents?booking_ref={reference}"),
+        PRIYA,
+        None,
+        None,
+    );
+    assert_eq!(
+        theirs.status, 200,
+        "a foreign reference is not a refusal: {:?}",
+        theirs.body
+    );
+    assert!(
+        theirs.body["bookings"].as_array().expect("rows").is_empty(),
+        "a stranger must learn nothing about the reference: {:?}",
+        theirs.body
+    );
+
+    // `cancellable` is scoped the same way, and a Booked booking still offers
+    // Cancel — so this cannot pass by returning nothing to everyone.
+    let mine = call(
+        &world,
+        "GET",
+        "/booking-intents?cancellable=true",
+        LUCY,
+        None,
+        None,
+    );
+    assert_eq!(mine.body["bookings"].as_array().expect("rows").len(), 1);
+    let none = call(
+        &world,
+        "GET",
+        "/booking-intents?cancellable=true",
+        PRIYA,
+        None,
+        None,
+    );
+    assert!(none.body["bookings"].as_array().expect("rows").is_empty());
 }

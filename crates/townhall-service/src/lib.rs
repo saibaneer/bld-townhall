@@ -1503,10 +1503,17 @@ where
 
         // The ETag after the turn, and — only for an unresolved turn — the
         // store's own schedule for the next attempt.
+        //
+        // Scoped, like every other externally visible read. Admission was
+        // settled at the top of this method and ownership is immutable, so
+        // these cannot fail for visibility — but an unscoped read here would
+        // leave a path that does not care who is asking, sitting inside the one
+        // method that most looks like it already checked. Those are the paths
+        // that get reused later by something that has not.
         let (current_version, retry_after_ms) = match &outcome {
             BoundaryOutcome::Committed(aggregate) => (aggregate.version, None),
             BoundaryOutcome::Unresolved => {
-                let aggregate = self.load(id).await?;
+                let aggregate = self.load_visible(id, authority).await?;
                 let hint = match &aggregate.active_effect {
                     Some(effect) => self
                         .coordinator
@@ -1518,7 +1525,7 @@ where
                 };
                 (aggregate.version, hint)
             }
-            _ => (self.load(id).await?.version, None),
+            _ => (self.load_visible(id, authority).await?.version, None),
         };
         Ok(Mutated {
             outcome,
@@ -1602,14 +1609,6 @@ where
             }
         }
         Ok(outcomes)
-    }
-
-    async fn load(&self, id: &BookingId) -> Result<BookingAggregate, ApiError> {
-        match self.coordinator.repository().load(id).await {
-            Ok(aggregate) => Ok(aggregate),
-            Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
-            Err(error) => Err(ApiError::Unavailable(error.to_string())),
-        }
     }
 
     /// The load every externally visible operation uses.

@@ -3139,6 +3139,7 @@ async fn an_erroring_attend_backs_off_instead_of_monopolizing_the_queue() {
 /// a background job, a test harness. If the facade only conceals things when
 /// something above it remembered to ask, it does not conceal anything.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     let h = harness().await;
     let coordinator = Arc::new(Coordinator::new(
@@ -3171,6 +3172,46 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
         .expect("Lucy creates it");
     assert_eq!(created.version, 0);
 
+    // Drive it to an IN-FLIGHT effect before any of the foreign probes below.
+    //
+    // This is not scene-setting. The first version of this test left the
+    // booking in `Draft`, where there is no active effect at all — so the
+    // council-call-count witness on the foreign reconcile could not move no
+    // matter what the implementation did, and a facade that attended first and
+    // checked ownership afterwards would have passed it. A `Draft` has nothing
+    // to chase; only an in-flight booking tells the two orderings apart.
+    let mut version = created.version;
+    for proposal in [select(), BookingProposal::VerifySlot] {
+        version = api
+            .propose_at(&id, version, proposal, &authority())
+            .await
+            .expect("committed")
+            .current_version;
+    }
+    h.council.script([Script::SucceedThenGoQuiet("eaten")]);
+    let booked = api
+        .propose_at(&id, version, BookingProposal::Book, &authority())
+        .await
+        .expect("the turn runs");
+    assert!(
+        matches!(booked.outcome, BoundaryOutcome::Unresolved),
+        "the fixture needs a live chase to witness, got {:?}",
+        booked.outcome
+    );
+    let in_flight_version = booked.current_version;
+    assert!(
+        h.repo
+            .load(&id)
+            .await
+            .expect("load")
+            .active_effect
+            .is_some(),
+        "there must be an effect a wrong implementation could reach for"
+    );
+    // Past the cadence, so the effect really is DUE — otherwise `attend` would
+    // decline for a reason that has nothing to do with ownership.
+    h.clock.advance(10_000);
+
     // Read.
     assert!(
         matches!(
@@ -3197,11 +3238,15 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     );
     // Reconcile trigger — refused, AND the chase never ran.
     //
-    // The status alone would not prove the second half: a facade that attended
-    // first and refused afterwards returns the same error while having already
-    // reached out to the council. The council's own call count is the witness
-    // that nothing happened, not just that nothing was reported.
-    let calls_before = h.council.call_count();
+    // The status alone cannot prove the second half: a facade that attended
+    // first and refused afterwards returns the very same error, having already
+    // resolved the effect. The witness is the booking's own state — a chase
+    // that ran would have SETTLED this effect and moved the booking on, so
+    // finding it still in flight afterwards is what proves nothing happened.
+    //
+    // (An earlier version counted council calls on a `Draft` booking, which has
+    // no effect at all: the count could not move whatever the implementation
+    // did. That witness was incapable of failing.)
     assert!(
         matches!(
             api.attend_booking(&id, &priya).await,
@@ -3209,10 +3254,15 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
         ),
         "a foreign reconcile reached the chase"
     );
+    let after_foreign = h.repo.load(&id).await.expect("load");
+    assert!(
+        after_foreign.active_effect.is_some(),
+        "a refused reconcile resolved the effect anyway: state is {}",
+        after_foreign.state.name()
+    );
     assert_eq!(
-        h.council.call_count(),
-        calls_before,
-        "a refused reconcile still reached the council"
+        after_foreign.version, in_flight_version,
+        "a refused reconcile advanced the booking"
     );
 
     // Mutation, at the correct version — so a refusal cannot be a precondition
@@ -3220,7 +3270,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     let refused = api
         .propose_at(
             &id,
-            created.version,
+            in_flight_version,
             BookingProposal::Cancel {
                 reason: "not mine".to_owned(),
             },
@@ -3232,22 +3282,43 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
         "a foreign mutation reached the coordinator: {refused:?}"
     );
 
-    // Nothing moved, and Lucy still owns a live booking.
+    // Nothing moved: same version, same trail length as before the probes.
+    let trail_before_owner = h.repo.audit_events(&id).await.expect("audit").len();
     let mine = api
         .read(&id, &authority())
         .await
         .expect("the owner reads it");
-    assert_eq!(mine.version, 0, "a refused turn must not advance a version");
-    assert!(
-        h.repo.audit_events(&id).await.expect("audit").is_empty(),
-        "a refused turn must not write a trail"
+    assert_eq!(
+        mine.version, in_flight_version,
+        "a refused turn must not advance a version"
     );
 
     // And the same operations succeed for the owner, so none of the above
-    // passed by refusing everyone.
+    // passed by refusing everyone. The owner's attend DOES reach the council,
+    // which is what makes the foreign call-count assertion meaningful: the
+    // chase was reachable from here, and only ownership stopped it.
     assert!(api.ensure_visible(&id, &authority()).await.is_ok());
     assert!(api.audit(&id, &authority()).await.is_ok());
-    assert!(api.attend_booking(&id, &authority()).await.is_ok());
+    let outcomes = api
+        .attend_booking(&id, &authority())
+        .await
+        .expect("the owner may attend");
+    assert_eq!(
+        outcomes,
+        vec![Attended::Settled],
+        "the owner's reconcile must actually run the chase — otherwise the \
+         foreign case above proves nothing, since an unreachable chase cannot \
+         run for anybody"
+    );
+    let settled = h.repo.load(&id).await.expect("load");
+    assert!(
+        settled.active_effect.is_none(),
+        "the owner's chase left the effect in flight"
+    );
+    assert!(
+        h.repo.audit_events(&id).await.expect("audit").len() > trail_before_owner,
+        "settling the chase advances the trail; the stranger's attempt did not"
+    );
 }
 
 /// The lookup surface is principal-scoped, and `cancellable` follows the menu.

@@ -4988,6 +4988,64 @@ mod pursuit {
         (repo, clock, effect)
     }
 
+    /// A migrated legacy row's IN-FLIGHT EFFECT is still recoverable.
+    ///
+    /// # Why the earlier witness was not enough
+    ///
+    /// `a_null_owner_row_is_concealed_from_everyone_yet_still_decodes` asserts
+    /// that an orphan row decodes through the unscoped `load`, and concluded
+    /// from that that recovery still works. It does not follow. Recovery is a
+    /// pipeline — `due_effects`, then `claim_effect`, then the aggregate load —
+    /// and only the last step was witnessed.
+    ///
+    /// The failure that slips through: join `due_effects` against `bookings`
+    /// and require a non-NULL owner. Every fixture in this suite has an owner,
+    /// so every existing test stays green, while every migrated in-flight
+    /// intent in a real database is stranded forever — the effect never comes
+    /// back as due, so the chase never resumes and a booking that may exist at
+    /// the council is never reconciled.
+    ///
+    /// This drives the pipeline itself, on a row whose owner is NULL.
+    #[tokio::test]
+    async fn a_migrated_row_can_still_be_discovered_and_claimed_for_recovery() {
+        let temp = TempDir::new().expect("temp dir");
+        let (repo, clock, effect) = claimable_world(&temp).await;
+
+        // Migrate the booking into the pre-ownership world, effect and all.
+        sqlx::query("UPDATE bookings SET owner_principal = NULL WHERE id = ?")
+            .bind("BKG-PURSUIT")
+            .execute(&repo.pool)
+            .await
+            .expect("orphan the row");
+
+        // It is invisible to every principal...
+        assert!(
+            matches!(
+                repo.load_visible(&test_owner(), &BookingId::new("BKG-PURSUIT"))
+                    .await,
+                Err(StoreError::NotFound(_))
+            ),
+            "the orphan must still be concealed"
+        );
+
+        // ...and still fully recoverable.
+        clock.advance(10_000);
+        let due = repo.due_effects(16).await.expect("due");
+        assert!(
+            due.contains(&effect),
+            "a migrated in-flight effect vanished from the recovery queue: {due:?}"
+        );
+        let claimed = repo.claim_effect(&effect, 30_000).await.expect("claim");
+        assert!(
+            claimed.is_some(),
+            "a migrated in-flight effect could not be claimed for recovery"
+        );
+        assert!(
+            repo.load(&BookingId::new("BKG-PURSUIT")).await.is_ok(),
+            "and the reconciler must still be able to load its aggregate"
+        );
+    }
+
     /// The pursuit columns, read raw — these tests are ABOUT the writes, so
     /// they read the row rather than trusting a struct that might derive.
     async fn pursuit_row(

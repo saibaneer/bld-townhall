@@ -1422,11 +1422,21 @@ principal and must still finish an in-flight effect.
 ### Scoped load rather than comparison
 
 `load_visible(owner, id)` puts the ownership predicate beside the id in one `WHERE`.
-There is deliberately no `if aggregate.owner == access.principal` anywhere: a foreign row
-does not come back, and `NotFound` was already the 404 path. The bug where someone loads
-unscoped and forgets the comparison becomes unwritable — and that failure would have been
-silent, because a missing check looks exactly like a passing one. Remove the capability,
-don't guard it.
+There is deliberately no `if aggregate.owner == access.principal` anywhere on a visible
+path: a foreign row does not come back, and `NotFound` was already the 404 path. The bug
+where someone forgets *the comparison* therefore cannot exist, because there is no
+comparison — and that failure would have been silent, since a missing check looks exactly
+like a passing one.
+
+**What this does claim, exactly.** The facade has *no* unscoped read left — scoping every
+visible path turned its private unscoped helper into dead code, and the compiler said so,
+so it is gone. The repository still exposes an unscoped `load`, deliberately, because
+recovery needs it: a timer-driven reconcile pass has no principal to scope by, and a
+migrated NULL-owned row must still be attendable.
+
+So the remaining mistake is "reach past the facade to the repository", which is visible at
+the call site and blocked by the crate graph for the wire, rather than "forget a comparison
+several lines below the load", which is invisible. A smaller target, not an empty one.
 
 ### 404, not 403 — and where the concealment stops
 
@@ -1496,7 +1506,18 @@ occupies the space where a real one would go.
 
 Every externally visible facade method grows an authority parameter — 23 `NewBooking`
 initializers and both `BookingRepository` implementations changed. `audit_events` still
-reads by id alone after admission, which is safe only because ownership is immutable. The
+reads by id alone after admission, which is safe because ownership is immutable **through
+the repository's commit API** — the aggregate `UPDATE` never names `owner_principal`, so no
+committed transition can change hands.
+
+That is an application-level guarantee, not a database constraint, and the distinction is
+worth recording rather than blurring: the pool is public, so anything holding it could
+rewrite the column directly, and a caller doing so between `audit`'s admission check and
+its unscoped `audit_events` query would deliver the trail to a principal who no longer owns
+the row. Nothing in this workspace does that, and the tests that orphan rows on purpose
+rely on being able to. Enforcing it at the database boundary — a trigger refusing any
+change to a non-NULL `owner_principal` — is the fix if ownership ever becomes transferable
+by anything other than a migration. The
 duplicate-create bit above. And M7 inherits a named debt: ADR-020's attribution now has no
 public path exercising it, so M7 owes a **facade-level** delegated-cancellation test in
 which Lucy owns the booking, Marco requests it under a verified delegation naming that

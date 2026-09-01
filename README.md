@@ -94,7 +94,7 @@ The execution contract is [`docs/technical-spec-v0.4.2.md`](docs/technical-spec-
 
 M0–M5 implemented, plus M5.1. The next milestone is M6: the channel-agnostic HumanChannel with the local SMS simulator — the first consumer of the escalated-question queue ADR-019 left waiting for a human who can actually act. Approval/VerifiedAuthority issuance (M7, replacing the dev-authority stand-in in the composition root), usage metering, discovery, Stripe, Rig, and real SMS remain later milestones.
 
-The decision record is [`docs/decisions.md`](docs/decisions.md) (ADR-001–021): the spec is never edited, and the ADRs are the amendment trail against it.
+The decision record is [`docs/decisions.md`](docs/decisions.md) (ADR-001–022): the spec is never edited, and the ADRs are the amendment trail against it.
 
 
 ## M3 / M4 engineering notes

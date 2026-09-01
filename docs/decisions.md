@@ -1233,3 +1233,115 @@ wrong-identity `NotYetVisible` as authorization.** Rejected and negatively teste
 not-yet for identity A must never authorize resending identity B. **Carrying the canceller
 on the successor only.** Rejected: by handoff time the cancelling authority is out of
 scope; the state is the only honest carrier across the ambiguous window.
+
+## ADR-021 — The wire: M5's decisions before M5's code
+
+Decided 2026-09-01, during M5 planning (six review rounds: redesign → four fix rounds →
+build as planned; an independent paper-reviewer contributed the HTTP-contract findings).
+Recorded before implementation, per the plan's own ordering rule.
+
+### The application boundary comes before the HTTP adapter
+
+Two structures carry the M5 gate's "handlers do not mutate directly", so it is a fact
+about what code can express rather than a review item:
+
+- **`BookingApi`**, the facade in `townhall-service`: handlers hold it and nothing else,
+  and its complete mutation surface is `create(BookingId, BookingRequirements)` and
+  `propose_at(id, expected_version, proposal, authority)`. Reads: projection (with the
+  domain's exported behaviour menu), audit projection (service-owned type, not the
+  store's), catalogue/availability ports, and the reconcile trigger.
+- **The two-crate split**: `crates/townhall-http` (handlers, DTOs, the status mapping,
+  the loop driver; depends on service/domain/types plus axum/serde/tokio and never on a
+  storage or provider crate) and `services/townhall-server` (the composition-root
+  binary; instantiates the store, denial log, council client, config, authority
+  resolver). Cargo has no per-target dependency table, so the boundary needs two crates
+  to be real — the same crate-graph enforcement ADR-012 uses for evidence types. A
+  source scan remains as a secondary tripwire only.
+
+### `propose_at`: the caller's expected version joins the trusted turn
+
+Spec §9.2 demands the stale writer fail. A handler-side load/compare/propose cannot
+deliver that (the stale request is silently rebased between the compare and the turn's
+own load), so the expected version travels into the coordinator: refused before
+classification when it does not match the load, enforced by the CAS at exactly that
+version after it, both surfacing as a typed `PreconditionFailed { current }` → 412 with
+the fresh ETag.
+
+**Replay means stale, on this surface.** M4's replay-first prepare (the
+lost-acknowledgement guarantee) returns a rival's committed intent without reaching the
+CAS — under an expected version, a replayed prepare means *this caller performed no
+mutation and the world already moved*, and the honest HTTP answer is 412, never a 202
+claiming work this request did not do. The store's replay contract and the versionless
+in-process `propose` (which correctly answers `Unresolved` to its own retries) are
+unchanged; the two entry semantics are pinned side by side by one paused-race test.
+
+### The cadence-persistence repair (a live defect since slice E)
+
+`note_attempt_finished` persisted `MIN(cadence, now + MAX_CADENCE_MS)` where callers pass
+a **duration** — the stored "next attempt" was milliseconds after 1970, always past,
+always due. The retry cadence never gated a retry; escalation's write (`now + cadence`)
+was correct, which is why every existing assertion held, and every test advanced its
+clock past the cadence anyway — the missing assertion was the not-yet-due boundary
+itself. One parameter, two meanings: the recurring defect in its purest form. The
+parameter becomes a validated duration end to end; the store persists
+`now + min(cadence_ms, MAX_CADENCE_MS)` under its own clock; clock-pinned tests assert
+the stored timestamp exactly and the due/not-due boundary on both sides. `Retry-After`
+derives from a new store-owned `retry_hint_ms` (the store's clock — computing `row − now`
+in the service would mint a second clock, ADR-016 §1's own lesson), converted to whole
+seconds by ceiling with a 1s floor. Cadences, lease, and budgets become one validated
+`PursuitConfig` shared by coordinator and reconciler; the single sanctioned zero is the
+re-classification budget, as a test seam.
+
+### Status-mapping decisions the spec table does not settle
+
+- **Provider unavailability is 503, not 502**, including the catalogue routes — §10.2's
+  own row is the contract; deviating to 502 would be a private improvement on it.
+- **`FeeExceeded` names its ceiling**: `FeeExceededAuthority` (403) vs
+  `FeeExceededRequirement` (422), authority winning when both are exceeded — and the two
+  stable names keep ADR-017's denial dedup from merging a grant story with a data story.
+- **Unavailable availability is not missing availability**: the source answers three
+  ways, and `Denied(FactsUnavailable)` (could not ask — 503, before any durable intent)
+  is distinct from `VenueFactsMissing` (asked and answered nothing — 422). The domain
+  distinguishes two shapes of its input, not the network. `Unresolved` stays 202: after
+  Phase A there is a durable intent and the chase owns it.
+- **`ServiceError::UnexpectedPlan` is 500**: an internal invariant failure, never
+  dressed as provider trouble.
+
+### The reconcile trigger is exempt from `If-Match`, by classification
+
+Spec §10 lists the demo/admin reconcile endpoint and §10.1 requires `If-Match` on
+mutations. The trigger routes to `due`/`attend` — it asserts no expected state, its claim
+is atomic, and its facts are version-fenced below — so an HTTP precondition would be
+theatre. Recorded as a deliberate exception: `If-Match` is required on `behaviours/*`
+except `reconcile`; a **present** `If-Match` where no precondition applies (create,
+reconcile) is refused 400 rather than ignored. ADR-012's supersession of
+`BookingProposal::Reconcile` stands — the endpoint is not a proposal and never was.
+
+### Amendment to ADR-017 point 4: the private-field half
+
+ADR-017 deferred the verdict's anti-forgery ceremony — "private fields and no
+`Deserialize`" — to M5. The no-`Deserialize` half lands as static assertions
+(`BoundaryOutcome`, `VerifiedProviderFact`, `VerifiedAuthority`; `Verified<T>` already
+had one). The private-field half is **amended away, with reasons**: Rust cannot make an
+enum's variant fields private without destroying the trusted half's legitimate
+construction (the coordinator builds outcomes) and the mapper's exhaustive match — and
+the forgery the ceremony targeted is already unrepresentable three other ways: the crate
+graph (untrusted crates cannot name `bld-kernel`), the serde assertions (a verdict cannot
+arrive over a wire), and the facade (the server sees only what it returns).
+`VerifiedAuthority`'s constructor ceremony belongs to M7, with its issuer.
+
+### DevAuthority, contained until M7
+
+A fixed two-token allowlist (`dev-lucy` permissive, `dev-marco-restricted` refused
+booking and cancellation authority) — nothing pattern-derived, so "unknown bearer" is a
+real 401. Behind a cargo feature AND a mandatory startup flag; absent either, the server
+refuses to start. `X-BLD-Delegation` is reserved and refused loudly (400) until M7's
+envelope exists. M7 replaces the resolver in the composition root.
+
+### Costs accepted
+
+The facade is a second surface over the coordinator to keep honest forever. The
+two-crate split adds a crate whose whole job is wiring. 412-on-replay is stricter than
+202 for a client retrying its own request with a stale tag — the client re-reads and
+sees the in-flight truth, which is the point of preconditions. The reconcile exemption
+is a documented hole in a blanket rule, chosen over a meaningless precondition.

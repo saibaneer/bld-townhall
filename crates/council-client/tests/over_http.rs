@@ -279,7 +279,7 @@ async fn the_deadline_the_council_binds_is_the_one_we_sent() {
             .await
             .expect("an answer");
 
-    let refused = h.client.verifier().verify(raw);
+    let refused = h.client.verifier().verify(answered(raw));
     match refused {
         Err(VerificationError::Unknown(detail)) => {
             assert!(
@@ -398,29 +398,48 @@ async fn a_cancellation_travels_under_its_own_identity() {
     );
 }
 
+/// Unwrap an answer, refusing the not-yet arm: these tests ask about effects
+/// whose answers are settled or conflicted, so a `NotYetVisible` here means
+/// the fixture is wrong, not the protocol.
+fn answered(
+    resolved: townhall_service::Resolved<council_wire::SignedEffectResponse>,
+) -> council_wire::SignedEffectResponse {
+    match resolved {
+        townhall_service::Resolved::Answer(raw) => raw,
+        townhall_service::Resolved::NotYetVisible => {
+            panic!("expected an answer; the council said 'not yet'")
+        }
+    }
+}
+
 // -------------------------------------------------------------- reconciliation
 
 /// The typed path a reconciler needs: ask about an intent that was never
 /// delivered, before its deadline, and get told nothing has settled.
 ///
-/// `NotYetVisible` must stay `Unknown`. Reading it as absence is how a live
-/// booking gets cancelled underneath us.
+/// Since ADR-020 that reply has its own type: the authenticated,
+/// identity-bound `Resolved::NotYetVisible` — a pursuit signal that never
+/// reaches the verifier and never becomes a fact. Reading it as absence is
+/// still how a live booking gets cancelled underneath us; what it MAY now do
+/// is authorize a resend of the same identity, which is the reconciler's
+/// decision, not this client's.
 #[tokio::test]
-async fn resolving_an_undelivered_intent_before_its_deadline_is_unknown() {
+async fn resolving_an_undelivered_intent_before_its_deadline_is_not_yet() {
     let h = Harness::new().await;
 
-    let raw = townhall_service::EffectResolver::resolve(
+    let resolved = townhall_service::EffectResolver::resolve(
         &h.client,
         &Harness::attempt("EFF-NEVER-SENT"),
         OperationKind::Book,
     )
     .await
-    .expect("an answer");
+    .expect("a usable reply");
 
-    match h.client.verifier().verify(raw) {
-        Err(VerificationError::Unknown(_)) => {}
-        other => panic!("expected Unknown before the deadline, got {other:?}"),
-    }
+    assert_eq!(
+        resolved,
+        townhall_service::Resolved::NotYetVisible,
+        "unsettled and pre-deadline: the council's signed 'nothing yet', typed"
+    );
 }
 
 /// Past the deadline the same question has a definitive answer, and only then.
@@ -437,7 +456,7 @@ async fn resolving_an_undelivered_intent_after_its_deadline_is_absence() {
     .await
     .expect("an answer");
 
-    let fact = h.client.verifier().verify(raw).expect("verified");
+    let fact = h.client.verifier().verify(answered(raw)).expect("verified");
     assert_eq!(
         *fact.get(),
         VerifiedProviderFact::EffectAbsent {
@@ -463,7 +482,11 @@ async fn resolve_finds_what_execute_created() {
     .expect("an answer");
 
     assert_eq!(
-        *h.client.verifier().verify(raw).expect("verified").get(),
+        *h.client
+            .verifier()
+            .verify(answered(raw))
+            .expect("verified")
+            .get(),
         created
     );
 }
@@ -483,7 +506,7 @@ async fn resolving_with_the_wrong_kind_is_unknown() {
     .await
     .expect("an answer");
 
-    match h.client.verifier().verify(raw) {
+    match h.client.verifier().verify(answered(raw)) {
         Err(VerificationError::Unknown(_)) => {}
         other => panic!("expected Unknown for a kind conflict, got {other:?}"),
     }
@@ -569,7 +592,7 @@ async fn a_signed_response_for_another_identity_verifies_and_is_the_domains_to_r
     let fact = h
         .client
         .verifier()
-        .verify(raw)
+        .verify(answered(raw))
         .expect("a genuine council response verifies");
 
     assert_eq!(

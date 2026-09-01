@@ -281,11 +281,13 @@ async fn the_dropped_response_converges_to_exactly_one_booking() {
     );
 }
 
-/// Test 1: our process dies AFTER the intent commits and BEFORE one byte
-/// reaches the council. The intent is durable; the provider has nothing; and
-/// recovery converges without ever double-booking.
+/// Test 1, first half: our process dies AFTER the intent commits and BEFORE one
+/// byte reaches the council — and recovery FINISHES THE JOB (ADR-020, the
+/// owner's decision of 2026-08-25). The intent is Lucy's durable authorization;
+/// an outbox that never sends is not an outbox. Recovery queries, receives the
+/// council's authenticated "nothing yet", and resends under the same identity.
 #[tokio::test]
-async fn a_crash_before_the_call_leaves_a_durable_intent_and_an_ignorant_council() {
+async fn a_crash_before_the_call_is_finished_by_recovery() {
     let dir = tempfile::tempdir().expect("tempdir");
     let world = spawn_council(dir.path());
 
@@ -296,38 +298,60 @@ async fn a_crash_before_the_call_leaves_a_durable_intent_and_an_ignorant_council
     let effect =
         townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
 
-    // The two halves of test 1, asserted from the two databases.
+    // The crash state, asserted from the two databases BEFORE recovery runs:
+    // the intent is durable, and the provider has nothing — read from its
+    // file, not through an endpoint that would bind the identity on first
+    // sight.
     let (reconciliation, repo, clock) = reconciler_over(&world).await;
     let intent = repo
         .load_effect(&effect)
         .await
         .expect("the intent is durable");
     assert_eq!(intent.effect_intent_id, effect);
-    assert!(
-        !council_knows(&world, effect.as_str()).await,
-        "the provider has nothing — read from its database, not through an \
-         endpoint that would bind the identity on first sight"
-    );
+    assert!(!council_knows(&world, effect.as_str()).await);
 
-    // Recovery, ask-only: before the deadline the council honestly says
-    // "not yet visible", which is Unknown, which drives nothing.
+    // Recovery: query → the council's signed, identity-bound "nothing yet" →
+    // resend the persisted plan under the same identity → Booked. One turn.
     clock.advance(60_000);
     let attended = reconciliation.attend(&effect).await.expect("attend");
-    assert!(
-        matches!(attended, Attended::StillUnknown { .. }),
-        "pre-deadline, an undelivered create is genuinely unknown: {attended:?}"
+    assert_eq!(
+        attended,
+        Attended::Settled,
+        "recovery completes what the state still wants"
     );
+    let healed = repo.load(&id).await.expect("load");
+    assert_eq!(healed.state.name(), "Booked");
+    assert_eq!(
+        council_bookings(&world).await,
+        1,
+        "exactly one booking — finished, not duplicated"
+    );
+}
 
-    // Past the effect's deadline the council tombstones it: definitive absence,
-    // and the booking returns to re-proposable. The room was NEVER booked, so
-    // "it failed, try again" is now literally true (ADR-019 / the owner's rule).
-    //
+/// Test 1, second half — the ADR-016 case, preserved: the same crash, but the
+/// deadline passes before any recovery runs. The council tombstones the
+/// identity, the resend never happens (there is nothing to authorize it: the
+/// answer is definitive absence, not "not yet"), and the booking fails closed
+/// to re-proposable. "It failed, try again" is literally true.
+#[tokio::test]
+async fn a_crash_before_the_call_that_outlives_its_deadline_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let world = spawn_council(dir.path());
+
+    let status = run_driver(&world, "BKG-DIES-UNSEEN", "before-call");
+    assert!(!status.success(), "the driver aborted, as armed");
+
+    let id = BookingId::new("BKG-DIES-UNSEEN");
+    let effect =
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+    assert!(!council_knows(&world, effect.as_str()).await);
+
     // The deadline is the COUNCIL's to judge, on the COUNCIL's clock (ADR-016)
     // — advancing our store clock moves only our cadence, never its verdict. So
     // "later" is a council restart with its clock ahead, which is what actually
-    // happens when real time passes. (The first draft of this test advanced our
-    // clock and expected absence: the council rightly kept answering "not yet",
-    // which is ADR-016 §2 refusing to let OUR clock manufacture absence.)
+    // happens when real time passes. (An earlier draft advanced our clock and
+    // expected absence: the council rightly kept answering "not yet", which is
+    // ADR-016 §2 refusing to let OUR clock manufacture absence.)
     drop(world);
     let world = spawn_council_at(dir.path(), Some(MovableClock::now() + 600_000));
     let (reconciliation, repo, clock) = reconciler_over(&world).await;

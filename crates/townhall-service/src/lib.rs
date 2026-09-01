@@ -93,7 +93,33 @@ pub trait AvailabilitySource: Send + Sync {
 /// say so.
 #[async_trait]
 pub trait EffectResolver<Raw>: Send + Sync {
-    async fn resolve(&self, attempt: &EffectAttempt, kind: OperationKind) -> Result<Raw, Unknown>;
+    async fn resolve(
+        &self,
+        attempt: &EffectAttempt,
+        kind: OperationKind,
+    ) -> Result<Resolved<Raw>, Unknown>;
+}
+
+/// What one ask produced, for the pursuit decision (ADR-020).
+///
+/// `NotYetVisible` is the one reply that can authorize a resend, so its bar is
+/// stated at the trait: an implementation may only produce it after **(1)** the
+/// reply's signature verified against the pinned council key and **(2)** the
+/// reply names exactly the asked attempt's identity. A signed not-yet for
+/// identity A must never authorize resending identity B. Everything that fails
+/// either check — bad or missing signature, wrong identity, protocol conflict,
+/// "unavailable", garbage — is `Err(Unknown)`: an unusable reply that drives
+/// nothing.
+///
+/// Deliberately not a `VerifiedProviderFact`: "not yet" is a pursuit signal,
+/// not a fact about the world, and it never enters the fact door.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved<Raw> {
+    /// An answer to hand to the verifier and, if it passes, the fact door.
+    Answer(Raw),
+    /// The council's authenticated, identity-bound "I know this attempt and
+    /// nothing is settled".
+    NotYetVisible,
 }
 
 #[derive(Debug, Error)]
@@ -358,15 +384,48 @@ where
             return Ok(BoundaryOutcome::Unresolved);
         };
 
-        // The attempt is durable BEFORE the wire (ADR-014 one level in): the row
-        // moves Prepared -> Unknown here, so `Prepared` keeps meaning "never
-        // attempted" and a crash mid-call still spent budget.
+        let outcome = self
+            .send_claimed(id, &claimed.intent, claimed.token, RETRY_CADENCE_MS)
+            .await;
+
+        // The lease is given back whatever happened, so the reconciler may pick
+        // the intent up at its ordinary cadence rather than waiting out a dead
+        // lease.
+        let _ = self
+            .repository
+            .release_lease(&effect_id, claimed.token)
+            .await;
+
+        // A lost row means someone else owns this turn now — Unresolved, same
+        // as losing the claim.
+        Ok(outcome?.unwrap_or(BoundaryOutcome::Unresolved))
+    }
+
+    /// One SEND under a held claim: mark, execute the persisted plan, verify,
+    /// settle, mark finished. The only place in this crate a capability is
+    /// invoked — `propose` reaches it for a freshly prepared intent, and
+    /// recovery reaches it through [`Reconciliation::attend`] for an intent
+    /// that is still wanted (ADR-020). `None` means the token lost the row.
+    ///
+    /// Each wire call is an attempt: the mark is durable BEFORE the wire
+    /// (ADR-014 one level in — the row moves Prepared → Unknown here, so
+    /// `Prepared` keeps meaning "never attempted" and a crash mid-call still
+    /// spent budget), and the finish is recorded when the call returns control,
+    /// answer or not.
+    async fn send_claimed(
+        &self,
+        id: &BookingId,
+        intent: &townhall_domain::EffectIntent,
+        token: i64,
+        cadence_ms: i64,
+    ) -> Result<Option<Turn>, ServiceError> {
+        let effect_id = intent.effect_intent_id.clone();
         if !self
             .repository
-            .note_attempt_started(&effect_id, claimed.token)
+            .note_attempt_started(&effect_id, token)
             .await?
         {
-            return Ok(BoundaryOutcome::Unresolved);
+            return Ok(None);
         }
 
         // Both halves come off the *persisted* intent, and this is the only place
@@ -376,11 +435,15 @@ where
         // lookup, sending this one, would be refused as a conflict forever.
         let attempt = EffectAttempt {
             id: effect_id.clone(),
-            expires_at_ms: prepared.intent.expires_at_ms,
+            expires_at_ms: intent.expires_at_ms,
         };
 
         // PHASE B — outside, with no transaction open.
-        let outcome = match self.capability.execute(&effect, &attempt).await {
+        let outcome = match self
+            .capability
+            .execute(&intent.canonical_plan, &attempt)
+            .await
+        {
             // Neither success nor failure. The aggregate stays in flight and
             // reconciliation resolves it; treating this as failure would return
             // the booking to a re-proposable state while the council may hold a
@@ -394,20 +457,13 @@ where
             },
         };
 
-        // The call returned control — answer or not — and the turn is over.
-        // Recorded and released even on the unresolved paths, so the reconciler
-        // may pick the intent up at its ordinary cadence rather than waiting out
-        // a dead lease.
+        // The call returned control — answer or not.
         let _ = self
             .repository
-            .note_attempt_finished(&effect_id, claimed.token, RETRY_CADENCE_MS)
-            .await;
-        let _ = self
-            .repository
-            .release_lease(&effect_id, claimed.token)
+            .note_attempt_finished(&effect_id, token, cadence_ms)
             .await;
 
-        outcome
+        outcome.map(Some)
     }
 
     /// PHASE C — classify the evidence against freshly loaded state, and commit.
@@ -721,11 +777,44 @@ where
             return self.escalate(id, claimed).await;
         }
 
-        // The attempt is durable before the wire — same discipline as Phase B.
+        let cadence = if claimed.escalated {
+            ESCALATED_CADENCE_MS
+        } else {
+            RETRY_CADENCE_MS
+        };
+        let booking_id = claimed.intent.booking_id.clone();
+
+        // The pursuit consultation (ADR-020): may this turn CAUSE the effect,
+        // or only learn its fate? The domain's table answers per state; the
+        // extra bindings are conservative — a state that no longer names this
+        // intent, or names it as a different kind, wants nothing sent. Read
+        // once, before the wire: a withdrawal that lands mid-turn is the
+        // best-effort case ADR-020 accepts, bounded by the deadline and healed
+        // by the fact arms.
+        let state = Booking::from(&repository.load(&booking_id).await?).state;
+        let wanted = state.effect_intent_id() == Some(id)
+            && state.in_flight_kind() == Some(claimed.intent.operation_kind)
+            && matches!(
+                state.pursuit(),
+                Some(townhall_domain::Pursuit::SendAndResolve)
+            );
+
+        // Never attempted, and still wanted: recovery's FIRST-SEND leg —
+        // the crash window between a handoff's commit and its successor's
+        // mark, resumed under the same identity (test 12's sentence).
+        if claimed.intent.status == townhall_domain::EffectStatus::Prepared && wanted {
+            return Ok(self.turn_to_attended(
+                self.coordinator
+                    .send_claimed(&booking_id, &claimed.intent, claimed.token, cadence)
+                    .await?,
+                claimed.attempts_started + 1,
+            ));
+        }
+
+        // The QUERY — its own attempt, marked before the wire like any other.
         if !repository.note_attempt_started(id, claimed.token).await? {
             return Ok(Attended::NotDue);
         }
-
         let attempt = EffectAttempt {
             id: id.clone(),
             expires_at_ms: claimed.intent.expires_at_ms,
@@ -734,28 +823,16 @@ where
             .resolver
             .resolve(&attempt, claimed.intent.operation_kind)
             .await;
-
-        let outcome = match asked {
-            Err(Unknown { .. }) => None,
-            Ok(raw) => self.coordinator.verifier.verify(raw).ok(),
-        };
-
-        let cadence = if claimed.escalated {
-            ESCALATED_CADENCE_MS
-        } else {
-            RETRY_CADENCE_MS
-        };
         let _ = repository
             .note_attempt_finished(id, claimed.token, cadence)
             .await;
 
-        match outcome {
+        match asked {
             // The reconciler never interprets the fact — the coordinator's
             // settle path asks the domain and commits, exactly as it would for
             // a fact that arrived any other way.
-            Some(fact) => {
-                let booking_id = claimed.intent.booking_id.clone();
-                match self.coordinator.settle(&booking_id, &fact).await? {
+            Ok(Resolved::Answer(raw)) => match self.coordinator.verifier.verify(raw) {
+                Ok(fact) => match self.coordinator.settle(&booking_id, &fact).await? {
                     BoundaryOutcome::Committed(_) | BoundaryOutcome::Converged => {
                         Ok(Attended::Settled)
                     }
@@ -766,11 +843,39 @@ where
                     _ => Ok(Attended::StillUnknown {
                         attempts_started: claimed.attempts_started + 1,
                     }),
-                }
-            }
-            None => Ok(Attended::StillUnknown {
+                },
+                Err(_) => Ok(Attended::StillUnknown {
+                    attempts_started: claimed.attempts_started + 1,
+                }),
+            },
+            // The council's authenticated, identity-bound "nothing yet" — and
+            // the state still wants the effect: RESEND the persisted plan under
+            // the same identity (ADR-020). A second wire call, so a second
+            // attempt on the books.
+            Ok(Resolved::NotYetVisible) if wanted => Ok(self.turn_to_attended(
+                self.coordinator
+                    .send_claimed(&booking_id, &claimed.intent, claimed.token, cadence)
+                    .await?,
+                claimed.attempts_started + 2,
+            )),
+            // "Nothing yet" for an effect nobody wants caused: the deadline
+            // will end this story (ADR-016); until then, honestly unknown.
+            Ok(Resolved::NotYetVisible) => Ok(Attended::StillUnknown {
                 attempts_started: claimed.attempts_started + 1,
             }),
+            Err(Unknown { .. }) => Ok(Attended::StillUnknown {
+                attempts_started: claimed.attempts_started + 1,
+            }),
+        }
+    }
+
+    /// What a send amounted to, from the reconciler's doorway.
+    fn turn_to_attended(&self, sent: Option<Turn>, attempts_started: u32) -> Attended {
+        match sent {
+            // The token lost the row: someone else owns this turn now.
+            None => Attended::NotDue,
+            Some(BoundaryOutcome::Committed(_) | BoundaryOutcome::Converged) => Attended::Settled,
+            Some(_) => Attended::StillUnknown { attempts_started },
         }
     }
 

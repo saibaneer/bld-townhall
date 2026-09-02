@@ -37,22 +37,18 @@ with deviations named rather than smoothed over.
 
 ## Deviations from the plan, named
 
-1. **A5's deterministic pre-CAS barrier is not implemented — and cannot be.**
-   The PR review judged the naming of this residue insufficient and asked for
-   the deterministic witness. Working the schedule through settles it: the
-   discriminating interleaving for check-then-insert needs a caller parked
-   *between* the check and the insert, and any hook that can park there exists
-   only in an implementation that has the gap — parking outside the call cannot
-   order the two halves of an operation the correct implementation performs as
-   one. So the guarantee is made structural instead:
-   `ReplayWindow::insert_if_absent` is a single `Mutex`-guarded `entry()` (the
-   check and write are one operation), and the API exposes **no read at all** —
-   pinned by `the_replay_window_exposes_no_read_to_race_against`, a source scan
-   that fails if a query method ever appears — so the caller-side
-   check-then-insert cannot be written either. The 16-thread race remains as a
-   belt. A model checker (loom) would be the fully deterministic witness and
-   costs a cfg-gated lane normal CI never runs; adopted only if this surface
-   grows.
+1. **RESOLVED — the deterministic concurrency witness is a CI-executed loom
+   lane.** The first defence (a source scan proving the API exposes no read,
+   plus a 16-thread race) was adjudicated insufficient, and the adjudication
+   was right twice over: the scan cannot regress *internal* atomicity — an
+   `insert_if_absent` rewritten with two lock acquisitions stays green — and
+   "a deterministic schedule is unbuildable" confused ad-hoc hooks with model
+   checking, which controls schedules without adding a production seam. The
+   loom test (`tests/loom.rs`, `--features loom`, its own CI step) explores
+   every interleaving of the modelled lock and was verified against exactly
+   that internal two-lock mutation: loom finds the admitting interleaving
+   deterministically where the thread race finds it by mood. The source scan
+   stays as the caller-side half of the argument.
 2. **The gateway's `IN_FLIGHT` set is a hardcoded const**, and the coverage
    claim is stated exactly (the review caught the first version overstating
    it): only `BookingInProgress` is functionally exercised, by the fault-run

@@ -31,3 +31,17 @@ tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+# The deterministic concurrency lane (CI runs it as its own step):
+# `cargo test -p townhall-channel --features loom --test loom`. Loom explores
+# every interleaving of the modelled Mutex — the witness a probabilistic race
+# cannot be, and one that also regresses the INTERNAL atomicity a public-API
+# scan cannot see. A feature rather than `--cfg loom` because RUSTFLAGS is
+# global and tokio's own loom branches break under it; the same
+# test-machinery-as-feature pattern as mock-council's `test-faults`.
+[features]
+loom = ["dep:loom"]
+
+[dependencies.loom]
+version = "0.7"
+optional = true

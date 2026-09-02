@@ -4,6 +4,12 @@ use bld_types::BookingId;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+
+// The lock loom models under the deterministic lane, std everywhere else. Loom
+// mirrors std's API, so the swap is the import and nothing downstream.
+#[cfg(feature = "loom")]
+use loom::sync::Mutex;
+#[cfg(not(feature = "loom"))]
 use std::sync::Mutex;
 
 /// What makes an inbound message *this* message.

@@ -16,3 +16,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      # The deterministic concurrency lane: loom explores every interleaving of
+      # the replay window's lock. A probabilistic race passes a broken
+      # check-then-insert by scheduler mood; this cannot.
+      - run: cargo test -p townhall-channel --features loom --test loom

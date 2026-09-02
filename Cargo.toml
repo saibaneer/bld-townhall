@@ -9,6 +9,8 @@ members = [
   "crates/council-wire",
   "crates/council-client",
   "crates/townhall-http",
+  "crates/townhall-channel",
+  "crates/townhall-gateway",
   "services/mock-council",
   "services/townhall-server",
 ]

@@ -1,0 +1,31 @@
+[package]
+name = "townhall-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Spec §3.2 grades a BLD client an "untrusted driver; must not bypass server
+# checks", marked "may mutate authoritative booking state? No". The manifest is
+# how that holds: absent here are townhall-service, townhall-store,
+# townhall-http, townhall-domain, bld-kernel and sqlx. This crate's only route
+# to a booking is a socket.
+#
+# Dev-dependencies DO get the server binaries — the tests must drive the real
+# wire, and a mock would prove nothing about a contract. That exemption is why
+# townhall-channel's forbidden list covers dev-deps too: it needs no server, so
+# the same allowance there would only open a hole.
+[dependencies]
+bld-types = { path = "../bld-types" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "townhall-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The dependency list IS the trust posture (spec §3.2: a HumanChannel adapter is
+# a "trusted parser/normalizer only; must not invent authority").
+#
+# Absent, deliberately, in BOTH normal and dev dependencies: townhall-gateway,
+# townhall-service, townhall-store, townhall-http, bld-kernel, sqlx, reqwest.
+# A crate that cannot name a mutation surface cannot mutate, so §14's "must not
+# own booking state, policy, authority or model decisions" is discharged by the
+# crate graph rather than by discipline.
+#
+# The dev list matters as much as the normal one here: this crate's tests need no
+# server, so allowing dev-dependencies the exemption the gateway needs would let
+# a #[cfg(test)] module reach straight into the store.
+[dependencies]
+async-trait = { workspace = true }
+bld-types = { path = "../bld-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

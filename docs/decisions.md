@@ -1675,3 +1675,282 @@ invariants rather than an exact convergence-GET count, trading the plan's "18"
 for freedom from the reconciler's cadence. The demo binary hardcodes the dev
 bindings, exactly as the tests do, because it is a composition root for a demo
 of those tests' world.
+
+## ADR-025 — Authority: M7's decisions before M7's code
+
+Decided 2026-09-02 with the project owner. Plans M7 (Approval +
+VerifiedAuthority), amends ADR-021 and ADR-022, and settles what ADR-021
+deferred by name: "`VerifiedAuthority`'s constructor ceremony belongs to M7,
+with its issuer."
+
+Three reviewers read the plan independently — codex gpt-5.6-sol with repo
+access, deepseek-v4-flash and glm-5.3 with spec and code excerpts. All three
+reached the same three answers the plan proposed and refuted all three of the
+reasons it gave for them. What follows is the corrected version.
+
+### One `principal` was doing three jobs
+
+Today's envelope carries one `PrincipalId`, and ADR-022 spent it three times:
+the booking's owner at create, the visibility predicate in SQL, and the
+requester persisted in the cancellation plan. ADR-020 promised the booker and
+the canceller need not be the same person; one field cannot keep that promise,
+and §13's sketch — also one `principal` — would have carried the ambiguity into
+the schema.
+
+M7's envelope separates three things:
+
+- **grantor** — on whose behalf; the booking's owner and the visibility scope;
+- **subject** — the principal the action is attributed to (ADR-020's requester);
+- **actor** — the authenticated workload that presented the grant.
+
+Lucy books: grantor = subject = `lucy`. Marco cancels under delegation: grantor
+= `lucy`, subject = `marco`, actor = Marco's agent. ADR-022's outstanding
+facade-level delegated-cancellation test is the witness, and it lands in M7A —
+early, because it is the test most likely to expose a wrong envelope before that
+envelope becomes schema and wire compatibility debt.
+
+### Widening does not avoid a second vocabulary; it relocates it
+
+The plan's reason for widening rather than wrapping — "two types that both
+describe what you are allowed to do is two places to forget a check" — is void.
+§9's `delegations` table must persist the envelope for expiry and revocation to
+be checkable at all, and ADR-021's surviving half of ADR-017 point 4 forbids the
+domain type from being that representation: `VerifiedAuthority` implements
+neither `Serialize` nor `DeserializeOwned`, asserted. A row type appears either
+way.
+
+Recorded consequences:
+
+- the row representation is **owned by the issuer**, not by the store's decoder;
+  the store persists opaque bytes plus only the columns revocation and expiry
+  must index;
+- the round trip is pinned by a test that issues, persists, reloads and compares
+  the **issued** value — never a hand-built one;
+- the no-serde assertion is now known to be **insufficient on its own**, and its
+  comment says so: it forbids the domain type crossing a wire while the row
+  mapping beside it is the real minting path.
+
+Widen anyway. Of the two second vocabularies on offer, a narrow struct plus an
+envelope was the worse, because both of its halves would have lived in code and
+described scope.
+
+### Nobody mints authority by struct literal, tests included
+
+The plan's reason for a separate crate — "the orchestrator physically cannot
+mint a grant" — is also void. All five fields are `pub` today and `DevAuthority`
+builds one with a struct literal, so any crate can. A crate boundary is not a
+capability boundary while the constructor is public; ADR-022's `load_visible`
+removed a capability, and crate placement alone removes nothing.
+
+`VerifiedAuthority` and `VerifiedApproval` move to `townhall-authority` with
+private fields, below the domain in the graph, and the only constructor takes a
+`VerifiedApproval` that the verifier alone can produce. Private fields in
+`townhall-domain` would have blocked the issuer too — the type lives with the
+thing that issues it.
+
+Which leaves the 24 construction sites. **No `test-support` constructor is
+added.** That is the backdoor this section exists to close, and a cargo feature
+that leaks through unification would close it only on paper. Tests obtain
+authority the way production does: `townhall-testkit` gains an in-memory issuer
+that drives the real challenge → approval → grant path, and the sites migrate to
+it. A test whose premise is a forged grant asserts against a fiction — the
+project's hard rule, applied to the authority type itself.
+
+### Two headers, because authentication is not delegation
+
+§10.1 always specified both: `Authorization` authenticates the agent or service,
+`X-BLD-Delegation` carries or references the verified grant. M5 conflated them —
+the bearer *is* the authority — and reserved the delegation header with a 400.
+
+M7 separates them, and the order of work matters: **un-reserve the header before
+writing any tamper test.** `authorize()` refuses `x-bld-delegation` as its first
+statement, before the bearer is even read, so a test that sends a tampered
+envelope and expects a denial passes today against code that performs no check.
+Recorded as a trap because the acceptance gate names "tampered" and the gate is
+presently satisfiable by nothing.
+
+The separation also removes a live hazard: with one header, revoking a grant
+would also remove the caller's ability to read, to request another approval, or
+to send REVOKE.
+
+### The authority plane is the server's, and the proposer cannot reach it
+
+Two processes need one authoritative store: the SMS side asks for a challenge,
+the server resolves the resulting grant. The simulator currently mints its own
+credentials locally, which is a composition-root convenience and not a topology.
+Rather than a second service or a deliberately shared database file, the trusted
+authority endpoints live **in the server**, on a router `Gateway` does not know:
+the gateway keeps its socket and its ignorance, and the orchestrator reaches
+issuance through a narrow begin/submit/revoke port returning opaque references.
+
+The orchestrator receives no issuer capability and no dependency on
+`townhall-authority`. ADR-023's resolved-dependency tripwire gains that crate by
+name, beside the crates it already forbids — the guarantee is an assertion or it
+is a hope.
+
+### Approval comes before the durable mutation
+
+§23.1 is normative and M6's dispatcher has it backwards: `BOOK` creates the
+intent, searches venues, selects and verifies, and *then* asks for `CONFIRM`.
+Replacing the word with `YES 7312` in place would leave approval standing after
+four committed versions. M7's order is the spec's — preview, challenge,
+approval, and only then create, select, verify, book.
+
+This forces something the plan had not noticed: the `BookingId` must be **minted
+at challenge time**. ADR-024 derives it from `message.identity`, and the `YES`
+reply is a different message with a different identity, so resuming from it
+would create a second booking. The id is derived from the original request,
+carried inside the approved scope, persisted with the challenge and reused after
+approval. The same move gives "approve the cancellation of that booking"
+somewhere to point before a row exists.
+
+### The canonical scope is data; the preview is rendered from it
+
+A hash proves equality and reconstructs nothing. If only the hash is durable,
+resuming after a restart requires session memory or re-parsing an old SMS, and
+§2's "durable state is not conversational memory" forbids both. The challenge
+stores the canonical scope **data** and its versioned hash; the issuer loads
+that object rather than accepting replacement scope from its caller; the hash's
+encoding is order-fixed, because an unordered behaviour set would hash
+differently between runs.
+
+The preview renderer lands in **M7A, not M7C**. The correspondence between what
+Lucy was shown and what was hashed is the property that makes approval mean
+anything, and it is invisible to every "tampered" test — both strings are
+system-generated, so drift between them is silent by construction.
+
+### One challenge, one grant — and a grant is used many times
+
+Two different rules, and conflating them would break the workflow while passing
+a test. A challenge is one-time, expiring and attempt-bounded (§9.1); a
+delegation is stable until expiry or revocation. Therefore:
+
+- replaying an approval must not mint a second grant;
+- **reusing a valid grant across create → select → verify → book → cancel is
+  expected**;
+- "one booking" is a property of the exact-resource scope, never of HTTP call
+  count.
+
+A test that refuses the second presentation of a valid grant would pass while
+implementing the wrong semantics. Recorded so that it cannot be written.
+
+### The replay witness needs two messages
+
+`ReplayWindow` is built and loom-tested in `townhall-channel` and is **not wired
+into the dispatcher**: M6's redelivery safety is entirely ADR-024's derived id
+landing on `AlreadyExists`. An approval reply has no such structural defence, so
+a carrier-redelivered `YES` reaches the verifier twice and the second arrival is
+indistinguishable from an attack.
+
+Decided: the dispatcher absorbs redelivery by message identity **before** the
+verifier, so a legitimate redelivery is idempotent rather than denied — and the
+verifier's replay check is therefore witnessed only by **two distinct messages
+carrying one code**. A replay test built from one repeated message asserts the
+dedupe, not the check, and would keep passing if the check were deleted.
+
+### Revocation blocks the next mutation, not the last one
+
+ADR-014 persists an effect intent before the effect; ADR-019's recovery finishes
+it without a requesting principal, and the store's reconciliation path
+deliberately has none. Requiring the grant to stay live through reconciliation
+would strand that protocol. Explicitly:
+
+- expiry or revocation refuses to **start** an authorized mutation;
+- it neither erases nor invalidates an already-committed effect intent;
+- recovery proceeds from durable booking state, as it already does;
+- any later cancellation is separately authorized.
+
+Tested with revocation racing both before and after Phase A.
+
+### Assurance is enforced, or it is decoration
+
+A stored string reading `Sms` that nothing compares against satisfies a schema
+test and enforces nothing. The channel binding establishes an assurance level;
+the issuer **caps** the grant's at the binding's; the service carries a minimum
+and refuses below it. §13.1's point — that SMS approval suits the town-hall risk
+profile and not a higher one — is that cap and nothing else.
+
+### Delegated visibility intersects; it does not substitute
+
+ADR-022's concealment comes from the row predicate `WHERE id = ? AND
+owner_principal = ?`. `lookup_cancellable` returns every row for an owner and
+lets the domain decide what "cancellable" means. Handing Marco a grant for one
+of Lucy's bookings by substituting Lucy as the owner would expose all of them.
+
+Delegated reads intersect in SQL — authorized owner ∩ granted resources ∩
+permitted behaviours — and the base-row predicate stays positive. Fetching
+Lucy's rows and filtering in application code is the shape ADR-022 rejected.
+
+### `NO 7312` is not REVOKE
+
+Rejecting a pending challenge and revoking an issued grant are different acts,
+and today's grammar models neither. §13.2's own preview offers both words, so
+`NO` ships with the challenge: it makes that challenge terminal, and a later
+`YES` must not revive it. REVOKE keeps ADR-024's position — answered from ports
+before the proposer is consulted or any wire is built — but gains a
+verified-channel path, must not require the grant it is revoking, and is
+idempotent.
+
+### Amendment to ADR-021: the curl lane survives, and is named
+
+ADR-021 recorded that M7 "replaces the resolver in the composition root", which
+the trait's own comment reads as "no fallback survives beside it". Keeping
+`--dev-authority` for M5's curl-only gate is exactly such a fallback, so it is
+amended here rather than retained quietly:
+
+- the dev resolver stays behind the cargo feature **and** the startup flag;
+  absent either, the server refuses to start;
+- without the flag, a feature-enabled build resolves through the **real**
+  resolver — never a silent dev fallback;
+- the real resolver **explicitly rejects every `dev-*` token**;
+- dev grants are pinned to the lowest assurance and a short expiry, because
+  widening would otherwise make a dev token a forged full envelope that reads as
+  maximally assured;
+- two separate tests, because these are two properties: the flag is unavailable
+  in a no-feature build, and the running real resolver refuses a dev token;
+- a **no-feature CI lane**, because `services/townhall-server/tests/http.rs`
+  carries `#![cfg(feature = "dev-authority")]` on line 1 and a test hidden inside
+  that file cannot prove the escape hatch closed.
+
+### The slice boundary, moved
+
+The plan's two slices put the resolver swap in the first, before anything could
+issue a grant — a window in which the SMS lane (dev credentials → dev resolver)
+and the curl lane both break, and in which nothing exercises the new resolver end
+to end. §2's "build dependency-first" requires each slice to be independently
+runnable and testable, so there are three:
+
+- **M7A — the authority component.** IDs and types with private construction;
+  `channel_bindings`, `approval_challenges`, `delegations` (migration 0006); the
+  canonical scope codec and the preview renderer; atomic attempt counting,
+  one-challenge-one-grant issuance, expiry, revocation; the testkit issuer and
+  the 24-site migration; ADR-022's delegated-cancellation test; the facade's
+  exact-resource delegated admission.
+- **M7B — the HTTP contract.** `Authorization` and `X-BLD-Delegation` separated
+  and the header un-reserved; the real resolver and the trusted authority
+  endpoints; the composition root; this ADR's amendment tests and the no-feature
+  lane.
+- **M7C — the human half.** Approve-first ordering; `YES` and `NO`; verified
+  REVOKE; the `CredentialSource` swap **in the same slice as the journey test**,
+  because a journey still drawing `dev-lucy` would pass with the code purely
+  decorative; Lucy's end-to-end £45 booking and the hostile battery.
+
+### Costs accepted
+
+Twenty-four construction sites migrate to a testkit issuer that runs real
+issuance — slower tests, and a testkit that can now refuse. `townhall-domain`
+gains a dependency on `townhall-authority`, inverting the intuition that the
+domain sits lowest. M6's journey is rewritten rather than extended, and its
+script changes visibly for anyone who learned the old order. Three slices where
+the roadmap gives M7 one week alongside M8.
+
+### What the reviewers found, credited
+
+codex gpt-5.6-sol: the ordering error (approval before create), the id minted at
+challenge time, the absent authority plane, grant reuse against challenge
+replay. glm-5.3: the persistence tension that voids the widening argument, the
+tamper test satisfiable by the reserved-header 400, the replay witness, and
+`DevAuthority` as a forger of the widened envelope. deepseek-v4-flash: this
+section's existence — that keeping the curl lane contradicts ADR-021 as written
+and needed amending rather than assuming. All three refuted the reasons; none
+changed the answers.

@@ -683,25 +683,32 @@ async fn b15_conversations_do_not_bleed_across_principals() {
     let world = world();
     let talk = talk(&world, &world.server_url);
 
-    talk.book(LUCY_PHONE).await;
-    talk.book(PRIYA_PHONE).await;
+    // ASYMMETRIC on purpose — the review's finding: with identical bookings, a
+    // consistently swapped principal/credential/session implementation passes
+    // a symmetric witness verbatim. The attendee counts differ, so a swap
+    // shows Lucy 21 and fails.
+    talk.book(LUCY_PHONE).await; // 20 attendees
+    talk.say(
+        PRIYA_PHONE,
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=21 accessible=yes max=5000",
+    )
+    .await;
 
-    // Each STATUS sees its own single booking.
     let lucy_status = talk.say(LUCY_PHONE, "STATUS").await;
+    assert!(
+        lucy_status.contains("AwaitingBooking. Attendees 20."),
+        "Lucy sees HER booking, with HER count: {lucy_status}"
+    );
     let priya_status = talk.say(PRIYA_PHONE, "STATUS").await;
-    assert!(lucy_status.contains("AwaitingBooking"), "{lucy_status}");
-    assert!(priya_status.contains("AwaitingBooking"), "{priya_status}");
+    assert!(
+        priya_status.contains("AwaitingBooking. Attendees 21."),
+        "Priya sees HERS: {priya_status}"
+    );
 
     // Each "cancel it" resolves to ONE candidate — their own. If the
-    // cancellable set bled across principals, both would see two and ask.
+    // cancellable set bled, both would see two and ask.
     let lucy_cancel = talk.say(LUCY_PHONE, "cancel it").await;
-    assert!(
-        lucy_cancel.contains("Cancelled"),
-        "one candidate, cancelled without asking: {lucy_cancel}"
-    );
+    assert!(lucy_cancel.contains("Cancelled"), "{lucy_cancel}");
     let priya_cancel = talk.say(PRIYA_PHONE, "cancel it").await;
-    assert!(
-        priya_cancel.contains("Cancelled"),
-        "priya's own, likewise: {priya_cancel}"
-    );
+    assert!(priya_cancel.contains("Cancelled"), "{priya_cancel}");
 }

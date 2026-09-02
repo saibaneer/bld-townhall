@@ -12,15 +12,18 @@
 //! ```text
 //! # comment
 //! > +447700900123 BOOK date=2026-09-10 ...   an inbound message
-//! < Maximum booking fee                       the next reply must contain this
+//! < Maximum booking fee                       the next REPLY, to that sender
+//! <! Booked. Council ref                      the next AUTOMATED message
 //! !followups                                  drain the follow-up queue
 //! ```
 //!
-//! Every `<` consumes exactly one outbound message, in order. A reply that
-//! never came fails as *missing*; one that came unexpected fails as *extra*;
-//! two that swap fail as *out-of-order*. The strictness is the point — a runner
-//! that only searched for substrings anywhere would pass a conversation whose
-//! shape had quietly changed.
+//! Every expectation consumes exactly one outbound message, in order, and
+//! checks THREE things: the text contains the fragment, the recipient is the
+//! current sender, and the class matches the arrow (`<` is a `Reply`, `<!` is
+//! `Automated`). The PR review found the first version checking only the text —
+//! under which every reply misdelivered to the wrong phone, or every reply sent
+//! as `Automated` (and therefore silenceable by someone else's STOP), passed
+//! the gate verbatim.
 
 use crate::dispatcher::Dispatcher;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,8 +34,14 @@ use townhall_channel::{
 
 #[derive(Debug)]
 enum Step {
-    Inbound { from: String, body: String },
-    Expect { fragment: String },
+    Inbound {
+        from: String,
+        body: String,
+    },
+    Expect {
+        fragment: String,
+        class: townhall_channel::OutboundClass,
+    },
     Followups,
 }
 
@@ -62,9 +71,15 @@ impl Script {
                     from: from.to_owned(),
                     body: body.trim().to_owned(),
                 });
+            } else if let Some(fragment) = line.strip_prefix("<! ") {
+                steps.push(Step::Expect {
+                    fragment: fragment.to_owned(),
+                    class: townhall_channel::OutboundClass::Automated,
+                });
             } else if let Some(fragment) = line.strip_prefix("< ") {
                 steps.push(Step::Expect {
                     fragment: fragment.to_owned(),
+                    class: townhall_channel::OutboundClass::Reply,
                 });
             } else if line == "!followups" {
                 steps.push(Step::Followups);
@@ -95,6 +110,7 @@ pub async fn run(
 
     let mut consumed = channel.outbox().len();
     let mut turn = 0_usize;
+    let mut sender: Option<ChannelAddress> = None;
 
     for step in &script.steps {
         match step {
@@ -127,11 +143,14 @@ pub async fn run(
                     .await
                     .map_err(|error| format!("turn {turn}: channel failure: {error}"))?;
                 // The script address must be real, or the silence that follows
-                // would read as a missing reply with the wrong culprit.
-                ChannelAddress::parse(from, region)
-                    .map_err(|error| format!("turn {turn}: script address: {error}"))?;
+                // would read as a missing reply with the wrong culprit — and it
+                // becomes the recipient every expectation is checked against.
+                sender = Some(
+                    ChannelAddress::parse(from, region)
+                        .map_err(|error| format!("turn {turn}: script address: {error}"))?,
+                );
             }
-            Step::Expect { fragment } => {
+            Step::Expect { fragment, class } => {
                 let outbox = channel.outbox();
                 let Some(sent) = outbox.get(consumed) else {
                     return Err(format!(
@@ -144,6 +163,21 @@ pub async fn run(
                          got {:?}",
                         sent.text
                     ));
+                }
+                if sent.class != *class {
+                    return Err(format!(
+                        "turn {turn}: wrong class — {fragment:?} arrived as {:?}, expected {class:?}",
+                        sent.class
+                    ));
+                }
+                match &sender {
+                    Some(expected_to) if &sent.to == expected_to => {}
+                    _ => {
+                        return Err(format!(
+                            "turn {turn}: misdelivered — {fragment:?} went to {:?}",
+                            sent.to
+                        ));
+                    }
                 }
                 consumed += 1;
             }

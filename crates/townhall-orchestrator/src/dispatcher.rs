@@ -184,8 +184,20 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         );
         for followup in pending {
             if self.suppression.is_suppressed(&followup.address) {
-                continue; // the whole turn, skipped
+                continue; // the whole turn, skipped — deliberately, forever:
+                // the human said stop, and the booking's truth stays
+                // reachable through STATUS.
             }
+            // Re-resolve the binding AT DRAIN TIME. The follow-up captured an
+            // (address, principal) pair that was true when queued; if the
+            // directory has since rebound that address, sending would put one
+            // principal's booking reference on another principal's phone — the
+            // review's sharpest scenario. Drift means drop, before any wire
+            // exists to leak through.
+            if self.directory.resolve(&followup.address).as_ref() != Some(&followup.principal) {
+                continue;
+            }
+
             let Some(token) = self.credentials.token_for(&followup.principal) else {
                 continue;
             };
@@ -211,16 +223,21 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 Some(principal) => self.balance.describe(&principal),
                 None => "I don't recognize this number.".to_owned(),
             },
-            ControlCommand::Stop => {
-                self.suppression.suppress(&message.address);
-                "Automated messages stopped. Reply START to resume. \
+            // A failed persist is a failed STOP, and saying otherwise is the
+            // failure mode the review named: a confirmation that lasts exactly
+            // until the next restart. The human hears the truth and can retry.
+            ControlCommand::Stop => match self.suppression.suppress(&message.address) {
+                Ok(()) => "Automated messages stopped. Reply START to resume. \
                  This does not cancel bookings."
-                    .to_owned()
-            }
-            ControlCommand::Start => {
-                self.suppression.allow(&message.address);
-                "Automated messages resumed.".to_owned()
-            }
+                    .to_owned(),
+                Err(_) => "I couldn't make that stick — automated messages are NOT \
+                 stopped. Reply STOP to try again."
+                    .to_owned(),
+            },
+            ControlCommand::Start => match self.suppression.allow(&message.address) {
+                Ok(()) => "Automated messages resumed.".to_owned(),
+                Err(_) => "I couldn't make that stick — reply START to try again.".to_owned(),
+            },
             ControlCommand::Revoke => {
                 "Delegations arrive with M7; there is nothing to revoke yet.".to_owned()
             }

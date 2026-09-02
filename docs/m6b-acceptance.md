@@ -29,25 +29,41 @@ drift — asserted by the test actually executing the binary.
 
 ## Deviations from the plan, named
 
-1. **The clean schedule is 14 requests, not the plan's 16 — and shaped
-   differently.** Two reasons, both discovered by building rather than
-   deciding: (a) each committed turn's *response* carries the fresh version, so
-   no separate reload `GET` precedes a proposal that directly follows one — the
-   reload rule is satisfied by reading the server's own last answer, one
-   round-trip earlier; (b) every freeform turn costs one
-   `GET ?cancellable=true` as the proposer's projected context, which the
-   plan's table omitted. The schedule is asserted **exactly** (ordered, full
-   length, no others), which is what the plan's number existed to guarantee.
-2. **The fault run's "exactly 18" became invariants rather than a count.** The
-   convergence `GET`s ride the reconciler's real cadence; pinning their number
-   would pin a race. What is asserted: exactly **one** book POST (never
-   re-POSTed), the fault fired, the ack is a `Reply` and the outcome an
-   `Automated` message, one council booking. The council's pause/barrier lane
-   remains available if a count is ever worth its determinism cost.
+1. **The clean schedule differs from the plan's table for THREE reasons, not the
+   two first claimed** (the review caught the omission): (a) committed turn
+   responses carry the fresh version, replacing pre-proposal reload `GET`s;
+   (b) every freeform turn reads `?cancellable=true` as the proposer's context;
+   and (c) **the demo script cannot contain the plan's out-of-band bump** — a
+   bump is a *test actor's* move, not a message, so the moved-world leg lives as
+   its own gate test (`m6_gate_the_journey_with_the_world_moving_under_it`),
+   with the bump, the `STATUS` showing the moved count, and the
+   revalidate → verify → book walk counted one POST each in the post-bump
+   window. The clean schedule itself is asserted as **whole request lines,
+   compared for equality** — method, full path, query — after the review found
+   fragment-matching passing a changed query shape.
+2. **The fault run asserts invariants rather than the plan's "exactly 18"** —
+   pinning convergence-GET counts pins the reconciler's cadence into a race —
+   but now over the FULL journey: BOOK, CONFIRM under a dropped answer (ack as
+   a `Reply`, outcome as `Automated` — both **classes asserted by the runner**,
+   not inferred), STATUS of the settled truth, then *cancel it* under a second
+   dropped answer, ending with one cancel POST and the council record
+   cancelled.
 3. **`CONFIRM` stands where M7's approval challenge will.** Named in the
-   script's own comments and `Request::Confirm`'s doc — a stand-in, not a
-   design: nothing in M6 treats the word as authority, and the server's
-   `may_book` guard is what B10 proves still decides.
+   script's own comments and `Request::Confirm`'s doc; the server's `may_book`
+   guard is what disposes, and B10 proves it. (The review concurred: holds.)
+
+### Follow-up semantics, stated exactly
+
+Queued in memory, drained explicitly, **at-most-once**: a suppressed follow-up
+is skipped forever (deliberate — the human said stop; the booking's truth stays
+reachable through `STATUS`); a binding that has **drifted by drain time** is
+dropped before any wire exists (re-resolved against the directory, so one
+principal's reference can never land on another principal's phone — the
+review's sharpest scenario); a process death loses queued notifications (the
+booking still settles server-side). What is NOT accepted: silent suppression
+persistence failure — see `FileSuppression`, whose `suppress` now persists
+first, commits to memory second, and whose failure reaches the human as "NOT
+stopped" rather than as a confirmation with an expiry date.
 
 ## Found during the build
 

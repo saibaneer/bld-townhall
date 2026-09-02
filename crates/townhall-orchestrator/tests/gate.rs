@@ -76,48 +76,47 @@ async fn m6_gate_the_scripted_journey_clean() {
         .await
         .expect("the journey completes");
 
-    // The complete ordered schedule. Fewer requests than the plan's table —
-    // each turn's RESPONSE carries the fresh version, so no separate reload GET
-    // precedes a proposal that follows one (the reload rule is satisfied by
-    // reading the server's own last answer); and every freeform turn reads the
-    // cancellable set as the proposer's projected context. Named in the
-    // acceptance doc as the deviation it is.
-    let id = "sms-"; // the derived id's prefix — the exact digest varies by turn number
-    let expected: Vec<(&str, &str)> = vec![
-        // BOOK
-        ("GET", "/booking-intents?cancellable=true"), // proposer context
-        ("POST", "/booking-intents"),                 // create, 201
-        ("GET", "/venues"),
-        ("POST", "/behaviours/select-venue"),
-        ("POST", "/behaviours/verify-slot"),
-        // STATUS
-        ("GET", "/booking-intents/sms-"),
-        // CONFIRM
-        ("GET", "/booking-intents?cancellable=true"), // proposer context
-        ("GET", "/booking-intents/sms-"),             // the walk's reload
-        ("POST", "/behaviours/book"),
-        ("GET", "/booking-intents/sms-"), // the outcome read for the reply text
-        // STATUS
-        ("GET", "/booking-intents/sms-"),
-        // cancel it
-        ("GET", "/booking-intents?cancellable=true"), // proposer context
-        ("GET", "/booking-intents?cancellable=true"), // the referent resolution
-        ("POST", "/behaviours/cancel"),
-    ];
+    // The complete ordered schedule, as FULL request lines — the review found
+    // the first version matching fragments, under which a changed query shape
+    // or a request against the wrong booking still passed. The derived id is
+    // extracted from the trace itself and every line is compared whole.
     let requests = proxy.requests();
+    let id = requests
+        .iter()
+        .find_map(|line| {
+            let start = line.find("/booking-intents/sms-")? + "/booking-intents/".len();
+            // "sms-" plus 16 digest bytes as hex — the derived id's exact shape.
+            line.get(start..start + 4 + 32).map(str::to_owned)
+        })
+        .expect("a derived id appears in the trace");
+    let expected: Vec<String> = [
+        // BOOK
+        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
+        "POST /booking-intents".to_owned(),                 // create, 201
+        "GET /venues".to_owned(),
+        format!("POST /booking-intents/{id}/behaviours/select-venue"),
+        format!("POST /booking-intents/{id}/behaviours/verify-slot"),
+        // STATUS
+        format!("GET /booking-intents/{id}"),
+        // CONFIRM
+        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
+        format!("GET /booking-intents/{id}"),               // the walk's reload
+        format!("POST /booking-intents/{id}/behaviours/book"),
+        format!("GET /booking-intents/{id}"), // the outcome read for the reply
+        // STATUS
+        format!("GET /booking-intents/{id}"),
+        // cancel it
+        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
+        "GET /booking-intents?cancellable=true".to_owned(), // referent resolution
+        format!("POST /booking-intents/{id}/behaviours/cancel"),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
-        requests.len(),
-        expected.len(),
-        "the schedule is exact — an extra request is drift, a missing one is a \
-         skipped authority: {requests:#?}"
+        requests, expected,
+        "the wire schedule is exact — an extra request is drift, a missing one \
+         is a skipped authority"
     );
-    for (line, (method, fragment)) in requests.iter().zip(expected.iter()) {
-        assert!(
-            line.starts_with(method) && line.contains(fragment),
-            "schedule diverged: expected {method} …{fragment}…, got {line:?}\n{requests:#?}"
-        );
-    }
-    let _ = id;
 
     // The world agrees with the transcript: one council booking, cancelled.
     assert_eq!(council_count(&world, "SELECT COUNT(*) FROM bookings"), 1);
@@ -156,12 +155,15 @@ async fn m6_gate_the_scripted_journey_with_the_answer_lost() {
     let effect = format!("EFF-{}-BOOK-{}", parked.id, parked.version);
     let fault = arm_fault(&world, &effect, "create", "drop_response").await;
 
-    // CONFIRM under the fault: acknowledgement now, outcome after !followups.
+    // CONFIRM under the fault: the acknowledgement is a REPLY now, the outcome
+    // an AUTOMATED message after the follow-up turn — asserted as classes, not
+    // just words, since a "Booking now." that arrived as Automated would be
+    // silenceable by a STOP it has no business obeying.
     let faulted = journey::Script::parse(
         "> +447700900123 CONFIRM\n\
          < Booking now.\n\
          !followups\n\
-         < Booked. Council ref",
+         <! Booked. Council ref",
     )
     .expect("parses");
     journey::run(&dispatcher, &channel, &faulted, Region::Gb)
@@ -179,11 +181,135 @@ async fn m6_gate_the_scripted_journey_with_the_answer_lost() {
         "the chase owns the effect — convergence never re-POSTs: {:?}",
         proxy.requests()
     );
-    // The follow-up was an Automated message, not a reply.
-    let outbox = channel.outbox();
-    let last = outbox.last().expect("the outcome");
-    assert_eq!(last.class, townhall_channel::OutboundClass::Automated);
-    assert_eq!(council_count(&world, "SELECT COUNT(*) FROM bookings"), 1);
+    // The journey continues past the fault — STATUS reads the settled truth,
+    // and the cancellation takes the same lost-answer path, so both halves of
+    // the two-message shape are exercised end to end.
+    let booked = gateway
+        .read(&bld_types::BookingId::new(parked.id.clone()))
+        .await
+        .expect("read");
+    let cancel_effect = format!("EFF-{}-CANCEL-{}", booked.id, booked.version);
+    let cancel_fault = arm_fault(&world, &cancel_effect, "cancel", "drop_response").await;
+
+    let closing = journey::Script::parse(
+        "> +447700900123 STATUS\n\
+         < Booked. Attendees 20. Council ref\n\
+         > +447700900123 cancel it\n\
+         < Cancelling now.\n\
+         !followups\n\
+         <! Cancelled. Council ref",
+    )
+    .expect("parses");
+    journey::run(&dispatcher, &channel, &closing, Region::Gb)
+        .await
+        .expect("the closing completes");
+    assert_eq!(fault_fired(&world, cancel_fault).await, 1);
+
+    assert_eq!(
+        proxy.count("POST", "/behaviours/cancel"),
+        1,
+        "one cancel POST, converged, never re-POSTed: {:?}",
+        proxy.requests()
+    );
+    assert_eq!(
+        council_count(
+            &world,
+            "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NOT NULL"
+        ),
+        1,
+        "the council record ends cancelled"
+    );
+}
+
+/// The moved-world variant of the clean gate — the leg the reviewed plan's
+/// schedule contained and the demo script cannot: an out-of-band bump is a TEST
+/// actor's move, not a message, so it lives here rather than in the script the
+/// binary runs. STATUS must show the moved world; the walk must follow the
+/// reloaded menu through revalidate and verify.
+#[tokio::test]
+async fn m6_gate_the_journey_with_the_world_moving_under_it() {
+    let world = world();
+    let proxy = RecordingProxy::in_front_of(&world.server_url);
+    let dir = world.council_db.parent().expect("dir").to_path_buf();
+    let (dispatcher, channel) = dispatcher_against(&proxy.url, &dir);
+
+    let opening = journey::Script::parse(
+        "> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000\n\
+         < Maximum booking fee: £50.00.\n\
+         > +447700900123 STATUS\n\
+         < AwaitingBooking. Attendees 20.",
+    )
+    .expect("parses");
+    journey::run(&dispatcher, &channel, &opening, Region::Gb)
+        .await
+        .expect("the opening completes");
+
+    // The out-of-band bump: attendees 20 → 24, Lucy's own credential,
+    // AwaitingBooking → NeedsRevalidation (the domain insists the changed
+    // count re-checks capacity).
+    let gateway = Gateway::new(world.server_url.clone(), LUCY);
+    let parked = gateway.cancellable().await.expect("lookup").remove(0);
+    let id = bld_types::BookingId::new(parked.id.clone());
+    let bumped = gateway
+        .propose_at(
+            &id,
+            parked.version,
+            "update-requirements",
+            Some(serde_json::json!({"attendees": 24})),
+        )
+        .await
+        .expect("bump");
+    let townhall_gateway::Turn::Committed {
+        version: bumped_version,
+        ..
+    } = bumped
+    else {
+        panic!("the bump commits: {bumped:?}");
+    };
+
+    // STATUS shows the MOVED world — a cached reply says 20 and fails — and
+    // CONFIRM walks revalidate → verify → book off the reload. Counted within
+    // the post-bump window: verify-slot legitimately ran once in the OPENING
+    // walk too, which is the plan's own two-verify shape.
+    let walk_start = proxy.requests().len();
+    let closing = journey::Script::parse(
+        "> +447700900123 STATUS\n\
+         < NeedsRevalidation. Attendees 24.\n\
+         > +447700900123 CONFIRM\n\
+         < Booked. Council ref\n\
+         > +447700900123 cancel it\n\
+         < Cancelled. Council ref",
+    )
+    .expect("parses");
+    journey::run(&dispatcher, &channel, &closing, Region::Gb)
+        .await
+        .expect("the closing completes");
+
+    // The walk's steps: one each, none duplicated (a stale submit would retry),
+    // and the revalidate departs from the bumped version.
+    let walk: Vec<String> = proxy.requests()[walk_start..].to_vec();
+    for behaviour in ["revalidate-venue", "verify-slot", "book", "cancel"] {
+        let path = format!("/behaviours/{behaviour}");
+        assert_eq!(
+            walk.iter()
+                .filter(|line| line.starts_with("POST") && line.contains(&path))
+                .count(),
+            1,
+            "{behaviour} exactly once in the post-bump walk: {walk:?}"
+        );
+    }
+    let audit = gateway.audit(&id).await.expect("audit");
+    assert!(
+        audit.iter().any(|row| row.from_version == bumped_version),
+        "a walk step departs from the bumped version {bumped_version}"
+    );
+    assert_eq!(
+        council_count(
+            &world,
+            "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NOT NULL"
+        ),
+        1
+    );
 }
 
 /// The demo binary runs the same script through the same runner — asserted by

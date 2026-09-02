@@ -64,7 +64,16 @@ impl Proposer for ScriptedProposer {
             return Proposed::Unclear;
         }
 
-        let Ok(people) = fields["people"].parse::<u16>() else {
+        // The formats the contract advertises are the formats it checks — the
+        // review found "date=tomorrow from=noon people=0" sailing through as a
+        // typed request, and nothing downstream compensates.
+        if !looks_like_date(fields["date"])
+            || !looks_like_time(fields["from"])
+            || !looks_like_time(fields["to"])
+        {
+            return Proposed::Unclear;
+        }
+        let Ok(people @ 1..) = fields["people"].parse::<u16>() else {
             return Proposed::Unclear;
         };
         let Ok(max_pence) = fields["max"].parse::<u64>() else {
@@ -85,4 +94,23 @@ impl Proposer for ScriptedProposer {
             max_pence,
         }))
     }
+}
+
+/// `YYYY-MM-DD`, by shape — four digits, dash, two, dash, two. Shape only:
+/// whether the 31st of February exists is the council's business, not a
+/// grammar's.
+fn looks_like_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit())
+}
+
+/// `HH:MM`, by shape.
+fn looks_like_time(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 5 && bytes[2] == b':' && [0, 1, 3, 4].iter().all(|&i| bytes[i].is_ascii_digit())
 }

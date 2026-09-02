@@ -20,6 +20,7 @@ townhall-channel = { path = "../townhall-channel" }
 townhall-gateway = { path = "../townhall-gateway" }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 townhall-testkit = { path = "../townhall-testkit" }
 
 [lints]

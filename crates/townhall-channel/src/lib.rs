@@ -257,8 +257,23 @@ pub enum ChannelError {
 /// and this crate cannot name the orchestrator.
 pub trait SuppressionStore: Send + Sync + std::fmt::Debug {
     fn is_suppressed(&self, address: &ChannelAddress) -> bool;
-    fn suppress(&self, address: &ChannelAddress);
-    fn allow(&self, address: &ChannelAddress);
+
+    /// Silence automated sends to this address.
+    ///
+    /// # Errors
+    /// The store could not make the change DURABLE. Fallible on purpose: STOP
+    /// is a safety exit, and the PR review found the first version confirming
+    /// "stopped" while the write had already failed — a success that lasts
+    /// until the next restart is a lie with a delay on it. A caller that
+    /// receives an error must not tell the human it worked.
+    fn suppress(&self, address: &ChannelAddress) -> Result<(), String>;
+
+    /// Re-allow automated sends.
+    ///
+    /// # Errors
+    /// As [`Self::suppress`] — the failure direction differs, the honesty
+    /// requirement does not.
+    fn allow(&self, address: &ChannelAddress) -> Result<(), String>;
 }
 
 /// Spec §14's trait, verbatim in shape.

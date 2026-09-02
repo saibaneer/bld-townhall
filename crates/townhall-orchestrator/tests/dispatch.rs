@@ -140,6 +140,27 @@ impl WireFactory for FixedWireFactory {
     }
 }
 
+/// A directory that panics on resolve — the witness that identity was never
+/// even ASKED for. The review's point: counting wire calls alone lets a
+/// dispatcher resolve identity, fetch credentials and build a wire before
+/// recognizing `HELP`, and nothing fails.
+struct PanickingDirectory;
+
+impl PrincipalDirectory for PanickingDirectory {
+    fn resolve(&self, _: &ChannelAddress) -> Option<PrincipalId> {
+        panic!("a control command resolved identity");
+    }
+}
+
+/// A factory that panics on `wire_for` — no wire may even be CONSTRUCTED.
+struct PanickingFactory;
+
+impl WireFactory for PanickingFactory {
+    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
+        panic!("a control command built a wire");
+    }
+}
+
 /// A balance port that counts and answers a nonsense sentinel a hardcoded
 /// string could not reproduce.
 #[derive(Default)]
@@ -233,31 +254,65 @@ impl Bench {
 
 // ------------------------------------------------------------------ B11
 
-/// Every control command answers with ZERO proposer entries and ZERO wire
-/// calls — the panicking proposer makes the first half loud, the counting wire
-/// makes the second half a number.
+/// Every control command answers with NOTHING else consulted: no proposer, no
+/// wire, no wire CONSTRUCTION — and for the four that need no identity, no
+/// directory resolution either. Everything past the classification panics, so a
+/// dispatcher that "just quickly resolves who this is" before recognizing HELP
+/// dies here instead of passing a call-count check it never incremented.
 #[tokio::test]
 async fn b11_control_commands_reach_nothing() {
-    let bench = bench(&ProposerChoice::Panicking);
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(PanickingDirectory),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        suppression,
+        Arc::new(PanickingFactory),
+    );
+    let counter = AtomicUsize::new(0);
     for (text, expect) in [
         ("HELP", "BOOK date="),
         ("STOP", "Automated messages stopped"),
         ("START", "Automated messages resumed"),
         ("REVOKE", "M7"),
-        ("BALANCE", BALANCE_SENTINEL),
     ] {
-        bench
-            .dispatcher
-            .handle(bench.raw("07700 900123", text))
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        dispatcher
+            .handle(RawInbound {
+                identity: InboundIdentity::new("sim", "acct", format!("ctl-{n}")),
+                channel: ChannelKind::SmsSimulator,
+                from: "07700 900123".to_owned(),
+                body: text.to_owned(),
+                received_at_ms: 0,
+                evidence: TransportEvidence::new("sim", "07700 900123", true),
+            })
             .await
             .expect("handled");
-        let reply = bench.last_reply();
+        let outbox = channel.outbox();
+        let reply = &outbox.last().expect("a reply").text;
         assert!(
             reply.contains(expect),
             "{text}: expected {expect:?} in {reply:?}"
         );
     }
-    assert_eq!(bench.wire.count(), 0, "a control command touched the wire");
+
+    // BALANCE is the one control that legitimately asks WHO — so it runs on a
+    // bench whose directory answers, while the wire still panics on touch (a
+    // counting wire asserting zero, plus the panicking proposer).
+    let bench = bench(&ProposerChoice::Panicking);
+    bench
+        .dispatcher
+        .handle(bench.raw("07700 900123", "BALANCE"))
+        .await
+        .expect("handled");
+    assert!(bench.last_reply().contains(BALANCE_SENTINEL));
+    assert_eq!(bench.wire.count(), 0, "BALANCE touched the wire");
 }
 
 // ------------------------------------------------------------------ B12
@@ -380,6 +435,9 @@ async fn the_scripted_grammar_refuses_near_misses() {
         "BOOK date=2026-09-10 date=2026-09-11 from=14:00 to=17:00 people=20 accessible=yes max=5000", // duplicate
         "BOOK date=2026-09-10 from=14:00 to=17:00 people=lots accessible=yes max=5000", // bad number
         "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=maybe max=5000", // bad bool
+        "BOOK date=tomorrow from=14:00 to=17:00 people=20 accessible=yes max=5000", // date shape
+        "BOOK date=2026-09-10 from=noon to=17:00 people=20 accessible=yes max=5000", // time shape
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=0 accessible=yes max=5000", // zero people
     ] {
         bench
             .dispatcher
@@ -411,5 +469,242 @@ async fn the_scripted_grammar_refuses_near_misses() {
         bench.wire.mutation_count(),
         1,
         "the complete request, in any key order, creates"
+    );
+}
+
+// ------------------------------------------------------------------ the STOP lie
+
+/// A suppression store whose disk is gone.
+#[derive(Debug)]
+struct BrokenSuppression;
+
+impl SuppressionStore for BrokenSuppression {
+    fn is_suppressed(&self, _: &ChannelAddress) -> bool {
+        false
+    }
+    fn suppress(&self, _: &ChannelAddress) -> Result<(), String> {
+        Err("disk full".to_owned())
+    }
+    fn allow(&self, _: &ChannelAddress) -> Result<(), String> {
+        Err("disk full".to_owned())
+    }
+}
+
+/// A failed persist must reach the human as "NOT stopped" — the review's HIGH:
+/// the first implementation confirmed STOP while the write had already failed,
+/// a success that lasted exactly until the next restart. This mutation-verified
+/// witness is what makes that regression loud (reverting `suppress()` to
+/// memory-first-ignore-errors passes every other test in this workspace).
+#[tokio::test]
+async fn a_failed_stop_is_reported_as_not_stopped() {
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::new(BrokenSuppression) as Arc<dyn SuppressionStore>,
+    ));
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(PanickingDirectory),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        Arc::new(BrokenSuppression),
+        Arc::new(PanickingFactory),
+    );
+    dispatcher
+        .handle(RawInbound {
+            identity: InboundIdentity::new("sim", "acct", "stop-fail"),
+            channel: ChannelKind::SmsSimulator,
+            from: "07700 900123".to_owned(),
+            body: "STOP".to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", "07700 900123", true),
+        })
+        .await
+        .expect("handled");
+    let outbox = channel.outbox();
+    let reply = &outbox.last().expect("a reply").text;
+    assert!(
+        reply.contains("NOT stopped"),
+        "a failed persist must not be confirmed as stopped: {reply}"
+    );
+    assert!(
+        !reply.contains("Automated messages stopped."),
+        "the success text must be absent: {reply}"
+    );
+}
+
+/// And the store itself: persist-first means a failed write leaves memory
+/// unchanged, so `is_suppressed` never claims a state the disk does not hold.
+#[test]
+fn file_suppression_does_not_commit_what_it_could_not_persist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store =
+        townhall_orchestrator::FileSuppression::open(dir.path().join("stop.list")).expect("open");
+    let lucy =
+        ChannelAddress::parse("+447700900123", townhall_channel::Region::Gb).expect("address");
+
+    // Make the parent unwritable, so the staged write fails.
+    let mut permissions = std::fs::metadata(dir.path()).expect("meta").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o555);
+    std::fs::set_permissions(dir.path(), permissions.clone()).expect("chmod");
+
+    let outcome = store.suppress(&lucy);
+    assert!(
+        outcome.is_err(),
+        "an unwritable disk must surface: {outcome:?}"
+    );
+    assert!(
+        !store.is_suppressed(&lucy),
+        "memory must not hold a state the disk refused — that state evaporates \
+         at restart, which is the whole failure"
+    );
+
+    // Restore writability so the tempdir can clean up (and prove recovery).
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(dir.path(), permissions).expect("chmod back");
+    store.suppress(&lucy).expect("a healthy disk suppresses");
+    assert!(store.is_suppressed(&lucy));
+}
+
+// ------------------------------------------------------------------ binding drift
+
+/// A directory whose binding can be changed mid-test.
+#[derive(Debug, Default)]
+struct SwappableDirectory(std::sync::Mutex<Option<&'static str>>);
+
+impl PrincipalDirectory for SwappableDirectory {
+    fn resolve(&self, _: &ChannelAddress) -> Option<PrincipalId> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(PrincipalId::new)
+    }
+}
+
+/// A wire that accepts a cancellation and PANICS if convergence runs — the
+/// witness that a drifted follow-up's turn never started.
+struct AcceptingWire;
+
+#[async_trait]
+impl BookingWire for AcceptingWire {
+    async fn create(
+        &self,
+        _: &BookingId,
+        _: &BookingRequirements,
+    ) -> Result<Projection, GatewayError> {
+        unreachable!()
+    }
+    async fn read(&self, _: &BookingId) -> Result<Projection, GatewayError> {
+        unreachable!()
+    }
+    async fn cancellable(&self) -> Result<Vec<Projection>, GatewayError> {
+        Ok(vec![Projection {
+            id: "sms-test".to_owned(),
+            version: 4,
+            state: "Booked".to_owned(),
+            requirements: townhall_gateway::dto::Requirements {
+                purpose: "p".to_owned(),
+                requested_date: "2026-09-10".to_owned(),
+                from: "14:00".to_owned(),
+                to: "17:00".to_owned(),
+                attendees: 20,
+                wheelchair_accessible: true,
+                max_fee_pence: 5_000,
+            },
+            selected_venue: None,
+            booking_ref: Some("TH-1".to_owned()),
+            available_behaviours: vec!["Cancel".to_owned()],
+        }])
+    }
+    async fn by_reference(&self, _: &CouncilBookingRef) -> Result<Vec<Projection>, GatewayError> {
+        unreachable!()
+    }
+    async fn venues(&self) -> Result<Vec<VenueRow>, GatewayError> {
+        unreachable!()
+    }
+    async fn propose_at(
+        &self,
+        _: &BookingId,
+        _: u64,
+        _: &str,
+        _: Option<serde_json::Value>,
+    ) -> Result<Turn, GatewayError> {
+        Ok(Turn::Accepted {
+            retry_after: std::time::Duration::from_millis(1),
+        })
+    }
+    async fn converge(
+        &self,
+        _: &BookingId,
+        _: std::time::Duration,
+    ) -> Result<Projection, GatewayError> {
+        panic!("a drifted follow-up ran its turn");
+    }
+}
+
+struct AcceptingFactory;
+
+impl WireFactory for AcceptingFactory {
+    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
+        Arc::new(AcceptingWire)
+    }
+}
+
+/// A follow-up whose binding drifted between queueing and draining is dropped
+/// BEFORE any wire exists — otherwise the dispatcher authenticates as the OLD
+/// principal and sends their booking reference to whoever holds the number now.
+/// (The review's sharpest scenario; converge panics, so a wrong implementation
+/// dies rather than passes.)
+#[tokio::test]
+async fn a_drifted_binding_drops_the_followup_before_any_wire() {
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let directory = Arc::new(SwappableDirectory::default());
+    *directory
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("lucy");
+
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::clone(&directory) as Arc<dyn PrincipalDirectory>,
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(ScriptedProposer),
+        suppression,
+        Arc::new(AcceptingFactory),
+    );
+
+    // "cancel it" → one candidate → Accepted → a follow-up is queued.
+    dispatcher
+        .handle(RawInbound {
+            identity: InboundIdentity::new("sim", "acct", "drift-1"),
+            channel: ChannelKind::SmsSimulator,
+            from: "07700 900123".to_owned(),
+            body: "cancel it".to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", "07700 900123", true),
+        })
+        .await
+        .expect("handled");
+    let sent_before = channel.outbox().len();
+
+    // The number changes hands before the queue is drained.
+    *directory
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("priya");
+
+    dispatcher.run_followups().await;
+
+    // Nothing ran (converge panics if it did) and nothing was sent.
+    assert_eq!(
+        channel.outbox().len(),
+        sent_before,
+        "a drifted follow-up must send nothing: {:?}",
+        channel.outbox().last()
     );
 }

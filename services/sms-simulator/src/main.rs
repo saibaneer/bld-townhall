@@ -47,10 +47,19 @@ impl CredentialSource for DevCredentials {
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (mut server, mut script_path) = (None, None);
+    // The stop list defaults beside the process, not in the SHARED temp dir —
+    // the review's point: a predictable path under /tmp is world-guessable and
+    // holds phone numbers.
+    let mut stop_file = "sms-simulator-stop.list".to_owned();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--server" => server = args.next(),
             "--script" => script_path = args.next(),
+            "--stop-file" => {
+                if let Some(path) = args.next() {
+                    stop_file = path;
+                }
+            }
             other => {
                 eprintln!("sms-simulator: unknown flag {other:?}");
                 return ExitCode::from(2);
@@ -78,7 +87,7 @@ async fn main() -> ExitCode {
     };
 
     let suppression: Arc<dyn SuppressionStore> =
-        match FileSuppression::open(std::env::temp_dir().join("sms-simulator-stop.list")) {
+        match FileSuppression::open(std::path::PathBuf::from(stop_file)) {
             Ok(store) => Arc::new(store),
             Err(error) => {
                 eprintln!("sms-simulator: suppression store: {error}");
@@ -101,6 +110,11 @@ async fn main() -> ExitCode {
 
     match journey::run(&dispatcher, &channel, &script, Region::Gb).await {
         Ok(()) => {
+            // The transcript IS the demo — a demo of an SMS conversation
+            // that hid the SMS would demonstrate nothing. The address is
+            // masked by its own Debug; the text is fixture conversation from
+            // the script, never live user data, and that boundary is what this
+            // print relies on.
             for sent in channel.outbox() {
                 println!("BLD -> {:?}: {}", sent.to, sent.text);
             }

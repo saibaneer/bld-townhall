@@ -35,13 +35,20 @@ pub struct SelectedVenue {
     pub slot_id: String,
 }
 
+/// One catalogue row as `/venues` actually reports it.
+///
+/// The first version of this struct had a `name` field the wire has never sent
+/// and was missing two it does — and stayed green, because nothing exercised
+/// it. An independently written DTO only tests the contract when a test drives
+/// it; an undriven one is just a second place to be wrong.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct VenueRow {
     pub venue_id: String,
-    pub name: String,
-    pub capacity: u64,
+    pub slot_id: String,
+    pub capacity: u16,
     pub accessible: bool,
     pub fee_pence: u64,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -89,7 +96,17 @@ impl RawResponse {
     /// person, about whose fault it was.
     #[must_use]
     pub fn is_domain_denial(&self) -> bool {
-        self.etag.is_some() && self.body.get("detail").is_some()
+        // All three or nothing: the ETag, the error NAME as a string, and the
+        // detail. Requiring only two let `422 + ETag + {"detail"}` with no name
+        // become a `Denied("(no error field)")` — a refusal quoting an error
+        // that was never sent.
+        self.etag.is_some()
+            && self
+                .body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            && self.body.get("detail").is_some()
     }
 
     #[must_use]

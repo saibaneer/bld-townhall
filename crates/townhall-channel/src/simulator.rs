@@ -11,12 +11,28 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One message the simulator was asked to send, as it went out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sent {
     pub to: ChannelAddress,
     pub text: String,
     pub class: OutboundClass,
     pub receipt: MessageReceipt,
+}
+
+/// The outbox record redacts like everything else: the address is already
+/// masked by its own `Debug`, and the text becomes a length. Tests that need
+/// the delivered text read the field; logs never should.
+impl std::fmt::Debug for Sent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Sent {{ to: {:?}, class: {:?}, text: <{} chars>, receipt: {:?} }}",
+            self.to,
+            self.class,
+            self.text.chars().count(),
+            self.receipt
+        )
+    }
 }
 
 /// Suppression kept in memory. M6B swaps in a durable one.
@@ -66,8 +82,12 @@ pub struct SmsSimulator {
 }
 
 impl SmsSimulator {
+    /// # Panics
+    /// On a configuration [`ChannelConfig::validated`] refuses — a simulator
+    /// that can only send truncation markers should not construct.
     #[must_use]
     pub fn new(config: ChannelConfig, suppression: Arc<dyn SuppressionStore>) -> Self {
+        let config = config.validated().expect("a satisfiable channel config");
         Self {
             window: ReplayWindow::new(config.replay_window_ms),
             config,

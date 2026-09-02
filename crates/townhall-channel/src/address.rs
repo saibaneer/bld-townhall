@@ -65,7 +65,7 @@ impl ChannelAddress {
     /// # Errors
     /// [`ChannelError::UnroutableAddress`] for anything outside that subset.
     pub fn parse(raw: &str, region: Region) -> Result<Self, ChannelError> {
-        let unroutable = || ChannelError::UnroutableAddress(raw.to_owned());
+        let unroutable = || ChannelError::UnroutableAddress(Self::mask_raw(raw));
 
         // Separators are presentation, not data: humans and providers both
         // sprinkle them, and no two agree where.
@@ -78,6 +78,13 @@ impl ChannelAddress {
             None => (stripped, false),
         };
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(unroutable());
+        }
+
+        // E.164 country codes never begin with zero, so `+0…` is not a number
+        // anywhere — refusing it here catches the general case the trunk-zero
+        // check below only catches for the configured region.
+        if international && digits.starts_with('0') {
             return Err(unroutable());
         }
 
@@ -108,6 +115,20 @@ impl ChannelAddress {
             return Err(unroutable());
         }
         Ok(Self(format!("+{e164}")))
+    }
+
+    /// A raw, unparseable input, masked for an error message: the first three
+    /// characters and the length. Enough to see "started with +44, 30 chars
+    /// long" — not enough to identify a subscriber, which an unroutable string
+    /// may still very nearly do.
+    #[must_use]
+    pub fn mask_raw(raw: &str) -> String {
+        let count = raw.chars().count();
+        if count <= 3 {
+            return format!("<{count} chars>");
+        }
+        let prefix: String = raw.chars().take(3).collect();
+        format!("{prefix}\u{2026} ({count} chars)")
     }
 
     /// The full value, for routing — named to be conspicuous at the call site.

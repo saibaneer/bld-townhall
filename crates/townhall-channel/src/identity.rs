@@ -1,6 +1,9 @@
 //! One definition of "the same message", used everywhere it matters.
 
+use bld_types::BookingId;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 /// What makes an inbound message *this* message.
@@ -37,13 +40,44 @@ impl InboundIdentity {
         }
     }
 
-    /// A stable, opaque key — the value a derived booking id is built from.
+    /// The booking id this message deterministically names.
+    ///
+    /// This is ADR-014's stable-effect-identity discipline applied one layer
+    /// out: the message IS the intent, so it names the intent. A carrier
+    /// redelivery — even after a restart has emptied the replay window — derives
+    /// the same id, the server answers `AlreadyExists`, and the duplicate
+    /// becomes a report about the original rather than a second booking.
+    ///
+    /// # Why a real digest, and why length-prefixed
+    ///
+    /// The components are provider-controlled text, so two rules hold. First,
+    /// fields are length-prefixed into the hash — naive joining with a
+    /// delimiter is not injective when a field may contain the delimiter, and
+    /// `("a\u{1f}b", "c")` colliding with `("a", "b\u{1f}c")` would let one
+    /// message shadow another. Second, SHA-256 rather than something fast and
+    /// forgeable: collision resistance here should not lean on M5.1's ownership
+    /// concealment as a backstop, even though it would hold.
     #[must_use]
-    pub fn key(&self) -> String {
-        format!(
-            "{}\u{1f}{}\u{1f}{}",
-            self.provider, self.provider_account, self.provider_message_id
-        )
+    pub fn booking_id(&self) -> BookingId {
+        let mut hasher = Sha256::new();
+        for part in [
+            &self.provider,
+            &self.provider_account,
+            &self.provider_message_id,
+        ] {
+            hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        let digest = hasher.finalize();
+        // 16 bytes of a 256-bit digest: collision-safe at any plausible scale,
+        // and short enough to live in a URL path without dominating it.
+        let hex = digest[..16]
+            .iter()
+            .fold(String::with_capacity(32), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
+        BookingId::new(format!("sms-{hex}"))
     }
 }
 
@@ -71,7 +105,10 @@ pub enum Seen {
 /// are easy to confuse and only one of them survives a crash.
 #[derive(Debug)]
 pub struct ReplayWindow {
-    seen: Mutex<HashMap<String, i64>>,
+    // Keyed on the identity ITSELF, not a stringified join of its fields — a
+    // joined key is not injective when fields can contain the delimiter, and a
+    // collision here rejects a legitimate message as a duplicate.
+    seen: Mutex<HashMap<InboundIdentity, i64>>,
     window_ms: i64,
 }
 
@@ -99,8 +136,10 @@ impl ReplayWindow {
             .seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.retain(|_, at| now_ms - *at < self.window_ms);
-        match seen.entry(identity.key()) {
+        // Saturating: a clock that moved backwards must not turn expiry into an
+        // overflow panic inside the one lock everything shares.
+        seen.retain(|_, at| now_ms.saturating_sub(*at) < self.window_ms);
+        match seen.entry(identity.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => Seen::Duplicate,
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(now_ms);

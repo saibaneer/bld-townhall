@@ -115,7 +115,7 @@ impl std::fmt::Debug for TransportEvidence {
 }
 
 /// What a provider handed us, before any of it is trusted.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RawInbound {
     pub identity: InboundIdentity,
     pub channel: ChannelKind,
@@ -125,6 +125,23 @@ pub struct RawInbound {
     pub body: String,
     pub received_at_ms: i64,
     pub evidence: TransportEvidence,
+}
+
+/// The raw wrapper redacts like its parts, because a wrapper that derives
+/// `Debug` un-redacts everything inside it — the leaf types were masked and the
+/// first review found the full body and address reachable straight through
+/// here.
+impl std::fmt::Debug for RawInbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RawInbound {{ identity: {:?}, from: <unparsed, {} chars>, body: <{} chars>, evidence: {:?} }}",
+            self.identity,
+            self.from.chars().count(),
+            self.body.chars().count(),
+            self.evidence
+        )
+    }
 }
 
 /// One inbound message, normalized (spec §14's shape, verbatim).
@@ -152,10 +169,23 @@ pub enum OutboundClass {
     Automated,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OutboundMessage {
     pub text: String,
     pub class: OutboundClass,
+}
+
+/// Outbound text is a person's booking details — masked the same way inbound
+/// is, because logs do not care which direction PII travelled.
+impl std::fmt::Debug for OutboundMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OutboundMessage {{ class: {:?}, text: <{} chars> }}",
+            self.class,
+            self.text.chars().count()
+        )
+    }
 }
 
 impl OutboundMessage {
@@ -199,7 +229,14 @@ pub enum MessageReceipt {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ChannelError {
-    #[error("address {0:?} is not routable")]
+    /// Carries a MASKED preview, never the raw input.
+    ///
+    /// The first review found the raw address reachable through this variant's
+    /// `Display` — an unroutable address is still a phone number someone typed,
+    /// and error strings are the text most likely to be logged verbatim.
+    /// [`ChannelAddress::mask_raw`] keeps enough shape to debug a routing
+    /// problem (prefix and length) and nothing that identifies a subscriber.
+    #[error("address {0} is not routable")]
     UnroutableAddress(String),
     #[error("message body is {scalars} characters; the limit is {limit}")]
     TooLong { scalars: usize, limit: usize },
@@ -267,5 +304,25 @@ impl Default for ChannelConfig {
             segment_ceiling: 3,
             replay_window_ms: 24 * 60 * 60 * 1000,
         }
+    }
+}
+
+impl ChannelConfig {
+    /// Refuse a configuration no message can satisfy.
+    ///
+    /// A zero segment ceiling would make every send "fit" as a bare truncation
+    /// marker and report it delivered — a channel that can only say `…` is not
+    /// degraded, it is broken, and the place to find out is construction.
+    ///
+    /// # Errors
+    /// A description of the impossible field.
+    pub fn validated(self) -> Result<Self, String> {
+        if self.segment_ceiling == 0 {
+            return Err("segment_ceiling must be at least 1".to_owned());
+        }
+        if self.replay_window_ms <= 0 {
+            return Err("replay_window_ms must be positive".to_owned());
+        }
+        Ok(self)
     }
 }

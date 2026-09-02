@@ -111,10 +111,17 @@ pub enum GatewayError {
 }
 
 /// How hard the gateway tries before giving up.
+///
+/// There is deliberately NO contention-retry knob. The wire's own 429 body says
+/// "re-read and retry", and building this gateway proved why: a contended turn
+/// may already have committed (the test that found it got `Stale {current: 3}`
+/// back on its verbatim retry — the version had moved). A blind re-POST of the
+/// same `If-Match` can therefore only answer 412 or 429 again; the one correct
+/// follow-up is a fresh read, and fresh reads are the CALLER's discipline
+/// (reload-before-propose), not something to bury in a client loop.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
-    /// Bounded, because an unbounded retry is a hang wearing a loop.
-    pub max_contention_retries: u32,
+    /// Bounded, because an unbounded poll is a hang wearing a loop.
     pub max_convergence_polls: u32,
     pub convergence_deadline: Duration,
 }
@@ -122,7 +129,6 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            max_contention_retries: 3,
             max_convergence_polls: 8,
             convergence_deadline: Duration::from_secs(30),
         }
@@ -149,6 +155,12 @@ pub struct Gateway {
     policy: RetryPolicy,
     /// Set when the caller wants request ids it chose rather than minted.
     request_id: Option<String>,
+    /// The id the server answered with on the most recent call.
+    ///
+    /// Recorded because a correlation key nobody retains correlates nothing —
+    /// the PR review found the gateway reading this header and throwing it
+    /// away, which made the "recorded" claim in the contract a hope.
+    last_request_id: std::sync::Mutex<Option<String>>,
 }
 
 impl Gateway {
@@ -160,7 +172,19 @@ impl Gateway {
             http: reqwest::Client::new(),
             policy: RetryPolicy::default(),
             request_id: None,
+            last_request_id: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The `X-Request-ID` the server answered with most recently — the caller's
+    /// own if one was configured (the middleware echoes it), the server's mint
+    /// otherwise.
+    #[must_use]
+    pub fn last_request_id(&self) -> Option<String> {
+        self.last_request_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[must_use]
@@ -234,6 +258,13 @@ impl Gateway {
         let request_id = header("x-request-id");
         let body = response.json().await.unwrap_or(serde_json::Value::Null);
 
+        request_id.clone_into(
+            &mut self
+                .last_request_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+
         Ok(dto::RawResponse {
             status,
             etag,
@@ -243,47 +274,8 @@ impl Gateway {
         })
     }
 
-    /// Everything that is not a turn, classified once.
-    ///
-    /// Exhaustive over the statuses M5 and M5.1 actually emit — and keyed on the
-    /// distinguisher rather than the number wherever one number covers two
-    /// situations.
     fn classify_error(response: &dto::RawResponse) -> GatewayError {
-        match response.status {
-            401 => GatewayError::Unauthenticated,
-            404 => GatewayError::UnknownBooking,
-            428 => GatewayError::PreconditionRequired,
-            400 => GatewayError::BadRequest(response.error_text()),
-            409 => match response.etag {
-                // The owner's duplicate ships a version so a retry can carry a
-                // precondition; a stranger's ships nothing at all.
-                Some(current) => GatewayError::Existing { current },
-                None => GatewayError::IdentifierUnavailable,
-            },
-            412 => GatewayError::Stale {
-                current: response.etag.unwrap_or_default(),
-            },
-            422 => {
-                if response.is_domain_denial() {
-                    GatewayError::Internal(format!(
-                        "a domain denial reached the error path: {}",
-                        response.error_text()
-                    ))
-                } else {
-                    GatewayError::Malformed(response.error_text())
-                }
-            }
-            429 => GatewayError::Contended,
-            503 => {
-                if response.is_domain_denial() {
-                    GatewayError::ProviderSilent(response.error_text())
-                } else {
-                    GatewayError::Unavailable(response.error_text())
-                }
-            }
-            500 => GatewayError::Internal(response.error_text()),
-            other => GatewayError::Unrecognized(format!("status {other}")),
-        }
+        classify_error(response)
     }
 
     /// Create a booking intent. No precondition applies to a new resource.
@@ -356,6 +348,43 @@ impl Gateway {
         .await
     }
 
+    /// The browsable catalogue — M6B's proposer needs candidates, and the gate
+    /// journey's step 2 is `GET /venues`. Absent from the first build, which is
+    /// why its 503 test had to bypass the gateway entirely.
+    ///
+    /// # Errors
+    /// [`GatewayError::Unavailable`] when the catalogue cannot be asked.
+    pub async fn venues(&self) -> Result<Vec<VenueRow>, GatewayError> {
+        let response = self.call("GET", "/venues", None, None).await?;
+        if response.status == 200 {
+            let rows = response
+                .body
+                .get("venues")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            return serde_json::from_value(rows)
+                .map_err(|error| GatewayError::Unrecognized(error.to_string()));
+        }
+        Err(Self::classify_error(&response))
+    }
+
+    /// One slot's verified facts, or `None` where the council answers "no such
+    /// slot" — which is an answer, not an error.
+    ///
+    /// # Errors
+    /// [`GatewayError::ProviderSilent`] when the provider cannot be asked.
+    pub async fn slot(&self, venue: &str, slot: &str) -> Result<Option<SlotFacts>, GatewayError> {
+        let path = format!("/venues/{venue}/slots/{slot}");
+        let response = self.call("GET", &path, None, None).await?;
+        match response.status {
+            200 => serde_json::from_value(response.body.clone())
+                .map(Some)
+                .map_err(|error| GatewayError::Unrecognized(error.to_string())),
+            404 => Ok(None),
+            _ => Err(Self::classify_error(&response)),
+        }
+    }
+
     async fn lookup(&self, path: &str) -> Result<Vec<Projection>, GatewayError> {
         let response = self.call("GET", path, None, None).await?;
         if response.status == 200 {
@@ -391,9 +420,9 @@ impl Gateway {
 
     /// One versioned mutation, at a version the caller just read.
     ///
-    /// Returns `Accepted` **without converging** — see [`Turn::Accepted`]. On
-    /// contention it retries within the policy, then gives up typed rather than
-    /// looping.
+    /// Returns `Accepted` **without converging** — see [`Turn::Accepted`], and
+    /// `Err(Contended)` immediately on a 429 — see [`RetryPolicy`] for why a
+    /// client-side retry of a contended mutation is wrong on this wire.
     ///
     /// # Errors
     /// The full vocabulary of [`GatewayError`].
@@ -405,78 +434,14 @@ impl Gateway {
         body: Option<serde_json::Value>,
     ) -> Result<Turn, GatewayError> {
         let path = format!("/booking-intents/{}/behaviours/{behaviour}", id.as_str());
-        let mut attempt = 0;
-        loop {
-            let response = self
-                .call("POST", &path, Some(expected_version), body.clone())
-                .await?;
-            match response.status {
-                200 => {
-                    // Two shapes share this number: a committed transition, and
-                    // a chase that found its effect already settled.
-                    if response.body.get("converged").is_some() {
-                        return Ok(Turn::Converged {
-                            state: response
-                                .body
-                                .get("state")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                        });
-                    }
-                    let state = response
-                        .body
-                        .get("state")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            GatewayError::Unrecognized(
-                                "a committed turn without a state".to_owned(),
-                            )
-                        })?
-                        .to_owned();
-                    return Ok(Turn::Committed {
-                        state,
-                        version: response.etag.unwrap_or_default(),
-                    });
-                }
-                202 => {
-                    return Ok(Turn::Accepted {
-                        retry_after: Duration::from_secs(response.retry_after.unwrap_or(1)),
-                    });
-                }
-                409 if response.body.get("available_behaviours").is_some() => {
-                    let menu = response
-                        .body
-                        .get("available_behaviours")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|rows| {
-                            rows.iter()
-                                .filter_map(|row| row.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return Ok(Turn::NotAvailable { menu });
-                }
-                403 => {
-                    return Ok(Turn::Denied {
-                        reason: response.error_text(),
-                    });
-                }
-                // One arm for two statuses on purpose: a 422 guard story and a
-                // 503 provider-silence are both domain denials wearing different
-                // numbers, and the caller's next move is the same for each.
-                422 | 503 if response.is_domain_denial() => {
-                    return Ok(Turn::Denied {
-                        reason: response.error_text(),
-                    });
-                }
-                429 if attempt < self.policy.max_contention_retries => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_secs(response.retry_after.unwrap_or(1)))
-                        .await;
-                }
-                _ => return Err(Self::classify_error(&response)),
-            }
-        }
+        let response = self
+            .call("POST", &path, Some(expected_version), body)
+            .await?;
+        // 429 surfaces IMMEDIATELY as Contended — no retry loop. See
+        // [`RetryPolicy`]: a contended turn may already have committed, so the
+        // only correct follow-up is the caller re-reading, which no amount of
+        // re-POSTing the same version can substitute for.
+        classify_turn(&response)
     }
 
     /// Follow an accepted turn to its outcome.
@@ -493,22 +458,158 @@ impl Gateway {
         first_wait: Duration,
     ) -> Result<Projection, GatewayError> {
         let started = std::time::Instant::now();
-        let mut wait = first_wait;
         for attempt in 0..self.policy.max_convergence_polls {
-            tokio::time::sleep(wait).await;
+            // The deadline bounds the SLEEP, not just the loop. The first
+            // version slept the whole Retry-After before ever consulting the
+            // clock — so a server saying `Retry-After: 3600` against a
+            // thirty-second deadline blocked for an hour, which is a deadline
+            // in name only.
+            let remaining = self
+                .policy
+                .convergence_deadline
+                .checked_sub(started.elapsed())
+                .ok_or(GatewayError::NotConverged { attempts: attempt })?;
+            tokio::time::sleep(first_wait.min(remaining)).await;
+
             let projection = self.read(id).await?;
             if !IN_FLIGHT.contains(&projection.state.as_str()) {
                 return Ok(projection);
             }
-            if started.elapsed() > self.policy.convergence_deadline {
-                return Err(GatewayError::NotConverged {
-                    attempts: attempt + 1,
-                });
-            }
-            wait = first_wait;
         }
         Err(GatewayError::NotConverged {
             attempts: self.policy.max_convergence_polls,
         })
+    }
+}
+
+/// One turn's response, classified — pure, so malformed shapes are testable
+/// without a server that would have to misbehave on purpose.
+///
+/// # This POLICES the wire, not just reads it
+///
+/// The PR review's finding: the first version keyed on the status number plus
+/// whichever body field happened to exist, so `202 {}` became a legitimate
+/// acceptance with an invented one-second wait, and `422 + ETag + {"detail"}`
+/// with no error name became a `Denied("(no error field)")`. An untrusted driver
+/// is the one place that must not extend good faith to the wire: a response
+/// missing the fields its status promises is `Unrecognized`, loudly, because the
+/// alternative is acting on a contract nobody actually sent.
+///
+/// # Errors
+/// Everything non-turn, via [`classify_error`]; `Unrecognized` for a shape that
+/// breaks the contract its status claims.
+#[allow(clippy::missing_panics_doc)] // the unwraps below are guarded by checks
+pub fn classify_turn(response: &dto::RawResponse) -> Result<Turn, GatewayError> {
+    match response.status {
+        200 => {
+            if response.body.get("converged").is_some() {
+                return Ok(Turn::Converged {
+                    state: response
+                        .body
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            let (Some(state), Some(version)) = (
+                response
+                    .body
+                    .get("state")
+                    .and_then(serde_json::Value::as_str),
+                response.etag,
+            ) else {
+                return Err(GatewayError::Unrecognized(
+                    "a committed turn must carry a state and an ETag".to_owned(),
+                ));
+            };
+            Ok(Turn::Committed {
+                state: state.to_owned(),
+                version,
+            })
+        }
+        // A 202 without its schedule or its ETag is not an acceptance — it is a
+        // response shaped like one, and inventing a wait for it would paper
+        // over a server that stopped keeping its own contract.
+        202 => match (response.retry_after, response.etag) {
+            (Some(seconds), Some(_)) => Ok(Turn::Accepted {
+                retry_after: Duration::from_secs(seconds),
+            }),
+            _ => Err(GatewayError::Unrecognized(
+                "a 202 must carry Retry-After and an ETag".to_owned(),
+            )),
+        },
+        409 if response.body.get("available_behaviours").is_some() => {
+            let menu = response
+                .body
+                .get("available_behaviours")
+                .and_then(serde_json::Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Turn::NotAvailable { menu })
+        }
+        403 | 422 | 503 if response.is_domain_denial() => Ok(Turn::Denied {
+            reason: response.error_text(),
+        }),
+        // A bare 403 with no denial shape is not a refusal this wire defines.
+        403 => Err(GatewayError::Unrecognized(
+            "a 403 must carry a domain denial shape".to_owned(),
+        )),
+        _ => Err(classify_error(response)),
+    }
+}
+
+/// Everything that is not a turn, classified once.
+///
+/// Exhaustive over the statuses M5 and M5.1 actually emit — and keyed on the
+/// distinguisher rather than the number wherever one number covers two
+/// situations.
+#[must_use]
+pub fn classify_error(response: &dto::RawResponse) -> GatewayError {
+    match response.status {
+        401 => GatewayError::Unauthenticated,
+        404 => GatewayError::UnknownBooking,
+        428 => GatewayError::PreconditionRequired,
+        400 => GatewayError::BadRequest(response.error_text()),
+        409 => match (response.etag, response.body.get("version")) {
+            // The owner's duplicate ships a version so a retry can carry a
+            // precondition; a stranger's ships nothing at all. An ETag with no
+            // version field is neither shape — refuse to guess.
+            (Some(current), Some(_)) => GatewayError::Existing { current },
+            (None, None) => GatewayError::IdentifierUnavailable,
+            _ => GatewayError::Unrecognized(
+                "a 409 must be the owner's shape (ETag + version) or the generic one (neither)"
+                    .to_owned(),
+            ),
+        },
+        412 => match response.etag {
+            Some(current) => GatewayError::Stale { current },
+            None => GatewayError::Unrecognized(
+                "a 412 must carry the current version as an ETag".to_owned(),
+            ),
+        },
+        422 => {
+            if response.is_domain_denial() {
+                GatewayError::Internal(format!(
+                    "a domain denial reached the error path: {}",
+                    response.error_text()
+                ))
+            } else {
+                GatewayError::Malformed(response.error_text())
+            }
+        }
+        429 => GatewayError::Contended,
+        503 => {
+            if response.is_domain_denial() {
+                GatewayError::ProviderSilent(response.error_text())
+            } else {
+                GatewayError::Unavailable(response.error_text())
+            }
+        }
+        500 => GatewayError::Internal(response.error_text()),
+        other => GatewayError::Unrecognized(format!("status {other}")),
     }
 }

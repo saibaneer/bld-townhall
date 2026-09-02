@@ -28,6 +28,11 @@ fn gateway(world: &World, bearer: &str) -> Gateway {
     Gateway::new(world.server_url.clone(), bearer)
 }
 
+/// One fixed inbound message identity — the value a redelivery repeats.
+fn townhall_channel_identity() -> townhall_channel::InboundIdentity {
+    townhall_channel::InboundIdentity::new("sim", "acct", "msg-create-1")
+}
+
 /// Drive a booking to `AwaitingBooking`, returning its current version.
 async fn awaiting(gw: &Gateway, id: &BookingId) -> u64 {
     let created = gw.create(id, &requirements()).await.expect("create");
@@ -96,7 +101,13 @@ async fn a11_a12_duplicate_create_distinguishes_owner_from_stranger() {
     let world = world();
     let lucy = gateway(&world, LUCY);
     let priya = gateway(&world, PRIYA);
-    let id = BookingId::new("BKG-A12");
+
+    // The DERIVED id — the redelivery protection this test is actually about.
+    // A hand-picked "BKG-A12" tested nothing about the seam M6B will stand on:
+    // that the same message names the same booking across restarts.
+    let message = townhall_channel_identity();
+    let id = message.booking_id();
+    assert_eq!(id, townhall_channel_identity().booking_id());
 
     lucy.create(&id, &requirements()).await.expect("create");
 
@@ -142,6 +153,7 @@ async fn a13_propose_sends_the_version_it_was_given() {
 
 /// The statuses that need a distinguisher, each reached on purpose.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one sweep, deliberately: the table IS the test
 async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     let world = world();
     let lucy = gateway(&world, LUCY);
@@ -228,11 +240,42 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
         "a malformed body is not a domain denial: {bad:?}"
     );
 
-    // 400: an unsupported collection query.
-    assert!(matches!(
-        lucy.by_reference(&CouncilBookingRef::new("")).await,
-        Err(GatewayError::BadRequest(_)) | Ok(_)
-    ));
+    // 422 as a DOMAIN DENIAL — the other shape of the same number, which the
+    // first version of this test never exercised at all: a data guard (the
+    // capacity check) refusing with the domain's own name, ETag attached.
+    let crowded = BookingId::new("BKG-A14-CROWDED");
+    let mut wants_too_many = requirements();
+    wants_too_many.attendees = 999;
+    let created = lucy
+        .create(&crowded, &wants_too_many)
+        .await
+        .expect("create");
+    let selected = lucy
+        .propose_at(
+            &crowded,
+            created.version,
+            "select-venue",
+            Some(serde_json::json!({"venue_id": "TH-A", "slot_id": "SLOT-A"})),
+        )
+        .await
+        .expect("turn");
+    let Turn::Committed { version, .. } = selected else {
+        panic!("select-venue: {selected:?}");
+    };
+    assert_eq!(
+        lucy.propose_at(&crowded, version, "verify-slot", None)
+            .await
+            .expect("turn"),
+        Turn::Denied {
+            reason: "CapacityInsufficient".to_owned()
+        },
+        "a data guard's 422 is a Denied turn carrying the domain's name"
+    );
+
+    // 400 through the gateway's own API is UNREPRESENTABLE — typed lookups
+    // cannot send a malformed query, like 428 cannot omit If-Match. The first
+    // version asserted `BadRequest(_) | Ok(_)` here, which cannot fail; the
+    // classification is unit-tested against constructed responses instead.
 
     // 401: no usable credential.
     let anonymous = Gateway::new(world.server_url.clone(), "not-a-token");
@@ -303,20 +346,21 @@ async fn a15_a16_acceptance_returns_before_convergence() {
 
 // ------------------------------------------------------------------ A17
 
-/// Convergence gives up typed rather than looping forever.
+/// Convergence gives up typed rather than looping forever — deterministically.
+///
+/// The first version allowed `Ok(_)`, "in case the reconciler won the race" —
+/// which made it a test that could not fail. Killing the council removes the
+/// race: the effect can NEVER settle, so anything but `NotConverged` is a bug.
 #[tokio::test]
 async fn a17_convergence_is_bounded() {
-    let world = world();
+    let mut world = world();
     let gw = gateway(&world, LUCY).with_policy(RetryPolicy {
-        max_contention_retries: 1,
         max_convergence_polls: 2,
-        convergence_deadline: Duration::from_millis(1),
+        convergence_deadline: Duration::from_millis(400),
     });
     let id = BookingId::new("BKG-A17");
     let version = awaiting(&gw, &id).await;
 
-    // Pause the council so the effect cannot settle, then ask a gateway with a
-    // one-millisecond deadline to converge. It must give up, not hang.
     let effect = format!("EFF-{}-BOOK-{version}", id.as_str());
     arm_fault(&world, &effect, "create", "drop_response").await;
     let turn = gw
@@ -327,11 +371,53 @@ async fn a17_convergence_is_bounded() {
         panic!("expected Accepted: {turn:?}");
     };
 
-    // A tiny first wait so the bound is what ends this, not the cadence.
-    match gw.converge(&id, Duration::from_millis(1)).await {
-        Err(GatewayError::NotConverged { .. }) | Ok(_) => {}
-        other => panic!("a bounded chase ends typed: {other:?}"),
+    // Now nothing can ever settle this effect.
+    world.kill_council();
+
+    match gw.converge(&id, Duration::from_millis(50)).await {
+        Err(GatewayError::NotConverged { attempts }) => {
+            assert!(attempts <= 2, "the bound is the polls, not luck");
+        }
+        other => panic!("an unsettleable chase must end NotConverged: {other:?}"),
     }
+}
+
+/// The deadline caps every sleep — a server saying Retry-After: 3600 against a
+/// short deadline must not block for an hour before the first clock check.
+#[tokio::test]
+async fn a17_the_deadline_caps_the_sleep_itself() {
+    let mut world = world();
+    let gw = gateway(&world, LUCY).with_policy(RetryPolicy {
+        max_convergence_polls: 8,
+        convergence_deadline: Duration::from_millis(300),
+    });
+    let id = BookingId::new("BKG-A17B");
+    let version = awaiting(&gw, &id).await;
+    let effect = format!("EFF-{}-BOOK-{version}", id.as_str());
+    arm_fault(&world, &effect, "create", "drop_response").await;
+    let Turn::Accepted { .. } = gw
+        .propose_at(&id, version, "book", None)
+        .await
+        .expect("turn")
+    else {
+        panic!("expected Accepted");
+    };
+    world.kill_council();
+
+    // An HOUR of first_wait against a 300ms deadline: with the sleep capped by
+    // the remaining deadline this returns promptly; the first implementation
+    // slept the whole hour before consulting the clock.
+    let started = std::time::Instant::now();
+    let outcome = gw.converge(&id, Duration::from_secs(3600)).await;
+    assert!(
+        matches!(outcome, Err(GatewayError::NotConverged { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline did not bound the sleep: {:?}",
+        started.elapsed()
+    );
 }
 
 // ------------------------------------------------------------------ A18
@@ -364,6 +450,10 @@ async fn a18_ownership_reaches_the_client() {
 // ------------------------------------------------------------------ A14b
 
 /// A request id the caller chose comes back; one it did not is still recorded.
+///
+/// Through the GATEWAY, both halves — the first version made raw `reqwest` calls,
+/// so the gateway's own recording (the thing under test) was never touched, and
+/// in fact the gateway threw the header away.
 #[tokio::test]
 async fn a14b_request_ids_survive_the_round_trip() {
     let world = world();
@@ -371,44 +461,21 @@ async fn a14b_request_ids_survive_the_round_trip() {
 
     let chosen = gateway(&world, LUCY).with_request_id("req-of-my-own");
     chosen.create(&id, &requirements()).await.expect("create");
-
-    // The middleware echoes a supplied id verbatim and mints only when absent,
-    // so a caller's own correlation key survives — which is the only reason to
-    // send one.
-    let raw = reqwest::Client::new()
-        .get(format!(
-            "{}/booking-intents/{}",
-            world.server_url,
-            id.as_str()
-        ))
-        .header("authorization", format!("Bearer {LUCY}"))
-        .header("x-request-id", "req-of-my-own")
-        .send()
-        .await
-        .expect("answer");
     assert_eq!(
-        raw.headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok()),
-        Some("req-of-my-own")
+        chosen.last_request_id().as_deref(),
+        Some("req-of-my-own"),
+        "the middleware echoes a supplied id verbatim, and the gateway keeps it"
     );
 
-    let minted = reqwest::Client::new()
-        .get(format!(
-            "{}/booking-intents/{}",
-            world.server_url,
-            id.as_str()
-        ))
-        .header("authorization", format!("Bearer {LUCY}"))
-        .send()
-        .await
-        .expect("answer");
+    let minted = gateway(&world, LUCY);
+    minted.read(&id).await.expect("read");
     let value = minted
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+        .last_request_id()
         .expect("the server mints one when the caller sends none");
-    assert!(value.starts_with("req-"), "unexpected id {value:?}");
+    assert!(
+        value.starts_with("req-") && value != "req-of-my-own",
+        "unexpected id {value:?}"
+    );
 }
 
 // ------------------------------------------------------------------ M6A's gate
@@ -467,6 +534,13 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     assert_eq!(state, "Cancelled");
 
     // --- faulted: the book response is lost, so the chase owns the outcome.
+    //
+    // This half runs through the RECORDING PROXY, because "never re-POSTs"
+    // cannot be witnessed at the council: it is idempotent on effect identity,
+    // so an erroneous second POST leaves exactly one row and the wrong
+    // implementation walks free. The requests themselves are the witness.
+    let proxy = harness::RecordingProxy::in_front_of(&world.server_url);
+    let gw = Gateway::new(proxy.url.clone(), LUCY);
     let faulted = BookingId::new("BKG-GATE-FAULT");
     let version = awaiting(&gw, &faulted).await;
     let effect = format!("EFF-{}-BOOK-{version}", faulted.as_str());
@@ -486,6 +560,14 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     );
     let settled = gw.converge(&faulted, retry_after).await.expect("converge");
     assert_eq!(settled.state, "Booked");
+    assert_eq!(
+        proxy.count("POST", "/behaviours/book"),
+        1,
+        "convergence must never re-POST the behaviour — the chase owns the \
+         effect (ADR-019), and a second POST risks a second council booking \
+         that idempotency would then hide from a row count: {:?}",
+        proxy.requests()
+    );
 
     let cancelled = gw
         .propose_at(
@@ -518,6 +600,32 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
         ),
         2
     );
+}
+
+/// The catalogue, round-tripped — because the first `VenueRow` had a field the
+/// wire has never sent and was missing two it does, and stayed green precisely
+/// because nothing drove it.
+#[tokio::test]
+async fn the_catalogue_round_trips() {
+    let world = world();
+    let rows = gateway(&world, LUCY).venues().await.expect("venues");
+    assert_eq!(rows.len(), 4, "spec §11's four seeded venues");
+    let th_a = rows
+        .iter()
+        .find(|row| row.venue_id == "TH-A")
+        .expect("TH-A");
+    assert_eq!(th_a.slot_id, "SLOT-A");
+    assert_eq!(th_a.capacity, 30);
+    assert!(th_a.accessible);
+    assert_eq!(th_a.fee_pence, 4_500);
+    assert!(th_a.available);
+
+    let facts = gateway(&world, LUCY)
+        .slot("TH-A", "SLOT-A")
+        .await
+        .expect("slot")
+        .expect("facts");
+    assert_eq!(facts.fee_pence, 4_500);
 }
 
 // ------------------------------------------------------------------ A14: the 503s
@@ -564,55 +672,58 @@ async fn a14_the_two_503_shapes_are_distinguished() {
         "an unreachable provider is the domain's refusal, not a malformed request"
     );
 
-    // 503 PLAIN: the venues catalogue cannot be asked at all. No ETag, no
-    // domain name — the service itself cannot answer. A gateway keying on the
-    // number alone would give both cases whichever sentence it wrote first.
-    let raw = reqwest::Client::new()
-        .get(format!("{}/venues", world.server_url))
-        .header("authorization", format!("Bearer {LUCY}"))
-        .send()
-        .await
-        .expect("transport");
-    assert_eq!(raw.status().as_u16(), 503);
+    // 503 PLAIN: the venues catalogue cannot be asked at all. Driven through
+    // the GATEWAY — the first version used raw reqwest and never observed
+    // `GatewayError::Unavailable` at all, so the subject of the test was
+    // bypassed by the test.
+    let plain = gw.venues().await;
     assert!(
-        raw.headers().get("etag").is_none(),
-        "the plain 503 carries no ETag; that absence IS the distinguisher"
+        matches!(plain, Err(GatewayError::Unavailable(_))),
+        "a dead catalogue is Unavailable, not ProviderSilent: {plain:?}"
     );
 }
 
 // ------------------------------------------------------------------ A17: 429
 
-/// Contention surfaces as a bounded retry, then a typed refusal — never a loop.
+/// Contention surfaces immediately and typed — and the 429 was telling the
+/// truth about why a blind retry is wrong.
+///
+/// Writing this test found the behaviour: the first version had the gateway
+/// re-POST the same version after a wait, and the retry came back
+/// `Stale {current: 3}` — because the contended turn had ALREADY COMMITTED
+/// `BookingInProgress`. The wire's 429 body says "re-read and retry"; this test
+/// now proves both halves — the typed refusal, and the re-read that shows what
+/// the 429 was hiding.
 #[tokio::test]
-async fn a17_contention_backs_off_and_gives_up_typed() {
-    // The deterministic-429 seam: zero reclassification attempts means every
-    // contended turn refuses immediately (ADR-021's one sanctioned zero).
+async fn a17_contention_surfaces_typed_and_a_reread_tells_the_truth() {
+    // The deterministic-429 seam: zero reclassification attempts (ADR-021's
+    // sanctioned zero).
     let world = harness::world_with(&["--reclassify-attempts", "0"]);
-    let gw = gateway(&world, LUCY).with_policy(RetryPolicy {
-        max_contention_retries: 2,
-        max_convergence_polls: 2,
-        convergence_deadline: Duration::from_secs(5),
-    });
+    let gw = gateway(&world, LUCY);
 
     let id = BookingId::new("BKG-429");
     let version = awaiting(&gw, &id).await;
 
-    // A stale-but-plausible turn drives the server into its contention path.
-    // With zero attempts sanctioned it answers 429; the gateway must retry its
-    // bounded twice and then hand back Contended rather than spinning.
     let started = std::time::Instant::now();
-    let outcome = gw.propose_at(&id, version - 1, "verify-slot", None).await;
-    match outcome {
-        Err(GatewayError::Contended) => {
-            // Two retries at Retry-After: 1 each — the wait happened, bounded.
-            assert!(
-                started.elapsed() >= Duration::from_secs(2),
-                "the gateway must actually honour Retry-After between retries"
-            );
-        }
-        // A stale tag may also legitimately answer 412 before contention is
-        // reached; the seam decides which. Either is a bounded, typed end.
-        Err(GatewayError::Stale { .. }) => {}
-        other => panic!("contention must end typed: {other:?}"),
-    }
+    let outcome = gw.propose_at(&id, version, "book", None).await;
+    assert!(
+        matches!(outcome, Err(GatewayError::Contended)),
+        "zero sanctioned attempts must surface as Contended: {outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "no invented client-side waits — the caller decides what to do next"
+    );
+
+    // The re-read the 429 demanded: the turn was NOT nothing. The version
+    // advanced and the booking is mid-book — which is exactly why re-POSTing
+    // the old version could never have been right.
+    let truth = gw.read(&id).await.expect("read");
+    assert!(
+        truth.version > version,
+        "the contended turn committed: {} -> {}",
+        version,
+        truth.version
+    );
+    assert_eq!(truth.state, "BookingInProgress");
 }

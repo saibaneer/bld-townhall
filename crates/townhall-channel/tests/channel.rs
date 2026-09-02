@@ -51,6 +51,7 @@ fn a1_addresses_normalize_against_a_configured_region() {
         "+44abc",           // not digits
         "",                 // nothing at all
         "+44 07700 900123", // a `+` number that kept its trunk zero
+        "+01234567890",     // no country code begins with zero, anywhere
     ] {
         assert!(
             matches!(
@@ -98,6 +99,25 @@ fn a2_inbound_body_rejects_and_preserves() {
 /// Segment counting, across the real alphabet and at every boundary.
 #[test]
 fn a3_segment_counting_is_exact() {
+    // The whole basic table, iterated — not a sample — and pinned against a
+    // copy that lives HERE, in the test. Iterating production's own table is
+    // circular: swap `¤` for a duplicate `@` in the production array and a
+    // production-table loop stays green while `¤` silently becomes UCS-2. The
+    // PR review caught exactly that circularity. (This copy was verified
+    // against ETSI GSM 03.38 §6.2.1 by the reviewer before being trusted.)
+    const GSM_BASIC_PINNED: [char; 128] = [
+        '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å', 'Δ', '_',
+        'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', '\u{1b}', 'Æ', 'æ', 'ß', 'É', ' ', '!', '"',
+        '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4',
+        '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?', '¡', 'A', 'B', 'C', 'D', 'E', 'F',
+        'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
+        'Y', 'Z', 'Ä', 'Ö', 'Ñ', 'Ü', '§', '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'ä', 'ö',
+        'ñ', 'ü', 'à',
+    ];
+    const GSM_EXTENSION_PINNED: [char; 10] =
+        ['\u{c}', '^', '{', '}', '\\', '[', '~', ']', '|', '€'];
+
     let gsm = |n: usize| "a".repeat(n);
     for (chars, expected) in [(160, 1), (161, 2), (306, 2), (307, 3)] {
         assert_eq!(
@@ -107,13 +127,15 @@ fn a3_segment_counting_is_exact() {
         );
     }
 
-    // The whole basic table, iterated — not a sample. An "including…" list
-    // cannot catch an implementation that omits precisely the characters nobody
-    // thought to name.
     assert_eq!(
-        body::GSM_BASIC.len(),
-        128,
-        "the basic table must be complete, or iterating it proves nothing"
+        body::GSM_BASIC,
+        GSM_BASIC_PINNED,
+        "production's basic table drifted from the pinned copy"
+    );
+    assert_eq!(
+        body::GSM_EXTENSION,
+        GSM_EXTENSION_PINNED,
+        "production's extension table drifted from the pinned copy"
     );
     for character in body::GSM_BASIC {
         let single = character.to_string();
@@ -468,6 +490,60 @@ fn a9_debug_renderings_are_exactly_these() {
         format!("{evidence:?}"),
         r#"TransportEvidence { provider: "sim", verified: true }"#
     );
+
+    // The WRAPPERS. Masking the leaf types is worthless if a struct that
+    // contains them derives Debug — the PR review found the full body and raw
+    // address reachable through every one of these.
+    let raw = RawInbound {
+        identity: InboundIdentity::new("sim", "acct", "m-9"),
+        channel: ChannelKind::SmsSimulator,
+        from: "+447700900123".to_owned(),
+        body: "YES 7312".to_owned(),
+        received_at_ms: 0,
+        evidence: TransportEvidence::new("sim", "+447700900123", true),
+    };
+    let rendered = format!("{raw:?}");
+    assert!(
+        !rendered.contains("7312") && !rendered.contains("900123"),
+        "RawInbound leaked: {rendered}"
+    );
+    assert!(
+        rendered.contains("<8 chars>"),
+        "the shape survives: {rendered}"
+    );
+
+    let outbound = OutboundMessage::reply("YES 7312");
+    let rendered = format!("{outbound:?}");
+    assert!(
+        !rendered.contains("7312"),
+        "OutboundMessage leaked: {rendered}"
+    );
+
+    // The unroutable ERROR is the likeliest string to be logged verbatim, and
+    // an unroutable input is still very nearly a phone number.
+    let refused = ChannelAddress::parse("+44abc07700900123", Region::Gb).unwrap_err();
+    let rendered = refused.to_string();
+    assert!(
+        !rendered.contains("900123"),
+        "the error carries the raw address: {rendered}"
+    );
+    assert!(
+        rendered.contains("(17 chars)"),
+        "the masked shape survives for debugging: {rendered}"
+    );
+}
+
+/// The outbox record redacts too — asserted separately because it lives in the
+/// simulator, the type most likely to be dumped wholesale in a failing test.
+#[tokio::test]
+async fn a9_the_outbox_record_redacts() {
+    let (channel, _suppression, lucy) = simulator();
+    channel
+        .send(&lucy, OutboundMessage::reply("YES 7312"))
+        .await
+        .expect("send");
+    let rendered = format!("{:?}", channel.outbox());
+    assert!(!rendered.contains("7312"), "Sent leaked: {rendered}");
 }
 
 // ------------------------------------------------------------------ receive()
@@ -655,4 +731,108 @@ fn the_seam_m6b_consumes_is_exactly_this() {
     for (text, expected) in cases {
         assert_eq!(classify(text), expected, "the seam moved under {text:?}");
     }
+}
+
+// ------------------------------------------------------------------ derived id
+
+/// The id the message deterministically names — the seam M6B builds create on.
+///
+/// The PR review's finding: the plan promised `sms-<digest>` and nothing
+/// implemented it, so M6B would have invented the algorithm — and a restart plus
+/// an implementation change could then derive a DIFFERENT id for the same
+/// redelivered message, creating the second booking this exists to prevent.
+#[test]
+fn the_derived_booking_id_is_stable_and_component_sensitive() {
+    let identity = InboundIdentity::new("sim", "acct", "msg-1");
+    let id = identity.booking_id();
+    assert!(id.as_str().starts_with("sms-"), "{id:?}");
+    assert_eq!(
+        id.as_str().len(),
+        4 + 32,
+        "sms- plus 16 digest bytes as hex"
+    );
+    assert_eq!(
+        identity.booking_id(),
+        id,
+        "the same message must always name the same booking"
+    );
+
+    // Any single component changing changes the id.
+    for other in [
+        InboundIdentity::new("sim2", "acct", "msg-1"),
+        InboundIdentity::new("sim", "acct2", "msg-1"),
+        InboundIdentity::new("sim", "acct", "msg-2"),
+    ] {
+        assert_ne!(other.booking_id(), id);
+    }
+
+    // The injectivity case a delimiter-joined key gets wrong: fields shuffled
+    // across a boundary must not collide. Length-prefixing is what makes
+    // ("a\u{1f}b","c") and ("a","b\u{1f}c") distinct inputs to the digest —
+    // and keying the window on the struct itself removes the stringly key
+    // entirely.
+    let left = InboundIdentity::new("a\u{1f}b", "c", "d");
+    let right = InboundIdentity::new("a", "b\u{1f}c", "d");
+    assert_ne!(left.booking_id(), right.booking_id());
+    let window = ReplayWindow::new(1_000);
+    assert_eq!(window.insert_if_absent(&left, 0), Seen::Accepted);
+    assert_eq!(
+        window.insert_if_absent(&right, 0),
+        Seen::Accepted,
+        "a legitimate message was rejected as a duplicate of a different one"
+    );
+}
+
+/// A configuration no message can satisfy refuses to construct.
+#[test]
+fn an_impossible_config_is_refused_at_construction() {
+    let zero = ChannelConfig {
+        segment_ceiling: 0,
+        ..ChannelConfig::default()
+    };
+    assert!(
+        zero.validated().is_err(),
+        "a channel that can only send truncation markers is broken, not degraded"
+    );
+    assert!(
+        ChannelConfig {
+            replay_window_ms: 0,
+            ..ChannelConfig::default()
+        }
+        .validated()
+        .is_err()
+    );
+}
+
+/// The dedupe window's atomicity argument, made structural.
+///
+/// A deterministic external schedule provably cannot catch check-then-insert:
+/// the discriminating interleaving needs a caller parked BETWEEN the check and
+/// the insert, and any hook that can park there only exists in an
+/// implementation that has the gap. So the guarantee is enforced one level up —
+/// the API exposes NO read: `insert_if_absent` is the only question a caller
+/// can ask, so the check-then-insert a caller might write cannot be expressed,
+/// and internally the check and write are one locked `entry()` call. This scan
+/// pins the "no read" half so a helpful future `contains()` fails loudly here
+/// instead of quietly reopening the gap.
+#[test]
+fn the_replay_window_exposes_no_read_to_race_against() {
+    let source = include_str!("../src/identity.rs");
+    let impl_start = source
+        .find("impl ReplayWindow")
+        .expect("the impl block exists");
+    let impl_body = &source[impl_start..];
+    let public_methods: Vec<&str> = impl_body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("pub fn "))
+        .collect();
+    assert_eq!(
+        public_methods.len(),
+        2,
+        "ReplayWindow's public surface is new + insert_if_absent, and nothing \
+         else — a query method would let callers check-then-insert around the \
+         atomic call: {public_methods:?}"
+    );
+    assert!(public_methods[0].contains("fn new"));
+    assert!(public_methods[1].contains("fn insert_if_absent"));
 }

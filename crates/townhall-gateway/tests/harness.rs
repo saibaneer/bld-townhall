@@ -206,3 +206,141 @@ pub async fn fault_fired(world: &World, fault_id: u64) -> u64 {
         .expect("json");
     response["consumed"].as_u64().unwrap_or_default()
 }
+
+/// A recording proxy in front of the server: every request line, in order.
+///
+/// This exists because counting COUNCIL ROWS cannot witness "never re-POSTs" —
+/// the council is idempotent on effect identity, so an erroneous second POST
+/// leaves exactly one row and the wrong implementation passes. The witness has
+/// to be the requests themselves.
+///
+/// One request per connection, enforced by injecting `Connection: close` both
+/// ways — which trades keep-alive for a proxy simple enough to be obviously
+/// correct in a test harness.
+pub struct RecordingProxy {
+    pub url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingProxy {
+    pub fn in_front_of(upstream_url: &str) -> Self {
+        let upstream = upstream_url
+            .strip_prefix("http://")
+            .expect("an http upstream")
+            .to_owned();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let log = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let upstream = upstream.clone();
+                let log = std::sync::Arc::clone(&log);
+                std::thread::spawn(move || forward_once(client, &upstream, &log));
+            }
+        });
+
+        Self {
+            url: format!("http://127.0.0.1:{port}"),
+            requests,
+        }
+    }
+
+    /// Every request line seen so far, e.g. `POST /booking-intents/x/behaviours/book`.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many requests matched a `METHOD path-substring` pair.
+    pub fn count(&self, method: &str, path_fragment: &str) -> usize {
+        self.requests()
+            .iter()
+            .filter(|line| line.starts_with(method) && line.contains(path_fragment))
+            .count()
+    }
+}
+
+fn forward_once(
+    mut client: std::net::TcpStream,
+    upstream: &str,
+    log: &std::sync::Mutex<Vec<String>>,
+) {
+    use std::io::{Read as _, Write as _};
+
+    // Read the request head, then exactly Content-Length of body.
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let head_end = loop {
+        let n = client.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let request_line = head.lines().next().unwrap_or_default();
+    let (method_path, _) = request_line.rsplit_once(' ').unwrap_or((request_line, ""));
+    log.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(method_path.to_owned());
+
+    let content_length: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    while buffer.len() < head_end + content_length {
+        let n = client.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+
+    // Rewrite the head: force Connection: close so both sides speak one
+    // request per connection, which is what lets this proxy stream the
+    // response until EOF instead of parsing framing.
+    let mut rewritten = String::new();
+    for line in head[..head.len() - 2].lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let lowered = line.to_ascii_lowercase();
+        if lowered.starts_with("connection:") {
+            continue;
+        }
+        rewritten.push_str(line);
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str("connection: close\r\n\r\n");
+
+    let Ok(mut server) = std::net::TcpStream::connect(upstream) else {
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+        return;
+    };
+    let _ = server.write_all(rewritten.as_bytes());
+    let _ =
+        server.write_all(&buffer[head_end..head_end + content_length.min(buffer.len() - head_end)]);
+
+    // Stream the whole response back until the server closes.
+    loop {
+        match server.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if client.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}

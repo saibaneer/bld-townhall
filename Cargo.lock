@@ -228,9 +228,11 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
  "townhall-service",
  "townhall-store",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2062,6 +2064,8 @@ dependencies = [
  "static_assertions",
  "thiserror",
  "tokio",
+ "townhall-authority",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2119,6 +2123,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
  "townhall-http",
  "townhall-service",
@@ -2138,6 +2143,7 @@ dependencies = [
  "tokio",
  "townhall-domain",
  "townhall-store",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2160,9 +2166,12 @@ dependencies = [
 name = "townhall-testkit"
 version = "0.1.0"
 dependencies = [
+ "bld-types",
  "reqwest",
  "serde_json",
  "tempfile",
+ "tokio",
+ "townhall-authority",
 ]
 
 [[package]]

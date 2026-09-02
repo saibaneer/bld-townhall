@@ -5,7 +5,7 @@ use bld_kernel::{
     BoundaryDomain, FactResolution, Resolution, SystemEventResolution, TransitionPlan, Verified,
 };
 use bld_types::{
-    ActorId, AvailabilityGrant, BookingId, BookingRequirements, BoundedString, CouncilBookingRef,
+    AvailabilityGrant, Behaviour, BookingId, BookingRequirements, BoundedString, CouncilBookingRef,
     EffectIntentId, Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
 };
 use serde::{Deserialize, Serialize};
@@ -307,14 +307,23 @@ impl BookingProposal {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedAuthority {
-    pub principal: PrincipalId,
-    pub actor: ActorId,
-    pub max_fee: Money,
-    pub may_book: bool,
-    pub may_cancel: bool,
-}
+/// The authority envelope, re-exported from the crate that can construct it.
+///
+/// # Why the domain no longer defines this
+///
+/// It used to be five public fields here, and any crate could write the struct
+/// literal — including the one holding the untrusted proposer seat. ADR-021
+/// deferred the constructor ceremony to M7 "with its issuer", and ADR-025
+/// settled where that leaves the type: private fields are only enforceable in
+/// the module that owns them, so the envelope moved to `townhall-authority`,
+/// below this crate, beside the verifier that mints it.
+///
+/// What the domain reads through it is unchanged in spirit and sharper in
+/// detail: three principals where there was one (grantor owns, subject is
+/// attributed, actor presented it), and `covers` in place of two capability
+/// flags — because a flag says "may cancel something" while a grant says "may
+/// cancel THIS".
+pub use townhall_authority::VerifiedAuthority;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VenueFacts {
@@ -1289,7 +1298,12 @@ impl TownHallDomain {
         requirements: &BookingRequirements,
         authority: &VerifiedAuthority,
     ) -> Money {
-        Money::from_pence(requirements.max_fee.pence().min(authority.max_fee.pence()))
+        Money::from_pence(
+            requirements
+                .max_fee
+                .pence()
+                .min(authority.max_fee().pence()),
+        )
     }
 
     fn validate_facts(
@@ -1314,7 +1328,7 @@ impl TownHallDomain {
             // is derived here, where both ceilings are in hand — authority wins
             // when both are exceeded, because the caller's grant is
             // insufficient regardless of the data (ADR-021).
-            let ceiling = if facts.fee > authority.max_fee {
+            let ceiling = if facts.fee > authority.max_fee() {
                 FeeCeiling::Authority
             } else {
                 FeeCeiling::Requirement
@@ -2039,7 +2053,13 @@ impl TownHallDomain {
         authority: &VerifiedAuthority,
         context: &BookingContext,
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        if !authority.may_book {
+        // `covers`, not a capability flag.
+        //
+        // `may_book` said "this caller may book something"; a grant says "this
+        // caller may book THIS". ADR-025 records why the difference matters:
+        // once a grant can be delegated, a flag would let one approval reach
+        // every booking its holder could name.
+        if !authority.covers(Behaviour::Book, &booking.id) {
             return Resolution::Denied(BookingError::BookingAuthorityRequired);
         }
         // The whole observation, so the grant that reaches the council is the one
@@ -2073,7 +2093,11 @@ impl TownHallDomain {
                 ..booking.clone()
             },
             effect: BookingEffect::Book {
-                principal: authority.principal.clone(),
+                // The SUBJECT — who this action is attributed to. Under
+                // delegation the grantor owns the booking and the subject asked
+                // for it, and the council's record should name the asker
+                // (ADR-020, representable at last by ADR-025's envelope).
+                principal: authority.subject().clone(),
                 attendees: booking.requirements.attendees,
                 facts: facts.clone(),
                 grant: observation.grant.clone(),
@@ -2093,7 +2117,7 @@ impl TownHallDomain {
         authority: &VerifiedAuthority,
         context: &BookingContext,
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        if !authority.may_cancel {
+        if !authority.covers(Behaviour::Cancel, &booking.id) {
             return Resolution::Denied(BookingError::CancellationAuthorityRequired);
         }
         let Some(effect_intent_id) = context.pending_effect.clone() else {
@@ -2111,7 +2135,9 @@ impl TownHallDomain {
             },
             effect: BookingEffect::CancelBooking {
                 booking_ref: booked.booking_ref.clone(),
-                principal: authority.principal.clone(),
+                // The subject: ADR-020's "the booker and the canceller need not
+                // be the same person", now with somewhere to record it.
+                principal: authority.subject().clone(),
             },
         })
     }
@@ -2130,13 +2156,13 @@ impl TownHallDomain {
         in_progress: &BookingInProgress,
         authority: &VerifiedAuthority,
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        if !authority.may_cancel {
+        if !authority.covers(Behaviour::Cancel, &booking.id) {
             return Resolution::Denied(BookingError::CancellationAuthorityRequired);
         }
         local(Booking {
             state: BookingState::CancellationRequested(CancellationRequested {
                 effect_intent_id: in_progress.effect_intent_id.clone(),
-                cancelled_by: authority.principal.clone(),
+                cancelled_by: authority.subject().clone(),
             }),
             // Still waiting on the same booking intent; nothing external moved.
             active_effect: Some(in_progress.effect_intent_id.clone()),
@@ -2364,6 +2390,25 @@ fn update_requirements(
 /// must run when the model is offline, hostile or absent (ADR-012). So the
 /// matrix is 10 states x 7 proposals = 70 cells, not 80.
 /// Test-only helpers shared by the suites below.
+/// The state × proposal topology, pinned.
+///
+/// Spec §7 draws arrows in two vocabularies, and only one of them is a
+/// `BookingProposal`. These are: `SelectVenue`, `VerifySlot`, `ChangeVenue`,
+/// `UpdateRequirements`, `RevalidateVenue`, `Book`, `Cancel`.
+/// These are **not** — they are evidence or read outcomes, and no agent can
+/// submit them: `booking_confirmed`, `booking_failed`, `no_booking_found`,
+/// `booking_found`, `reconciliation_failed`, `cancellation_confirmed`,
+/// `cancellation_failed`, `view_booking`.
+///
+/// Counting proposal arrows only, the spec defines 15 cells and this code
+/// implements 14. The single difference is recorded in [`PENDING`].
+///
+/// The spec's §7.1 vocabulary also lists `Reconcile`, but draws it on **no
+/// arrow anywhere**. B2 removed the variant entirely rather than keep a
+/// proposal that is `Undefined` everywhere: recovery is runtime machinery and
+/// must run when the model is offline, hostile or absent (ADR-012). So the
+/// matrix is 10 states x 7 proposals = 70 cells, not 80.
+/// Test-only helpers shared by the suites below.
 #[cfg(test)]
 mod fixtures {
     use super::{AvailabilityGrant, BookingEffect, PrincipalId, VenueFacts, VerifiedAvailability};
@@ -2394,9 +2439,29 @@ mod fixtures {
 }
 
 #[cfg(test)]
+mod test_grants {
+    //! How every test in this crate obtains authority.
+    //!
+    //! One module rather than one helper per test module, so there is a single
+    //! answer to "where do these grants come from" — and so the answer stays
+    //! "from a real challenge". The work itself lives in `townhall-testkit`,
+    //! which every crate's tests share; see `townhall_testkit::issuer` for why
+    //! no constructor exists to reach for instead (ADR-025).
+
+    use super::{Behaviour, VerifiedAuthority};
+    use townhall_testkit::issuer::{GrantSpec, issue_blocking};
+
+    /// A grant over this crate's fixture booking, naming exactly `behaviours`.
+    pub(crate) fn issued(behaviours: &[Behaviour], max_fee_pence: u64) -> VerifiedAuthority {
+        issue_blocking(&GrantSpec::own("lucy", "BKG-1001", max_fee_pence).permitting(behaviours))
+    }
+}
+
+#[cfg(test)]
 mod topology {
     use super::*;
     use crate::fixtures::observed;
+    use crate::test_grants::issued;
     use bld_kernel::Resolution;
     use bld_types::{BookingRequirements, Money, SlotId, TimeWindow, VenueId};
 
@@ -2556,13 +2621,7 @@ mod topology {
     const PENDING: &[(&str, &str, &str)] = &[];
 
     fn permissive_authority() -> VerifiedAuthority {
-        VerifiedAuthority {
-            principal: PrincipalId::new("lucy"),
-            actor: ActorId::new("townhall-agent"),
-            max_fee: Money::from_pence(5_000),
-            may_book: true,
-            may_cancel: true,
-        }
+        issued(&[Behaviour::Book, Behaviour::Cancel], 5_000)
     }
 
     fn permissive_requirements() -> BookingRequirements {
@@ -2616,12 +2675,7 @@ mod topology {
     /// Every guard fails. Used to prove that whether a behaviour *exists* does
     /// not depend on authority or context — only on `(state, proposal)`.
     fn hostile_authority() -> VerifiedAuthority {
-        VerifiedAuthority {
-            may_book: false,
-            may_cancel: false,
-            max_fee: Money::from_pence(0),
-            ..permissive_authority()
-        }
+        issued(&[], 0)
     }
 
     fn hostile_context() -> BookingContext {
@@ -2829,17 +2883,12 @@ mod topology {
 mod characterization {
     use super::*;
     use crate::fixtures::observed;
+    use crate::test_grants::issued;
     use bld_kernel::{Resolution, TransitionPlan};
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
     fn authority() -> VerifiedAuthority {
-        VerifiedAuthority {
-            principal: PrincipalId::new("lucy"),
-            actor: ActorId::new("townhall-agent"),
-            max_fee: Money::from_pence(5_000),
-            may_book: true,
-            may_cancel: true,
-        }
+        issued(&[Behaviour::Book, Behaviour::Cancel], 5_000)
     }
 
     fn requirements() -> BookingRequirements {
@@ -4105,8 +4154,7 @@ mod characterization {
     #[tokio::test]
     async fn the_ceiling_that_refused_is_named() {
         // Exceeds only the REQUIREMENT: generous authority, tight budget.
-        let mut generous = authority();
-        generous.max_fee = Money::from_pence(20_000);
+        let generous = issued(&[Behaviour::Book, Behaviour::Cancel], 20_000);
         let mut ctx = context();
         ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             fee: Money::from_pence(9_000),
@@ -4128,8 +4176,7 @@ mod characterization {
         );
 
         // Exceeds only the AUTHORITY: generous budget, tight delegation.
-        let mut restricted = authority();
-        restricted.max_fee = Money::from_pence(1_000);
+        let restricted = issued(&[Behaviour::Book, Behaviour::Cancel], 1_000);
         let mut wanting = requirements();
         wanting.max_fee = Money::from_pence(20_000);
         let mut ctx = context();
@@ -4191,10 +4238,9 @@ mod characterization {
     /// runs first.
     #[tokio::test]
     async fn book_denies_without_booking_authority() {
-        let auth = VerifiedAuthority {
-            may_book: false,
-            ..authority()
-        };
+        // A grant that names Cancel and not Book — the delegated shape, rather
+        // than a capability flag turned off.
+        let auth = issued(&[Behaviour::Cancel], 5_000);
         let got = turn(awaiting_booking(), BookingProposal::Book, &auth, &context()).await;
         assert_eq!(
             got,
@@ -4223,10 +4269,7 @@ mod characterization {
 
     #[tokio::test]
     async fn cancel_denies_a_booked_resource_without_cancellation_authority() {
-        let auth = VerifiedAuthority {
-            may_cancel: false,
-            ..authority()
-        };
+        let auth = issued(&[Behaviour::Book], 5_000);
         let got = turn(
             booked(),
             BookingProposal::Cancel {
@@ -4399,6 +4442,7 @@ mod characterization {
 mod fact_topology {
     use super::*;
     use crate::fixtures::observed;
+    use crate::test_grants::issued;
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
     const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
@@ -5940,13 +5984,7 @@ mod fact_topology {
     /// council cannot conclude our retry budget is exhausted.
     #[tokio::test]
     async fn no_door_reaches_a_state_that_is_not_its_to_reach() {
-        let authority = VerifiedAuthority {
-            principal: PrincipalId::new("lucy"),
-            actor: ActorId::new("townhall-agent"),
-            max_fee: Money::from_pence(5_000),
-            may_book: true,
-            may_cancel: true,
-        };
+        let authority = issued(&[Behaviour::Book, Behaviour::Cancel], 5_000);
         let proposal_context = BookingContext {
             selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),

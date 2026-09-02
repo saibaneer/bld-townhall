@@ -555,7 +555,7 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
             townhall_domain::BookingProposal::Cancel {
                 reason: "no longer needed".to_owned(),
             },
-            &driver_authority(),
+            &driver_authority(&id),
         )
         .await
         .expect("the turn runs");
@@ -612,14 +612,17 @@ async fn a_signed_wrong_kind_answer_is_refused_by_the_domain_not_the_wire() {
     assert_eq!(rows[0].principal, "lucy");
 }
 
-fn driver_authority() -> townhall_domain::VerifiedAuthority {
-    townhall_domain::VerifiedAuthority {
-        principal: bld_types::PrincipalId::new("lucy"),
-        actor: bld_types::ActorId::new("agent-1"),
-        max_fee: bld_types::Money::from_pence(5_000),
-        may_book: true,
-        may_cancel: true,
-    }
+/// Lucy's grant over one booking, issued through the real approval path.
+///
+/// Takes the booking because a grant names its resource (ADR-025) — the old
+/// fixture carried capability flags, which held for anything its bearer could
+/// name.
+fn driver_authority(id: &bld_types::BookingId) -> townhall_domain::VerifiedAuthority {
+    townhall_testkit::issuer::issue_blocking(&townhall_testkit::issuer::GrantSpec::own(
+        "lucy",
+        id.as_str(),
+        5_000,
+    ))
 }
 
 /// Faults that mangle the wire become Unknown, never a fact: garbage, and a
@@ -812,7 +815,7 @@ async fn ambiguous_cancellation(
             townhall_domain::BookingProposal::Cancel {
                 reason: "changed my mind".to_owned(),
             },
-            &driver_authority(),
+            &driver_authority(&id),
         )
         .await
         .expect("the turn runs");
@@ -887,7 +890,7 @@ async fn a_cancellation_requested_for_a_booking_nobody_received_fails_closed() {
             townhall_domain::BookingProposal::Cancel {
                 reason: "give up".to_owned(),
             },
-            &driver_authority(),
+            &driver_authority(&id),
         )
         .await
         .expect("cancel");
@@ -967,7 +970,7 @@ async fn a_cancellation_whose_answer_is_eaten_converges_to_one_cancellation() {
             townhall_domain::BookingProposal::Cancel {
                 reason: "no longer needed".to_owned(),
             },
-            &driver_authority(),
+            &driver_authority(&id),
         )
         .await
         .expect("turn");
@@ -1155,7 +1158,7 @@ async fn a_cancel_retried_under_the_same_identity_returns_the_original() {
             townhall_domain::BookingProposal::Cancel {
                 reason: "retry me".to_owned(),
             },
-            &driver_authority(),
+            &driver_authority(&id),
         )
         .await
         .expect("turn");

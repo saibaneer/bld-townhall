@@ -25,8 +25,7 @@
 
 use bld_kernel::{Capability, Unknown};
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, EffectAttempt, Money, PrincipalId, SlotId, TimeWindow,
-    VenueId,
+    BookingId, BookingRequirements, EffectAttempt, Money, PrincipalId, SlotId, TimeWindow, VenueId,
 };
 use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::CouncilKey;
@@ -85,14 +84,80 @@ impl Capability<BookingEffect> for DiesOnCue {
     }
 }
 
-fn authority() -> VerifiedAuthority {
-    VerifiedAuthority {
-        principal: PrincipalId::new("lucy"),
-        actor: ActorId::new("agent-1"),
-        max_fee: Money::from_pence(5_000),
-        may_book: true,
-        may_cancel: true,
+/// The driver's own grant, issued the way production issues one.
+///
+/// # Why a demo binary now runs the whole approval flow
+///
+/// It used to write a five-field struct literal. ADR-025 sealed the envelope —
+/// private fields, and no constructor to reach for — precisely so that nothing
+/// can assert its own authority, and a demo is not an exception to that. So
+/// this is a small composition root: it raises a challenge over the booking it
+/// is about to drive, answers it, and carries the resulting grant.
+///
+/// The store is in-memory because this driver is a single run of a single
+/// booking; a deployment binds `SqlApprovalStore` here instead, which is M7B's
+/// work.
+async fn authority(id: &BookingId) -> VerifiedAuthority {
+    use bld_types::Behaviour;
+    use townhall_authority::{
+        ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
+        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+    };
+
+    /// The demo's fixed code. A real one comes from the OS (M7B).
+    struct DemoCode;
+    impl Entropy for DemoCode {
+        fn code(&self) -> ApprovalCode {
+            ApprovalCode::new("7312").expect("four digits")
+        }
+        fn identifier(&self) -> String {
+            format!("driver-{}", std::process::id())
+        }
     }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    let service = AuthorityService::new(
+        MemoryApprovalStore::new(),
+        DemoCode,
+        AuthorityPolicy::default(),
+    );
+    let binding = BindingRef {
+        principal: PrincipalId::new("lucy"),
+        version: 1,
+    };
+    let raised = service
+        .begin(
+            &ApprovalRequest {
+                scope: PendingScope {
+                    service: bld_types::ServiceId::new("demo-council-town-hall"),
+                    agent: "bld-driver".to_owned(),
+                    booking: id.clone(),
+                    behaviours: BehaviourSet::new([Behaviour::Book, Behaviour::Cancel]),
+                    requirements: requirements(),
+                },
+                binding: binding.clone(),
+                grantor: PrincipalId::new("lucy"),
+                subject: PrincipalId::new("lucy"),
+            },
+            now,
+        )
+        .await
+        .expect("a challenge over an empty store");
+    println!("APPROVAL PREVIEW\n{}", raised.preview);
+    service
+        .submit(
+            &raised.id,
+            raised.code.revealed(),
+            &binding,
+            AssuranceLevel::SmsReply,
+            now + 1,
+        )
+        .await
+        .expect("the driver answers its own challenge")
 }
 
 fn requirements() -> BookingRequirements {
@@ -248,10 +313,14 @@ async fn main() -> ExitCode {
     }
 
     let id = BookingId::new(args.booking_id.expect("checked in parse_args"));
+    // Approval FIRST, then the booking (spec §23.1). The grant names this
+    // booking, so it has to be minted before anything is created — which is
+    // exactly the ordering ADR-025 recorded and M7C wires into the SMS path.
+    let authority = authority(&id).await;
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
-        owner: authority().principal,
+        owner: authority.grantor().clone(),
     })
     .await
     .expect("create");
@@ -266,7 +335,7 @@ async fn main() -> ExitCode {
     ] {
         let name = proposal.name();
         let outcome = coordinator
-            .propose(&id, proposal, &authority())
+            .propose(&id, proposal, &authority)
             .await
             .expect("a turn must not fail at the transport level");
         println!("TURN {name} {outcome:?}");

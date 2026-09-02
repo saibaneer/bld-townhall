@@ -13,6 +13,9 @@ council-wire = { path = "../council-wire" }
 reqwest.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The driver binary is a composition root: it issues its own grant, because
+# nothing can assert its own authority any more (ADR-025).
+townhall-authority = { path = "../townhall-authority" }
 townhall-domain = { path = "../townhall-domain" }
 townhall-service = { path = "../townhall-service" }
 townhall-store = { path = "../townhall-store" }
@@ -20,6 +23,8 @@ townhall-store = { path = "../townhall-store" }
 serde_json.workspace = true
 
 [dev-dependencies]
+# The shared test issuer — the only way a test obtains authority (ADR-025).
+townhall-testkit = { path = "../townhall-testkit" }
 axum.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 ed25519-dalek.workspace = true

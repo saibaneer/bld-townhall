@@ -429,7 +429,9 @@ where
                         driver_kind: audit.provenance(),
                         driver_detail: audit.driver_name(),
                         reason: error.name(),
-                        principal: authority.principal.to_string(),
+                        // The subject: who was refused, not on whose
+                        // behalf they were acting.
+                        principal: authority.subject().to_string(),
                     })
                     .await;
                 }
@@ -1386,7 +1388,10 @@ where
             .create(townhall_store::NewBooking {
                 id: id.clone(),
                 requirements,
-                owner: access.principal.clone(),
+                // The grantor owns the booking. Under delegation the
+                // subject asks and the grantor owns, and it is the
+                // owner every later visibility query scopes to.
+                owner: access.grantor().clone(),
             })
             .await
         {
@@ -1405,7 +1410,7 @@ where
             // the same bit while misdescribing a collection POST. ADR-022
             // records it as an accepted residual.
             Err(StoreError::AlreadyExists(_)) => {
-                match repository.load_visible(&access.principal, &id).await {
+                match repository.load_visible(access.grantor(), &id).await {
                     Ok(existing) => Err(ApiError::AlreadyExists {
                         current: existing.version,
                     }),
@@ -1461,16 +1466,14 @@ where
     pub async fn lookup(
         &self,
         query: &LookupQuery,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Projection>, ApiError> {
         let repository = self.coordinator.repository();
         let rows = match query {
             LookupQuery::ByBookingRef(booking_ref) => {
-                repository
-                    .lookup_by_ref(&access.principal, booking_ref)
-                    .await
+                repository.lookup_by_ref(reader, booking_ref).await
             }
-            LookupQuery::Cancellable => repository.lookup_cancellable(&access.principal).await,
+            LookupQuery::Cancellable => repository.lookup_cancellable(reader).await,
         }
         .map_err(|error| ApiError::Unavailable(error.to_string()))?;
         Ok(rows.iter().map(Self::project).collect())
@@ -1627,7 +1630,7 @@ where
         match self
             .coordinator
             .repository()
-            .load_visible(&access.principal, id)
+            .load_visible(access.grantor(), id)
             .await
         {
             Ok(aggregate) => Ok(aggregate),
@@ -1688,10 +1691,16 @@ pub trait BookingFacade: Send + Sync {
         id: &BookingId,
         access: &VerifiedAuthority,
     ) -> Result<(), ApiError>;
+    /// Listing takes an IDENTITY, not a grant.
+    ///
+    /// Every other method here names a booking and so needs authority over it.
+    /// This one asks "what is mine?", which is a question about who is asking
+    /// and about nothing else — so it is handed the one thing it needs, and
+    /// cannot be handed anything it could act on (ADR-025).
     async fn lookup(
         &self,
         query: &LookupQuery,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Projection>, ApiError>;
     async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError>;
     async fn slot_facts(
@@ -1735,9 +1744,9 @@ where
     async fn lookup(
         &self,
         query: &LookupQuery,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Projection>, ApiError> {
-        Self::lookup(self, query, access).await
+        Self::lookup(self, query, reader).await
     }
     async fn propose_at(
         &self,

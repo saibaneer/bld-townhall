@@ -136,11 +136,7 @@ async fn an_answered_challenge_yields_one_grant_that_permits_the_forty_five_poun
         Money::from_pence(4_500).pence() <= grant.max_fee().pence(),
         "the £45 slot must fit inside the £50 ceiling Lucy approved"
     );
-    assert!(grant.permits(
-        Behaviour::Book,
-        &BookingId::new("sms-lucy-0001"),
-        NOW + 1_000
-    ));
+    assert!(grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0001")));
 }
 
 /// The grant's clock starts at the approval, not at the offer.
@@ -171,17 +167,17 @@ async fn a_grant_approved_at_the_last_second_still_has_its_full_life() {
         .expect("answered inside the window");
 
     assert_eq!(grant.expires_at_ms(), last_moment + GRANT_TTL_MS);
-    assert!(grant.permits(
-        Behaviour::Book,
-        &BookingId::new("sms-lucy-0001"),
-        last_moment + GRANT_TTL_MS - 1
-    ));
-    assert!(
-        !grant.permits(
-            Behaviour::Book,
-            &BookingId::new("sms-lucy-0001"),
-            last_moment + GRANT_TTL_MS
-        ),
+
+    // Liveness is the resolver's, so that is where it is asserted.
+    service
+        .resolve(grant.delegation(), last_moment + GRANT_TTL_MS - 1)
+        .await
+        .expect("live until its own deadline");
+    assert_eq!(
+        service
+            .resolve(grant.delegation(), last_moment + GRANT_TTL_MS)
+            .await,
+        Err(ResolveError::Expired),
         "the grant must stop at its own deadline"
     );
 }
@@ -725,18 +721,15 @@ async fn a_grant_reaches_only_the_resource_it_names() {
         )
         .await
         .expect("answered");
-    let at = NOW + 2_000;
-
-    assert!(grant.permits(Behaviour::Book, &BookingId::new("sms-lucy-0001"), at));
+    assert!(grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0001")));
     assert!(
-        !grant.permits(Behaviour::Book, &BookingId::new("sms-lucy-0002"), at),
+        !grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0002")),
         "one approval must not reach a neighbouring booking"
     );
     assert!(
-        !grant.permits(
+        !grant.covers(
             Behaviour::UpdateRequirements,
-            &BookingId::new("sms-lucy-0001"),
-            at
+            &BookingId::new("sms-lucy-0001")
         ),
         "a behaviour nobody approved must not be permitted"
     );
@@ -783,17 +776,9 @@ async fn a_delegated_grant_separates_the_owner_from_the_requester() {
         &ActorId::new("agent:marco"),
         "the workload presenting the grant acts for the subject"
     );
-    assert!(grant.permits(
-        Behaviour::Cancel,
-        &BookingId::new("sms-lucy-0001"),
-        NOW + 2_000
-    ));
+    assert!(grant.covers(Behaviour::Cancel, &BookingId::new("sms-lucy-0001")));
     assert!(
-        !grant.permits(
-            Behaviour::Book,
-            &BookingId::new("sms-lucy-0001"),
-            NOW + 2_000
-        ),
+        !grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0001")),
         "a cancellation delegation must not also book"
     );
 }

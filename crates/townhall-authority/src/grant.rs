@@ -330,16 +330,25 @@ impl VerifiedAuthority {
         self.constraints.max_fee()
     }
 
-    /// Whether this grant permits `behaviour` on `booking`, at `now_ms`.
+    /// Whether this grant names `behaviour` over `booking`.
     ///
-    /// All three questions in one call, because the three-part answer is the
-    /// only useful one and asking them separately is how one gets forgotten.
-    /// Revocation is NOT asked here — it lives in the store, and a grant value
-    /// in hand cannot know it (see `crate::resolver`).
+    /// # Why time is not a parameter
+    ///
+    /// An earlier version took `now_ms` and folded expiry in. That made a
+    /// SECOND place where liveness is decided, and the two would answer
+    /// differently: this one can see expiry, and only the resolver can see
+    /// REVOCATION — it has the store. A caller checking `permits(…, now)` and
+    /// believing it had asked the whole question would sail past a grant
+    /// revoked a moment ago.
+    ///
+    /// So liveness belongs to `AuthorityService::resolve` alone, and a grant
+    /// that reached this method has already been proven live by it. What is
+    /// left is the part a value in hand can actually answer: does this grant
+    /// name this behaviour, over this resource. No clock, which also keeps one
+    /// out of the domain (spec §2's "no HTTP or SMS logic in the domain" has
+    /// the same motive).
     #[must_use]
-    pub fn permits(&self, behaviour: Behaviour, booking: &BookingId, now_ms: u64) -> bool {
-        now_ms < self.expires_at_ms
-            && self.behaviours.permits(behaviour)
-            && self.constraints.reaches(booking)
+    pub fn covers(&self, behaviour: Behaviour, booking: &BookingId) -> bool {
+        self.behaviours.permits(behaviour) && self.constraints.reaches(booking)
     }
 }

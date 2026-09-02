@@ -46,8 +46,8 @@
 
 use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
 use bld_types::{
-    ActorId, AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId,
-    Money, PrincipalId, SlotId, TimeWindow, VenueId,
+    AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId, Money,
+    PrincipalId, SlotId, TimeWindow, VenueId,
 };
 use std::{fmt::Write as _, fs, path::PathBuf};
 use townhall_domain::{
@@ -177,14 +177,17 @@ const REFERENCE: &str = "TH-92718";
 /// A successor identity, for the one fact-door cell that mints a new effect.
 const SUCCESSOR_EFFECT: &str = "EFF-BKG-1001-CANCEL-9";
 
+/// A grant over this suite's one fixture booking.
+///
+/// Issued through the real approval path rather than constructed: the envelope
+/// has private fields and no `test-support` constructor, because a feature that
+/// revealed one would leak through unification (ADR-025). The topology this
+/// file pins does not depend on authority at all — that is the point it makes —
+/// so any real grant serves.
 fn authority() -> VerifiedAuthority {
-    VerifiedAuthority {
-        principal: PrincipalId::new("lucy"),
-        actor: ActorId::new("agent-1"),
-        max_fee: Money::from_pence(9_000),
-        may_book: true,
-        may_cancel: true,
-    }
+    townhall_testkit::issuer::issue_blocking(&townhall_testkit::issuer::GrantSpec::own(
+        "lucy", "BKG-1001", 9_000,
+    ))
 }
 
 fn all_states() -> Vec<BookingState> {

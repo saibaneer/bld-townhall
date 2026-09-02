@@ -25,7 +25,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+townhall-testkit = { path = "../townhall-testkit" }
 # The derived-id seam under test is the channel's export; M6B holds both crates,
 # and this dev-edge is the compatibility direction the tripwire permits (the
 # CHANNEL must never name the gateway; the gateway's tests may name the channel).

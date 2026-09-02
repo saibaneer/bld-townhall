@@ -3,12 +3,10 @@
 //! Nothing here is mocked. A mock would prove the gateway agrees with my idea of
 //! the wire, which is the belief actually under test.
 
-mod harness;
-
 use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, Money, TimeWindow};
-use harness::{LUCY, MARCO, PRIYA, World, arm_fault, council_count, fault_fired, world};
 use std::time::Duration;
 use townhall_gateway::{Gateway, GatewayError, RetryPolicy, Turn};
+use townhall_testkit::{LUCY, MARCO, PRIYA, World, arm_fault, council_count, fault_fired, world};
 
 fn requirements() -> BookingRequirements {
     BookingRequirements {
@@ -539,7 +537,7 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     // cannot be witnessed at the council: it is idempotent on effect identity,
     // so an erroneous second POST leaves exactly one row and the wrong
     // implementation walks free. The requests themselves are the witness.
-    let proxy = harness::RecordingProxy::in_front_of(&world.server_url);
+    let proxy = townhall_testkit::RecordingProxy::in_front_of(&world.server_url);
     let gw = Gateway::new(proxy.url.clone(), LUCY);
     let faulted = BookingId::new("BKG-GATE-FAULT");
     let version = awaiting(&gw, &faulted).await;
@@ -698,7 +696,7 @@ async fn a14_the_two_503_shapes_are_distinguished() {
 async fn a17_contention_surfaces_typed_and_a_reread_tells_the_truth() {
     // The deterministic-429 seam: zero reclassification attempts (ADR-021's
     // sanctioned zero).
-    let world = harness::world_with(&["--reclassify-attempts", "0"]);
+    let world = townhall_testkit::world_with(&["--reclassify-attempts", "0"]);
     let gw = gateway(&world, LUCY);
 
     let id = BookingId::new("BKG-429");

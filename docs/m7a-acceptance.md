@@ -141,7 +141,9 @@ This is the smaller half of codex's finding #1 ("two decisions: authenticate the
 actor; authorize the presented delegation against that actor, service, resource
 and behaviour"). **Still M7B's:** the `Authorization` / `X-BLD-Delegation` split,
 un-reserving that header, and binding the actor to an authenticated workload.
-**ADR-025 should record the boundary moving.**
+
+**Recorded in ADR-025** under "Amendment, made during M7A", so the plan of
+record and the code agree about which slice owns this seam.
 
 **2. The preview renders expiry relatively, not as §13.2's wall clock.**
 "Reply within 10 minutes" rather than "17:00 Thu 20 Aug": a calendar date needs

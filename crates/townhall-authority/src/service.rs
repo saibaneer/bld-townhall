@@ -80,6 +80,13 @@ pub struct ApprovalRequest {
     pub grantor: PrincipalId,
     /// Who the resulting action would be attributed to.
     pub subject: PrincipalId,
+    /// The AUTHENTICATED workload that will present the resulting grant.
+    ///
+    /// Supplied by the caller's own credential, not derived from the subject —
+    /// see migration 0007 for why this is settled when the challenge is raised
+    /// rather than when it is answered. The preview names this agent, so the
+    /// person is approving THIS workload and no other.
+    pub actor: ActorId,
 }
 
 /// A scope before the issuer stamps its deadlines onto it.
@@ -96,6 +103,20 @@ pub struct PendingScope {
     pub booking: bld_types::BookingId,
     pub behaviours: crate::scope::BehaviourSet,
     pub requirements: bld_types::BookingRequirements,
+}
+
+/// What an approval produced.
+#[derive(Clone, Debug)]
+pub struct IssuedGrant {
+    /// The opaque reference a caller presents afterwards.
+    ///
+    /// Everything else about the grant stays here: spec §13.1 step 7 gives the
+    /// agent "only the resulting narrow authority reference/grant, never an
+    /// SMS-derived trust-me flag", and a reference is the narrowest thing that
+    /// can be handed over.
+    pub reference: DelegationId,
+    /// When it stops working, so a caller can say so without guessing.
+    pub expires_at_ms: u64,
 }
 
 /// A raised challenge: what to send, and what to send it about.
@@ -249,6 +270,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             attempts_used: 0,
             status: ChallengeStatus::Pending,
             assurance: self.policy.assurance,
+            actor: request.actor.clone(),
         };
         self.store.insert_challenge(&record).await?;
         Ok(RaisedChallenge { id, preview, code })
@@ -312,7 +334,11 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             &approval,
             challenge.grantor.clone(),
             challenge.subject.clone(),
-            actor_of(&challenge),
+            // The actor the CHALLENGE recorded, which is the workload the
+            // person was told about. Not the caller of this method: a
+            // different workload answering must not receive a grant naming
+            // itself.
+            challenge.actor.clone(),
             assurance,
         );
 
@@ -445,19 +471,4 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         }
         Ok(challenge)
     }
-}
-
-/// The actor a challenge's grant is issued to.
-///
-/// # Why this is derived and not carried
-///
-/// A challenge records the binding that may answer; the actor is the workload
-/// that will present the grant, and in M7 that is the orchestrator acting for
-/// the subject. Carrying a caller-supplied actor through the challenge would let
-/// the value at issuance differ from the value at request, which is exactly the
-/// "state outliving the moment it was true" defect this project keeps finding.
-/// M7B binds the actor to an authenticated workload; until then it is derived
-/// from the subject and says so.
-fn actor_of(challenge: &ChallengeRecord) -> ActorId {
-    ActorId::new(format!("agent:{}", challenge.subject.as_str()))
 }

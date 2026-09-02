@@ -16,6 +16,10 @@ bld-types = { path = "../bld-types" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
+# The approval endpoints speak the issuer's vocabulary. This crate holds no
+# issuer and can mint nothing: `ApprovalIssuer` is a trait the composition root
+# implements (ADR-025).
+townhall-authority = { path = "../townhall-authority" }
 townhall-domain = { path = "../townhall-domain" }
 townhall-service = { path = "../townhall-service" }
 

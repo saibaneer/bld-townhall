@@ -87,6 +87,12 @@ fn spawn_server(world: &mut World, extra: &[&str]) {
         .arg(world.dir.path().join("denials.sqlite"))
         .args(["--council-url", &world.council_url])
         .args(["--key-hex", KEY_HEX, "--port", "0", "--dev-authority"])
+        // Fixed, because this suite restarts the server mid-test and a grant
+        // issued before the restart must still verify after it.
+        .args([
+            "--authority-key",
+            "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        ])
         .args(["--retry-cadence-ms", "100"])
         .args(["--reconcile-interval-ms", "50"])
         .args(extra);

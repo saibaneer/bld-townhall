@@ -26,6 +26,15 @@ use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 
 pub const KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+
+/// The delegation envelope's authentication key, for every spawned world.
+///
+/// A DIFFERENT value from `KEY_HEX` on purpose: that one is the council's
+/// signing key, and a test that accidentally passed one where the other
+/// belonged would still work if they matched — and would keep working until the
+/// day the two keys legitimately differed.
+pub const AUTHORITY_KEY_HEX: &str =
+    "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
 pub const LUCY: &str = "dev-lucy";
 pub const MARCO: &str = "dev-marco-restricted";
 pub const PRIYA: &str = "dev-priya-nobook";
@@ -128,6 +137,13 @@ pub fn world_with(extra: &[&str]) -> World {
             KEY_HEX,
             "--port",
             "0",
+            // The envelope key. Fixed, because these worlds are restarted
+            // mid-test (the chase-survives-a-restart cases) and a grant issued
+            // before the restart has to still verify after it — which is the
+            // whole reason the key is configuration and not a per-process
+            // accident.
+            "--authority-key",
+            AUTHORITY_KEY_HEX,
             "--dev-authority",
             "--retry-cadence-ms",
             "200",
@@ -413,7 +429,8 @@ pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
 /// test that depends on authority rather than silently keeping them green.
 pub mod issuer {
     use bld_types::{
-        Behaviour, BookingId, BookingRequirements, Money, PrincipalId, ServiceId, TimeWindow,
+        ActorId, Behaviour, BookingId, BookingRequirements, Money, PrincipalId, ServiceId,
+        TimeWindow,
     };
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
@@ -574,6 +591,9 @@ pub mod issuer {
                     binding: binding.clone(),
                     grantor: spec.grantor.clone(),
                     subject: spec.subject.clone(),
+                    // Every test grant names one workload, so a test that cares
+                    // about the actor check has a value to disagree with.
+                    actor: ActorId::new("agent:townhall"),
                 },
                 ISSUED_AT_MS,
             )

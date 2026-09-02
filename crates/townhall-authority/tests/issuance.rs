@@ -116,6 +116,7 @@ fn lucys_request() -> ApprovalRequest {
         binding: lucys_binding(),
         grantor: PrincipalId::new("lucy"),
         subject: PrincipalId::new("lucy"),
+        actor: ActorId::new("agent:townhall"),
     }
 }
 
@@ -791,10 +792,19 @@ async fn a_delegated_grant_separates_the_owner_from_the_requester() {
         "marco",
         "the cancellation is attributed to Marco"
     );
-    assert_eq!(
-        grant.actor(),
-        &ActorId::new("agent:marco"),
-        "the workload presenting the grant acts for the subject"
+    // The actor is the AUTHENTICATED WORKLOAD, and deliberately not derived
+    // from anybody's name.
+    //
+    // It used to be `agent:{subject}` — an identity nothing had authenticated,
+    // invented by string formatting. M7B binds it to the caller's own
+    // credential and the challenge persists it, so the person approving a
+    // preview that says "Agent: TownHallAgent" is approving THAT agent. A
+    // different workload answering the same challenge receives nothing.
+    assert_eq!(grant.actor(), &ActorId::new("agent:townhall"));
+    assert_ne!(
+        grant.actor().as_str(),
+        format!("agent:{}", grant.subject().as_str()),
+        "an actor derived from the subject would be a name nobody authenticated"
     );
     assert!(grant.covers(Behaviour::Cancel, &BookingId::new("sms-lucy-0001")));
     assert!(
@@ -1011,6 +1021,7 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
                 attempts_used: 0,
                 status: townhall_authority::ChallengeStatus::Pending,
                 assurance: AssuranceLevel::SmsReply,
+                actor: ActorId::new("agent:townhall"),
             }))
         }
         async fn record_failed_attempt(

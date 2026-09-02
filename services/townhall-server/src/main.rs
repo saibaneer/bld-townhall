@@ -23,12 +23,26 @@ use std::sync::Arc;
 
 use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::CouncilKey;
+mod authority;
+
+use authority::{OsEntropy, RealAuthority};
+use townhall_authority::AuthorityService;
 use townhall_http::{AuthorityResolver, ServerState};
 use townhall_service::{BookingApi, Coordinator, PursuitConfig, Reconciliation};
 use townhall_store::{SqliteBookingRepository, StoreClock, SystemStoreClock};
 
 struct Args {
     db: String,
+    /// The key the delegation envelope's authentication tag is made with.
+    ///
+    /// 64 hex characters. Required whenever grants are READ BACK — which is
+    /// every real deployment — because a tag verified with a different key than
+    /// it was written with is no tag at all, and a per-process key would make
+    /// every grant expire at restart.
+    ///
+    /// Optional only with `--dev-authority`, whose resolver mints a grant per
+    /// request and never reads one back (see `DevAuthority::issue`).
+    authority_key: Option<String>,
     denials_db: String,
     council_url: String,
     key_hex: String,
@@ -45,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let (mut db, mut denials, mut council, mut key, mut port) = (None, None, None, None, None);
     let mut dev_authority = false;
+    let mut authority_key = None;
     let mut retry_cadence_ms = 5_000;
     let mut reconcile_interval_ms = 1_000;
     let mut reclassify_attempts = None;
@@ -63,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--dev-authority" => dev_authority = true,
+            "--authority-key" => authority_key = Some(value()?),
             "--retry-cadence-ms" => {
                 retry_cadence_ms = value()?
                     .parse::<i64>()
@@ -88,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         db: db.ok_or("--db is required")?,
+        authority_key,
         denials_db: denials.ok_or("--denials-db is required")?,
         council_url: council.ok_or("--council-url is required")?,
         key_hex: key.ok_or("--key-hex is required")?,
@@ -291,6 +308,9 @@ impl DevAuthority {
             binding: binding.clone(),
             grantor: PrincipalId::new(principal),
             subject: PrincipalId::new(principal),
+            // The same actor `authenticate` hands out for this token, so the
+            // grant this mints is presentable by the caller that asked for it.
+            actor: bld_types::ActorId::new(format!("dev:{principal}")),
         };
 
         // Blocking on a fresh runtime in a thread: this resolver is called from
@@ -360,29 +380,71 @@ impl AuthorityResolver for DevAuthority {
     }
 }
 
-fn resolver(args: &Args) -> Result<Arc<dyn AuthorityResolver>, String> {
+/// The issuer, and the resolver that reads what it wrote.
+///
+/// # Why the issuer is built unconditionally
+///
+/// The approval endpoints exist in every build: a person can be asked for
+/// approval whether or not the dev lane is armed, and a challenge answered
+/// through them produces a real delegation row either way. Only the RESOLVER
+/// differs — which is precisely ADR-025's amendment to ADR-021: the real one is
+/// the default and `--dev-authority` selects the stand-in explicitly, so there
+/// is no silent fallback in either direction.
+type Issuer = AuthorityService<townhall_store::authority::SqlApprovalStore, OsEntropy>;
+
+fn authority(
+    args: &Args,
+    pool: &sqlx::SqlitePool,
+) -> Result<(Arc<dyn AuthorityResolver>, Arc<Issuer>), String> {
+    use townhall_authority::{AuthorityPolicy, EnvelopeKey};
+
+    let key_hex = args
+        .authority_key
+        .as_deref()
+        .ok_or("--authority-key is required: 64 hex characters")?;
+    let key_bytes = parse_key(key_hex)
+        .ok_or("--authority-key must be 64 hex characters (32 bytes)".to_owned())?;
+    let key = EnvelopeKey::new(key_bytes.to_vec()).map_err(|error| error.to_string())?;
+
+    let store = Arc::new(townhall_store::authority::SqlApprovalStore::new(
+        pool.clone(),
+    ));
+    let issuer = Arc::new(AuthorityService::new(
+        Arc::clone(&store),
+        OsEntropy,
+        AuthorityPolicy::default(),
+        key,
+    ));
+
     #[cfg(feature = "dev-authority")]
     {
         if args.dev_authority {
             eprintln!(
                 "==============================================================\n\
-                 townhall-server: DEV AUTHORITY IS ACTIVE (ADR-021).\n\
-                 Three fixed tokens exist: dev-lucy, dev-marco-restricted,\n\
-                 dev-priya-nobook.\n\
-                 This resolver is a stand-in until M7 and must never ship.\n\
+                 townhall-server: DEV AUTHORITY IS ACTIVE (ADR-021, amended by\n\
+                 ADR-025). Three fixed tokens exist: dev-lucy,\n\
+                 dev-marco-restricted, dev-priya-nobook. Each mints a grant per\n\
+                 request over whatever booking was named — nobody is asked.\n\
+                 This resolver is a stand-in and must never ship.\n\
                  =============================================================="
             );
-            return Ok(Arc::new(DevAuthority));
+            return Ok((Arc::new(DevAuthority), issuer));
         }
     }
     if args.dev_authority {
         return Err("--dev-authority requires building with the dev-authority feature".to_owned());
     }
-    Err(
-        "no authority resolver: until M7, start with the dev-authority feature AND \
-         --dev-authority"
-            .to_owned(),
-    )
+
+    // The real resolver. It can mint nothing: a grant exists because somebody
+    // answered a challenge, and this looks it up.
+    let actors = vec![(
+        "agent-townhall".to_owned(),
+        bld_types::ActorId::new("agent:townhall"),
+    )];
+    Ok((
+        Arc::new(RealAuthority::new(Arc::clone(&issuer), store, actors)),
+        issuer,
+    ))
 }
 
 // One long function, deliberately: the composition root's whole job is this
@@ -401,13 +463,6 @@ async fn main() -> ExitCode {
     let Some(key_bytes) = parse_key(&args.key_hex) else {
         eprintln!("townhall-server: --key-hex must be exactly 64 hex characters");
         return ExitCode::from(2);
-    };
-    let authority = match resolver(&args) {
-        Ok(authority) => authority,
-        Err(problem) => {
-            eprintln!("townhall-server: {problem}");
-            return ExitCode::from(2);
-        }
     };
     let mut config = PursuitConfig {
         retry_cadence_ms: args.retry_cadence_ms,
@@ -437,6 +492,17 @@ async fn main() -> ExitCode {
         Err(error) => {
             eprintln!("townhall-server: cannot open {}: {error}", args.db);
             return ExitCode::FAILURE;
+        }
+    };
+    // The issuer and resolver, built here because they need the pool the
+    // repository owns — one database, so a delegation written by the endpoints
+    // is the same row the resolver reads back (ADR-025's shared authority
+    // plane, which is why these endpoints live in the server at all).
+    let (authority, issuer) = match authority(&args, repository.pool()) {
+        Ok(pair) => pair,
+        Err(problem) => {
+            eprintln!("townhall-server: {problem}");
+            return ExitCode::from(2);
         }
     };
     let denials = match townhall_store::denials::DenialLog::open(&args.denials_db, clock).await {
@@ -478,7 +544,20 @@ async fn main() -> ExitCode {
         stopped,
     ));
 
-    let router = townhall_http::router(ServerState { api, authority });
+    // Two routers, one listener.
+    //
+    // The booking API and the trusted approval endpoints are separate surfaces
+    // that happen to share a port. What keeps the untrusted proposer away from
+    // the second is not the network — it is that `Gateway` has no method naming
+    // any of these paths and `townhall-orchestrator` cannot name
+    // `townhall-authority` at all (ADR-025, asserted by that crate's
+    // resolved-dependency test).
+    let approvals =
+        townhall_http::approvals::approval_router(townhall_http::approvals::ApprovalState {
+            issuer: Arc::new(authority::ServiceIssuer(issuer)),
+            authority: Arc::clone(&authority),
+        });
+    let router = townhall_http::router(ServerState { api, authority }).merge(approvals);
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(error) => {

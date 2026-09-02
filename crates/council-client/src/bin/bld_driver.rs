@@ -98,7 +98,7 @@ impl Capability<BookingEffect> for DiesOnCue {
 /// booking; a deployment binds `SqlApprovalStore` here instead, which is M7B's
 /// work.
 async fn authority(id: &BookingId) -> VerifiedAuthority {
-    use bld_types::Behaviour;
+    use bld_types::{ActorId, Behaviour};
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
         BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
@@ -155,6 +155,7 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
                 binding: binding.clone(),
                 grantor: PrincipalId::new("lucy"),
                 subject: PrincipalId::new("lucy"),
+                actor: ActorId::new("agent:bld-driver"),
             },
             now,
         )

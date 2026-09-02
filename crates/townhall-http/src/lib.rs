@@ -35,6 +35,7 @@ use townhall_service::{
     BookingFacade, LookupQuery, Mutated, Projection, ReconcilerHandle, VenueFilters,
 };
 
+pub mod approvals;
 pub mod mapping;
 
 /// The two decisions every request needs, and they are not the same decision.
@@ -247,6 +248,19 @@ fn header_text<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'h
 /// Authenticate the caller — the half both gates share, so neither can skip it.
 #[allow(clippy::result_large_err)]
 fn actor_of(state: &ServerState, headers: &HeaderMap) -> Result<ActorId, Response> {
+    authenticated(state.authority.as_ref(), headers)
+}
+
+/// Authenticate against any resolver.
+///
+/// Shared with the approval router so both surfaces answer "which workload is
+/// calling" the same way — one notion of the question, not two that could
+/// drift.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authenticated(
+    authority: &dyn AuthorityResolver,
+    headers: &HeaderMap,
+) -> Result<ActorId, Response> {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -257,7 +271,7 @@ fn actor_of(state: &ServerState, headers: &HeaderMap) -> Result<ActorId, Respons
             "no verified caller identity",
         ));
     };
-    state.authority.authenticate(token).ok_or_else(|| {
+    authority.authenticate(token).ok_or_else(|| {
         mapping::plain_error(StatusCode::UNAUTHORIZED, "no verified caller identity")
     })
 }

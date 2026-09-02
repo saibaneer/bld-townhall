@@ -2118,6 +2118,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
  "townhall-service",
 ]
@@ -2141,12 +2142,14 @@ dependencies = [
 name = "townhall-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bld-types",
  "council-client",
  "council-wire",
  "reqwest",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "townhall-authority",

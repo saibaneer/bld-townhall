@@ -11,8 +11,8 @@
 //! Migration 0006 is exercised by every test here simply by opening the store.
 
 use bld_types::{
-    Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId, ServiceId,
-    TimeWindow,
+    ActorId, Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId,
+    ServiceId, TimeWindow,
 };
 use std::sync::Mutex;
 use townhall_authority::{
@@ -105,6 +105,7 @@ fn request() -> ApprovalRequest {
         binding: lucys_binding(),
         grantor: PrincipalId::new("lucy"),
         subject: PrincipalId::new("marco"),
+        actor: ActorId::new("agent:townhall"),
     }
 }
 

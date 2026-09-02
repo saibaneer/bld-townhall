@@ -420,7 +420,7 @@ async fn a8_delivery_outcomes_are_driven_not_just_typed() {
     );
 
     // Suppressed: automated only, and only while suppressed.
-    suppression.suppress(&lucy);
+    suppression.suppress(&lucy).expect("suppress");
     assert_eq!(
         channel
             .send(&lucy, OutboundMessage::automated("progress"))
@@ -437,7 +437,7 @@ async fn a8_delivery_outcomes_are_driven_not_just_typed() {
             .expect("send"),
         MessageReceipt::Delivered { .. }
     ));
-    suppression.allow(&lucy);
+    suppression.allow(&lucy).expect("allow");
     assert!(matches!(
         channel
             .send(&lucy, OutboundMessage::automated("progress"))
@@ -673,7 +673,7 @@ async fn m6a_gate_b_the_complete_channel_contract() {
     assert!(sent.text.ends_with('…'));
 
     // Suppressed where suppressed — and only the automated class.
-    suppression.suppress(&lucy);
+    suppression.suppress(&lucy).expect("suppress");
     assert_eq!(
         channel
             .send(&lucy, OutboundMessage::automated("progress"))

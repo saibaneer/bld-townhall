@@ -48,17 +48,19 @@ impl SuppressionStore for InMemorySuppression {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(address.revealed())
     }
-    fn suppress(&self, address: &ChannelAddress) {
+    fn suppress(&self, address: &ChannelAddress) -> Result<(), String> {
         self.silenced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(address.revealed().to_owned());
+        Ok(())
     }
-    fn allow(&self, address: &ChannelAddress) {
+    fn allow(&self, address: &ChannelAddress) -> Result<(), String> {
         self.silenced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(address.revealed());
+        Ok(())
     }
 }
 

@@ -1615,3 +1615,63 @@ posture in M6B: nothing downstream re-suppresses, so a safety exit that forgets
 is not one. The durable suppression store lives in M6B's orchestrator on
 `std::fs`. The gateway's `IN_FLIGHT` const is named debt until a domain-exported
 name list exists.
+
+## ADR-024 — The dispatcher: deterministic routing over one probabilistic seat
+
+Decided 2026-09-02 with the project owner. Completes M6 (with ADR-023's M6A);
+the milestone gate — the scripted SMS conversation — passes clean, faulted, and
+as the demo binary, which runs the same script through the same runner.
+
+### One seat for the model, everything else decided
+
+`townhall-orchestrator` routes deterministically. Its one probabilistic seat is
+the `Proposer` port: projected context in, typed request out, no route to
+anything that acts. M6 seats a strict grammar (`ScriptedProposer` — `BOOK k=v…`,
+`CONFIRM`, `cancel it`; near-misses are `Unclear`, never guesses); M11 seats a
+model through the same trait. `CONFIRM` is named in code and script as the
+stand-in M7's approval challenge replaces.
+
+The ordering is the contract, held by hostile ports in the tests: channel
+controls answer from ports before the proposer is consulted or any wire is built
+(panicking proposer + counting wire, zero of each, REVOKE included); identity
+resolution precedes every wire construction (panic-on-touch wire); the balance
+port is consulted exactly once and only for BALANCE (sentinel).
+
+### STOP gates the turn; suppression is durable; the boundary is exempt
+
+`run_followups` skips a suppressed follow-up BEFORE any wire exists — §14.1's
+"and scheduled agent turns", not just the outbound. Mutation-verified: an
+implementation that ran the turn and suppressed only the message fails the
+counting-factory witness. The server's own reconciliation is deliberately
+untouched — the booking still settles at the council, because STOP silences the
+messenger, not the boundary. Suppression lives in `FileSuppression` on
+`std::fs` (the crate graph forbids `sqlx` here): the replay window may forget
+across restarts because the boundary makes duplicates harmless, but nothing
+downstream re-suppresses, so this store must not.
+
+### Sessions hold ids and nothing else
+
+`Session { recent: Vec<BookingId> }` — no version field to go stale. Every
+proposal path acts on a version the server just reported: a fresh read, or the
+committed turn's own response (which is why the clean schedule is 14 requests,
+not the plan's 16 — recorded as a deviation, asserted exactly). "Cancel it"
+resolves from `?cancellable=true`; ambiguity asks, naming the candidates, with
+session recency only ordering the question. Mutation-verified: a dispatcher
+acting on assumed state fails the reload witness.
+
+### The gate's own catch
+
+The journey runner deduped the second script's first message as a carrier retry
+— two runs shared the replay window while each restarted its turn numbering.
+Correct dedupe plus careless identity generation is indistinguishable from lost
+mail; runner identities are process-unique now, and the incident is the best
+argument yet for the derived-id discipline it briefly defeated.
+
+### Costs accepted
+
+A `GET ?cancellable=true` per freeform turn (the proposer's context) — one
+round-trip per conversational beat at POC scale. The fault run asserts
+invariants rather than an exact convergence-GET count, trading the plan's "18"
+for freedom from the reconciler's cadence. The demo binary hardcodes the dev
+bindings, exactly as the tests do, because it is a composition root for a demo
+of those tests' world.

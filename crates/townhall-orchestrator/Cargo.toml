@@ -1,0 +1,27 @@
+[package]
+name = "townhall-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The routing layer: it decides WHICH conversation move to make, and reaches a
+# booking only through the gateway's socket. Absent, deliberately:
+# townhall-service, townhall-store, townhall-http, bld-kernel, sqlx — the same
+# trust posture as the gateway (spec §3.2), enforced by the resolved graph
+# (see tests/boundary.rs).
+[dependencies]
+async-trait = { workspace = true }
+bld-types = { path = "../bld-types" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+townhall-channel = { path = "../townhall-channel" }
+townhall-gateway = { path = "../townhall-gateway" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+townhall-testkit = { path = "../townhall-testkit" }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "sms-simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The demo composition root: wires the simulator channel, the dispatcher and a
+# running townhall-server URL together, and runs a conversation script. The
+# acceptance test calls the SAME runner function this binary calls, so the demo
+# and the test cannot drift (PLAN-M6B §4).
+[dependencies]
+bld-types = { path = "../../crates/bld-types" }
+tokio = { workspace = true }
+townhall-channel = { path = "../../crates/townhall-channel" }
+townhall-orchestrator = { path = "../../crates/townhall-orchestrator" }
+
+[lints]
+workspace = true

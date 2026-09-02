@@ -1,0 +1,23 @@
+# Lucy's journey — spec §15.2, exercised end to end with no telecom and no LLM.
+#
+# The request line is STRUCTURED, not natural language: M6's own gate says
+# "without ... LLM", and M11 owns the verbatim natural-language line (the
+# ScriptedProposer's grammar stands where the model will). CONFIRM stands where
+# M7's approval challenge will — both stand-ins are named, not disguised.
+
+> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000
+< I can ask TownHallAgent to make one booking matching those limits. Maximum booking fee: £50.00.
+
+> +447700900123 STATUS
+< AwaitingBooking. Attendees 20.
+
+> +447700900123 CONFIRM
+< Booked. Council ref
+
+> +447700900123 STATUS
+< Booked. Attendees 20. Council ref
+
+# Twenty minutes later (spec §15.2's beat) — the referent resolves from the
+# authoritative cancellable set, not from anything the session remembered.
+> +447700900123 cancel it
+< Cancelled. Council ref

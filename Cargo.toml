@@ -11,8 +11,11 @@ members = [
   "crates/townhall-http",
   "crates/townhall-channel",
   "crates/townhall-gateway",
+  "crates/townhall-orchestrator",
+  "crates/townhall-testkit",
   "services/mock-council",
   "services/townhall-server",
+  "services/sms-simulator",
 ]
 
 [workspace.package]

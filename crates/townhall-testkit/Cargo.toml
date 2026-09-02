@@ -1,0 +1,17 @@
+[package]
+name = "townhall-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Test scaffolding ONLY — a dev-dependency of the crates whose tests spawn the
+# real binaries. Never a normal dependency of anything: appearing in a normal
+# graph would hand production code a process-spawning, DB-reading toolkit.
+[dependencies]
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

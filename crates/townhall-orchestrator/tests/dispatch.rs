@@ -1,0 +1,710 @@
+//! B9, B11–B13: the dispatcher's ordering contract, held with hostile ports.
+//!
+//! No server here. The wire is a fake that counts or panics, the proposer
+//! panics on entry, and the witnesses are what NEVER got called — which is the
+//! only way "the control commands reach nothing" is an assertion rather than a
+//! hope.
+
+use async_trait::async_trait;
+use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, PrincipalId};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use townhall_channel::{
+    ChannelAddress, ChannelConfig, ChannelKind, InboundIdentity, InboundMessage, MessageReceipt,
+    RawInbound, SmsSimulator, SuppressionStore, TransportEvidence, simulator::InMemorySuppression,
+};
+use townhall_gateway::{GatewayError, Projection, Turn, VenueRow};
+use townhall_orchestrator::{
+    BookingWire, CredentialSource, Dispatcher, NoLedgerYet, PrincipalDirectory, ProjectedContext,
+    Proposed, Proposer, ScriptedProposer, UsageBalance, WireFactory,
+};
+
+// ------------------------------------------------------------------ fakes
+
+struct FixedDirectory(Vec<(&'static str, &'static str)>);
+
+impl PrincipalDirectory for FixedDirectory {
+    fn resolve(&self, address: &ChannelAddress) -> Option<PrincipalId> {
+        self.0
+            .iter()
+            .find(|(bound, _)| *bound == address.revealed())
+            .map(|(_, principal)| PrincipalId::new(*principal))
+    }
+}
+
+struct FixedCredentials;
+
+impl CredentialSource for FixedCredentials {
+    fn token_for(&self, principal: &PrincipalId) -> Option<String> {
+        Some(format!("dev-{principal}"))
+    }
+}
+
+/// Panics on entry: the witness that a message NEVER reached the proposer.
+struct PanickingProposer;
+
+#[async_trait]
+impl Proposer for PanickingProposer {
+    async fn propose(&self, _: &ProjectedContext, _: &InboundMessage) -> Proposed {
+        panic!("a control command reached the proposer");
+    }
+}
+
+/// Answers `Unclear` and counts — for proving the proposer WAS consulted,
+/// exactly once, when that is the claim.
+#[derive(Default)]
+struct UnclearProposer(AtomicUsize);
+
+#[async_trait]
+impl Proposer for UnclearProposer {
+    async fn propose(&self, _: &ProjectedContext, _: &InboundMessage) -> Proposed {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Proposed::Unclear
+    }
+}
+
+/// Counts every call; panics if constructed panicking.
+#[derive(Default)]
+struct CountingWire {
+    calls: AtomicUsize,
+    mutations: AtomicUsize,
+    panicking: bool,
+}
+
+impl CountingWire {
+    fn count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+    fn mutation_count(&self) -> usize {
+        self.mutations.load(Ordering::SeqCst)
+    }
+    fn touch(&self) {
+        assert!(!self.panicking, "the wire was reached");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl BookingWire for CountingWire {
+    async fn create(
+        &self,
+        _: &BookingId,
+        _: &BookingRequirements,
+    ) -> Result<Projection, GatewayError> {
+        self.touch();
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Err(GatewayError::Unavailable("counting fake".to_owned()))
+    }
+    async fn read(&self, _: &BookingId) -> Result<Projection, GatewayError> {
+        self.touch();
+        Err(GatewayError::UnknownBooking)
+    }
+    async fn cancellable(&self) -> Result<Vec<Projection>, GatewayError> {
+        self.touch();
+        Ok(Vec::new())
+    }
+    async fn by_reference(&self, _: &CouncilBookingRef) -> Result<Vec<Projection>, GatewayError> {
+        self.touch();
+        Ok(Vec::new())
+    }
+    async fn venues(&self) -> Result<Vec<VenueRow>, GatewayError> {
+        self.touch();
+        Ok(Vec::new())
+    }
+    async fn propose_at(
+        &self,
+        _: &BookingId,
+        _: u64,
+        _: &str,
+        _: Option<serde_json::Value>,
+    ) -> Result<Turn, GatewayError> {
+        self.touch();
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Err(GatewayError::Unavailable("counting fake".to_owned()))
+    }
+    async fn converge(
+        &self,
+        _: &BookingId,
+        _: std::time::Duration,
+    ) -> Result<Projection, GatewayError> {
+        self.touch();
+        Err(GatewayError::NotConverged { attempts: 0 })
+    }
+}
+
+struct FixedWireFactory(Arc<CountingWire>);
+
+impl WireFactory for FixedWireFactory {
+    fn wire_for(&self, _token: &str) -> Arc<dyn BookingWire> {
+        Arc::clone(&self.0) as Arc<dyn BookingWire>
+    }
+}
+
+/// A directory that panics on resolve — the witness that identity was never
+/// even ASKED for. The review's point: counting wire calls alone lets a
+/// dispatcher resolve identity, fetch credentials and build a wire before
+/// recognizing `HELP`, and nothing fails.
+struct PanickingDirectory;
+
+impl PrincipalDirectory for PanickingDirectory {
+    fn resolve(&self, _: &ChannelAddress) -> Option<PrincipalId> {
+        panic!("a control command resolved identity");
+    }
+}
+
+/// A factory that panics on `wire_for` — no wire may even be CONSTRUCTED.
+struct PanickingFactory;
+
+impl WireFactory for PanickingFactory {
+    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
+        panic!("a control command built a wire");
+    }
+}
+
+/// A balance port that counts and answers a nonsense sentinel a hardcoded
+/// string could not reproduce.
+#[derive(Default)]
+struct SentinelBalance(AtomicUsize);
+
+const BALANCE_SENTINEL: &str = "UNMETERED-SENTINEL-7f3a";
+
+impl UsageBalance for SentinelBalance {
+    fn describe(&self, _: &PrincipalId) -> String {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        BALANCE_SENTINEL.to_owned()
+    }
+}
+
+// ------------------------------------------------------------------ harness
+
+struct Bench {
+    dispatcher: Dispatcher<SmsSimulator>,
+    channel: Arc<SmsSimulator>,
+    wire: Arc<CountingWire>,
+    balance: Arc<SentinelBalance>,
+    proposer_calls: Option<Arc<UnclearProposer>>,
+    counter: AtomicUsize,
+}
+
+fn bench(proposer: &ProposerChoice) -> Bench {
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let wire = Arc::new(CountingWire::default());
+    let balance = Arc::new(SentinelBalance::default());
+    let (proposer_arc, proposer_calls): (Arc<dyn Proposer>, Option<Arc<UnclearProposer>>) =
+        match proposer {
+            ProposerChoice::Panicking => (Arc::new(PanickingProposer), None),
+            ProposerChoice::Unclear => {
+                let counting = Arc::new(UnclearProposer::default());
+                (Arc::clone(&counting) as Arc<dyn Proposer>, Some(counting))
+            }
+            ProposerChoice::Scripted => (Arc::new(ScriptedProposer), None),
+        };
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
+        Arc::new(FixedCredentials),
+        Arc::clone(&balance) as Arc<dyn UsageBalance>,
+        proposer_arc,
+        suppression,
+        Arc::new(FixedWireFactory(Arc::clone(&wire))),
+    );
+    Bench {
+        dispatcher,
+        channel,
+        wire,
+        balance,
+        proposer_calls,
+        counter: AtomicUsize::new(0),
+    }
+}
+
+enum ProposerChoice {
+    Panicking,
+    Unclear,
+    Scripted,
+}
+
+impl Bench {
+    fn raw(&self, from: &str, body: &str) -> RawInbound {
+        let n = self.counter.fetch_add(1, Ordering::SeqCst);
+        RawInbound {
+            identity: InboundIdentity::new("sim", "acct", format!("m-{n}")),
+            channel: ChannelKind::SmsSimulator,
+            from: from.to_owned(),
+            body: body.to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", from, true),
+        }
+    }
+
+    fn last_reply(&self) -> String {
+        let outbox = self.channel.outbox();
+        let last = outbox.last().expect("a reply was sent");
+        assert!(
+            matches!(last.receipt, MessageReceipt::Delivered { .. }),
+            "the reply must actually go out: {last:?}"
+        );
+        last.text.clone()
+    }
+}
+
+// ------------------------------------------------------------------ B11
+
+/// Every control command answers with NOTHING else consulted: no proposer, no
+/// wire, no wire CONSTRUCTION — and for the four that need no identity, no
+/// directory resolution either. Everything past the classification panics, so a
+/// dispatcher that "just quickly resolves who this is" before recognizing HELP
+/// dies here instead of passing a call-count check it never incremented.
+#[tokio::test]
+async fn b11_control_commands_reach_nothing() {
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(PanickingDirectory),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        suppression,
+        Arc::new(PanickingFactory),
+    );
+    let counter = AtomicUsize::new(0);
+    for (text, expect) in [
+        ("HELP", "BOOK date="),
+        ("STOP", "Automated messages stopped"),
+        ("START", "Automated messages resumed"),
+        ("REVOKE", "M7"),
+    ] {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        dispatcher
+            .handle(RawInbound {
+                identity: InboundIdentity::new("sim", "acct", format!("ctl-{n}")),
+                channel: ChannelKind::SmsSimulator,
+                from: "07700 900123".to_owned(),
+                body: text.to_owned(),
+                received_at_ms: 0,
+                evidence: TransportEvidence::new("sim", "07700 900123", true),
+            })
+            .await
+            .expect("handled");
+        let outbox = channel.outbox();
+        let reply = &outbox.last().expect("a reply").text;
+        assert!(
+            reply.contains(expect),
+            "{text}: expected {expect:?} in {reply:?}"
+        );
+    }
+
+    // BALANCE is the one control that legitimately asks WHO — so it runs on a
+    // bench whose directory answers, while the wire still panics on touch (a
+    // counting wire asserting zero, plus the panicking proposer).
+    let bench = bench(&ProposerChoice::Panicking);
+    bench
+        .dispatcher
+        .handle(bench.raw("07700 900123", "BALANCE"))
+        .await
+        .expect("handled");
+    assert!(bench.last_reply().contains(BALANCE_SENTINEL));
+    assert_eq!(bench.wire.count(), 0, "BALANCE touched the wire");
+}
+
+// ------------------------------------------------------------------ B12
+
+/// BALANCE consults the port — exactly once, only for BALANCE — and the reply
+/// carries the port's own words, so a hardcoded string cannot pass.
+#[tokio::test]
+async fn b12_balance_consults_the_port_and_answers_honestly() {
+    let bench = bench(&ProposerChoice::Panicking);
+    bench
+        .dispatcher
+        .handle(bench.raw("07700900123", "BALANCE"))
+        .await
+        .expect("handled");
+    assert!(bench.last_reply().contains(BALANCE_SENTINEL));
+    assert_eq!(bench.balance.0.load(Ordering::SeqCst), 1);
+
+    // HELP and STOP must not spend a balance question.
+    for text in ["HELP", "STOP", "START"] {
+        bench
+            .dispatcher
+            .handle(bench.raw("07700900123", text))
+            .await
+            .expect("handled");
+    }
+    assert_eq!(
+        bench.balance.0.load(Ordering::SeqCst),
+        1,
+        "only BALANCE may consult the balance port"
+    );
+    // And no digit-only invention: the sentinel is not a number.
+    assert!(!bench.last_reply().chars().all(|c| c.is_ascii_digit()));
+}
+
+// ------------------------------------------------------------------ B9
+
+/// An unbound address is refused before the wire exists to be called.
+///
+/// The wire is set panicking-on-touch: a "resolve unbound to a guest" or a
+/// "look them up anyway" implementation dies here rather than passing quietly.
+#[tokio::test]
+async fn b9_an_unbound_address_is_refused_before_any_wire_call() {
+    let mut bench = bench(&ProposerChoice::Panicking);
+    // Replace the wire with one that treats ANY touch as a failure.
+    let panicking = Arc::new(CountingWire {
+        panicking: true,
+        ..CountingWire::default()
+    });
+    bench.dispatcher = Dispatcher::new(
+        Arc::clone(&bench.channel),
+        Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        Arc::new(InMemorySuppression::default()),
+        Arc::new(FixedWireFactory(panicking)),
+    );
+
+    // A number the directory does not know — STATUS needs identity and a wire,
+    // so both refusal layers are in play.
+    bench
+        .dispatcher
+        .handle(bench.raw("07700111222", "STATUS"))
+        .await
+        .expect("handled");
+    assert!(
+        bench.last_reply().contains("recognize"),
+        "the stranger gets a deterministic refusal: {}",
+        bench.last_reply()
+    );
+}
+
+// ------------------------------------------------------------------ B13
+
+/// Unrecognized text reaches the proposer — exactly once — and mutates nothing.
+///
+/// Zero mutations alone is not enough: it also holds for a message the
+/// dispatcher swallowed. The proposer's own call count proves the text was
+/// judged rather than lost.
+#[tokio::test]
+async fn b13_unrecognized_text_is_judged_once_and_mutates_nothing() {
+    let bench = bench(&ProposerChoice::Unclear);
+    bench
+        .dispatcher
+        .handle(bench.raw("07700900123", "please sort out a room for tuesday"))
+        .await
+        .expect("handled");
+
+    assert!(
+        bench.last_reply().contains("Reply HELP"),
+        "the reply points at HELP: {}",
+        bench.last_reply()
+    );
+    assert_eq!(
+        bench
+            .proposer_calls
+            .as_ref()
+            .expect("counting proposer")
+            .0
+            .load(Ordering::SeqCst),
+        1,
+        "the text must REACH the proposer and be judged, exactly once"
+    );
+    assert_eq!(
+        bench.wire.mutation_count(),
+        0,
+        "an Unclear judgment must submit nothing"
+    );
+}
+
+// ------------------------------------------------------------------ the grammar
+
+/// The scripted grammar's near-misses are Unclear, not guesses.
+#[tokio::test]
+async fn the_scripted_grammar_refuses_near_misses() {
+    let bench = bench(&ProposerChoice::Scripted);
+    for text in [
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes", // missing max
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000 color=red", // unknown key
+        "BOOK date=2026-09-10 date=2026-09-11 from=14:00 to=17:00 people=20 accessible=yes max=5000", // duplicate
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=lots accessible=yes max=5000", // bad number
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=maybe max=5000", // bad bool
+        "BOOK date=tomorrow from=14:00 to=17:00 people=20 accessible=yes max=5000", // date shape
+        "BOOK date=2026-09-10 from=noon to=17:00 people=20 accessible=yes max=5000", // time shape
+        "BOOK date=2026-09-10 from=14:00 to=17:00 people=0 accessible=yes max=5000", // zero people
+    ] {
+        bench
+            .dispatcher
+            .handle(bench.raw("07700900123", text))
+            .await
+            .expect("handled");
+        assert!(
+            bench.last_reply().contains("Reply HELP"),
+            "{text:?} must be Unclear, got: {}",
+            bench.last_reply()
+        );
+    }
+    assert_eq!(
+        bench.wire.mutation_count(),
+        0,
+        "a half-understood BOOK must never create anything"
+    );
+
+    // And the well-formed one, keys shuffled, DOES reach the wire.
+    bench
+        .dispatcher
+        .handle(bench.raw(
+            "07700900123",
+            "book max=5000 people=20 to=17:00 accessible=yes from=14:00 date=2026-09-10",
+        ))
+        .await
+        .expect("handled");
+    assert_eq!(
+        bench.wire.mutation_count(),
+        1,
+        "the complete request, in any key order, creates"
+    );
+}
+
+// ------------------------------------------------------------------ the STOP lie
+
+/// A suppression store whose disk is gone.
+#[derive(Debug)]
+struct BrokenSuppression;
+
+impl SuppressionStore for BrokenSuppression {
+    fn is_suppressed(&self, _: &ChannelAddress) -> bool {
+        false
+    }
+    fn suppress(&self, _: &ChannelAddress) -> Result<(), String> {
+        Err("disk full".to_owned())
+    }
+    fn allow(&self, _: &ChannelAddress) -> Result<(), String> {
+        Err("disk full".to_owned())
+    }
+}
+
+/// A failed persist must reach the human as "NOT stopped" — the review's HIGH:
+/// the first implementation confirmed STOP while the write had already failed,
+/// a success that lasted exactly until the next restart. This mutation-verified
+/// witness is what makes that regression loud (reverting `suppress()` to
+/// memory-first-ignore-errors passes every other test in this workspace).
+#[tokio::test]
+async fn a_failed_stop_is_reported_as_not_stopped() {
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::new(BrokenSuppression) as Arc<dyn SuppressionStore>,
+    ));
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(PanickingDirectory),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        Arc::new(BrokenSuppression),
+        Arc::new(PanickingFactory),
+    );
+    dispatcher
+        .handle(RawInbound {
+            identity: InboundIdentity::new("sim", "acct", "stop-fail"),
+            channel: ChannelKind::SmsSimulator,
+            from: "07700 900123".to_owned(),
+            body: "STOP".to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", "07700 900123", true),
+        })
+        .await
+        .expect("handled");
+    let outbox = channel.outbox();
+    let reply = &outbox.last().expect("a reply").text;
+    assert!(
+        reply.contains("NOT stopped"),
+        "a failed persist must not be confirmed as stopped: {reply}"
+    );
+    assert!(
+        !reply.contains("Automated messages stopped."),
+        "the success text must be absent: {reply}"
+    );
+}
+
+/// And the store itself: persist-first means a failed write leaves memory
+/// unchanged, so `is_suppressed` never claims a state the disk does not hold.
+#[test]
+fn file_suppression_does_not_commit_what_it_could_not_persist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store =
+        townhall_orchestrator::FileSuppression::open(dir.path().join("stop.list")).expect("open");
+    let lucy =
+        ChannelAddress::parse("+447700900123", townhall_channel::Region::Gb).expect("address");
+
+    // Make the parent unwritable, so the staged write fails.
+    let mut permissions = std::fs::metadata(dir.path()).expect("meta").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o555);
+    std::fs::set_permissions(dir.path(), permissions.clone()).expect("chmod");
+
+    let outcome = store.suppress(&lucy);
+    assert!(
+        outcome.is_err(),
+        "an unwritable disk must surface: {outcome:?}"
+    );
+    assert!(
+        !store.is_suppressed(&lucy),
+        "memory must not hold a state the disk refused — that state evaporates \
+         at restart, which is the whole failure"
+    );
+
+    // Restore writability so the tempdir can clean up (and prove recovery).
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(dir.path(), permissions).expect("chmod back");
+    store.suppress(&lucy).expect("a healthy disk suppresses");
+    assert!(store.is_suppressed(&lucy));
+}
+
+// ------------------------------------------------------------------ binding drift
+
+/// A directory whose binding can be changed mid-test.
+#[derive(Debug, Default)]
+struct SwappableDirectory(std::sync::Mutex<Option<&'static str>>);
+
+impl PrincipalDirectory for SwappableDirectory {
+    fn resolve(&self, _: &ChannelAddress) -> Option<PrincipalId> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(PrincipalId::new)
+    }
+}
+
+/// A wire that accepts a cancellation and PANICS if convergence runs — the
+/// witness that a drifted follow-up's turn never started.
+struct AcceptingWire;
+
+#[async_trait]
+impl BookingWire for AcceptingWire {
+    async fn create(
+        &self,
+        _: &BookingId,
+        _: &BookingRequirements,
+    ) -> Result<Projection, GatewayError> {
+        unreachable!()
+    }
+    async fn read(&self, _: &BookingId) -> Result<Projection, GatewayError> {
+        unreachable!()
+    }
+    async fn cancellable(&self) -> Result<Vec<Projection>, GatewayError> {
+        Ok(vec![Projection {
+            id: "sms-test".to_owned(),
+            version: 4,
+            state: "Booked".to_owned(),
+            requirements: townhall_gateway::dto::Requirements {
+                purpose: "p".to_owned(),
+                requested_date: "2026-09-10".to_owned(),
+                from: "14:00".to_owned(),
+                to: "17:00".to_owned(),
+                attendees: 20,
+                wheelchair_accessible: true,
+                max_fee_pence: 5_000,
+            },
+            selected_venue: None,
+            booking_ref: Some("TH-1".to_owned()),
+            available_behaviours: vec!["Cancel".to_owned()],
+        }])
+    }
+    async fn by_reference(&self, _: &CouncilBookingRef) -> Result<Vec<Projection>, GatewayError> {
+        unreachable!()
+    }
+    async fn venues(&self) -> Result<Vec<VenueRow>, GatewayError> {
+        unreachable!()
+    }
+    async fn propose_at(
+        &self,
+        _: &BookingId,
+        _: u64,
+        _: &str,
+        _: Option<serde_json::Value>,
+    ) -> Result<Turn, GatewayError> {
+        Ok(Turn::Accepted {
+            retry_after: std::time::Duration::from_millis(1),
+        })
+    }
+    async fn converge(
+        &self,
+        _: &BookingId,
+        _: std::time::Duration,
+    ) -> Result<Projection, GatewayError> {
+        panic!("a drifted follow-up ran its turn");
+    }
+}
+
+struct AcceptingFactory;
+
+impl WireFactory for AcceptingFactory {
+    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
+        Arc::new(AcceptingWire)
+    }
+}
+
+/// A follow-up whose binding drifted between queueing and draining is dropped
+/// BEFORE any wire exists — otherwise the dispatcher authenticates as the OLD
+/// principal and sends their booking reference to whoever holds the number now.
+/// (The review's sharpest scenario; converge panics, so a wrong implementation
+/// dies rather than passes.)
+#[tokio::test]
+async fn a_drifted_binding_drops_the_followup_before_any_wire() {
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let directory = Arc::new(SwappableDirectory::default());
+    *directory
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("lucy");
+
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::clone(&directory) as Arc<dyn PrincipalDirectory>,
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(ScriptedProposer),
+        suppression,
+        Arc::new(AcceptingFactory),
+    );
+
+    // "cancel it" → one candidate → Accepted → a follow-up is queued.
+    dispatcher
+        .handle(RawInbound {
+            identity: InboundIdentity::new("sim", "acct", "drift-1"),
+            channel: ChannelKind::SmsSimulator,
+            from: "07700 900123".to_owned(),
+            body: "cancel it".to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", "07700 900123", true),
+        })
+        .await
+        .expect("handled");
+    let sent_before = channel.outbox().len();
+
+    // The number changes hands before the queue is drained.
+    *directory
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("priya");
+
+    dispatcher.run_followups().await;
+
+    // Nothing ran (converge panics if it did) and nothing was sent.
+    assert_eq!(
+        channel.outbox().len(),
+        sent_before,
+        "a drifted follow-up must send nothing: {:?}",
+        channel.outbox().last()
+    );
+}

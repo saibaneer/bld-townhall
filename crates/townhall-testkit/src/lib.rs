@@ -1,5 +1,9 @@
 //! Both binaries, spawned — the real wire, nothing faked.
 //!
+//! A real crate rather than a tests/ module, because M6B needs it too and
+//! test files cannot be imported across crates — this is the "no third copy"
+//! promise, kept.
+//!
 //! Lifted out of `services/townhall-server/tests/http.rs` so M6A and M6B share
 //! one, rather than the third copy this would otherwise become.
 //!
@@ -343,4 +347,52 @@ fn forward_once(
             }
         }
     }
+}
+
+/// The RESOLVED dependency names of one workspace package, by kind.
+///
+/// `resolve.nodes`, not `packages[].dependencies` — the declared list is what
+/// a manifest says; the resolved list is what the resolver linked, and only
+/// the linked graph shows a forbidden crate arriving transitively.
+pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
+    let output = Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .expect("cargo metadata");
+    assert!(output.status.success());
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata json");
+
+    // `resolve.nodes`, not `packages[].dependencies` — the review's point: the
+    // latter is what the manifest DECLARED, the former is what the resolver
+    // actually LINKED, and only the linked graph shows a forbidden crate
+    // arriving through a re-export or a transitive edge.
+    let subject_id = metadata["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|p| p["name"] == package)
+        .unwrap_or_else(|| panic!("{package} not in the workspace"))["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let nodes = metadata["resolve"]["nodes"].as_array().expect("nodes");
+    let node = nodes
+        .iter()
+        .find(|n| n["id"] == subject_id.as_str())
+        .expect("a resolve node");
+    node["deps"]
+        .as_array()
+        .expect("deps")
+        .iter()
+        .filter(|dep| {
+            dep["dep_kinds"].as_array().is_none_or(|dep_kinds| {
+                dep_kinds.iter().any(|dk| {
+                    let kind = dk["kind"].as_str().unwrap_or("normal");
+                    kinds.contains(&kind)
+                })
+            })
+        })
+        .map(|dep| dep["name"].as_str().expect("name").replace('_', "-"))
+        .collect()
 }

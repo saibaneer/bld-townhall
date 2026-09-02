@@ -271,3 +271,50 @@ fn the_preview_offers_rejection() {
     let preview = scope().preview(CODE, NOW);
     assert!(preview.contains("Reply NO 7312 to reject."));
 }
+
+/// A scope survives the round trip the challenge row puts it through.
+#[test]
+fn a_scope_round_trips_through_its_encoding() {
+    let original = scope();
+    assert_eq!(CanonicalScope::decode(&original.encode()), Some(original));
+}
+
+/// Every edited byte either refuses or comes back visibly different.
+///
+/// The same battery the envelope gets, for the same reason: a decode that
+/// succeeded and returned the ORIGINAL scope would mean the edited field is
+/// never read, and a field nobody reads is a term nobody approved.
+#[test]
+fn no_edited_byte_decodes_back_to_the_original_scope() {
+    let original = scope();
+    let bytes = original.encode();
+
+    for index in 0..bytes.len() {
+        for bit in [0x01u8, 0x80u8] {
+            let mut edited = bytes.clone();
+            edited[index] ^= bit;
+            if let Some(decoded) = CanonicalScope::decode(&edited) {
+                assert_ne!(
+                    decoded, original,
+                    "byte {index} bit {bit:#x} edited, yet the decode produced \
+                     the original scope — that field is not being read"
+                );
+            }
+        }
+    }
+}
+
+/// A truncated or over-long buffer is refused, never partially believed.
+#[test]
+fn a_damaged_scope_buffer_is_refused() {
+    let bytes = scope().encode();
+    for cut in 0..bytes.len() {
+        assert!(
+            CanonicalScope::decode(&bytes[..cut]).is_none(),
+            "a {cut}-byte prefix decoded as a scope"
+        );
+    }
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(CanonicalScope::decode(&trailing).is_none());
+}

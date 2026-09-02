@@ -20,7 +20,7 @@
 //! way to hold a preview for one scope and a digest for another, because
 //! producing either requires the same `self`.
 
-use crate::codec::push_field;
+use crate::codec::{Reader, push_field};
 use bld_types::{Behaviour, BookingId, BookingRequirements, Money, ServiceId};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
@@ -198,6 +198,69 @@ impl CanonicalScope {
         out
     }
 
+    /// Read a scope back from [`Self::encode`]'s bytes, or refuse.
+    ///
+    /// # Why this is public where the envelope's decoder is not
+    ///
+    /// A scope is a description of what was ASKED, not a grant. Reconstructing
+    /// one confers nothing — the authority it might lead to still requires a
+    /// challenge, a code and a bound channel. So the store may hold the bytes
+    /// and read them back, which is what lets an approval resume after a
+    /// restart without conversational memory.
+    ///
+    /// Every failure is `None`. A scope that half-decodes is not the scope
+    /// anybody approved.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+        if reader.field()? != SCOPE_ENCODING_VERSION {
+            return None;
+        }
+        let service = ServiceId::new(reader.text()?);
+        let agent = reader.text()?;
+        let booking = BookingId::new(reader.text()?);
+
+        // NOT `with_capacity`: the count comes off the bytes being distrusted.
+        // See the same note in `crate::envelope`, where trusting it cost the
+        // process a 72-petabyte allocation.
+        let count = usize::try_from(reader.u64()?).ok()?;
+        let mut behaviours = Vec::new();
+        for _ in 0..count {
+            behaviours.push(behaviour_named(&reader.text()?)?);
+        }
+
+        let requirements = BookingRequirements {
+            purpose: reader.text()?,
+            requested_date: reader.text()?,
+            time_window: bld_types::TimeWindow {
+                from: reader.text()?,
+                to: reader.text()?,
+            },
+            attendees: u16::from_be_bytes(reader.field()?.try_into().ok()?),
+            wheelchair_accessible: match reader.field()? {
+                [0] => false,
+                [1] => true,
+                _ => return None,
+            },
+            max_fee: Money::from_pence(reader.u64()?),
+        };
+        let expires_at_ms = reader.u64()?;
+        let grant_ttl_ms = reader.u64()?;
+
+        if !reader.is_finished() {
+            return None;
+        }
+        Some(Self {
+            service,
+            agent,
+            booking,
+            behaviours: BehaviourSet::new(behaviours),
+            requirements,
+            expires_at_ms,
+            grant_ttl_ms,
+        })
+    }
+
     /// The digest of [`Self::encode`].
     #[must_use]
     pub fn digest(&self) -> ScopeHash {
@@ -315,4 +378,23 @@ fn duration(ttl_ms: u64) -> String {
         1 => "1 minute".to_owned(),
         many => format!("{many} minutes"),
     }
+}
+
+/// The behaviour names' only reader on this side of the crate.
+///
+/// A closed lookup rather than a permissive fallback: a scope naming a
+/// behaviour this build does not know must fail to decode, not decode into
+/// something adjacent.
+fn behaviour_named(name: &str) -> Option<Behaviour> {
+    [
+        Behaviour::SelectVenue,
+        Behaviour::VerifySlot,
+        Behaviour::ChangeVenue,
+        Behaviour::UpdateRequirements,
+        Behaviour::RevalidateVenue,
+        Behaviour::Book,
+        Behaviour::Cancel,
+    ]
+    .into_iter()
+    .find(|behaviour| behaviour.name() == name)
 }

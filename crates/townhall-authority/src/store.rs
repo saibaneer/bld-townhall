@@ -16,6 +16,7 @@
 //! in a transaction.
 
 use crate::challenge::{ChallengeRecord, ChallengeStatus};
+use async_trait::async_trait;
 use bld_types::{ApprovalChallengeId, DelegationId, PrincipalId, ServiceId};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -41,6 +42,11 @@ pub struct DelegationRecord {
     /// Indexed: "everything Marco holds".
     pub subject: PrincipalId,
     pub service: ServiceId,
+    /// When the grant was issued — the row's own `created_at_ms`.
+    ///
+    /// Carried rather than read out of the envelope, because the store must be
+    /// able to write the column without interpreting those bytes.
+    pub issued_at_ms: u64,
     /// Indexed: expiry sweeps, and the resolver's liveness check.
     pub expires_at_ms: u64,
     /// `Some` once revoked. Never un-set.
@@ -71,18 +77,19 @@ pub enum StoreError {
 }
 
 /// Everything the verifier and issuer need to persist.
+#[async_trait]
 pub trait ApprovalStore: Send + Sync {
     /// Record a new challenge. Refuses a duplicate id rather than overwriting —
     /// an overwrite would reset the attempt count, which is the bound.
     ///
     /// # Errors
     /// The id already exists, or the store is unreachable.
-    fn insert_challenge(&self, challenge: &ChallengeRecord) -> Result<(), StoreError>;
+    async fn insert_challenge(&self, challenge: &ChallengeRecord) -> Result<(), StoreError>;
 
     /// # Errors
     /// The store is unreachable. A missing challenge is `Ok(None)`, not an
     /// error — "no such challenge" is an answer.
-    fn load_challenge(
+    async fn load_challenge(
         &self,
         id: &ApprovalChallengeId,
     ) -> Result<Option<ChallengeRecord>, StoreError>;
@@ -94,7 +101,7 @@ pub trait ApprovalStore: Send + Sync {
     ///
     /// # Errors
     /// No such challenge, or the store is unreachable.
-    fn record_failed_attempt(
+    async fn record_failed_attempt(
         &self,
         id: &ApprovalChallengeId,
         now_ms: u64,
@@ -107,7 +114,7 @@ pub trait ApprovalStore: Send + Sync {
     ///
     /// # Errors
     /// No such challenge, a delegation id collision, or an unreachable store.
-    fn settle_with_grant(
+    async fn settle_with_grant(
         &self,
         id: &ApprovalChallengeId,
         grant: &DelegationRecord,
@@ -117,11 +124,14 @@ pub trait ApprovalStore: Send + Sync {
     ///
     /// # Errors
     /// No such challenge, or the store is unreachable.
-    fn settle_rejected(&self, id: &ApprovalChallengeId) -> Result<Settled, StoreError>;
+    async fn settle_rejected(&self, id: &ApprovalChallengeId) -> Result<Settled, StoreError>;
 
     /// # Errors
     /// The store is unreachable. A missing delegation is `Ok(None)`.
-    fn load_delegation(&self, id: &DelegationId) -> Result<Option<DelegationRecord>, StoreError>;
+    async fn load_delegation(
+        &self,
+        id: &DelegationId,
+    ) -> Result<Option<DelegationRecord>, StoreError>;
 
     /// Revoke, returning whether this call was the one that did it.
     ///
@@ -131,7 +141,7 @@ pub trait ApprovalStore: Send + Sync {
     /// # Errors
     /// The store is unreachable. An unknown or already-revoked delegation is
     /// `Ok(false)`.
-    fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError>;
+    async fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError>;
 }
 
 /// The in-memory store: this crate's tests, and the testkit issuer.
@@ -163,8 +173,9 @@ impl MemoryApprovalStore {
     }
 }
 
+#[async_trait]
 impl ApprovalStore for MemoryApprovalStore {
-    fn insert_challenge(&self, challenge: &ChallengeRecord) -> Result<(), StoreError> {
+    async fn insert_challenge(&self, challenge: &ChallengeRecord) -> Result<(), StoreError> {
         let mut held = self.locked();
         let key = challenge.id.as_str().to_owned();
         if held.challenges.contains_key(&key) {
@@ -174,14 +185,14 @@ impl ApprovalStore for MemoryApprovalStore {
         Ok(())
     }
 
-    fn load_challenge(
+    async fn load_challenge(
         &self,
         id: &ApprovalChallengeId,
     ) -> Result<Option<ChallengeRecord>, StoreError> {
         Ok(self.locked().challenges.get(id.as_str()).cloned())
     }
 
-    fn record_failed_attempt(
+    async fn record_failed_attempt(
         &self,
         id: &ApprovalChallengeId,
         _now_ms: u64,
@@ -201,7 +212,7 @@ impl ApprovalStore for MemoryApprovalStore {
         Ok((challenge.attempts_left(), challenge.status))
     }
 
-    fn settle_with_grant(
+    async fn settle_with_grant(
         &self,
         id: &ApprovalChallengeId,
         grant: &DelegationRecord,
@@ -230,7 +241,7 @@ impl ApprovalStore for MemoryApprovalStore {
         Ok(Settled::Now)
     }
 
-    fn settle_rejected(&self, id: &ApprovalChallengeId) -> Result<Settled, StoreError> {
+    async fn settle_rejected(&self, id: &ApprovalChallengeId) -> Result<Settled, StoreError> {
         let mut held = self.locked();
         let challenge = held
             .challenges
@@ -243,11 +254,14 @@ impl ApprovalStore for MemoryApprovalStore {
         Ok(Settled::Now)
     }
 
-    fn load_delegation(&self, id: &DelegationId) -> Result<Option<DelegationRecord>, StoreError> {
+    async fn load_delegation(
+        &self,
+        id: &DelegationId,
+    ) -> Result<Option<DelegationRecord>, StoreError> {
         Ok(self.locked().delegations.get(id.as_str()).cloned())
     }
 
-    fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError> {
+    async fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError> {
         let mut held = self.locked();
         let Some(delegation) = held.delegations.get_mut(id.as_str()) else {
             return Ok(false);

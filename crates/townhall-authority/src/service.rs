@@ -188,7 +188,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// The store refused the new challenge, or could not be reached. A
     /// challenge that cannot be persisted must not be sent: the person would
     /// receive a code that no reply could ever satisfy.
-    pub fn begin(
+    pub async fn begin(
         &self,
         request: &ApprovalRequest,
         now_ms: u64,
@@ -219,7 +219,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             status: ChallengeStatus::Pending,
             assurance: self.policy.assurance,
         };
-        self.store.insert_challenge(&record)?;
+        self.store.insert_challenge(&record).await?;
         Ok(RaisedChallenge { id, preview, code })
     }
 
@@ -243,7 +243,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// # Errors
     /// One [`ApprovalDenied`] per check, each distinct so the acceptance gate's
     /// "denied independently" can name which check refused.
-    pub fn submit(
+    pub async fn submit(
         &self,
         id: &ApprovalChallengeId,
         offered_code: &str,
@@ -251,10 +251,10 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         binding_assurance: AssuranceLevel,
         now_ms: u64,
     ) -> Result<VerifiedAuthority, ApprovalDenied> {
-        let challenge = self.pending(id, from, now_ms)?;
+        let challenge = self.pending(id, from, now_ms).await?;
 
         if !challenge.code.matches(offered_code) {
-            let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms)?;
+            let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms).await?;
             return Err(if status == ChallengeStatus::Exhausted {
                 ApprovalDenied::AttemptsExceeded
             } else {
@@ -290,12 +290,13 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             grantor: authority.grantor().clone(),
             subject: authority.subject().clone(),
             service: authority.service().clone(),
+            issued_at_ms: authority.issued_at_ms(),
             expires_at_ms: authority.expires_at_ms(),
             revoked_at_ms: None,
             envelope: envelope::encode(&authority),
         };
 
-        match self.store.settle_with_grant(id, &record)? {
+        match self.store.settle_with_grant(id, &record).await? {
             Settled::Now => Ok(authority),
             Settled::Already(status) => Err(ApprovalDenied::Replay(status.name())),
         }
@@ -309,23 +310,23 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// # Errors
     /// As [`Self::submit`]: unknown, expired, wrong channel, wrong code, out of
     /// attempts, or already settled.
-    pub fn reject(
+    pub async fn reject(
         &self,
         id: &ApprovalChallengeId,
         offered_code: &str,
         from: &BindingRef,
         now_ms: u64,
     ) -> Result<(), ApprovalDenied> {
-        let challenge = self.pending(id, from, now_ms)?;
+        let challenge = self.pending(id, from, now_ms).await?;
         if !challenge.code.matches(offered_code) {
-            let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms)?;
+            let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms).await?;
             return Err(if status == ChallengeStatus::Exhausted {
                 ApprovalDenied::AttemptsExceeded
             } else {
                 ApprovalDenied::WrongCode { attempts_left }
             });
         }
-        match self.store.settle_rejected(id)? {
+        match self.store.settle_rejected(id).await? {
             Settled::Now => Ok(()),
             Settled::Already(status) => Err(ApprovalDenied::Replay(status.name())),
         }
@@ -340,7 +341,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// # Errors
     /// Unknown, revoked, expired, or a row that does not decode — never
     /// "close enough".
-    pub fn resolve(
+    pub async fn resolve(
         &self,
         id: &DelegationId,
         now_ms: u64,
@@ -348,6 +349,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         let record = self
             .store
             .load_delegation(id)
+            .await
             .map_err(|error| ResolveError::Unavailable(error.to_string()))?
             .ok_or(ResolveError::Unknown)?;
 
@@ -365,12 +367,12 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     ///
     /// # Errors
     /// The store could not be reached.
-    pub fn revoke(&self, id: &DelegationId, now_ms: u64) -> Result<bool, StoreError> {
-        self.store.revoke_delegation(id, now_ms)
+    pub async fn revoke(&self, id: &DelegationId, now_ms: u64) -> Result<bool, StoreError> {
+        self.store.revoke_delegation(id, now_ms).await
     }
 
     /// The four checks every answer passes before its code is even looked at.
-    fn pending(
+    async fn pending(
         &self,
         id: &ApprovalChallengeId,
         from: &BindingRef,
@@ -378,7 +380,8 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     ) -> Result<ChallengeRecord, ApprovalDenied> {
         let challenge = self
             .store
-            .load_challenge(id)?
+            .load_challenge(id)
+            .await?
             .ok_or(ApprovalDenied::UnknownChallenge)?;
 
         // Two layers guard replay, and the mutation battery proved each

@@ -20,6 +20,12 @@ rust-version.workspace = true
 # and no server, so an exemption there would let a #[cfg(test)] module reach a
 # mutation surface the crate is forbidden.
 [dependencies]
+# A proc macro, not a runtime. The port has to be async because its SQL
+# implementation is, and a synchronous port over an async pool means blocking on
+# a runtime handle — which panics outright on a current-thread runtime, as the
+# first version of `townhall-store`'s implementation discovered. `async-trait`
+# names no executor, so this crate still depends on nothing that can act.
+async-trait = { workspace = true }
 bld-types = { path = "../bld-types" }
 # The canonical scope's digest. A real digest because the hash is what binds
 # what a human was shown to what an issuer later acts on.
@@ -33,6 +39,7 @@ thiserror = { workspace = true }
 # its own types, which is the property the assertions check.
 static_assertions = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

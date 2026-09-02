@@ -101,7 +101,7 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
     use bld_types::Behaviour;
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
     };
 
     /// The demo's fixed code. A real one comes from the OS (M7B).
@@ -124,6 +124,10 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
         std::sync::Arc::new(MemoryApprovalStore::new()),
         DemoCode,
         AuthorityPolicy::default(),
+        // This driver issues and resolves within one process and one run, so
+        // the key need only be unguessable from outside it. A deployment binds
+        // a configured key here instead.
+        EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8)).expect("32 bytes"),
     );
     let binding = BindingRef {
         principal: PrincipalId::new("lucy"),

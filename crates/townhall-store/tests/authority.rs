@@ -17,7 +17,8 @@ use bld_types::{
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, MAX_ATTEMPTS, PendingScope, ResolveError,
+    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS, PendingScope,
+    ResolveError,
 };
 use townhall_store::SqliteBookingRepository;
 use townhall_store::authority::{ChannelBinding, SqlApprovalStore};
@@ -71,6 +72,7 @@ fn service(store: SqlApprovalStore) -> AuthorityService<SqlApprovalStore, FixedE
             grant_ttl_ms: GRANT_TTL_MS,
             assurance: AssuranceLevel::SmsReply,
         },
+        EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes"),
     )
 }
 

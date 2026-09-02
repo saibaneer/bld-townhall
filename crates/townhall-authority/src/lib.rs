@@ -32,6 +32,7 @@ pub mod challenge;
 mod codec;
 mod envelope;
 pub mod grant;
+pub mod key;
 pub mod scope;
 pub mod service;
 pub mod store;
@@ -39,6 +40,7 @@ pub mod store;
 pub use assurance::AssuranceLevel;
 pub use challenge::{ApprovalCode, CODE_DIGITS, ChallengeRecord, ChallengeStatus, MAX_ATTEMPTS};
 pub use grant::{AuthorityConstraints, BindingRef, VerifiedApproval, VerifiedAuthority};
+pub use key::{EnvelopeKey, KeyTooShort};
 pub use scope::{BehaviourSet, CanonicalScope, ScopeHash};
 pub use service::{
     ApprovalDenied, ApprovalRequest, AuthorityPolicy, AuthorityService, Entropy, PendingScope,

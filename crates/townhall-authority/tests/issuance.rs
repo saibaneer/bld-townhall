@@ -14,8 +14,8 @@ use bld_types::{
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, MAX_ATTEMPTS, MemoryApprovalStore,
-    PendingScope, ResolveError,
+    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS,
+    MemoryApprovalStore, PendingScope, ResolveError,
 };
 
 const NOW: u64 = 1_700_000_000_000;
@@ -71,12 +71,19 @@ fn service_and_store() -> (Service, Arc<MemoryApprovalStore>) {
             grant_ttl_ms: GRANT_TTL_MS,
             assurance: AssuranceLevel::SmsReply,
         },
+        test_key(),
     );
     (service, store)
 }
 
 fn service() -> Service {
     service_and_store().0
+}
+
+/// One key for the whole suite. Fixed rather than random so a failure is a
+/// failure and not a coin flip.
+fn test_key() -> EnvelopeKey {
+    EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes")
 }
 
 fn lucys_binding() -> BindingRef {
@@ -701,6 +708,7 @@ async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed(
         Arc::new(CorruptStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
+        test_key(),
     );
 
     assert_eq!(
@@ -1046,6 +1054,7 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
         Arc::new(ForgedStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
+        test_key(),
     );
 
     // The right code, from the right channel, inside the window — and still no

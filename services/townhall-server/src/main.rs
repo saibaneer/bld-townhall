@@ -178,7 +178,7 @@ impl DevAuthority {
         use bld_types::{PrincipalId, ServiceId};
         use townhall_authority::{
             ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-            BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+            BehaviourSet, BindingRef, EnvelopeKey, Entropy, MemoryApprovalStore, PendingScope,
         };
 
         struct DevCode;
@@ -201,6 +201,13 @@ impl DevAuthority {
                 grant_ttl_ms: 5 * 60 * 1_000,
                 assurance: AssuranceLevel::Dev,
             },
+            // Per-process, and it genuinely does not matter here: this service
+            // issues a grant and hands it straight back, and its store is
+            // dropped on the next line. Nothing ever reads the envelope it
+            // wrote. A deployment binds a configured key at the composition
+            // root, where the grant IS read back — see M7B's resolver.
+            EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8))
+                .expect("32 bytes"),
         );
         let binding = BindingRef {
             principal: PrincipalId::new(principal),

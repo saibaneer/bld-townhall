@@ -43,6 +43,14 @@ axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 base64 = "0.23"
 sha2 = "0.11"
+# HMAC for the delegation envelope's authentication tag (M7B).
+#
+# A MAC rather than the council's ed25519: the server both writes and verifies
+# these tags, so there is no second party to hold a public key, and a symmetric
+# tag is the smaller thing to get right. RustCrypto's `hmac`, because a
+# hand-rolled `H(key || data)` over SHA-256 is length-extendable and this is
+# exactly the place not to be clever.
+hmac = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

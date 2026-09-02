@@ -417,7 +417,8 @@ pub mod issuer {
     };
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope, VerifiedAuthority,
+        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
+        VerifiedAuthority,
     };
 
     /// The instant every issued test grant is stamped with.
@@ -506,6 +507,9 @@ pub mod issuer {
                 grant_ttl_ms: GRANT_TTL_MS,
                 assurance: AssuranceLevel::SmsReply,
             },
+            // A fixed key: every grant a test holds was signed by the same
+            // issuer, which is the only property tests need from it.
+            EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes"),
         );
         let binding = BindingRef {
             principal: spec.grantor.clone(),

@@ -20,6 +20,7 @@ use crate::assurance::AssuranceLevel;
 use crate::challenge::{ApprovalCode, ChallengeRecord, ChallengeStatus};
 use crate::envelope;
 use crate::grant::{BindingRef, VerifiedApproval, VerifiedAuthority};
+use crate::key::EnvelopeKey;
 use crate::scope::CanonicalScope;
 use crate::store::{ApprovalStore, DelegationRecord, Settled, StoreError};
 use bld_types::{ActorId, ApprovalChallengeId, DelegationId, PrincipalId};
@@ -187,6 +188,10 @@ pub struct AuthorityService<S, E> {
     store: Arc<S>,
     entropy: E,
     policy: AuthorityPolicy,
+    /// Authenticates every envelope this service writes, and is required to
+    /// read one back. Held here rather than passed per call so no code path can
+    /// accidentally encode without it.
+    key: EnvelopeKey,
 }
 
 impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
@@ -195,11 +200,12 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// `Arc` rather than ownership so a composition root — or a test asserting
     /// on rows — can keep its own handle, without this type having to hand one
     /// out to whoever holds it.
-    pub fn new(store: Arc<S>, entropy: E, policy: AuthorityPolicy) -> Self {
+    pub fn new(store: Arc<S>, entropy: E, policy: AuthorityPolicy, key: EnvelopeKey) -> Self {
         Self {
             store,
             entropy,
             policy,
+            key,
         }
     }
 
@@ -318,7 +324,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             issued_at_ms: authority.issued_at_ms(),
             expires_at_ms: authority.expires_at_ms(),
             revoked_at_ms: None,
-            envelope: envelope::encode(&authority),
+            envelope: envelope::encode(&authority, &self.key),
         };
 
         match self.store.settle_with_grant(id, &record).await? {
@@ -384,7 +390,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         if now_ms >= record.expires_at_ms {
             return Err(ResolveError::Expired);
         }
-        envelope::decode(&record.envelope).ok_or(ResolveError::Unreadable)
+        envelope::decode(&record.envelope, &self.key).ok_or(ResolveError::Unreadable)
     }
 
     /// Revoke a grant. Idempotent — `false` means it was already revoked or

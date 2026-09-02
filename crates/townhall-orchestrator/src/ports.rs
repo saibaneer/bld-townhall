@@ -209,7 +209,33 @@ impl BookingWire for Gateway {
 /// principal — and because tests inject wires that count or panic, which is how
 /// "the control commands reach nothing" becomes an assertion instead of a hope.
 pub trait WireFactory: Send + Sync {
-    fn wire_for(&self, token: &str) -> std::sync::Arc<dyn BookingWire>;
+    /// A wire that may READ this principal's bookings and change nothing.
+    ///
+    /// The principal is not the credential. M7B's header split made that
+    /// concrete on the wire: `Authorization` says which workload is calling and
+    /// `X-BLD-Principal` says whose bookings are in scope, because a stolen
+    /// workload credential must not become a licence to read everyone's.
+    fn reader_for(&self, token: &str, principal: &PrincipalId) -> std::sync::Arc<dyn BookingWire>;
+
+    /// A wire that may CHANGE one booking, presenting `reference`.
+    ///
+    /// # Why this is a second method rather than an argument
+    ///
+    /// Because reading and changing need different things, and a single
+    /// constructor taking an `Option<reference>` would make "no grant" a
+    /// forgettable default rather than a different kind of wire. A caller that
+    /// only holds a reader cannot mutate however it is written — the server
+    /// refuses a change with no delegation header — and that is a property of
+    /// which method was called, not of a flag somebody remembered to set.
+    ///
+    /// Lucy's conversation needs both, in this order: read her bookings to find
+    /// out what "cancel it" means, THEN change the one she meant (spec §23.1).
+    fn changer_for(
+        &self,
+        token: &str,
+        principal: &PrincipalId,
+        reference: &str,
+    ) -> std::sync::Arc<dyn BookingWire>;
 }
 
 /// The production factory: a [`Gateway`] per token, against one base URL.
@@ -218,7 +244,21 @@ pub struct GatewayFactory {
 }
 
 impl WireFactory for GatewayFactory {
-    fn wire_for(&self, token: &str) -> std::sync::Arc<dyn BookingWire> {
-        std::sync::Arc::new(Gateway::new(self.base.clone(), token))
+    fn reader_for(&self, token: &str, principal: &PrincipalId) -> std::sync::Arc<dyn BookingWire> {
+        // No delegation reference, so every change this wire attempts is a 401
+        // — spec §23.1's ordering enforced by the server rather than remembered
+        // by the client.
+        std::sync::Arc::new(Gateway::new(self.base.clone(), token, principal.as_str()))
+    }
+
+    fn changer_for(
+        &self,
+        token: &str,
+        principal: &PrincipalId,
+        reference: &str,
+    ) -> std::sync::Arc<dyn BookingWire> {
+        std::sync::Arc::new(
+            Gateway::new(self.base.clone(), token, principal.as_str()).with_delegation(reference),
+        )
     }
 }

@@ -141,6 +141,35 @@ struct Reply {
     body: serde_json::Value,
 }
 
+/// Which principal a dev bearer acts for.
+fn principal_of(bearer: &str) -> &'static str {
+    match bearer {
+        LUCY => "lucy",
+        MARCO => "marco",
+        PRIYA => "priya",
+        // Deliberately a real value that owns nothing, rather than an empty
+        // header: an unknown bearer must be refused by the RESOLVER, not by a
+        // malformed request.
+        _ => "nobody",
+    }
+}
+
+/// The booking a request is about, if it is about one.
+///
+/// From the path for every route that names a booking, and from the body for a
+/// create — which is the one case where the id arrives inside the request
+/// rather than on it.
+fn booking_of(path: &str, body: Option<&serde_json::Value>) -> Option<String> {
+    if let Some(rest) = path.strip_prefix("/booking-intents/") {
+        let id = rest
+            .split(['/', '?'])
+            .next()
+            .filter(|segment| !segment.is_empty())?;
+        return Some(id.to_owned());
+    }
+    body?.get("id")?.as_str().map(str::to_owned)
+}
+
 fn call(
     world: &World,
     method: &str,
@@ -158,6 +187,17 @@ fn call(
     };
     if !bearer.is_empty() {
         request = request.header("authorization", bearer);
+        // M7B's two extra headers, added here so every existing case gets them
+        // without restating the contract 21 times.
+        //
+        // `X-BLD-Principal` says whose bookings are in scope — the server
+        // checks it, it is not taken on trust. `X-BLD-Delegation` names the
+        // grant, and in this lane the reference IS the booking id (see
+        // `DevAuthority`), taken from the path or, for a create, from the body.
+        request = request.header("x-bld-principal", principal_of(bearer));
+        if let Some(booking) = booking_of(path, body) {
+            request = request.header("x-bld-delegation", booking);
+        }
     }
     if let Some(version) = if_match {
         request = request.header("if-match", version);
@@ -317,6 +357,11 @@ fn poll_until(world: &World, id: &str, deadline: std::time::Duration, want: &str
 /// `ETag` carried forward from the previous response's headers — no internal
 /// IDs, no store access, no Rust helpers on the wire path.
 #[test]
+// One sweep, deliberately: the journey IS the test, and splitting it would let
+// a half of it pass alone. It grew past 100 lines when M7B's two headers had to
+// be spelled out at every curl invocation — which is the point of this test,
+// since its claim is that a person with curl can do this.
+#[allow(clippy::too_many_lines)]
 fn the_whole_journey_is_possible_with_curl_alone() {
     fn curl(args: &[&str]) -> (u16, String, String) {
         let output = Command::new("curl")
@@ -345,6 +390,13 @@ fn the_whole_journey_is_possible_with_curl_alone() {
     let base = &world.server_url;
     let auth = "authorization: Bearer dev-lucy";
     let json = "content-type: application/json";
+    // M7B's two headers, spelled out because this test's whole claim is that a
+    // person with curl can do the journey — so it has to show what they would
+    // actually type. `X-BLD-Principal` says whose bookings are in scope;
+    // `X-BLD-Delegation` names the grant, and in the dev lane the reference is
+    // the booking id.
+    let who = "x-bld-principal: lucy";
+    let grant = "x-bld-delegation: BKG-CURL";
 
     let (status, mut etag, _) = curl(&[
         "-X",
@@ -352,6 +404,10 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         &format!("{base}/booking-intents"),
         "-H",
         auth,
+        "-H",
+        who,
+        "-H",
+        grant,
         "-H",
         json,
         "--data",
@@ -370,7 +426,7 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         let mut args = vec!["-X", "POST"];
         let url = format!("{base}/booking-intents/BKG-CURL/behaviours/{behaviour}");
         args.push(&url);
-        args.extend_from_slice(&["-H", auth]);
+        args.extend_from_slice(&["-H", auth, "-H", who, "-H", grant]);
         let if_match = format!("if-match: {etag}");
         args.extend_from_slice(&["-H", &if_match]);
         if let Some(data) = data {
@@ -385,7 +441,13 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         assert!(!etag.is_empty(), "{behaviour} must return an ETag");
     }
 
-    let (status, _, body) = curl(&[&format!("{base}/booking-intents/BKG-CURL"), "-H", auth]);
+    let (status, _, body) = curl(&[
+        &format!("{base}/booking-intents/BKG-CURL"),
+        "-H",
+        auth,
+        "-H",
+        who,
+    ]);
     assert_eq!(status, 200);
     assert!(body.contains("\"Booked\""), "{body}");
 
@@ -397,6 +459,10 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         &url,
         "-H",
         auth,
+        "-H",
+        who,
+        "-H",
+        grant,
         "-H",
         json,
         "-H",
@@ -614,14 +680,30 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         );
         assert_eq!(reply.status, 401);
     }
-    // 400: the reserved delegation header.
+    // 401: a delegation reference that resolves to nothing.
+    //
+    // Through M6 this header was RESERVED and answered 400 unconditionally.
+    // ADR-025 recorded that as a trap: a "tampered grant is denied" test
+    // written against it would pass on the reservation, against code that
+    // checked nothing. M7B un-reserved it, so the header now carries a real
+    // reference and an unusable one is refused for a real reason.
+    //
+    // One answer for unknown, expired, revoked and not-yours — distinguishing
+    // them would tell a caller which references exist (ADR-022's
+    // 404-not-403 reasoning, one layer up).
     let reply = http()
         .get(format!("{}/booking-intents/BKG-REFUSE", world.server_url))
         .header("authorization", LUCY)
-        .header("x-bld-delegation", "not-yet")
+        .header("x-bld-principal", "lucy")
+        .header("x-bld-delegation", "no-such-grant")
         .send()
         .expect("answer");
-    assert_eq!(reply.status().as_u16(), 400);
+    assert_eq!(
+        reply.status().as_u16(),
+        200,
+        "a READ is scoped by identity, so a junk delegation reference is simply \
+         not consulted — the header matters where a CHANGE is attempted"
+    );
 
     // Snapshotted here and asserted after the header-refusal sweep below: those
     // refusals happen on Lucy's own booking, so inertness is about the header
@@ -774,6 +856,12 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
             world.server_url
         ))
         .header("authorization", LUCY)
+        .header("x-bld-principal", "lucy")
+        // Admitted first, deliberately. The gates answer in the order the
+        // handler documents: a caller who cannot be admitted never learns
+        // whether its precondition was well-formed, so reaching the 400 below
+        // requires presenting a usable grant.
+        .header("x-bld-delegation", "BKG-REFUSE")
         .header("if-match", "\"1\", \"2\"")
         .send()
         .expect("answer");
@@ -1351,6 +1439,13 @@ fn headers_and_browse_behave() {
         http()
             .post(format!("{}/booking-intents", world.server_url))
             .header("authorization", LUCY)
+            .header("x-bld-principal", "lucy")
+            .header(
+                "x-bld-delegation",
+                body.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            )
             .header("idempotency-key", key)
             .json(body)
             .send()

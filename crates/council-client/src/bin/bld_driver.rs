@@ -140,7 +140,16 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
                     service: bld_types::ServiceId::new("demo-council-town-hall"),
                     agent: "bld-driver".to_owned(),
                     booking: id.clone(),
-                    behaviours: BehaviourSet::new([Behaviour::Book, Behaviour::Cancel]),
+                    // The whole walk: M7B consults the grant for every
+                    // proposal, so a grant naming only `Book` stops at
+                    // `select-venue`.
+                    behaviours: BehaviourSet::new([
+                        Behaviour::SelectVenue,
+                        Behaviour::VerifySlot,
+                        Behaviour::RevalidateVenue,
+                        Behaviour::Book,
+                        Behaviour::Cancel,
+                    ]),
                     requirements: requirements(),
                 },
                 binding: binding.clone(),

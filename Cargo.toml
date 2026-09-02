@@ -52,6 +52,30 @@ sha2 = "0.11"
 # exactly the place not to be clever.
 hmac = "0.13"
 
+# Build-output size, which is a real constraint at this shape of workspace.
+#
+# A `cargo clean` here removed **49 GB across 446,906 files**. The arithmetic:
+# 22 integration-test files, each compiled into its OWN fully-linked executable
+# that statically links tokio, reqwest, axum and sqlx; 246 crates in the graph;
+# and those built under four different feature sets (default, --all-features,
+# dev-authority, loom), which Cargo keeps side by side because each feature
+# resolution is a separate fingerprint. Cargo never garbage-collects
+# superseded artifacts, so every signature change leaves the old ones behind.
+#
+# Neither setting affects a release build, CI (which builds fresh), or anything
+# shipped.
+[profile.dev]
+# `file:line` in every backtrace, without the full DWARF that dominates the
+# size of a debug binary. This is what the `debug = true` default buys and what
+# a test failure actually needs — a panic still names its file and line.
+debug = "line-tables-only"
+# The file-count fix, and macOS-specific.
+#
+# The dev default here is "unpacked": debug info stays in hundreds of thousands
+# of loose `.o` files rather than being collected. That is the only thing that
+# explains a six-figure file count, and it makes `cargo clean` itself slow.
+split-debuginfo = "packed"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

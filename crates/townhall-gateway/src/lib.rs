@@ -151,6 +151,19 @@ const IN_FLIGHT: &[&str] = &[
 pub struct Gateway {
     base: String,
     bearer: String,
+    /// Whose bookings this client reads.
+    ///
+    /// Sent as `X-BLD-Principal`, and the server checks it against a live
+    /// channel binding rather than believing it (M7B). A read is scoped to
+    /// somebody; there is no unscoped read.
+    principal: String,
+    /// The grant reference this client presents when it CHANGES something.
+    ///
+    /// `None` until an approval has produced one, and that is a real state
+    /// rather than an oversight: spec §23.1 puts approval before the first
+    /// mutation, so a client that has not been approved yet genuinely holds no
+    /// reference and every change it attempts is refused with 401.
+    delegation: Option<String>,
     http: reqwest::Client,
     policy: RetryPolicy,
     /// Set when the caller wants request ids it chose rather than minted.
@@ -164,11 +177,21 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// A client that can read `principal`'s bookings and change nothing.
+    ///
+    /// Changing requires [`Self::with_delegation`], because a change requires a
+    /// grant — which is the whole of M7B's header split.
     #[must_use]
-    pub fn new(base: impl Into<String>, bearer: impl Into<String>) -> Self {
+    pub fn new(
+        base: impl Into<String>,
+        bearer: impl Into<String>,
+        principal: impl Into<String>,
+    ) -> Self {
         Self {
             base: base.into(),
             bearer: bearer.into(),
+            principal: principal.into(),
+            delegation: None,
             http: reqwest::Client::new(),
             policy: RetryPolicy::default(),
             request_id: None,
@@ -185,6 +208,18 @@ impl Gateway {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Present this grant reference on every subsequent change.
+    ///
+    /// Takes `self` rather than `&mut self` so a client that has been approved
+    /// is a DIFFERENT VALUE from one that has not — an approved client cannot
+    /// be un-approved by accident, and code holding the unapproved one cannot
+    /// mutate however it is called.
+    #[must_use]
+    pub fn with_delegation(mut self, reference: impl Into<String>) -> Self {
+        self.delegation = Some(reference.into());
+        self
     }
 
     #[must_use]
@@ -208,8 +243,21 @@ impl Gateway {
         format!("{}{path}", self.base)
     }
 
+    /// The three headers, applied in one place so no call site can omit one.
+    ///
+    /// `Authorization` says who is calling; `X-BLD-Principal` says whose
+    /// bookings are in scope; `X-BLD-Delegation` says what may change, and is
+    /// sent only when this client holds a grant. The server refuses a change
+    /// without it, which is how an unapproved client fails loudly rather than
+    /// quietly succeeding (spec §10.1).
     fn authorized(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let builder = builder.header("authorization", format!("Bearer {}", self.bearer));
+        let builder = builder
+            .header("authorization", format!("Bearer {}", self.bearer))
+            .header("x-bld-principal", &self.principal);
+        let builder = match &self.delegation {
+            Some(reference) => builder.header("x-bld-delegation", reference),
+            None => builder,
+        };
         match &self.request_id {
             Some(id) => builder.header("x-request-id", id),
             None => builder,

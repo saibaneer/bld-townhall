@@ -445,15 +445,51 @@ pub mod issuer {
         pub max_fee: Money,
     }
 
+    /// Everything a booking walk needs, end to end.
+    ///
+    /// # Why this is the default and not `[Book, Cancel]`
+    ///
+    /// Getting a booking to `Book` takes `SelectVenue`, `VerifySlot` and
+    /// sometimes `RevalidateVenue` first. Until M7B those were ungated, so a
+    /// grant naming only `Book` walked the whole way regardless — a fixture
+    /// that looked narrow and was not. Now the grant is consulted for every
+    /// proposal, so a fixture has to name what it actually does.
+    ///
+    /// `UpdateRequirements` and `ChangeVenue` are deliberately ABSENT: they
+    /// change what a person approved, so a test that wants them says so.
+    pub const WALK: &[Behaviour] = &[
+        Behaviour::SelectVenue,
+        Behaviour::VerifySlot,
+        Behaviour::RevalidateVenue,
+        Behaviour::Book,
+        Behaviour::Cancel,
+    ];
+
+    /// Every behaviour there is.
+    ///
+    /// For fixtures whose subject is something OTHER than authority — the
+    /// topology matrix, the characterization suite — where a narrow grant would
+    /// make a test fail for a reason it is not about. A test that IS about
+    /// authority names its behaviours explicitly instead.
+    pub const ALL: &[Behaviour] = &[
+        Behaviour::SelectVenue,
+        Behaviour::VerifySlot,
+        Behaviour::ChangeVenue,
+        Behaviour::UpdateRequirements,
+        Behaviour::RevalidateVenue,
+        Behaviour::Book,
+        Behaviour::Cancel,
+    ];
+
     impl GrantSpec {
-        /// The ordinary case: one person, their own booking, book and cancel.
+        /// The ordinary case: one person, their own booking, the whole walk.
         #[must_use]
         pub fn own(principal: &str, booking: &str, max_fee_pence: u64) -> Self {
             Self {
                 grantor: PrincipalId::new(principal),
                 subject: PrincipalId::new(principal),
                 booking: BookingId::new(booking),
-                behaviours: vec![Behaviour::Book, Behaviour::Cancel],
+                behaviours: WALK.to_vec(),
                 max_fee: Money::from_pence(max_fee_pence),
             }
         }

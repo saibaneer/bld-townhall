@@ -185,9 +185,15 @@ const SUCCESSOR_EFFECT: &str = "EFF-BKG-1001-CANCEL-9";
 /// file pins does not depend on authority at all — that is the point it makes —
 /// so any real grant serves.
 fn authority() -> VerifiedAuthority {
-    townhall_testkit::issuer::issue_blocking(&townhall_testkit::issuer::GrantSpec::own(
-        "lucy", "BKG-1001", 9_000,
-    ))
+    // EVERY behaviour. This suite pins which cells EXIST, and since M7B
+    // consults the grant for every proposal, a fixture missing one would turn a
+    // legal cell into a guarded one and read as a topology change — a fixture
+    // detail masquerading as a state-machine change, in the one file whose job
+    // is to make real changes visible.
+    townhall_testkit::issuer::issue_blocking(
+        &townhall_testkit::issuer::GrantSpec::own("lucy", "BKG-1001", 9_000)
+            .permitting(townhall_testkit::issuer::ALL),
+    )
 }
 
 fn all_states() -> Vec<BookingState> {

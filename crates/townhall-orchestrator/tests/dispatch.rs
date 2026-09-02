@@ -135,7 +135,20 @@ impl BookingWire for CountingWire {
 struct FixedWireFactory(Arc<CountingWire>);
 
 impl WireFactory for FixedWireFactory {
-    fn wire_for(&self, _token: &str) -> Arc<dyn BookingWire> {
+    // One counting wire behind BOTH kinds, deliberately: the counts these
+    // tests assert on are about how many times the dispatcher touched the wire,
+    // not about which sort it asked for. Splitting the counters would silently
+    // halve every existing expectation.
+    fn reader_for(&self, _token: &str, _principal: &PrincipalId) -> Arc<dyn BookingWire> {
+        Arc::clone(&self.0) as Arc<dyn BookingWire>
+    }
+
+    fn changer_for(
+        &self,
+        _token: &str,
+        _principal: &PrincipalId,
+        _reference: &str,
+    ) -> Arc<dyn BookingWire> {
         Arc::clone(&self.0) as Arc<dyn BookingWire>
     }
 }
@@ -152,12 +165,26 @@ impl PrincipalDirectory for PanickingDirectory {
     }
 }
 
-/// A factory that panics on `wire_for` — no wire may even be CONSTRUCTED.
+/// A factory that panics either way — no wire of EITHER kind may be built.
+///
+/// Both methods panic, and that matters more since M7B split them: a factory
+/// that only refused to build a changer would let a control command construct
+/// a reader, and "controls reach no wire" would quietly become "controls reach
+/// no MUTATING wire" — a weaker claim wearing the same test name.
 struct PanickingFactory;
 
 impl WireFactory for PanickingFactory {
-    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
-        panic!("a control command built a wire");
+    fn reader_for(&self, _: &str, _principal: &PrincipalId) -> Arc<dyn BookingWire> {
+        panic!("a control command built a read wire");
+    }
+
+    fn changer_for(
+        &self,
+        _: &str,
+        _principal: &PrincipalId,
+        _reference: &str,
+    ) -> Arc<dyn BookingWire> {
+        panic!("a control command built a change wire");
     }
 }
 
@@ -645,7 +672,16 @@ impl BookingWire for AcceptingWire {
 struct AcceptingFactory;
 
 impl WireFactory for AcceptingFactory {
-    fn wire_for(&self, _: &str) -> Arc<dyn BookingWire> {
+    fn reader_for(&self, _: &str, _principal: &PrincipalId) -> Arc<dyn BookingWire> {
+        Arc::new(AcceptingWire)
+    }
+
+    fn changer_for(
+        &self,
+        _: &str,
+        _principal: &PrincipalId,
+        _reference: &str,
+    ) -> Arc<dyn BookingWire> {
         Arc::new(AcceptingWire)
     }
 }

@@ -133,8 +133,22 @@ impl BookingWire for CountingConvergeWire {
 }
 
 impl WireFactory for CountingFactory {
-    fn wire_for(&self, token: &str) -> Arc<dyn BookingWire> {
-        let gateway = Gateway::new(self.inner.base.clone(), token);
+    fn reader_for(&self, token: &str, principal: &PrincipalId) -> Arc<dyn BookingWire> {
+        let gateway = Gateway::new(self.inner.base.clone(), token, principal.as_str());
+        Arc::new(CountingConvergeWire {
+            inner: gateway,
+            converges: Arc::clone(&self.converges),
+        })
+    }
+
+    fn changer_for(
+        &self,
+        token: &str,
+        principal: &PrincipalId,
+        reference: &str,
+    ) -> Arc<dyn BookingWire> {
+        let gateway = Gateway::new(self.inner.base.clone(), token, principal.as_str())
+            .with_delegation(reference);
         Arc::new(CountingConvergeWire {
             inner: gateway,
             converges: Arc::clone(&self.converges),
@@ -233,7 +247,7 @@ impl Talk {
     }
 
     fn lucy_gateway(&self) -> Gateway {
-        Gateway::new(self.base.clone(), LUCY)
+        Gateway::new(self.base.clone(), LUCY, "lucy")
     }
 }
 
@@ -338,7 +352,12 @@ async fn b5_confirm_reloads_and_follows_the_menu() {
     let gateway = talk.lucy_gateway();
     let booking = gateway.cancellable().await.expect("lookup").remove(0);
     let id = bld_types::BookingId::new(booking.id.clone());
-    let bumped = gateway
+    // The bump is a CHANGE, so it presents a grant — and it needs
+    // `UpdateRequirements`, which no ordinary walk grant carries. That is the
+    // point of this fixture: the out-of-band change is something Lucy would
+    // have had to approve separately.
+    let third_party = talk.lucy_gateway().with_delegation(id.as_str());
+    let bumped = third_party
         .propose_at(
             &id,
             booking.version,

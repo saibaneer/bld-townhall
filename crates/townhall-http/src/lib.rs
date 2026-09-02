@@ -27,7 +27,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bld_types::{BookingId, BookingRequirements, Money, SlotId, TimeWindow, VenueId};
+use bld_types::{
+    ActorId, BookingId, BookingRequirements, Money, PrincipalId, SlotId, TimeWindow, VenueId,
+};
 use townhall_domain::{BookingProposal, VerifiedAuthority};
 use townhall_service::{
     BookingFacade, LookupQuery, Mutated, Projection, ReconcilerHandle, VenueFilters,
@@ -35,43 +37,55 @@ use townhall_service::{
 
 pub mod mapping;
 
-/// Resolves a bearer token to a verified authority over a NAMED RESOURCE — or
-/// nothing.
+/// The two decisions every request needs, and they are not the same decision.
 ///
-/// # Why the booking is a parameter
+/// # Why this is a trio and not one `resolve`
 ///
-/// It was not, through M5 and M6: a bearer resolved to a capability
-/// (`may_book`), which held for any booking its holder could name. ADR-025
-/// replaced capabilities with grants, and a grant names its resource — so
-/// "resolve this bearer" is no longer a whole question. The answer depends on
-/// which booking is being acted upon, and a resolver that could not see it
-/// would have to return something permissive.
+/// Spec §10.1 always specified two headers — `Authorization` carries
+/// "agent/service authentication", `X-BLD-Delegation` "carries or references
+/// the verified delegation envelope" — and M5 conflated them: the bearer WAS
+/// the authority. That conflation had a live consequence beyond untidiness:
+/// with one credential, revoking a grant would also remove the caller's
+/// ability to read, to ask for another approval, or to send REVOKE.
 ///
-/// `None` is the resource-scoped refusal: this bearer holds no live grant over
-/// THIS booking. Whether the bearer is unknown or merely unauthorized here is
-/// deliberately not distinguished at this seam — the caller maps both to 401,
-/// and the finer story belongs to the audit rather than to the wire (the same
-/// 404-not-403 reasoning ADR-022 recorded for ownership).
+/// So authentication and authorization are separated here, and a third
+/// question is separated from both:
+///
+/// - [`Self::authenticate`] — which workload is calling. A credential.
+/// - [`Self::resolve_delegation`] — what that workload may CHANGE. A grant,
+///   naming one booking, presented per request.
+/// - [`Self::may_read_for`] — whose bookings that workload may LOOK AT.
+///
+/// # Why reading is not a grant
+///
+/// A grant names one booking, and Lucy texting "cancel it" needs her list read
+/// BEFORE any grant can name the booking she means. So reading is scoped by
+/// identity: the server checks a live channel binding for the principal rather
+/// than taking the caller's word for it. The bounded consequence, stated
+/// plainly: a stolen workload credential can discover WHOSE bookings exist. It
+/// cannot change one, because changing one still needs a grant, and a grant
+/// still needs a code answered from the bound phone.
+///
+/// M7C replaces this with a read grant issued at binding time, which makes
+/// reading independently revocable.
 pub trait AuthorityResolver: Send + Sync {
-    fn resolve(&self, bearer: &str, booking: &BookingId) -> Option<VerifiedAuthority>;
+    /// Which workload this credential belongs to.
+    fn authenticate(&self, bearer: &str) -> Option<ActorId>;
 
-    /// Who is calling, for the routes that name no booking.
+    /// The grant this reference names — if it is live, and if it belongs to
+    /// this actor.
     ///
-    /// # Why this returns an identity and not a grant
+    /// Liveness (expiry AND revocation) is settled here, because only an
+    /// implementation with the store can see revocation. The actor check is
+    /// what stops a leaked delegation reference being usable by anything that
+    /// finds it: the reference alone is not a bearer token.
+    fn resolve_delegation(&self, reference: &str, actor: &ActorId) -> Option<VerifiedAuthority>;
+
+    /// Whether `actor` may read on `principal`'s behalf.
     ///
-    /// The first version returned a `VerifiedAuthority` and promised it would
-    /// "name no resources". It could not keep that promise: a grant's resource
-    /// list comes from an approved scope, which always names one booking, so
-    /// the reader grant ended up naming a synthetic id — authority over an
-    /// imaginary booking, which is still authority. The assertion guarding it
-    /// was worse: written over an `Option` that was `None` by construction, it
-    /// was vacuously true.
-    ///
-    /// So the seam says what it means. Listing your own bookings needs to know
-    /// WHO you are; touching one needs a grant. A caller on this path receives
-    /// something that cannot authorize anything, because it is not the kind of
-    /// thing authorization is made of.
-    fn resolve_reader(&self, bearer: &str) -> Option<bld_types::PrincipalId>;
+    /// Checked against a live channel binding, never taken on the caller's
+    /// word — the principal arrives in a header, and a header is a claim.
+    fn may_read_for(&self, actor: &ActorId, principal: &PrincipalId) -> bool;
 }
 
 /// Everything a handler can reach. The completeness of this struct is the
@@ -164,36 +178,75 @@ async fn request_id(request: axum::extract::Request, next: axum::middleware::Nex
 // The large-Err lint is silenced deliberately on the three header gates: the
 // Err IS a finished HTTP response, produced at most once per request, and
 // boxing it would trade clarity at every call site for bytes nobody counts.
+/// The gate for a state CHANGE: an authenticated actor presenting a live grant.
+///
+/// `booking` is not passed to the resolver. The grant names its own resource,
+/// and whether it reaches THIS booking is the domain's question, asked through
+/// `VerifiedAuthority::covers` where the proposal is known. Checking it here
+/// too would be a second place to get it right.
 #[allow(clippy::result_large_err)]
-fn authorize(
+fn authorize_change(
     state: &ServerState,
     headers: &HeaderMap,
-    booking: &BookingId,
 ) -> Result<VerifiedAuthority, Response> {
-    authorized(headers, |bearer| state.authority.resolve(bearer, booking))
-}
-
-/// The reader gate, for routes that name no booking.
-#[allow(clippy::result_large_err)]
-fn authorize_reader(
-    state: &ServerState,
-    headers: &HeaderMap,
-) -> Result<bld_types::PrincipalId, Response> {
-    authorized(headers, |bearer| state.authority.resolve_reader(bearer))
-}
-
-/// The header checks both gates share, so neither can forget one.
-#[allow(clippy::result_large_err)]
-fn authorized<T>(
-    headers: &HeaderMap,
-    resolve: impl FnOnce(&str) -> Option<T>,
-) -> Result<T, Response> {
-    if headers.contains_key("x-bld-delegation") {
+    let actor = actor_of(state, headers)?;
+    let Some(reference) = header_text(headers, DELEGATION_HEADER) else {
         return Err(mapping::plain_error(
-            StatusCode::BAD_REQUEST,
-            "delegation envelopes arrive with M7; this header is reserved",
+            StatusCode::UNAUTHORIZED,
+            "no delegation presented; a change needs an approved grant",
         ));
+    };
+    state
+        .authority
+        .resolve_delegation(reference, &actor)
+        .ok_or_else(|| {
+            // One answer for "unknown", "expired", "revoked" and "not yours".
+            // Distinguishing them here would tell a caller which references
+            // exist — the same oracle ADR-022 closed with 404-not-403.
+            mapping::plain_error(
+                StatusCode::UNAUTHORIZED,
+                "no live delegation for that reference",
+            )
+        })
+}
+
+/// The gate for a READ: an authenticated actor, and whose bookings it may see.
+#[allow(clippy::result_large_err)]
+fn authorize_reader(state: &ServerState, headers: &HeaderMap) -> Result<PrincipalId, Response> {
+    let actor = actor_of(state, headers)?;
+    let Some(claimed) = header_text(headers, PRINCIPAL_HEADER) else {
+        return Err(mapping::plain_error(
+            StatusCode::UNAUTHORIZED,
+            "no principal named; a read is scoped to somebody",
+        ));
+    };
+    let principal = PrincipalId::new(claimed);
+    if state.authority.may_read_for(&actor, &principal) {
+        Ok(principal)
+    } else {
+        Err(mapping::plain_error(
+            StatusCode::UNAUTHORIZED,
+            "that caller may not read for that principal",
+        ))
     }
+}
+
+/// The header that names the grant (spec §10.1).
+const DELEGATION_HEADER: &str = "x-bld-delegation";
+
+/// The header that names whose bookings a read is about.
+const PRINCIPAL_HEADER: &str = "x-bld-principal";
+
+fn header_text<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'headers str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+/// Authenticate the caller — the half both gates share, so neither can skip it.
+#[allow(clippy::result_large_err)]
+fn actor_of(state: &ServerState, headers: &HeaderMap) -> Result<ActorId, Response> {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -204,7 +257,7 @@ fn authorized<T>(
             "no verified caller identity",
         ));
     };
-    resolve(token).ok_or_else(|| {
+    state.authority.authenticate(token).ok_or_else(|| {
         mapping::plain_error(StatusCode::UNAUTHORIZED, "no verified caller identity")
     })
 }
@@ -381,7 +434,7 @@ async fn create_booking(
     // resource the grant must name — a create authorized for some other
     // booking is not an authorization for this one.
     let id = BookingId::new(body.id);
-    let authority = match authorize(&state, &headers, &id) {
+    let authority = match authorize_change(&state, &headers) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
@@ -411,11 +464,11 @@ async fn read_booking(
     Path(id): Path<String>,
 ) -> Response {
     let id = BookingId::new(id);
-    let authority = match authorize(&state, &headers, &id) {
-        Ok(authority) => authority,
+    let reader = match authorize_reader(&state, &headers) {
+        Ok(reader) => reader,
         Err(refused) => return refused,
     };
-    match state.api.read(&id, &authority).await {
+    match state.api.read(&id, &reader).await {
         Ok(projection) => mapping::projection_response(StatusCode::OK, &projection),
         Err(error) => mapping::api_error(&error),
     }
@@ -427,11 +480,11 @@ async fn read_audit(
     Path(id): Path<String>,
 ) -> Response {
     let id = BookingId::new(id);
-    let authority = match authorize(&state, &headers, &id) {
-        Ok(authority) => authority,
+    let reader = match authorize_reader(&state, &headers) {
+        Ok(reader) => reader,
         Err(refused) => return refused,
     };
-    match state.api.audit(&id, &authority).await {
+    match state.api.audit(&id, &reader).await {
         Ok(entries) => {
             let rows: Vec<serde_json::Value> = entries
                 .iter()
@@ -531,7 +584,7 @@ async fn propose_behaviour(
     body: Option<axum::Json<serde_json::Value>>,
 ) -> Response {
     let id = BookingId::new(id);
-    let authority = match authorize(&state, &headers, &id) {
+    let authority = match authorize_change(&state, &headers) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
@@ -547,7 +600,7 @@ async fn propose_behaviour(
     // before any answer is composed.
     //
     // Side-effect-free: one scoped load, nothing written, nothing chased.
-    if let Err(refused) = state.api.ensure_visible(&id, &authority).await {
+    if let Err(refused) = state.api.ensure_visible(&id, authority.grantor()).await {
         return mapping::api_error(&refused);
     }
 
@@ -560,7 +613,7 @@ async fn propose_behaviour(
         if let Err(refused) = refuse_precondition(&headers, "reconcile") {
             return refused;
         }
-        return match state.api.attend_booking(&id, &authority).await {
+        return match state.api.attend_booking(&id, authority.grantor()).await {
             Ok(outcomes) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
@@ -588,7 +641,7 @@ async fn propose_behaviour(
         .propose_at(&id, expected, proposal, &authority)
         .await
     {
-        Ok(mutated) => turn_response(&state, &id, mutated, &authority).await,
+        Ok(mutated) => turn_response(&state, &id, mutated, authority.grantor()).await,
         Err(error) => mapping::api_error(&error),
     }
 }
@@ -640,12 +693,12 @@ async fn turn_response(
     state: &ServerState,
     id: &BookingId,
     mutated: Mutated,
-    authority: &VerifiedAuthority,
+    reader: &PrincipalId,
 ) -> Response {
     // Scoped like every other external read. The caller has already been
     // admitted to reach here, so this cannot fail for visibility — but reading
     // unscoped would leave a path that does not care who is asking, and those
     // are exactly the paths that get reused later by something that should.
-    let menu: Option<Projection> = state.api.read(id, authority).await.ok();
+    let menu: Option<Projection> = state.api.read(id, reader).await.ok();
     mapping::turn(&mutated, menu.as_ref())
 }

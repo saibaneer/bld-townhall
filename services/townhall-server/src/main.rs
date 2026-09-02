@@ -127,8 +127,23 @@ impl DevAuthority {
     /// real 401.
     fn allowed(bearer: &str) -> Option<(&'static str, u64, &'static [bld_types::Behaviour])> {
         use bld_types::Behaviour;
-        const BOTH: &[Behaviour] = &[Behaviour::Book, Behaviour::Cancel];
-        const NEITHER: &[Behaviour] = &[];
+        // EVERY behaviour, because M7B consults the grant for every proposal
+        // and these tokens exist to isolate ONE guard each.
+        //
+        // An earlier version withheld `UpdateRequirements` and `ChangeVenue`
+        // from all three on the grounds that "no dev token pretends to that".
+        // That made Lucy restricted too, so she stopped being the control, and
+        // a version-bumping test broke on a guard it was not about.
+        const ALL: &[Behaviour] = &[
+            Behaviour::SelectVenue,
+            Behaviour::VerifySlot,
+            Behaviour::ChangeVenue,
+            Behaviour::UpdateRequirements,
+            Behaviour::RevalidateVenue,
+            Behaviour::Book,
+            Behaviour::Cancel,
+        ];
+
         // Restricted in EXACTLY ONE way, and that is the point.
         //
         // Marco is restricted twice over — a £10 ceiling and no behaviours — so
@@ -136,11 +151,48 @@ impl DevAuthority {
         // Lucy's ceiling and lacks only `Book`, so a refusal on her own booking
         // can only be `BookingAuthorityRequired`. Without her, the behaviour
         // guard has no test that isolates it.
-        const CANCEL_ONLY: &[Behaviour] = &[Behaviour::Cancel];
+        // Priya lacks exactly ONE behaviour — `Book` — so a refusal on her own
+        // booking can only be the booking-authority guard. She can still walk
+        // a booking to `AwaitingBooking`, which is what makes the isolation
+        // real rather than incidental.
+        const ALL_WITHOUT_BOOK: &[Behaviour] = &[
+            Behaviour::SelectVenue,
+            Behaviour::VerifySlot,
+            Behaviour::ChangeVenue,
+            Behaviour::UpdateRequirements,
+            Behaviour::RevalidateVenue,
+            Behaviour::Cancel,
+        ];
+        // Each token restricted in EXACTLY ONE way, which is what makes a
+        // refusal name its guard:
+        //
+        // - Lucy: unrestricted, the £50 ceiling every seeded slot fits under.
+        // - Marco: the same walk, a £10 ceiling. A refusal on his booking can
+        //   only be the FEE guard.
+        // - Priya: Lucy's ceiling, missing only `Book`. A refusal on hers can
+        //   only be the BEHAVIOUR guard.
+        //
+        // An earlier version of this table gave Marco no behaviours AND a £10
+        // ceiling — restricted twice, so "Marco is refused" said nothing about
+        // which guard refused him, and the fee-ceiling test broke at
+        // `select-venue` for a reason it was not about.
         match bearer {
-            "dev-lucy" => Some(("lucy", 5_000, BOTH)),
-            "dev-marco-restricted" => Some(("marco", 1_000, NEITHER)),
-            "dev-priya-nobook" => Some(("priya", 5_000, CANCEL_ONLY)),
+            "dev-lucy" => Some(("lucy", 5_000, ALL)),
+            "dev-marco-restricted" => Some(("marco", 1_000, ALL)),
+            "dev-priya-nobook" => Some(("priya", 5_000, ALL_WITHOUT_BOOK)),
+            _ => None,
+        }
+    }
+
+    /// Which token belongs to a principal — `allowed` read backwards.
+    ///
+    /// A closed match in both directions rather than a format string, so the
+    /// allowlist stays the only place a dev identity is named.
+    fn bearer_for(principal: &str) -> Option<&'static str> {
+        match principal {
+            "lucy" => Some("dev-lucy"),
+            "marco" => Some("dev-marco-restricted"),
+            "priya" => Some("dev-priya-nobook"),
             _ => None,
         }
     }
@@ -178,7 +230,7 @@ impl DevAuthority {
         use bld_types::{PrincipalId, ServiceId};
         use townhall_authority::{
             ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-            BehaviourSet, BindingRef, EnvelopeKey, Entropy, MemoryApprovalStore, PendingScope,
+            BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
         };
 
         struct DevCode;
@@ -206,8 +258,7 @@ impl DevAuthority {
             // dropped on the next line. Nothing ever reads the envelope it
             // wrote. A deployment binds a configured key at the composition
             // root, where the grant IS read back — see M7B's resolver.
-            EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8))
-                .expect("32 bytes"),
+            EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8)).expect("32 bytes"),
         );
         let binding = BindingRef {
             principal: PrincipalId::new(principal),
@@ -266,17 +317,46 @@ impl DevAuthority {
 
 #[cfg(feature = "dev-authority")]
 impl AuthorityResolver for DevAuthority {
-    fn resolve(
-        &self,
-        bearer: &str,
-        booking: &bld_types::BookingId,
-    ) -> Option<townhall_domain::VerifiedAuthority> {
-        Self::issue(bearer, booking)
+    /// A dev token names its own actor.
+    ///
+    /// The actor carries the principal, which is what lets the two questions
+    /// below be answered without a second lookup. A real deployment
+    /// authenticates a workload credential that has nothing to do with any
+    /// person, and finds the principal through the presented grant or the
+    /// channel binding instead.
+    fn authenticate(&self, bearer: &str) -> Option<bld_types::ActorId> {
+        Self::allowed(bearer)
+            .map(|(principal, _, _)| bld_types::ActorId::new(format!("dev:{principal}")))
     }
 
-    /// A reader gets a name, not a grant — nothing here to mint.
-    fn resolve_reader(&self, bearer: &str) -> Option<bld_types::PrincipalId> {
-        Self::allowed(bearer).map(|(principal, _, _)| bld_types::PrincipalId::new(principal))
+    /// In this lane the reference IS the booking id.
+    ///
+    /// # Why that is not cheating, and what it costs
+    ///
+    /// A real reference names a delegation that an approval produced, and the
+    /// resolver looks it up. Here nobody was asked, so there is nothing to look
+    /// up — the lane's whole nature is that it skips the person. Rather than
+    /// pretend, it says so: hand it a booking id and it issues a grant over
+    /// that booking, for the principal the actor names.
+    ///
+    /// What it costs is stated in `issue`: this lane cannot witness the
+    /// resource guard, because the grant always names whatever was asked for.
+    /// It still witnesses the behaviour guard and the ownership guard, and it
+    /// now also witnesses that a change without ANY delegation header is
+    /// refused — which is new in M7B and is a real property.
+    fn resolve_delegation(
+        &self,
+        reference: &str,
+        actor: &bld_types::ActorId,
+    ) -> Option<townhall_domain::VerifiedAuthority> {
+        let principal = actor.as_str().strip_prefix("dev:")?;
+        let bearer = Self::bearer_for(principal)?;
+        Self::issue(bearer, &bld_types::BookingId::new(reference))
+    }
+
+    /// A dev actor reads for its own principal and no other.
+    fn may_read_for(&self, actor: &bld_types::ActorId, principal: &bld_types::PrincipalId) -> bool {
+        actor.as_str().strip_prefix("dev:") == Some(principal.as_str())
     }
 }
 

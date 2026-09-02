@@ -305,6 +305,37 @@ impl BookingProposal {
             Self::Cancel { .. } => "Cancel",
         }
     }
+
+    /// Which permission this proposal needs.
+    ///
+    /// # Why every proposal has one
+    ///
+    /// Until M7B only `Book` and `Cancel` consulted the grant, inherited from
+    /// the days when authority was two capability flags. ADR-025 made the
+    /// PERMITTED BEHAVIOURS part of the grant, and five of the seven were still
+    /// ungated — so a grant naming only `Book` also permitted
+    /// `UpdateRequirements`.
+    ///
+    /// That is not a tidiness matter. Lucy approves "book one meeting room, 20
+    /// attendees, max £50"; an agent holding that grant could then send
+    /// `UpdateRequirements` with 500 attendees and book something she never saw.
+    /// The fee ceiling still bound, so the money was safe and the booking was
+    /// not.
+    ///
+    /// A total match rather than a default, so adding a proposal cannot
+    /// silently inherit "permitted".
+    #[must_use]
+    pub const fn behaviour(&self) -> Behaviour {
+        match self {
+            Self::SelectVenue { .. } => Behaviour::SelectVenue,
+            Self::VerifySlot => Behaviour::VerifySlot,
+            Self::ChangeVenue { .. } => Behaviour::ChangeVenue,
+            Self::UpdateRequirements { .. } => Behaviour::UpdateRequirements,
+            Self::RevalidateVenue => Behaviour::RevalidateVenue,
+            Self::Book => Behaviour::Book,
+            Self::Cancel { .. } => Behaviour::Cancel,
+        }
+    }
 }
 
 /// The authority envelope, re-exported from the crate that can construct it.
@@ -2190,12 +2221,43 @@ impl BoundaryDomain for TownHallDomain {
         authority: &Self::Authority,
         context: &Self::Context,
     ) -> Resolution<TransitionPlan<Self::State, Self::Effect>, Self::Error> {
+        // Does the grant permit THIS behaviour on THIS booking?
+        //
+        // Asked here, once, for every proposal — rather than in the individual
+        // resolvers, where five of seven had simply never asked. A central
+        // check cannot be forgotten by a new proposal, and `behaviour()` is a
+        // total match so a new variant cannot default to permitted.
+        //
+        // Ordered AFTER the Undefined check below in spirit but before the
+        // cell's guards in effect: an unauthorized proposal is denied whatever
+        // the aggregate says, and a proposal that does not exist in this state
+        // is still Undefined rather than a denial — because whether a behaviour
+        // EXISTS must not depend on authority (the topology suite's whole
+        // point).
+        let needed = proposal.behaviour();
         let resolution = Self::resolve_proposal_cell(booking, proposal, authority, context);
 
         // Whether a behaviour EXISTS depends on (state, proposal) alone, so an
         // Undefined cell stays Undefined no matter what the aggregate carries.
         if matches!(resolution, Resolution::Undefined) {
             return Resolution::Undefined;
+        }
+
+        // The cell exists, so authority becomes the question.
+        if !authority.covers(needed, &booking.id) {
+            // Two error names, not seven. ADR-017's denial dedup keys on the
+            // name, so five new names would be five new stories for one fact —
+            // the caller's grant does not reach this behaviour. Written without
+            // a `_` arm so a new `Behaviour` has to be placed deliberately.
+            return Resolution::Denied(match needed {
+                Behaviour::Cancel => BookingError::CancellationAuthorityRequired,
+                Behaviour::SelectVenue
+                | Behaviour::VerifySlot
+                | Behaviour::ChangeVenue
+                | Behaviour::UpdateRequirements
+                | Behaviour::RevalidateVenue
+                | Behaviour::Book => BookingError::BookingAuthorityRequired,
+            });
         }
 
         // For a cell that does exist: the same self-consistency step as the
@@ -2449,6 +2511,7 @@ mod test_grants {
     //! no constructor exists to reach for instead (ADR-025).
 
     use super::{Behaviour, VerifiedAuthority};
+    pub(crate) use townhall_testkit::issuer::ALL;
     use townhall_testkit::issuer::{GrantSpec, issue_blocking};
 
     /// A grant over this crate's fixture booking, naming exactly `behaviours`.
@@ -2461,7 +2524,7 @@ mod test_grants {
 mod topology {
     use super::*;
     use crate::fixtures::observed;
-    use crate::test_grants::issued;
+    use crate::test_grants::{ALL, issued};
     use bld_kernel::Resolution;
     use bld_types::{BookingRequirements, Money, SlotId, TimeWindow, VenueId};
 
@@ -2621,7 +2684,7 @@ mod topology {
     const PENDING: &[(&str, &str, &str)] = &[];
 
     fn permissive_authority() -> VerifiedAuthority {
-        issued(&[Behaviour::Book, Behaviour::Cancel], 5_000)
+        issued(ALL, 5_000)
     }
 
     fn permissive_requirements() -> BookingRequirements {
@@ -2883,12 +2946,12 @@ mod topology {
 mod characterization {
     use super::*;
     use crate::fixtures::observed;
-    use crate::test_grants::issued;
+    use crate::test_grants::{ALL, issued};
     use bld_kernel::{Resolution, TransitionPlan};
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
     fn authority() -> VerifiedAuthority {
-        issued(&[Behaviour::Book, Behaviour::Cancel], 5_000)
+        issued(ALL, 5_000)
     }
 
     fn requirements() -> BookingRequirements {
@@ -4154,7 +4217,7 @@ mod characterization {
     #[tokio::test]
     async fn the_ceiling_that_refused_is_named() {
         // Exceeds only the REQUIREMENT: generous authority, tight budget.
-        let generous = issued(&[Behaviour::Book, Behaviour::Cancel], 20_000);
+        let generous = issued(ALL, 20_000);
         let mut ctx = context();
         ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             fee: Money::from_pence(9_000),
@@ -4176,7 +4239,7 @@ mod characterization {
         );
 
         // Exceeds only the AUTHORITY: generous budget, tight delegation.
-        let restricted = issued(&[Behaviour::Book, Behaviour::Cancel], 1_000);
+        let restricted = issued(ALL, 1_000);
         let mut wanting = requirements();
         wanting.max_fee = Money::from_pence(20_000);
         let mut ctx = context();
@@ -4442,7 +4505,7 @@ mod characterization {
 mod fact_topology {
     use super::*;
     use crate::fixtures::observed;
-    use crate::test_grants::issued;
+    use crate::test_grants::{ALL, issued};
     use bld_types::{BookingRequirements, Money, TimeWindow};
 
     const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
@@ -5984,7 +6047,7 @@ mod fact_topology {
     /// council cannot conclude our retry budget is exhausted.
     #[tokio::test]
     async fn no_door_reaches_a_state_that_is_not_its_to_reach() {
-        let authority = issued(&[Behaviour::Book, Behaviour::Cancel], 5_000);
+        let authority = issued(ALL, 5_000);
         let proposal_context = BookingContext {
             selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),

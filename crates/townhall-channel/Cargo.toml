@@ -1,0 +1,47 @@
+[package]
+name = "townhall-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The dependency list IS the trust posture (spec §3.2: a HumanChannel adapter is
+# a "trusted parser/normalizer only; must not invent authority").
+#
+# Absent, deliberately, in BOTH normal and dev dependencies: townhall-gateway,
+# townhall-service, townhall-store, townhall-http, bld-kernel, sqlx, reqwest.
+# A crate that cannot name a mutation surface cannot mutate, so §14's "must not
+# own booking state, policy, authority or model decisions" is discharged by the
+# crate graph rather than by discipline.
+#
+# The dev list matters as much as the normal one here: this crate's tests need no
+# server, so allowing dev-dependencies the exemption the gateway needs would let
+# a #[cfg(test)] module reach straight into the store.
+[dependencies]
+async-trait = { workspace = true }
+bld-types = { path = "../bld-types" }
+# For the derived booking id only. A real digest rather than a fast hash because
+# the inputs are provider-controlled text and collision resistance should not
+# lean on ownership concealment as its backstop.
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
+
+# The deterministic concurrency lane (CI runs it as its own step):
+# `cargo test -p townhall-channel --features loom --test loom`. Loom explores
+# every interleaving of the modelled Mutex — the witness a probabilistic race
+# cannot be, and one that also regresses the INTERNAL atomicity a public-API
+# scan cannot see. A feature rather than `--cfg loom` because RUSTFLAGS is
+# global and tokio's own loom branches break under it; the same
+# test-machinery-as-feature pattern as mock-council's `test-faults`.
+[features]
+loom = ["dep:loom"]
+
+[dependencies.loom]
+version = "0.7"
+optional = true

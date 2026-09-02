@@ -17,6 +17,7 @@ Implemented, milestone by milestone (each gated on the previous — spec §21):
 - [x] **M4 — External effect protocol** (the real mock council, crash matrix, pursuit/reconciliation, in-flight cancellation; all 25 required failure-injection tests mapped and audited in [`docs/m4-acceptance.md`](docs/m4-acceptance.md))
 - [x] **M5 — Axum BLD service** (ETag/If-Match preconditions bound inside the trusted turn, spec §10.2 status mapping, the reconciler loop, the whole journey possible with curl alone)
 - [x] **M5.1 — Resource visibility and authoritative lookup** (not a spec milestone: bookings acquire an owner, so a principal can no longer cancel a booking they merely know the id of; `?booking_ref=` / `?cancellable=true` give `CANCEL <ref>` the authoritative lookup spec §14.1 requires — [ADR-022](docs/decisions.md))
+- [x] **M6A — HumanChannel core + town-hall gateway** (the channel that decides nothing — normalize/bound/dedupe/classify, `BOOK` is `Freeform` by design; the gateway as an untrusted driver over the real wire, 202-as-fault-path with the acknowledgement seam M6B's two-message shape needs — [ADR-023](docs/decisions.md), [`docs/m6a-acceptance.md`](docs/m6a-acceptance.md))
 - [ ] **M6 — HumanChannel core + SMS simulator**
 - [ ] **M7 — Approval + VerifiedAuthority**
 - [ ] **M8–M13** — usage metering, discovery, payment handoff, Rig, real SMS, hardening
@@ -92,9 +93,9 @@ The execution contract is [`docs/technical-spec-v0.4.2.md`](docs/technical-spec-
 
 ## Status
 
-M0–M5 implemented, plus M5.1. The next milestone is M6: the channel-agnostic HumanChannel with the local SMS simulator — the first consumer of the escalated-question queue ADR-019 left waiting for a human who can actually act. Approval/VerifiedAuthority issuance (M7, replacing the dev-authority stand-in in the composition root), usage metering, discovery, Stripe, Rig, and real SMS remain later milestones.
+M0–M5 implemented, plus M5.1 and M6A. Next is M6B — the conversation orchestrator and SMS simulator binary, carrying M6's official gate: the channel-agnostic HumanChannel with the local SMS simulator — the first consumer of the escalated-question queue ADR-019 left waiting for a human who can actually act. Approval/VerifiedAuthority issuance (M7, replacing the dev-authority stand-in in the composition root), usage metering, discovery, Stripe, Rig, and real SMS remain later milestones.
 
-The decision record is [`docs/decisions.md`](docs/decisions.md) (ADR-001–022): the spec is never edited, and the ADRs are the amendment trail against it.
+The decision record is [`docs/decisions.md`](docs/decisions.md) (ADR-001–023): the spec is never edited, and the ADRs are the amendment trail against it.
 
 
 ## M3 / M4 engineering notes

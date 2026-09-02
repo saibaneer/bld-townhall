@@ -9,6 +9,8 @@ members = [
   "crates/council-wire",
   "crates/council-client",
   "crates/townhall-http",
+  "crates/townhall-channel",
+  "crates/townhall-gateway",
   "services/mock-council",
   "services/townhall-server",
 ]
@@ -36,6 +38,7 @@ axum = "0.8"
 # been stored, relayed or replayed, and a TLS session is not.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 base64 = "0.23"
+sha2 = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1524,3 +1524,94 @@ which Lucy owns the booking, Marco requests it under a verified delegation namin
 booking, his agent is the actor, and the persisted plan records **Marco** — plus the
 delegation type itself (grantor, beneficiary, actor, audience, exact resource, permitted
 behaviours, constraints, expiry, revocation).
+
+## ADR-023 — The human edge's two crates: the channel that decides nothing, the gateway that owns a socket
+
+Decided 2026-09-02 with the project owner. M6 split into M6A (this) and M6B (the
+orchestrator and simulator binary), matching the reviewer's independent
+recommendation; six plan review rounds (revise ×5, then build as planned, with
+one prescription declined — below).
+
+### The trust split, enforced by two different dependency rules
+
+`townhall-channel` is spec §3.2's *"trusted parser/normalizer only"*: it
+normalizes, bounds, dedupes, classifies and transports, and can answer nothing —
+its manifest excludes every mutation surface **in dev-dependencies as well as
+normal ones**, because its tests need no server and the exemption the gateway
+needs would otherwise let a `#[cfg(test)]` module reach the store.
+`townhall-gateway` is the *"untrusted driver"*: its only route to a booking is a
+socket, its routes are hard-coded **on purpose** (a generic client is M9's gate,
+and building it now would claim M9's deliverable), and its DTOs are written
+independently of `townhall-http`'s so the wire contract is tested rather than
+assumed. The tripwire reads `cargo metadata`'s resolved graph, not manifest text.
+
+### 202 is the fault path — a four-revision-old error, corrected
+
+Plan revision 2 asserted *"202 Accepted is the normal case"*. False: an answering
+council settles synchronously (`run_proposal` prepares `BookingInProgress`,
+invokes, verifies, settles and returns `Committed` in one call), and the existing
+`lucy_books_a_room_over_http` proves it by destructuring the proposal's own
+return as `Booked`. 202 requires the answer to go missing. Consequences built in:
+every acceptance test **arms the drop fault and asserts it fired** (`consumed ==
+1` — the fault id is an index, legitimately `0`, so "it armed" witnesses
+nothing); and `propose_at` returns `Accepted` **before** convergence, which is a
+separate call, because the person who texted is owed *"Booking now"* immediately
+and the outcome later as a differently-classified message. A gateway that
+blocked until converged would make that two-message shape unexpressible.
+
+### The channel does not parse `BOOK`, and a word is not a reference
+
+Spec §14 forbids the channel owning booking vocabulary, so `BOOK date=…` is
+`Freeform` — the proposer reads its fields, in the position M11's model will
+occupy. The seam test (every classified arm, pinned as data for M6B's dispatcher)
+caught the first real bug of the slice: `"Cancel it"` classified as `CANCEL`
+with reference `"it"`, which would have had the dispatcher telling Lucy a booking
+named "it" does not exist instead of asking which booking (§14.1). The fix is one
+deliberate clause — a resource argument must contain a digit — and no richer,
+because anything more is the channel learning the council's namespace. A missed
+digit-free reference degrades to `Freeform`, where the whole text is still in
+hand.
+
+### Redaction: a digest of a low-entropy value is an encoding of it
+
+`InboundBody`'s `Debug` renders the length only. From M7 a body can be `YES
+7312` — ten thousand candidates — so an unkeyed hash is readable by enumeration,
+and a keyed one buys key management for correlation that `InboundIdentity`
+already provides safely. The three `Debug` renderings are pinned by equality
+against complete strings, not by absence-of-a-guessed-algorithm, which is not a
+writable test. A claimed `bld-types` precedent for the accessor ceremony was
+checked, found not to exist, and withdrawn.
+
+### `InboundBody` exists because `BoundedString` truncates
+
+`bld_types::BoundedString::truncating` silently drops everything past 512
+bytes; reusing it would have capped every SMS at under a third of the documented
+1600 **scalars** while returning success. The new type is fallible, and the test
+that discriminates is byte-for-byte round-trip of 600 emoji (2400 bytes) — a row
+"it returned Ok" cannot check.
+
+### One prescription declined, one deviation accepted
+
+- The reviewer asked for the 128-character GSM basic table copied into the test
+  battery's prose beside §6.4's copy. Declined: two hand-maintained copies in one
+  document is the drift this project avoids. The table lives once, as
+  `const GSM_BASIC: [char; 128]` **in executable form**, length-asserted and
+  iterated by the test; prose documents it.
+- The plan's deterministic pre-CAS barrier for the dedupe race is not built. The
+  check and the write are one `Mutex`-guarded `entry()` call, so the seam the
+  barrier would park in does not exist — adding a hook would loosen the structure
+  under test. Residue stated in `docs/m6a-acceptance.md`: a check-then-insert
+  fails the 16-thread race only probabilistically.
+
+### Deferred, named
+
+Rate limits per principal/channel and the global provider budget: **M8**, with
+the ledger that can account for them (this ADR is the recorded deferral an
+earlier plan draft wrongly attributed to ADR-022). The in-memory replay window's
+restart gap: accepted, because the boundary makes a re-admitted duplicate
+harmless (derived create ids collide; a cancel against `Cancelled` is
+`Undefined`) — which is also why STOP's suppression must NOT accept the same
+posture in M6B: nothing downstream re-suppresses, so a safety exit that forgets
+is not one. The durable suppression store lives in M6B's orchestrator on
+`std::fs`. The gateway's `IN_FLIGHT` const is named debt until a domain-exported
+name list exists.

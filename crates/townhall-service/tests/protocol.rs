@@ -6,7 +6,7 @@
 
 use bld_kernel::{BoundaryOutcome, Capability, Verified};
 use bld_types::{
-    ActorId, AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectAttempt,
+    AvailabilityGrant, Behaviour, BookingId, BookingRequirements, CouncilBookingRef, EffectAttempt,
     EffectIntentId, Money, PrincipalId, Provenance, SlotId, TimeWindow, VenueId,
 };
 use std::{path::PathBuf, sync::Arc};
@@ -27,6 +27,7 @@ use townhall_store::{
     HandedOffEffect, HandoffEffect, NewBooking, PrepareEffect, PreparedEffect,
     SqliteBookingRepository, StoreError, TransitionAudit, derive_effect_intent_id,
 };
+use townhall_testkit::issuer::{GrantSpec, issue_blocking};
 
 // --------------------------------------------------------------- fixtures
 
@@ -58,14 +59,20 @@ fn facts() -> VenueFacts {
     }
 }
 
-fn authority() -> VerifiedAuthority {
-    VerifiedAuthority {
-        principal: PrincipalId::new("lucy"),
-        actor: ActorId::new("townhall-agent"),
-        max_fee: Money::from_pence(5_000),
-        may_book: true,
-        may_cancel: true,
-    }
+/// Lucy's grant over ONE booking, issued through the real approval path.
+///
+/// # Why this takes an id where the old fixture took nothing
+///
+/// The old `authority()` carried `may_book: true` — a capability, holding for
+/// any booking its bearer could name. A grant names its resource
+/// (ADR-025), so a test has to say which booking it is authorized for, and a
+/// test that reaches for the wrong one now fails instead of passing.
+///
+/// It is issued, never constructed: the envelope has private fields and there
+/// is no `test-support` constructor to reach for. `townhall_testkit::issuer`
+/// explains why that rule has no exception.
+fn authority_for(id: &BookingId) -> VerifiedAuthority {
+    issue_blocking(&GrantSpec::own("lucy", id.as_str(), 5_000))
 }
 
 fn select() -> BookingProposal {
@@ -173,7 +180,7 @@ async fn awaiting(h: &Harness, id: &BookingId, requirements: BookingRequirements
         .create(NewBooking {
             id: id.clone(),
             requirements,
-            owner: authority().principal,
+            owner: PrincipalId::new("lucy"),
         })
         .await
         .expect("create");
@@ -181,7 +188,7 @@ async fn awaiting(h: &Harness, id: &BookingId, requirements: BookingRequirements
         let name = proposal.name();
         let outcome = h
             .coordinator
-            .propose(id, proposal, &authority())
+            .propose(id, proposal, &authority_for(id))
             .await
             .expect("no service error");
         assert!(
@@ -212,7 +219,7 @@ async fn lucy_books_a_room() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
 
@@ -285,7 +292,7 @@ async fn lucy_cancels_a_confirmed_booking() {
     let id = BookingId::new("BKG-CANCEL");
     awaiting(&h, &id, requirements()).await;
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
@@ -296,7 +303,7 @@ async fn lucy_cancels_a_confirmed_booking() {
             BookingProposal::Cancel {
                 reason: "changed mind".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("no service error");
@@ -335,7 +342,7 @@ async fn a_crash_before_the_call_leaves_no_external_consequence() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(
@@ -402,7 +409,7 @@ async fn a_crash_after_the_call_leaves_a_recoverable_record() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(outcome.is_unresolved());
@@ -486,18 +493,18 @@ async fn the_intent_is_durable_before_the_council_is_asked() {
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
-        owner: authority().principal,
+        owner: PrincipalId::new("lucy"),
     })
     .await
     .expect("create");
     for proposal in [select(), BookingProposal::VerifySlot] {
         coordinator
-            .propose(&id, proposal, &authority())
+            .propose(&id, proposal, &authority_for(&id))
             .await
             .expect("setup");
     }
     coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
@@ -529,7 +536,7 @@ async fn a_permanent_refusal_returns_to_awaiting_with_a_fresh_identity() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     let BoundaryOutcome::Committed(aggregate) = outcome else {
@@ -553,7 +560,7 @@ async fn a_permanent_refusal_returns_to_awaiting_with_a_fresh_identity() {
     // Try again. The council behaves this time.
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(matches!(outcome, BoundaryOutcome::Committed(_)));
@@ -575,7 +582,7 @@ async fn a_temporary_refusal_cannot_become_a_rejection() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(
@@ -612,7 +619,7 @@ async fn a_forged_response_concludes_nothing() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(outcome.is_unresolved());
@@ -636,7 +643,7 @@ async fn an_unknown_outcome_survives_restart_without_a_second_identity() {
     h.council.script([Script::GoQuiet("timed out")]);
 
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     let effect = in_flight_effect(&h, &id).await;
@@ -650,7 +657,7 @@ async fn an_unknown_outcome_survives_restart_without_a_second_identity() {
 
     let outcome = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("no service error");
     assert!(
@@ -705,7 +712,7 @@ async fn re_observing_a_settled_booking_converges() {
     awaiting(&h, &id, requirements()).await;
     let BoundaryOutcome::Committed(booked) = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book")
     else {
@@ -760,7 +767,7 @@ async fn exhaustion_marks_the_intent_and_a_late_fact_still_lands() {
     h.council
         .script([Script::SucceedThenGoQuiet("response eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -870,10 +877,8 @@ async fn a_denied_proposal_touches_nothing() {
     awaiting(&h, &id, requirements()).await;
     let before = h.repo.load(&id).await.expect("load");
 
-    let broke = VerifiedAuthority {
-        max_fee: Money::from_pence(4_000),
-        ..authority()
-    };
+    // A grant whose approved ceiling is £40 — below the room's £45.
+    let broke = issue_blocking(&GrantSpec::own("lucy", id.as_str(), 4_000));
     let outcome = h
         .coordinator
         .propose(&id, BookingProposal::Book, &broke)
@@ -907,13 +912,13 @@ async fn undefined_and_denied_reach_the_caller_as_different_answers() {
         .create(NewBooking {
             id: absent.clone(),
             requirements: requirements(),
-            owner: authority().principal,
+            owner: PrincipalId::new("lucy"),
         })
         .await
         .expect("create");
     let undefined = h
         .coordinator
-        .propose(&absent, BookingProposal::Book, &authority())
+        .propose(&absent, BookingProposal::Book, &authority_for(&absent))
         .await
         .expect("no service error");
     assert!(
@@ -931,17 +936,21 @@ async fn undefined_and_denied_reach_the_caller_as_different_answers() {
                 attendees: 999,
                 ..requirements()
             },
-            owner: authority().principal,
+            owner: PrincipalId::new("lucy"),
         })
         .await
         .expect("create");
     h.coordinator
-        .propose(&crowded, select(), &authority())
+        .propose(&crowded, select(), &authority_for(&crowded))
         .await
         .expect("select");
     let denied = h
         .coordinator
-        .propose(&crowded, BookingProposal::VerifySlot, &authority())
+        .propose(
+            &crowded,
+            BookingProposal::VerifySlot,
+            &authority_for(&crowded),
+        )
         .await
         .expect("no service error");
     assert!(
@@ -958,7 +967,7 @@ async fn exhausting_the_attempt_budget_is_reported() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("timed out")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
@@ -1027,13 +1036,13 @@ async fn two_coordinators_racing_one_booking_ask_the_council_once() {
     let left = async move {
         left_gate.wait().await;
         h.coordinator
-            .propose(&left_id, BookingProposal::Book, &authority())
+            .propose(&left_id, BookingProposal::Book, &authority_for(&left_id))
             .await
     };
     let right = async move {
         right_gate.wait().await;
         second
-            .propose(&right_id, BookingProposal::Book, &authority())
+            .propose(&right_id, BookingProposal::Book, &authority_for(&right_id))
             .await
     };
 
@@ -1078,7 +1087,7 @@ async fn a_fact_that_loses_a_race_is_re_classified_not_dropped() {
     // Leave the booking in flight with nothing concluded.
     h.council.script([Script::GoQuiet("no answer")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1202,8 +1211,12 @@ async fn a_refusal_leaves_a_durable_row() {
 
     // Lucy tries to book with no booking authority: the door exists, the guard
     // says no.
-    let mut no_authority = authority();
-    no_authority.may_book = false;
+    // A grant that names Cancel and not Book, over this very booking. The door
+    // exists, the guard says no — and the refusal cannot be blamed on the grant
+    // naming the wrong resource.
+    let no_authority = issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(&[Behaviour::Cancel]),
+    );
     let outcome = h
         .coordinator
         .propose(&id, BookingProposal::Book, &no_authority)
@@ -1230,11 +1243,12 @@ async fn identical_refusals_compress_but_principals_never_merge() {
     let id = BookingId::new("BKG-FLOOD");
     awaiting(&h, &id, requirements()).await;
 
-    let mut lucy = authority();
-    lucy.may_book = false;
-    let mut marco = authority();
-    marco.principal = PrincipalId::new("marco");
-    marco.may_book = false;
+    let lucy = issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(&[Behaviour::Cancel]),
+    );
+    let marco = issue_blocking(
+        &GrantSpec::own("marco", id.as_str(), 5_000).permitting(&[Behaviour::Cancel]),
+    );
 
     // Lucy is refused 40 times; Marco once. Every answer is the same typed
     // refusal — the 40th identical denial costs the caller nothing different.
@@ -1272,8 +1286,9 @@ async fn the_same_refusal_next_hour_is_a_new_row() {
     let (h, log) = harness_with_denials().await;
     let id = BookingId::new("BKG-WINDOWS");
     awaiting(&h, &id, requirements()).await;
-    let mut lucy = authority();
-    lucy.may_book = false;
+    let lucy = issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(&[Behaviour::Cancel]),
+    );
 
     h.coordinator
         .propose(&id, BookingProposal::Book, &lucy)
@@ -1301,7 +1316,7 @@ async fn asking_for_a_nonexistent_behaviour_is_counted_not_rowed() {
         .create(NewBooking {
             id: id.clone(),
             requirements: requirements(),
-            owner: authority().principal,
+            owner: PrincipalId::new("lucy"),
         })
         .await
         .expect("create");
@@ -1310,7 +1325,7 @@ async fn asking_for_a_nonexistent_behaviour_is_counted_not_rowed() {
     for _ in 0..3 {
         let outcome = h
             .coordinator
-            .propose(&id, BookingProposal::Book, &authority())
+            .propose(&id, BookingProposal::Book, &authority_for(&id))
             .await
             .expect("turn");
         assert_eq!(outcome, BoundaryOutcome::Undefined);
@@ -1333,7 +1348,7 @@ async fn a_fact_door_refusal_records_with_a_derived_principal() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1372,7 +1387,7 @@ async fn a_second_provider_reference_for_one_identity_is_refused_and_rowed() {
     let id = BookingId::new("BKG-TWOREFS");
     awaiting(&h, &id, requirements()).await;
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let booked = h.repo.load(&id).await.expect("load");
@@ -1424,7 +1439,7 @@ async fn an_exhausted_chase_for_the_wrong_effect_is_denied_and_rowed() {
     // Lucy's booking is honestly in flight on its OWN effect...
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let live = in_flight_effect(&h, &id).await;
@@ -1566,13 +1581,13 @@ async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
     repo.create(NewBooking {
         id: id.clone(),
         requirements: requirements(),
-        owner: authority().principal,
+        owner: PrincipalId::new("lucy"),
     })
     .await
     .expect("create");
     for proposal in [select(), BookingProposal::VerifySlot] {
         coordinator
-            .propose(&id, proposal, &authority())
+            .propose(&id, proposal, &authority_for(&id))
             .await
             .expect("setup");
     }
@@ -1580,7 +1595,7 @@ async fn phase_b_holds_the_lease_and_a_mid_call_reconciler_defers() {
     // release must not depend on an answer arriving.
     council.script([Script::GoQuiet("no answer")]);
     coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
@@ -1618,7 +1633,7 @@ async fn a_cancel_mid_flight_commits_locally_and_touches_no_wire() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1632,7 +1647,7 @@ async fn a_cancel_mid_flight_commits_locally_and_touches_no_wire() {
             BookingProposal::Cancel {
                 reason: "changed my mind".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("the turn runs");
@@ -1671,12 +1686,13 @@ async fn a_mid_flight_cancel_without_authority_is_denied_and_rowed() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
-    let mut no_authority = authority();
-    no_authority.may_cancel = false;
+    // Names Book and not Cancel: the mirror of the booking-authority case.
+    let no_authority =
+        issue_blocking(&GrantSpec::own("lucy", id.as_str(), 5_000).permitting(&[Behaviour::Book]));
     let outcome = h
         .coordinator
         .propose(
@@ -1711,7 +1727,7 @@ async fn cancel_is_proposable_on_an_escalated_booking() {
     h.council
         .script([Script::SucceedThenGoQuiet("response eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1737,7 +1753,7 @@ async fn cancel_is_proposable_on_an_escalated_booking() {
             BookingProposal::Cancel {
                 reason: "took too long".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("turn");
@@ -1766,7 +1782,7 @@ async fn a_requested_cancellation_only_asks_and_never_sends() {
     // the honest lookup answer below is "not yet visible".
     h.council.script([Script::GoQuiet("nothing")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1776,7 +1792,7 @@ async fn a_requested_cancellation_only_asks_and_never_sends() {
             BookingProposal::Cancel {
                 reason: "stop".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("cancel");
@@ -1852,7 +1868,7 @@ async fn a_never_attempted_create_is_not_sent_after_cancellation_is_requested() 
             BookingProposal::Cancel {
                 reason: "never mind".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("cancel");
@@ -1897,7 +1913,7 @@ async fn a_query_and_resend_turn_counts_both_attempts_and_asks_first() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("nothing happened")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1955,7 +1971,7 @@ async fn an_escalated_cancellation_is_finished_by_the_late_fact() {
     // be real.
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -1965,7 +1981,7 @@ async fn an_escalated_cancellation_is_finished_by_the_late_fact() {
             BookingProposal::Cancel {
                 reason: "waited too long".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("cancel");
@@ -2052,7 +2068,7 @@ async fn an_escalation_during_a_held_call_is_fenced_and_the_fact_still_lands() {
     let id = BookingId::new("BKG-M3");
     awaiting(&h, &id, requirements()).await;
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book to Booked");
     // The ordinary cancellation's send answers nothing: intent Unknown, 1/1.
@@ -2063,7 +2079,7 @@ async fn an_escalation_during_a_held_call_is_fenced_and_the_fact_still_lands() {
             BookingProposal::Cancel {
                 reason: "plans changed".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("cancel");
@@ -2394,7 +2410,7 @@ async fn a_lost_cas_reapplies_the_same_verified_absence() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("never arrived")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -2504,14 +2520,19 @@ async fn a_refusal_on_a_cancellation_intent_is_attributed_to_the_canceller() {
     let id = BookingId::new("BKG-CXLBLAME");
     awaiting(&h, &id, requirements()).await;
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book to Booked");
 
     // Marco — not Lucy — asks to cancel, and the cancel's answer goes quiet:
     // the persisted CancelBooking plan carries HIS name.
-    let mut marco = authority();
-    marco.principal = PrincipalId::new("marco");
+    // A genuinely DELEGATED grant, at last: Lucy is the grantor (she owns the
+    // booking, and her ownership is what makes it visible), Marco is the
+    // subject (the cancellation is attributed to him). Before ADR-025 this
+    // fixture could only rename one `principal` field and hope; the two roles
+    // are now separate values, and the assertion below reads Marco's name off
+    // the persisted plan while the row still belongs to Lucy.
+    let marco = issue_blocking(&GrantSpec::delegated("lucy", "marco", id.as_str(), 5_000));
     h.council.script([Script::GoQuiet("answer lost")]);
     h.coordinator
         .propose(
@@ -2619,7 +2640,7 @@ async fn a_stale_expectation_is_refused_before_classification() {
             &id,
             seen,
             BookingProposal::UpdateRequirements { attendees: None },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("the winner's turn runs");
@@ -2631,7 +2652,7 @@ async fn a_stale_expectation_is_refused_before_classification() {
     // The loser, still holding the old tag.
     let refused = h
         .coordinator
-        .propose_at(&id, seen, BookingProposal::Book, &authority())
+        .propose_at(&id, seen, BookingProposal::Book, &authority_for(&id))
         .await;
     let Err(ServiceError::PreconditionFailed { current }) = refused else {
         panic!("a stale expectation must be refused, got {refused:?}");
@@ -2693,7 +2714,7 @@ async fn a_cas_loss_mid_turn_is_refused_as_stale() {
             BookingProposal::UpdateRequirements {
                 attendees: Some(25),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await;
     let Err(ServiceError::PreconditionFailed { current }) = refused else {
@@ -2749,7 +2770,12 @@ async fn a_replayed_prepare_is_unresolved_in_process_and_stale_over_a_version() 
 
         if versioned {
             let refused = coordinator
-                .propose_at(&id, loaded.version, BookingProposal::Book, &authority())
+                .propose_at(
+                    &id,
+                    loaded.version,
+                    BookingProposal::Book,
+                    &authority_for(&id),
+                )
                 .await;
             let Err(ServiceError::PreconditionFailed { current }) = refused else {
                 panic!("a replayed prepare under a version must be stale: {refused:?}");
@@ -2757,7 +2783,7 @@ async fn a_replayed_prepare_is_unresolved_in_process_and_stale_over_a_version() 
             assert_eq!(current, loaded.version + 1);
         } else {
             let turn = coordinator
-                .propose(&id, BookingProposal::Book, &authority())
+                .propose(&id, BookingProposal::Book, &authority_for(&id))
                 .await
                 .expect("the turn runs");
             assert!(
@@ -2798,13 +2824,15 @@ async fn the_facade_carries_the_whole_surface() {
 
     let id = BookingId::new("BKG-FACADE");
     let created = api
-        .create(id.clone(), requirements(), &authority())
+        .create(id.clone(), requirements(), &authority_for(&id))
         .await
         .expect("created");
     assert_eq!(created.version, 0);
     assert_eq!(created.available_behaviours, &["SelectVenue", "Cancel"]);
 
-    let duplicate = api.create(id.clone(), requirements(), &authority()).await;
+    let duplicate = api
+        .create(id.clone(), requirements(), &authority_for(&id))
+        .await;
     let Err(townhall_service::ApiError::AlreadyExists { current }) = duplicate else {
         panic!("a duplicate create carries the existing version: {duplicate:?}");
     };
@@ -2814,12 +2842,12 @@ async fn the_facade_carries_the_whole_surface() {
     let mut version = created.version;
     for proposal in [select(), BookingProposal::VerifySlot] {
         let mutated = api
-            .propose_at(&id, version, proposal, &authority())
+            .propose_at(&id, version, proposal, &authority_for(&id))
             .await
             .expect("committed");
         version = mutated.current_version;
     }
-    let projection = api.read(&id, &authority()).await.expect("read");
+    let projection = api.read(&id, &authority_for(&id)).await.expect("read");
     assert_eq!(projection.state, "AwaitingBooking");
     assert_eq!(
         projection.available_behaviours,
@@ -2831,7 +2859,7 @@ async fn the_facade_carries_the_whole_surface() {
     // the STORE's schedule (the full retry cadence, freshly written).
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     let mutated = api
-        .propose_at(&id, version, BookingProposal::Book, &authority())
+        .propose_at(&id, version, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("the turn runs");
     assert!(matches!(mutated.outcome, BoundaryOutcome::Unresolved));
@@ -2843,25 +2871,36 @@ async fn the_facade_carries_the_whole_surface() {
 
     // The reconcile trigger drives the chase to done — attend, never propose.
     h.clock.advance(10_000);
-    let outcomes = api.attend_booking(&id, &authority()).await.expect("attend");
+    let outcomes = api
+        .attend_booking(&id, &authority_for(&id))
+        .await
+        .expect("attend");
     assert_eq!(outcomes, vec![Attended::Settled]);
     assert_eq!(
-        api.read(&id, &authority()).await.expect("read").state,
+        api.read(&id, &authority_for(&id))
+            .await
+            .expect("read")
+            .state,
         "Booked"
     );
     assert!(
-        api.attend_booking(&id, &authority())
+        api.attend_booking(&id, &authority_for(&id))
             .await
             .expect("attend")
             .is_empty(),
         "nothing in flight, nothing to attend"
     );
 
-    let audit = api.audit(&id, &authority()).await.expect("audit");
+    let audit = api.audit(&id, &authority_for(&id)).await.expect("audit");
     let last = audit.last().expect("rows");
     assert_eq!(last.driver_kind, "Fact");
     assert_eq!(last.driver_detail, "BookingExists");
-    let missing = api.audit(&BookingId::new("BKG-NOBODY"), &authority()).await;
+    let missing = api
+        .audit(
+            &BookingId::new("BKG-NOBODY"),
+            &authority_for(&BookingId::new("BKG-NOBODY")),
+        )
+        .await;
     assert!(matches!(
         missing,
         Err(townhall_service::ApiError::UnknownBooking)
@@ -2884,7 +2923,7 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("eaten")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
 
@@ -2902,16 +2941,16 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
         .create(NewBooking {
             id: other.clone(),
             requirements: requirements(),
-            owner: authority().principal,
+            owner: PrincipalId::new("lucy"),
         })
         .await
         .expect("create");
     unreachable
-        .propose(&other, select(), &authority())
+        .propose(&other, select(), &authority_for(&other))
         .await
         .expect("select commits — selection binds no facts");
     let refused = unreachable
-        .propose(&other, BookingProposal::VerifySlot, &authority())
+        .propose(&other, BookingProposal::VerifySlot, &authority_for(&other))
         .await
         .expect("the turn runs");
     assert!(
@@ -2929,7 +2968,7 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
             BookingProposal::Cancel {
                 reason: "provider down, mind changed".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("the turn runs");
@@ -2953,7 +2992,7 @@ async fn a_rejected_booking_under_cancellation_ends_cancelled_with_nothing_cause
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("answer lost")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -2963,7 +3002,7 @@ async fn a_rejected_booking_under_cancellation_ends_cancelled_with_nothing_cause
             BookingProposal::Cancel {
                 reason: "waited long enough".to_owned(),
             },
-            &authority(),
+            &authority_for(&id),
         )
         .await
         .expect("cancel");
@@ -3046,7 +3085,12 @@ async fn a_conflicting_plan_under_an_expected_version_is_stale_not_unavailable()
     );
 
     let refused = coordinator
-        .propose_at(&id, loaded.version, BookingProposal::Book, &authority())
+        .propose_at(
+            &id,
+            loaded.version,
+            BookingProposal::Book,
+            &authority_for(&id),
+        )
         .await;
     let Err(ServiceError::PreconditionFailed { current }) = refused else {
         panic!("a conflicting-plan rival means the world moved: {refused:?}");
@@ -3069,7 +3113,7 @@ async fn an_erroring_attend_backs_off_instead_of_monopolizing_the_queue() {
     awaiting(&h, &id, requirements()).await;
     h.council.script([Script::GoQuiet("nothing")]);
     h.coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("book");
     let effect = in_flight_effect(&h, &id).await;
@@ -3159,15 +3203,19 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
         Arc::new(FixedAvailability::new(facts())),
     );
 
-    // Priya can cancel — `may_cancel: true` — so nothing she is refused below
-    // can be blamed on a missing capability. Only ownership is left.
-    let mut priya = authority();
-    priya.principal = PrincipalId::new("priya");
-    assert!(priya.may_cancel, "the refusals must isolate visibility");
-
     let id = BookingId::new("BKG-FACADE-VIS");
+
+    // Priya's grant NAMES this booking and permits Cancel — so nothing she is
+    // refused below can be blamed on a missing capability or on the grant
+    // pointing elsewhere. Only ownership is left, which is the whole point:
+    // she is the grantor of her own grant, and the row belongs to Lucy.
+    let priya = issue_blocking(&GrantSpec::own("priya", id.as_str(), 5_000));
+    assert!(
+        priya.covers(Behaviour::Cancel, &id),
+        "the refusals must isolate visibility, not capability"
+    );
     let created = api
-        .create(id.clone(), requirements(), &authority())
+        .create(id.clone(), requirements(), &authority_for(&id))
         .await
         .expect("Lucy creates it");
     assert_eq!(created.version, 0);
@@ -3183,14 +3231,14 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     let mut version = created.version;
     for proposal in [select(), BookingProposal::VerifySlot] {
         version = api
-            .propose_at(&id, version, proposal, &authority())
+            .propose_at(&id, version, proposal, &authority_for(&id))
             .await
             .expect("committed")
             .current_version;
     }
     h.council.script([Script::SucceedThenGoQuiet("eaten")]);
     let booked = api
-        .propose_at(&id, version, BookingProposal::Book, &authority())
+        .propose_at(&id, version, BookingProposal::Book, &authority_for(&id))
         .await
         .expect("the turn runs");
     assert!(
@@ -3285,7 +3333,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // Nothing moved: same version, same trail length as before the probes.
     let trail_before_owner = h.repo.audit_events(&id).await.expect("audit").len();
     let mine = api
-        .read(&id, &authority())
+        .read(&id, &authority_for(&id))
         .await
         .expect("the owner reads it");
     assert_eq!(
@@ -3297,10 +3345,10 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // passed by refusing everyone. The owner's attend DOES reach the council,
     // which is what makes the foreign call-count assertion meaningful: the
     // chase was reachable from here, and only ownership stopped it.
-    assert!(api.ensure_visible(&id, &authority()).await.is_ok());
-    assert!(api.audit(&id, &authority()).await.is_ok());
+    assert!(api.ensure_visible(&id, &authority_for(&id)).await.is_ok());
+    assert!(api.audit(&id, &authority_for(&id)).await.is_ok());
     let outcomes = api
-        .attend_booking(&id, &authority())
+        .attend_booking(&id, &authority_for(&id))
         .await
         .expect("the owner may attend");
     assert_eq!(
@@ -3342,12 +3390,10 @@ async fn lookups_are_scoped_to_the_asking_principal() {
         Arc::new(FixedAvailability::new(facts())),
     );
 
-    let mut priya = authority();
-    priya.principal = PrincipalId::new("priya");
-
     let hers = BookingId::new("BKG-LOOKUP-LUCY");
     let his = BookingId::new("BKG-LOOKUP-PRIYA");
-    api.create(hers.clone(), requirements(), &authority())
+    let priya = issue_blocking(&GrantSpec::own("priya", his.as_str(), 5_000));
+    api.create(hers.clone(), requirements(), &authority_for(&hers))
         .await
         .expect("Lucy's");
     api.create(his.clone(), requirements(), &priya)
@@ -3357,11 +3403,17 @@ async fn lookups_are_scoped_to_the_asking_principal() {
     // Each principal sees exactly their own — a Draft offers Cancel, so both
     // qualify, and only scoping separates them.
     let lucys = api
-        .lookup(&townhall_service::LookupQuery::Cancellable, &authority())
+        .lookup(
+            &townhall_service::LookupQuery::Cancellable,
+            &PrincipalId::new("lucy"),
+        )
         .await
         .expect("lookup");
     let priyas = api
-        .lookup(&townhall_service::LookupQuery::Cancellable, &priya)
+        .lookup(
+            &townhall_service::LookupQuery::Cancellable,
+            &PrincipalId::new("priya"),
+        )
         .await
         .expect("lookup");
     assert_eq!(
@@ -3373,5 +3425,98 @@ async fn lookups_are_scoped_to_the_asking_principal() {
         priyas.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
         ["BKG-LOOKUP-PRIYA"],
         "Priya's listing leaked or lost a row"
+    );
+}
+
+/// A booking created under delegation belongs to the GRANTOR, not the asker.
+///
+/// # Why this test exists
+///
+/// Because its absence let a real defect through. Swapping `access.grantor()`
+/// for `access.subject()` on the `owner` column broke **nothing** in the whole
+/// workspace — 439 tests, all green — for a simple reason: in every other
+/// fixture the two principals are the same value, so no assertion could tell
+/// them apart. The one delegated case in this file creates its booking under a
+/// NON-delegated grant and only cancels under the delegation, so the `owner`
+/// column was never once written from a grant whose grantor and subject differ.
+///
+/// This is that missing witness. Marco holds Lucy's delegation and does the
+/// creating, so the two roles are different values at the exact moment the
+/// column is written:
+///
+/// - the row belongs to **Lucy** — she is on whose behalf it exists;
+/// - **Lucy** can see it, because visibility scopes to the owner;
+/// - **Marco** cannot, even holding the delegation that created it, because his
+///   own bookings are a different set. His authority over this one is the grant,
+///   not ownership — and ADR-022's concealment is a property of the row
+///   predicate, which knows nothing about grants.
+///
+/// Reverse the two accessors and every one of those three assertions moves.
+#[tokio::test]
+async fn a_booking_created_under_delegation_belongs_to_the_grantor() {
+    let h = harness().await;
+    let coordinator = Arc::new(Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(facts())),
+    ));
+    let reconciliation = Arc::new(Reconciliation::new(
+        Arc::clone(&coordinator),
+        Arc::clone(&h.council),
+    ));
+    let api = townhall_service::BookingApi::new(
+        coordinator,
+        reconciliation,
+        Arc::new(townhall_service::fake::FixedCatalogue::of(Vec::new())),
+        Arc::new(FixedAvailability::new(facts())),
+    );
+
+    let id = BookingId::new("BKG-DELEGATED-CREATE");
+    // Lucy's delegation to Marco, over this booking, permitting the create's
+    // walk. Grantor and subject are DIFFERENT values — which is the whole
+    // reason this test can see anything.
+    let marcos_delegation = issue_blocking(
+        &GrantSpec::delegated("lucy", "marco", id.as_str(), 5_000)
+            .permitting(&[Behaviour::Book, Behaviour::Cancel]),
+    );
+    assert_eq!(marcos_delegation.grantor().as_str(), "lucy");
+    assert_eq!(marcos_delegation.subject().as_str(), "marco");
+
+    api.create(id.clone(), requirements(), &marcos_delegation)
+        .await
+        .expect("Marco may create it, under Lucy's delegation");
+
+    // 1. The row belongs to Lucy — asserted through the SCOPED load, which is
+    //    the predicate that actually decides visibility. Reading an `owner`
+    //    field would assert against a column; this asserts against the query
+    //    every visible read goes through.
+    h.repo
+        .load_visible(&PrincipalId::new("lucy"), &id)
+        .await
+        .expect("a booking created on Lucy's behalf must be visible to Lucy");
+    assert!(
+        h.repo
+            .load_visible(&PrincipalId::new("marco"), &id)
+            .await
+            .is_err(),
+        "it must NOT belong to the person who merely asked for it"
+    );
+
+    // 2. And through the facade, which is what an adapter sees.
+    api.read(&id, &authority_for(&id))
+        .await
+        .expect("the owner can read her own booking");
+
+    // 3. Marco cannot, even holding the delegation that created it. His
+    //    visibility is his own bookings; his authority here is the grant.
+    let marcos_own = issue_blocking(&GrantSpec::own("marco", id.as_str(), 5_000));
+    assert!(
+        matches!(
+            api.read(&id, &marcos_own).await,
+            Err(townhall_service::ApiError::UnknownBooking)
+        ),
+        "a delegate's own visibility must not include the booking he acted on \
+         — 404, not 403, because 403 confirms it exists (ADR-022)"
     );
 }

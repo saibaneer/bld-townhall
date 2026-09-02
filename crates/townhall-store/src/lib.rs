@@ -17,6 +17,7 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod authority;
 pub mod denials;
 use townhall_domain::{
     Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,

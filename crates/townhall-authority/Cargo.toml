@@ -1,0 +1,45 @@
+[package]
+name = "townhall-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The dependency list IS the trust posture (spec §5 grades the approval verifier
+# and authority issuer as a trusted component that "issues VerifiedAuthority;
+# does not mutate booking state").
+#
+# Absent, deliberately, in BOTH normal and dev dependencies: townhall-domain,
+# townhall-service, townhall-store, townhall-http, townhall-gateway,
+# townhall-orchestrator, bld-kernel, sqlx, axum, reqwest. This crate sits BELOW
+# the domain (ADR-025) — it cannot name a booking mutation, a socket or a
+# connection pool, so "the issuer does not mutate booking state" is discharged
+# by the crate graph rather than by discipline.
+#
+# The dev list matters as much as the normal one: these tests need no database
+# and no server, so an exemption there would let a #[cfg(test)] module reach a
+# mutation surface the crate is forbidden.
+[dependencies]
+# A proc macro, not a runtime. The port has to be async because its SQL
+# implementation is, and a synchronous port over an async pool means blocking on
+# a runtime handle — which panics outright on a current-thread runtime, as the
+# first version of `townhall-store`'s implementation discovered. `async-trait`
+# names no executor, so this crate still depends on nothing that can act.
+async-trait = { workspace = true }
+bld-types = { path = "../bld-types" }
+# The canonical scope's digest. A real digest because the hash is what binds
+# what a human was shown to what an issuer later acts on.
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# For the no-serde assertions: an envelope that could arrive as JSON is an
+# envelope that can be minted by anything that can write JSON. `serde` is a DEV
+# dependency only — the library itself must not be able to name these traits for
+# its own types, which is the property the assertions check.
+static_assertions = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -15,6 +15,8 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+# The shared test issuer — the only way a test can obtain authority (ADR-025).
+townhall-testkit = { path = "../townhall-testkit" }
 sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

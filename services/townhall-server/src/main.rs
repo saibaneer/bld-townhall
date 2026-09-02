@@ -120,50 +120,156 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
 struct DevAuthority;
 
 #[cfg(feature = "dev-authority")]
-impl AuthorityResolver for DevAuthority {
-    fn resolve(&self, bearer: &str) -> Option<townhall_domain::VerifiedAuthority> {
-        use bld_types::{ActorId, Money, PrincipalId};
+impl DevAuthority {
+    /// What each dev token stands for: who, how much, and what they may do.
+    ///
+    /// A FIXED allowlist, nothing pattern-derived, so "unknown bearer" stays a
+    /// real 401.
+    fn allowed(bearer: &str) -> Option<(&'static str, u64, &'static [bld_types::Behaviour])> {
+        use bld_types::Behaviour;
+        const BOTH: &[Behaviour] = &[Behaviour::Book, Behaviour::Cancel];
+        const NEITHER: &[Behaviour] = &[];
+        // Restricted in EXACTLY ONE way, and that is the point.
+        //
+        // Marco is restricted twice over — a £10 ceiling and no behaviours — so
+        // "Marco is refused" never said which guard refused him. Priya carries
+        // Lucy's ceiling and lacks only `Book`, so a refusal on her own booking
+        // can only be `BookingAuthorityRequired`. Without her, the behaviour
+        // guard has no test that isolates it.
+        const CANCEL_ONLY: &[Behaviour] = &[Behaviour::Cancel];
         match bearer {
-            "dev-lucy" => Some(townhall_domain::VerifiedAuthority {
-                principal: PrincipalId::new("lucy"),
-                actor: ActorId::new("dev-terminal"),
-                max_fee: Money::from_pence(5_000),
-                may_book: true,
-                may_cancel: true,
-            }),
-            "dev-marco-restricted" => Some(townhall_domain::VerifiedAuthority {
-                principal: PrincipalId::new("marco"),
-                actor: ActorId::new("dev-terminal"),
-                max_fee: Money::from_pence(1_000),
-                may_book: false,
-                may_cancel: false,
-            }),
-            // Restricted in EXACTLY ONE way, and that is the point.
-            //
-            // Marco is restricted twice over — a £10 ceiling and no booking
-            // capability — so "Marco is refused" never said which guard refused
-            // him. Worse, once bookings have owners he cannot reach
-            // `AwaitingBooking` on his own booking at all: every seeded slot
-            // costs £45, so `verify-slot` stops him at the fee ceiling long
-            // before `book` could test his capability.
-            //
-            // Priya carries Lucy's ceiling and lacks only `may_book`, so a
-            // refusal on her own booking can only be
-            // `BookingAuthorityRequired`. Without her, the capability guard has
-            // no test that isolates it — and today's assertion only lands on
-            // the right error because `resolve_book` happens to check
-            // `may_book` before it binds the facts. Reorder those two lines and
-            // a Marco-based test would keep passing while asserting a different
-            // guard entirely.
-            "dev-priya-nobook" => Some(townhall_domain::VerifiedAuthority {
-                principal: PrincipalId::new("priya"),
-                actor: ActorId::new("dev-terminal"),
-                max_fee: Money::from_pence(5_000),
-                may_book: false,
-                may_cancel: true,
-            }),
+            "dev-lucy" => Some(("lucy", 5_000, BOTH)),
+            "dev-marco-restricted" => Some(("marco", 1_000, NEITHER)),
+            "dev-priya-nobook" => Some(("priya", 5_000, CANCEL_ONLY)),
             _ => None,
         }
+    }
+
+    /// Issue a dev grant over one booking, through the real approval path.
+    ///
+    /// # Why the stand-in now runs the whole flow
+    ///
+    /// It used to write a struct literal. ADR-025 sealed the envelope — private
+    /// fields, and no constructor to reach for — precisely so that nothing can
+    /// assert its own authority, and a demo lane is not an exception. So this
+    /// raises a challenge and answers it, exactly as the SMS path will. What
+    /// makes it a STAND-IN is not a shortcut through the machinery; it is that
+    /// nobody was asked.
+    ///
+    /// # What this lane does NOT prove
+    ///
+    /// The grant names whichever booking the request named, so its
+    /// resource check can never refuse anything here. That is honest for a lane
+    /// where nobody was asked, and it means the curl suite witnesses the
+    /// BEHAVIOUR guard (`dev-priya-nobook` is refused `Book`) and the OWNERSHIP
+    /// guard (M5.1's scoped rows), never the resource guard. The resource guard
+    /// is witnessed in `townhall-authority`, where a grant is issued for one
+    /// booking and asked about another.
+    ///
+    /// The assurance is pinned to the floor. Once the envelope carries a level,
+    /// a dev token must fabricate one like every other field, and the value a
+    /// careless implementation reaches for is the strongest — which would make
+    /// a dev token a forged envelope with a straight face (ADR-025's amendment
+    /// to ADR-021).
+    fn issue(
+        bearer: &str,
+        booking: &bld_types::BookingId,
+    ) -> Option<townhall_domain::VerifiedAuthority> {
+        use bld_types::{PrincipalId, ServiceId};
+        use townhall_authority::{
+            ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
+            BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+        };
+
+        struct DevCode;
+        impl Entropy for DevCode {
+            fn code(&self) -> ApprovalCode {
+                ApprovalCode::new("0000").expect("four digits")
+            }
+            fn identifier(&self) -> String {
+                "dev".to_owned()
+            }
+        }
+
+        let (principal, max_fee_pence, behaviours) = Self::allowed(bearer)?;
+        let service = AuthorityService::new(
+            std::sync::Arc::new(MemoryApprovalStore::new()),
+            DevCode,
+            AuthorityPolicy {
+                reply_window_ms: 60_000,
+                // Short, so a dev grant is never mistaken for a durable one.
+                grant_ttl_ms: 5 * 60 * 1_000,
+                assurance: AssuranceLevel::Dev,
+            },
+        );
+        let binding = BindingRef {
+            principal: PrincipalId::new(principal),
+            version: 1,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+
+        let request = ApprovalRequest {
+            scope: PendingScope {
+                service: ServiceId::new("demo-council-town-hall"),
+                agent: "dev-terminal".to_owned(),
+                booking: booking.clone(),
+                behaviours: BehaviourSet::new(behaviours.iter().copied()),
+                requirements: bld_types::BookingRequirements {
+                    purpose: "dev lane".to_owned(),
+                    requested_date: "2026-01-01".to_owned(),
+                    time_window: bld_types::TimeWindow {
+                        from: "00:00".to_owned(),
+                        to: "23:59".to_owned(),
+                    },
+                    attendees: 1,
+                    wheelchair_accessible: false,
+                    max_fee: bld_types::Money::from_pence(max_fee_pence),
+                },
+            },
+            binding: binding.clone(),
+            grantor: PrincipalId::new(principal),
+            subject: PrincipalId::new(principal),
+        };
+
+        // Blocking on a fresh runtime in a thread: this resolver is called from
+        // inside the server's runtime, where `block_on` panics. The whole dance
+        // disappears in M7B, when the resolver reads a delegation the approval
+        // path already issued instead of minting one per request.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a dev runtime")
+                .block_on(async move {
+                    let raised = service.begin(&request, now).await.ok()?;
+                    service
+                        .submit(&raised.id, "0000", &binding, AssuranceLevel::Dev, now + 1)
+                        .await
+                        .ok()
+                })
+        })
+        .join()
+        .ok()
+        .flatten()
+    }
+}
+
+#[cfg(feature = "dev-authority")]
+impl AuthorityResolver for DevAuthority {
+    fn resolve(
+        &self,
+        bearer: &str,
+        booking: &bld_types::BookingId,
+    ) -> Option<townhall_domain::VerifiedAuthority> {
+        Self::issue(bearer, booking)
+    }
+
+    /// A reader gets a name, not a grant — nothing here to mint.
+    fn resolve_reader(&self, bearer: &str) -> Option<bld_types::PrincipalId> {
+        Self::allowed(bearer).map(|(principal, _, _)| bld_types::PrincipalId::new(principal))
     }
 }
 

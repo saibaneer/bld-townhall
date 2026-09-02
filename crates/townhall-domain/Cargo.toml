@@ -9,11 +9,17 @@ rust-version.workspace = true
 async-trait.workspace = true
 bld-kernel = { path = "../bld-kernel" }
 bld-types = { path = "../bld-types" }
+# The authority envelope and its issuer live BELOW the domain (ADR-025): the
+# type has private fields, so it lives with the thing that can construct it.
+townhall-authority = { path = "../townhall-authority" }
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true
+# The shared test issuer. A dev-dependency, and `townhall-testkit` depends on
+# nothing in this workspace, so there is no cycle to argue about.
+townhall-testkit = { path = "../townhall-testkit" }
 serde_json.workspace = true
 tokio.workspace = true
 

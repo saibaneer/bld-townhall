@@ -9,9 +9,14 @@ rust-version.workspace = true
 # real binaries. Never a normal dependency of anything: appearing in a normal
 # graph would hand production code a process-spawning, DB-reading toolkit.
 [dependencies]
+bld-types = { path = "../bld-types" }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
+# The issuer, so a test can obtain authority the way production does. This crate
+# is a dev-dependency everywhere, so nothing shippable can reach it.
+townhall-authority = { path = "../townhall-authority" }
 
 [lints]
 workspace = true

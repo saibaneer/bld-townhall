@@ -11,9 +11,7 @@
 //! build D before E.
 
 use bld_kernel::BoundaryOutcome;
-use bld_types::{
-    ActorId, BookingId, BookingRequirements, Money, PrincipalId, SlotId, TimeWindow, VenueId,
-};
+use bld_types::{BookingId, BookingRequirements, Money, PrincipalId, SlotId, TimeWindow, VenueId};
 use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::{CouncilKey, CouncilSigner};
 use ed25519_dalek::SigningKey;
@@ -140,7 +138,7 @@ impl Harness {
             .create(NewBooking {
                 id: id.clone(),
                 requirements: requirements(),
-                owner: authority().principal,
+                owner: PrincipalId::new("lucy"),
             })
             .await
             .expect("create");
@@ -165,7 +163,7 @@ impl Harness {
     ) -> Result<BookingState, BookingError> {
         match self
             .coordinator
-            .propose(id, proposal, &authority())
+            .propose(id, proposal, &authority(id))
             .await
             .expect("the turn should not fail at the transport level")
         {
@@ -206,14 +204,17 @@ fn requirements() -> BookingRequirements {
     }
 }
 
-fn authority() -> VerifiedAuthority {
-    VerifiedAuthority {
-        principal: PrincipalId::new("lucy"),
-        actor: ActorId::new("agent-1"),
-        max_fee: Money::from_pence(5_000),
-        may_book: true,
-        may_cancel: true,
-    }
+/// Lucy's grant over one booking, issued through the real approval path.
+///
+/// Resource-scoped because a grant names its booking (ADR-025); the fixture it
+/// replaced carried capability flags that held for any id its bearer could
+/// type.
+fn authority(id: &BookingId) -> VerifiedAuthority {
+    townhall_testkit::issuer::issue_blocking(&townhall_testkit::issuer::GrantSpec::own(
+        "lucy",
+        id.as_str(),
+        5_000,
+    ))
 }
 
 // ------------------------------------------------------------------ the happy path
@@ -414,7 +415,7 @@ async fn booking_twice_never_reaches_the_council_a_second_time() {
 
     let again = h
         .coordinator
-        .propose(&id, BookingProposal::Book, &authority())
+        .propose(&id, BookingProposal::Book, &authority(&id))
         .await
         .expect("the turn should not fail");
 
@@ -441,7 +442,7 @@ async fn two_turns_racing_one_booking_ask_the_council_once() {
         .await
         .expect("reach AwaitingBooking");
 
-    let authority = authority();
+    let authority = authority(&id);
     let first = h
         .coordinator
         .propose(&id, BookingProposal::Book, &authority);

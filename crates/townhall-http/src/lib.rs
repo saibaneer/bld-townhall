@@ -35,14 +35,43 @@ use townhall_service::{
 
 pub mod mapping;
 
-/// Resolves a bearer token to a verified authority — or nothing.
+/// Resolves a bearer token to a verified authority over a NAMED RESOURCE — or
+/// nothing.
 ///
-/// M5's implementation is the composition root's `DevAuthority` (a fixed
-/// allowlist behind a feature gate and a startup flag); M7's approval flow
-/// replaces it IN the composition root, so no fallback survives beside it
-/// (ADR-021).
+/// # Why the booking is a parameter
+///
+/// It was not, through M5 and M6: a bearer resolved to a capability
+/// (`may_book`), which held for any booking its holder could name. ADR-025
+/// replaced capabilities with grants, and a grant names its resource — so
+/// "resolve this bearer" is no longer a whole question. The answer depends on
+/// which booking is being acted upon, and a resolver that could not see it
+/// would have to return something permissive.
+///
+/// `None` is the resource-scoped refusal: this bearer holds no live grant over
+/// THIS booking. Whether the bearer is unknown or merely unauthorized here is
+/// deliberately not distinguished at this seam — the caller maps both to 401,
+/// and the finer story belongs to the audit rather than to the wire (the same
+/// 404-not-403 reasoning ADR-022 recorded for ownership).
 pub trait AuthorityResolver: Send + Sync {
-    fn resolve(&self, bearer: &str) -> Option<VerifiedAuthority>;
+    fn resolve(&self, bearer: &str, booking: &BookingId) -> Option<VerifiedAuthority>;
+
+    /// Who is calling, for the routes that name no booking.
+    ///
+    /// # Why this returns an identity and not a grant
+    ///
+    /// The first version returned a `VerifiedAuthority` and promised it would
+    /// "name no resources". It could not keep that promise: a grant's resource
+    /// list comes from an approved scope, which always names one booking, so
+    /// the reader grant ended up naming a synthetic id — authority over an
+    /// imaginary booking, which is still authority. The assertion guarding it
+    /// was worse: written over an `Option` that was `None` by construction, it
+    /// was vacuously true.
+    ///
+    /// So the seam says what it means. Listing your own bookings needs to know
+    /// WHO you are; touching one needs a grant. A caller on this path receives
+    /// something that cannot authorize anything, because it is not the kind of
+    /// thing authorization is made of.
+    fn resolve_reader(&self, bearer: &str) -> Option<bld_types::PrincipalId>;
 }
 
 /// Everything a handler can reach. The completeness of this struct is the
@@ -136,7 +165,29 @@ async fn request_id(request: axum::extract::Request, next: axum::middleware::Nex
 // Err IS a finished HTTP response, produced at most once per request, and
 // boxing it would trade clarity at every call site for bytes nobody counts.
 #[allow(clippy::result_large_err)]
-fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<VerifiedAuthority, Response> {
+fn authorize(
+    state: &ServerState,
+    headers: &HeaderMap,
+    booking: &BookingId,
+) -> Result<VerifiedAuthority, Response> {
+    authorized(headers, |bearer| state.authority.resolve(bearer, booking))
+}
+
+/// The reader gate, for routes that name no booking.
+#[allow(clippy::result_large_err)]
+fn authorize_reader(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<bld_types::PrincipalId, Response> {
+    authorized(headers, |bearer| state.authority.resolve_reader(bearer))
+}
+
+/// The header checks both gates share, so neither can forget one.
+#[allow(clippy::result_large_err)]
+fn authorized<T>(
+    headers: &HeaderMap,
+    resolve: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, Response> {
     if headers.contains_key("x-bld-delegation") {
         return Err(mapping::plain_error(
             StatusCode::BAD_REQUEST,
@@ -153,7 +204,7 @@ fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<VerifiedAuthori
             "no verified caller identity",
         ));
     };
-    state.authority.resolve(token).ok_or_else(|| {
+    resolve(token).ok_or_else(|| {
         mapping::plain_error(StatusCode::UNAUTHORIZED, "no verified caller identity")
     })
 }
@@ -271,7 +322,7 @@ async fn lookup_bookings(
     headers: HeaderMap,
     Query(params): Query<LookupParams>,
 ) -> Response {
-    let authority = match authorize(&state, &headers) {
+    let authority = match authorize_reader(&state, &headers) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
@@ -325,7 +376,12 @@ async fn create_booking(
     // new row records, which is the whole of M5.1: before this, `authorize` was
     // a turnstile that proved someone was a caller and then threw away which
     // caller they were.
-    let authority = match authorize(&state, &headers) {
+    //
+    // The id comes off the BODY here rather than the path, and it is the
+    // resource the grant must name — a create authorized for some other
+    // booking is not an authorization for this one.
+    let id = BookingId::new(body.id);
+    let authority = match authorize(&state, &headers, &id) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
@@ -343,11 +399,7 @@ async fn create_booking(
         wheelchair_accessible: body.wheelchair_accessible,
         max_fee: Money::from_pence(body.max_fee_pence),
     };
-    match state
-        .api
-        .create(BookingId::new(body.id), requirements, &authority)
-        .await
-    {
+    match state.api.create(id, requirements, &authority).await {
         Ok(projection) => mapping::projection_response(StatusCode::CREATED, &projection),
         Err(error) => mapping::api_error(&error),
     }
@@ -358,11 +410,12 @@ async fn read_booking(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let authority = match authorize(&state, &headers) {
+    let id = BookingId::new(id);
+    let authority = match authorize(&state, &headers, &id) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
-    match state.api.read(&BookingId::new(id), &authority).await {
+    match state.api.read(&id, &authority).await {
         Ok(projection) => mapping::projection_response(StatusCode::OK, &projection),
         Err(error) => mapping::api_error(&error),
     }
@@ -373,11 +426,12 @@ async fn read_audit(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let authority = match authorize(&state, &headers) {
+    let id = BookingId::new(id);
+    let authority = match authorize(&state, &headers, &id) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
-    match state.api.audit(&BookingId::new(id), &authority).await {
+    match state.api.audit(&id, &authority).await {
         Ok(entries) => {
             let rows: Vec<serde_json::Value> = entries
                 .iter()
@@ -407,7 +461,7 @@ async fn browse_venues(
     headers: HeaderMap,
     Query(query): Query<VenueQuery>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &headers) {
+    if let Err(refused) = authorize_reader(&state, &headers) {
         return refused;
     }
     let filters = VenueFilters {
@@ -445,7 +499,7 @@ async fn read_slot(
     headers: HeaderMap,
     Path((venue, slot)): Path<(String, String)>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &headers) {
+    if let Err(refused) = authorize_reader(&state, &headers) {
         return refused;
     }
     match state
@@ -476,11 +530,11 @@ async fn propose_behaviour(
     Path((id, behaviour)): Path<(String, String)>,
     body: Option<axum::Json<serde_json::Value>>,
 ) -> Response {
-    let authority = match authorize(&state, &headers) {
+    let id = BookingId::new(id);
+    let authority = match authorize(&state, &headers, &id) {
         Ok(authority) => authority,
         Err(refused) => return refused,
     };
-    let id = BookingId::new(id);
     let payload = body.map_or(serde_json::Value::Null, |axum::Json(value)| value);
 
     // Admission FIRST — before either header gate, and before the behaviour

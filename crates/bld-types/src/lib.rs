@@ -36,6 +36,62 @@ id_type!(PrincipalId);
 id_type!(ActorId);
 id_type!(EffectIntentId);
 id_type!(CouncilBookingRef);
+// M7's identifiers (spec §9.1). Ids only — minting one of these grants nothing,
+// which is why they live in the shared vocabulary while the envelope they name
+// lives in `townhall-authority` behind a private constructor (ADR-025).
+id_type!(ApprovalChallengeId);
+id_type!(DelegationId);
+id_type!(ServiceId);
+
+/// One thing an authority may permit, named independently of the domain.
+///
+/// # Why this is not `BookingProposal::name()`
+///
+/// ADR-025 puts `townhall-authority` BELOW `townhall-domain` in the graph, so
+/// the issuer cannot name a proposal. The alternative to a shared enum was a
+/// second list of behaviour names inside the authority crate — two vocabularies
+/// for one set of permissions, and the drift between them would be silent until
+/// a grant permitted a behaviour the domain had renamed.
+///
+/// So the names live here once, and the domain maps its proposal onto this.
+/// A closed enum rather than a string: an authority carrying `"Bok"` should not
+/// be constructible, let alone storable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Behaviour {
+    SelectVenue,
+    VerifySlot,
+    ChangeVenue,
+    UpdateRequirements,
+    RevalidateVenue,
+    Book,
+    Cancel,
+}
+
+impl Behaviour {
+    /// The wire and audit name, matching `BookingProposal::name()`'s spelling.
+    ///
+    /// Pinned by a test in `townhall-domain`, where both types are visible: the
+    /// two lists agreeing is the whole reason this enum exists rather than a
+    /// private copy.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SelectVenue => "SelectVenue",
+            Self::VerifySlot => "VerifySlot",
+            Self::ChangeVenue => "ChangeVenue",
+            Self::UpdateRequirements => "UpdateRequirements",
+            Self::RevalidateVenue => "RevalidateVenue",
+            Self::Book => "Book",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+impl fmt::Display for Behaviour {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// One attempt at one external effect: its identity, and the deadline the
 /// provider must bind.

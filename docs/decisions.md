@@ -1954,3 +1954,65 @@ tamper test satisfiable by the reserved-header 400, the replay witness, and
 section's existence — that keeping the curl lane contradicts ADR-021 as written
 and needed amending rather than assuming. All three refuted the reasons; none
 changed the answers.
+
+### Amendment, made during M7A: the resolver's resource-awareness is M7A's
+
+Amended 2026-09-02 with the project owner, after M7A was built.
+
+The slice boundary above put the resolver in M7B. M7A moved it, and the plan of
+record should say so rather than leaving the code and the plan disagreeing.
+
+**What forced it.** `AuthorityResolver::resolve(bearer)` answered a question
+that no longer has an answer. A capability could be resolved from a bearer alone
+— `may_book` held for any booking its holder could name — but a grant names its
+resource, so "what may this bearer do" is only decidable against a booking. The
+M5 curl suite uses twenty-nine booking ids, so no fixed-resource dev grant could
+serve it, and a resolver that could not see the resource would have had to
+return something permissive. There was no version of M7A that both sealed the
+envelope and left this seam alone.
+
+**What moves into M7A**, therefore:
+
+```rust
+fn resolve(&self, bearer: &str, booking: &BookingId) -> Option<VerifiedAuthority>;
+fn resolve_reader(&self, bearer: &str) -> Option<PrincipalId>;
+```
+
+This is the smaller half of the plan's finding #1 — "authenticate the actor;
+authorize the presented delegation against that actor, service, resource and
+behaviour". The authorization half is now resource-scoped. **M7B keeps the rest**:
+separating `Authorization` from `X-BLD-Delegation`, un-reserving that header,
+and binding the actor to an authenticated workload rather than deriving it from
+the subject.
+
+**A reader is an identity, not a grant.** The first attempt had `resolve_reader`
+return a `VerifiedAuthority` "naming no resources", which a scope makes
+impossible — it named a synthetic booking id, and authority over an imaginary
+booking is still authority. The assertion guarding it was written over an
+`Option` that was `None` by construction and was vacuously true. Recorded
+because the correction is a rule and not a patch: **listing your own bookings
+needs to know who you are; touching one needs a grant.** A caller on the reading
+path receives something that cannot authorize anything, because it is not the
+kind of thing authorization is made of.
+
+**What the dev lane consequently cannot witness.** `DevAuthority` mints a grant
+naming whichever booking the request named, so its resource check can never
+refuse anything. The curl suite therefore witnesses the behaviour guard
+(`dev-priya-nobook` is refused `Book`) and the ownership guard (ADR-022's scoped
+rows), and never the resource guard — whose witness lives in
+`townhall-authority`, where a grant issued for one booking is asked about
+another. Named here so the gap is on the books rather than assumed absent.
+
+### What M7A's mutations found that no reviewer did
+
+Three reviewers read the plan and none of them caught this: the grantor/subject
+separation — the reason this ADR exists — had **no witness at all**. Swapping
+`access.grantor()` for `access.subject()` on the `owner` column broke nothing
+across 439 tests, because every fixture in the workspace used one principal for
+both roles, and the single delegated case created its booking under a
+non-delegated grant. The distinction was implemented, migrated across
+twenty-four sites, argued for at length above, and unobserved.
+
+Recorded as the ADR's own lesson: a design argument is not a witness, and a
+reviewer reading a plan cannot tell you which of its claims your tests would
+notice losing. Only mutating the implementation can.

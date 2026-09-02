@@ -228,9 +228,11 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
  "townhall-service",
  "townhall-store",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2026,6 +2028,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "townhall-authority"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bld-types",
+ "serde",
+ "sha2 0.11.0",
+ "static_assertions",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "townhall-channel"
 version = "0.1.0"
 dependencies = [
@@ -2049,6 +2064,8 @@ dependencies = [
  "static_assertions",
  "thiserror",
  "tokio",
+ "townhall-authority",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2106,6 +2123,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
  "townhall-http",
  "townhall-service",
@@ -2125,6 +2143,7 @@ dependencies = [
  "tokio",
  "townhall-domain",
  "townhall-store",
+ "townhall-testkit",
 ]
 
 [[package]]
@@ -2139,6 +2158,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "townhall-authority",
  "townhall-domain",
 ]
 
@@ -2146,9 +2166,12 @@ dependencies = [
 name = "townhall-testkit"
 version = "0.1.0"
 dependencies = [
+ "bld-types",
  "reqwest",
  "serde_json",
  "tempfile",
+ "tokio",
+ "townhall-authority",
 ]
 
 [[package]]

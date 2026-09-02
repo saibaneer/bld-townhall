@@ -396,3 +396,181 @@ pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
         .map(|dep| dep["name"].as_str().expect("name").replace('_', "-"))
         .collect()
 }
+
+/// How a test obtains authority.
+///
+/// # Why this exists rather than a constructor
+///
+/// `VerifiedAuthority` has private fields and no public constructor, and
+/// ADR-025 refused to add a `test-support` one: a cargo feature that reveals a
+/// minting path leaks through feature unification, so it would close the
+/// backdoor only on paper. The rule that replaced it is that **tests obtain
+/// authority the way production does** — by answering a real challenge.
+///
+/// This module is the whole cost of that rule, paid once. It runs the genuine
+/// `begin → submit` path against an in-memory store, so a test's grant is
+/// exactly as real as Lucy's, and a change that breaks issuance breaks every
+/// test that depends on authority rather than silently keeping them green.
+pub mod issuer {
+    use bld_types::{
+        Behaviour, BookingId, BookingRequirements, Money, PrincipalId, ServiceId, TimeWindow,
+    };
+    use townhall_authority::{
+        ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
+        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope, VerifiedAuthority,
+    };
+
+    /// The instant every issued test grant is stamped with.
+    ///
+    /// Fixed rather than `now()`, so a test that asserts on expiry has
+    /// something to assert against and nothing here drifts with the wall clock.
+    pub const ISSUED_AT_MS: u64 = 1_700_000_000_000;
+
+    /// How long a test grant lasts. An hour: long enough that no test has to
+    /// think about it, short enough to be a real deadline.
+    pub const GRANT_TTL_MS: u64 = 3_600_000;
+
+    /// What to ask for.
+    #[derive(Clone, Debug)]
+    pub struct GrantSpec {
+        /// On whose behalf — the booking's owner, and the visibility scope.
+        pub grantor: PrincipalId,
+        /// Who the action is attributed to. Equal to `grantor` unless the test
+        /// is about delegation.
+        pub subject: PrincipalId,
+        /// The exact resource. A grant reaches this booking and no other.
+        pub booking: BookingId,
+        pub behaviours: Vec<Behaviour>,
+        pub max_fee: Money,
+    }
+
+    impl GrantSpec {
+        /// The ordinary case: one person, their own booking, book and cancel.
+        #[must_use]
+        pub fn own(principal: &str, booking: &str, max_fee_pence: u64) -> Self {
+            Self {
+                grantor: PrincipalId::new(principal),
+                subject: PrincipalId::new(principal),
+                booking: BookingId::new(booking),
+                behaviours: vec![Behaviour::Book, Behaviour::Cancel],
+                max_fee: Money::from_pence(max_fee_pence),
+            }
+        }
+
+        /// Someone acting on another person's booking (ADR-020, ADR-025).
+        #[must_use]
+        pub fn delegated(grantor: &str, subject: &str, booking: &str, max_fee_pence: u64) -> Self {
+            Self {
+                grantor: PrincipalId::new(grantor),
+                subject: PrincipalId::new(subject),
+                booking: BookingId::new(booking),
+                behaviours: vec![Behaviour::Cancel],
+                max_fee: Money::from_pence(max_fee_pence),
+            }
+        }
+
+        /// Narrow the grant to exactly these behaviours.
+        #[must_use]
+        pub fn permitting(mut self, behaviours: &[Behaviour]) -> Self {
+            self.behaviours = behaviours.to_vec();
+            self
+        }
+    }
+
+    struct OneCode;
+
+    impl Entropy for OneCode {
+        fn code(&self) -> ApprovalCode {
+            ApprovalCode::new("7312").expect("four digits")
+        }
+
+        fn identifier(&self) -> String {
+            // Every call builds its own store, so a fixed identifier cannot
+            // collide with anything.
+            "testkit-issued".to_owned()
+        }
+    }
+
+    /// Issue a grant by answering a real challenge.
+    ///
+    /// # Panics
+    /// If issuance fails — which would mean the approval path itself is broken,
+    /// and every test resting on it should say so loudly rather than proceed.
+    #[must_use]
+    pub async fn issue(spec: &GrantSpec) -> VerifiedAuthority {
+        let service = AuthorityService::new(
+            std::sync::Arc::new(MemoryApprovalStore::new()),
+            OneCode,
+            AuthorityPolicy {
+                reply_window_ms: 600_000,
+                grant_ttl_ms: GRANT_TTL_MS,
+                assurance: AssuranceLevel::SmsReply,
+            },
+        );
+        let binding = BindingRef {
+            principal: spec.grantor.clone(),
+            version: 1,
+        };
+        let raised = service
+            .begin(
+                &ApprovalRequest {
+                    scope: PendingScope {
+                        service: ServiceId::new("demo-council-town-hall"),
+                        agent: "townhall-agent".to_owned(),
+                        booking: spec.booking.clone(),
+                        behaviours: BehaviourSet::new(spec.behaviours.clone()),
+                        requirements: BookingRequirements {
+                            purpose: "meeting".to_owned(),
+                            requested_date: "2026-08-20".to_owned(),
+                            time_window: TimeWindow {
+                                from: "13:00".to_owned(),
+                                to: "17:00".to_owned(),
+                            },
+                            attendees: 20,
+                            wheelchair_accessible: true,
+                            max_fee: spec.max_fee,
+                        },
+                    },
+                    binding: binding.clone(),
+                    grantor: spec.grantor.clone(),
+                    subject: spec.subject.clone(),
+                },
+                ISSUED_AT_MS,
+            )
+            .await
+            .expect("a challenge can always be raised against an empty store");
+        service
+            .submit(
+                &raised.id,
+                "7312",
+                &binding,
+                AssuranceLevel::SmsReply,
+                ISSUED_AT_MS + 1_000,
+            )
+            .await
+            .expect("the right code, from the bound channel, inside the window")
+    }
+
+    /// [`issue`], callable from a synchronous test.
+    ///
+    /// # Why a thread
+    ///
+    /// These helpers are called from both `#[test]` and `#[tokio::test]`
+    /// bodies, and `block_on` inside a running runtime panics. A thread with
+    /// its own runtime works from either, and the cost is paid once per grant.
+    ///
+    /// # Panics
+    /// As [`issue`], or if the issuing thread itself panics.
+    #[must_use]
+    pub fn issue_blocking(spec: &GrantSpec) -> VerifiedAuthority {
+        let spec = spec.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a test runtime")
+                .block_on(async move { issue(&spec).await })
+        })
+        .join()
+        .expect("the issuing thread did not panic")
+    }
+}

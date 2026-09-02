@@ -121,7 +121,7 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     let service = AuthorityService::new(
-        MemoryApprovalStore::new(),
+        std::sync::Arc::new(MemoryApprovalStore::new()),
         DemoCode,
         AuthorityPolicy::default(),
     );

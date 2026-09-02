@@ -64,7 +64,7 @@ async fn store() -> (SqlApprovalStore, tempfile::TempDir) {
 
 fn service(store: SqlApprovalStore) -> AuthorityService<SqlApprovalStore, FixedEntropy> {
     AuthorityService::new(
-        store,
+        std::sync::Arc::new(store),
         FixedEntropy::new("7312"),
         AuthorityPolicy {
             reply_window_ms: REPLY_WINDOW_MS,

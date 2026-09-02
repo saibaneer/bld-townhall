@@ -23,6 +23,7 @@ use crate::grant::{BindingRef, VerifiedApproval, VerifiedAuthority};
 use crate::scope::CanonicalScope;
 use crate::store::{ApprovalStore, DelegationRecord, Settled, StoreError};
 use bld_types::{ActorId, ApprovalChallengeId, DelegationId, PrincipalId};
+use std::sync::Arc;
 
 /// Where codes and opaque identifiers come from.
 ///
@@ -130,6 +131,9 @@ pub enum ApprovalDenied {
     Replay(&'static str),
     #[error("the authority store could not be reached: {0}")]
     Unavailable(String),
+    /// The stored challenge contradicts itself. Never "close enough".
+    #[error("that challenge could not be read")]
+    Unreadable,
 }
 
 impl From<StoreError> for ApprovalDenied {
@@ -158,24 +162,45 @@ pub enum ResolveError {
 }
 
 /// The trusted authority component (spec §5).
+///
+/// # Why the store is not reachable through this type
+///
+/// It was, briefly, behind a `store()` accessor "for callers that own both".
+/// That accessor was a complete minting path, and glm-5.3-flash found it in
+/// review before this shipped: [`ApprovalStore::insert_challenge`] is public
+/// (it must be — the SQL implementation lives in another crate),
+/// [`crate::ChallengeRecord`]'s fields are public, and
+/// [`crate::ApprovalCode::new`] is public. So anyone holding an
+/// `AuthorityService` could insert a challenge carrying a code THEY chose, over
+/// any scope, naming any grantor — then answer it and receive a real grant,
+/// with nobody ever texted. "The only route to authority is answering a real
+/// challenge" held only if the challenge was real.
+///
+/// So holding this type grants no store access. What remains true, and is
+/// stated rather than papered over: **an `ApprovalStore` implementor is trusted
+/// infrastructure.** Whoever can write its rows can write grants, exactly as
+/// whoever can write the database can. The defence is that the store is
+/// reachable only from a composition root, never from a crate that merely holds
+/// the service — and a keyed MAC over the challenge, which would beat even a
+/// row writer, needs a key to live somewhere and is therefore M7B's.
 pub struct AuthorityService<S, E> {
-    store: S,
+    store: Arc<S>,
     entropy: E,
     policy: AuthorityPolicy,
 }
 
 impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
-    pub fn new(store: S, entropy: E, policy: AuthorityPolicy) -> Self {
+    /// Build the component over a store the CALLER owns a handle to.
+    ///
+    /// `Arc` rather than ownership so a composition root — or a test asserting
+    /// on rows — can keep its own handle, without this type having to hand one
+    /// out to whoever holds it.
+    pub fn new(store: Arc<S>, entropy: E, policy: AuthorityPolicy) -> Self {
         Self {
             store,
             entropy,
             policy,
         }
-    }
-
-    /// The store, for callers that own both (the SQL lane's migrations, tests).
-    pub const fn store(&self) -> &S {
-        &self.store
     }
 
     /// Raise a challenge: step 2 of §13.1.
@@ -392,6 +417,17 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         // evidence, and it is the only one `reject` reaches at all. The store's
         // is the only one that holds when two correct replies arrive at once —
         // see the concurrency test, which is the sole witness for it.
+        // The stored digest must describe the stored scope.
+        //
+        // The SQL store checks this too, on the way out of the row. It is
+        // checked HERE as well because that made it a property of one
+        // implementation rather than of the component: an in-memory store, a
+        // future store, or a fabricated row all reach this line. If the two
+        // disagree, one was edited, and choosing which to believe would be
+        // choosing whose version of the approval stands.
+        if challenge.scope_hash != challenge.scope.digest() {
+            return Err(ApprovalDenied::Unreadable);
+        }
         if challenge.status.is_settled() {
             return Err(ApprovalDenied::Replay(challenge.status.name()));
         }

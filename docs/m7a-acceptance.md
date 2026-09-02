@@ -40,9 +40,9 @@ demo binaries and tests alike.
 
 ## What the mutations found
 
-Five defects, three of them in code written minutes earlier — and the
-fifth in the ADR's own central distinction, which turned out to have no witness
-at all. It is recorded under the grantor/subject split below.
+Six defects. Three were in code written minutes earlier; the fifth was in the
+ADR's own central distinction, which had no witness at all; the sixth was a
+complete grant-minting path, found by a reviewer rather than by a mutation.
 
 **The scope had one deadline, and it was wrong.** Approving in the last second
 of the reply window issued a grant that had *already expired* — and every test
@@ -77,6 +77,37 @@ identity; touching one needs a grant.** `resolve_reader` returns a
 `PrincipalId`, `lookup` takes one, and a reader can authorize nothing because it
 is not the kind of thing authorization is made of. No assertion required, and
 none written.
+
+### The sixth defect: `store()` was a complete minting path
+
+Found by **glm-5.3-flash** in review, before this shipped.
+
+`AuthorityService::store()` was public, returning `&S`. Three other things must
+be public — `ApprovalStore::insert_challenge` (the SQL implementation lives in
+another crate), `ChallengeRecord`'s fields, and `ApprovalCode::new`. Together
+they let anyone holding an `AuthorityService` insert a challenge carrying a code
+**they chose**, over **any scope**, naming **any grantor**, answer it, and
+receive a real grant — with nobody ever texted.
+
+"The only route to authority is answering a real challenge" held only if the
+challenge was real. The accessor's own doc read *"for callers that own both (the
+SQL lane's migrations, tests)"* — which is the exact reasoning ADR-025 rejected
+when it refused a `test-support` constructor. The front door was sealed and this
+one left open.
+
+**Fixed three ways.** `store()` is gone; `AuthorityService` takes an `Arc<S>` so
+a composition root or a test keeps its OWN handle and the service hands none
+out. The verifier now checks the challenge's digest against its scope, so the
+check is a property of the component rather than of the SQL store alone. And the
+remaining limit is stated rather than implied: **an `ApprovalStore` implementor
+is trusted infrastructure** — whoever writes its rows writes grants, as whoever
+writes the database does. A keyed MAC over the challenge would beat even a row
+writer, and needs a key to live somewhere: M7B's.
+
+Witness: `a_challenge_whose_digest_contradicts_its_scope_yields_no_grant` — a
+store returns a challenge whose scope says £50 while its digest describes £10;
+the right code arrives from the right channel inside the window; no grant.
+**Mutation-verified**: removing the verifier's check fails it.
 
 ## The 24 construction sites
 
@@ -187,9 +218,8 @@ failing on round 0.
 
 ## Counts
 
-- **440** workspace tests (439 before the migration — the count held because no
-  test was lost, only re-based onto real issuance; +1 is the delegated-create
-  witness the mutations proved was missing)
+- **441** workspace tests (439 before the migration; +1 the delegated-create
+  witness the mutations proved was missing, +1 the forged-challenge witness)
 - **+51** new: 41 in `townhall-authority`, 10 in `townhall-store`
 - **21** in the `--features dev-authority` lane
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean

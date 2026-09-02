@@ -193,7 +193,7 @@ impl DevAuthority {
 
         let (principal, max_fee_pence, behaviours) = Self::allowed(bearer)?;
         let service = AuthorityService::new(
-            MemoryApprovalStore::new(),
+            std::sync::Arc::new(MemoryApprovalStore::new()),
             DevCode,
             AuthorityPolicy {
                 reply_window_ms: 60_000,

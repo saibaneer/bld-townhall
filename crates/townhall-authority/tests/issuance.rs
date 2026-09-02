@@ -54,16 +54,29 @@ impl Entropy for FixedEntropy {
 
 type Service = AuthorityService<MemoryApprovalStore, FixedEntropy>;
 
-fn service() -> Service {
-    AuthorityService::new(
-        MemoryApprovalStore::new(),
+use std::sync::Arc;
+
+/// The service, plus the caller's own handle to the store.
+///
+/// Two values rather than one accessor: the service cannot hand out its store
+/// (that was a minting path — see `AuthorityService`), so a test that needs to
+/// assert on rows keeps its own `Arc` from the start.
+fn service_and_store() -> (Service, Arc<MemoryApprovalStore>) {
+    let store = Arc::new(MemoryApprovalStore::new());
+    let service = AuthorityService::new(
+        Arc::clone(&store),
         FixedEntropy::new("7312"),
         AuthorityPolicy {
             reply_window_ms: REPLY_WINDOW_MS,
             grant_ttl_ms: GRANT_TTL_MS,
             assurance: AssuranceLevel::SmsReply,
         },
-    )
+    );
+    (service, store)
+}
+
+fn service() -> Service {
+    service_and_store().0
 }
 
 fn lucys_binding() -> BindingRef {
@@ -344,7 +357,7 @@ async fn the_attempt_bound_spends_the_challenge_and_the_right_code_no_longer_hel
 /// because they never reach the code at all.
 #[tokio::test]
 async fn a_reply_from_another_channel_is_denied_and_costs_lucy_nothing() {
-    let service = service();
+    let (service, store) = service_and_store();
     let raised = service
         .begin(&lucys_request(), NOW)
         .await
@@ -367,8 +380,7 @@ async fn a_reply_from_another_channel_is_denied_and_costs_lucy_nothing() {
         Err(ApprovalDenied::WrongChannel)
     );
 
-    let challenge = service
-        .store()
+    let challenge = store
         .load_challenge(&raised.id)
         .await
         .expect("loadable")
@@ -686,7 +698,7 @@ async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed(
     }
 
     let service = AuthorityService::new(
-        CorruptStore,
+        Arc::new(CorruptStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
     );
@@ -919,4 +931,148 @@ async fn two_simultaneous_correct_replies_yield_exactly_one_grant() {
             "round {round}: the reply that lost must be refused as a replay"
         );
     }
+}
+
+/// A challenge whose digest does not describe its scope yields no grant.
+///
+/// # Why this is checked in the service and not only in the store
+///
+/// The SQL store checks it on the way out of a row, which made it a property of
+/// one implementation rather than of the component. A fabricated row, an
+/// in-memory store, or a future store all reach the verifier — so the verifier
+/// checks it too, and this test uses a store that returns a self-contradictory
+/// challenge to prove the verifier is the one refusing.
+///
+/// The scope says £50; the digest describes a £10 scope. If the two could
+/// disagree unnoticed, the digest would record what a person approved while the
+/// scope decided what they got.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
+    struct ForgedStore;
+
+    fn scope_of(max_fee_pence: u64) -> townhall_authority::CanonicalScope {
+        townhall_authority::CanonicalScope {
+            service: ServiceId::new("demo-council-town-hall"),
+            agent: "TownHallAgent".to_owned(),
+            booking: BookingId::new("sms-lucy-0001"),
+            behaviours: BehaviourSet::new([Behaviour::Book]),
+            requirements: BookingRequirements {
+                purpose: "town hall booking".to_owned(),
+                requested_date: "2026-09-10".to_owned(),
+                time_window: TimeWindow {
+                    from: "14:00".to_owned(),
+                    to: "17:00".to_owned(),
+                },
+                attendees: 20,
+                wheelchair_accessible: true,
+                max_fee: Money::from_pence(max_fee_pence),
+            },
+            expires_at_ms: NOW + 600_000,
+            grant_ttl_ms: GRANT_TTL_MS,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalStore for ForgedStore {
+        async fn insert_challenge(
+            &self,
+            _challenge: &townhall_authority::ChallengeRecord,
+        ) -> Result<(), townhall_authority::StoreError> {
+            Ok(())
+        }
+        async fn load_challenge(
+            &self,
+            id: &ApprovalChallengeId,
+        ) -> Result<Option<townhall_authority::ChallengeRecord>, townhall_authority::StoreError>
+        {
+            Ok(Some(townhall_authority::ChallengeRecord {
+                id: id.clone(),
+                code: ApprovalCode::new("7312").expect("four digits"),
+                // The scope permits £50 …
+                scope: scope_of(5_000),
+                // … while the digest describes £10.
+                scope_hash: scope_of(1_000).digest(),
+                binding: BindingRef {
+                    principal: PrincipalId::new("lucy"),
+                    version: 1,
+                },
+                grantor: PrincipalId::new("lucy"),
+                subject: PrincipalId::new("lucy"),
+                created_at_ms: NOW,
+                attempts_used: 0,
+                status: townhall_authority::ChallengeStatus::Pending,
+                assurance: AssuranceLevel::SmsReply,
+            }))
+        }
+        async fn record_failed_attempt(
+            &self,
+            _id: &ApprovalChallengeId,
+            _now_ms: u64,
+        ) -> Result<(u8, townhall_authority::ChallengeStatus), townhall_authority::StoreError>
+        {
+            unreachable!("the digest is checked before the code")
+        }
+        async fn settle_with_grant(
+            &self,
+            _id: &ApprovalChallengeId,
+            _grant: &townhall_authority::DelegationRecord,
+        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
+            unreachable!("nothing may settle a self-contradictory challenge")
+        }
+        async fn settle_rejected(
+            &self,
+            _id: &ApprovalChallengeId,
+        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
+            unreachable!("nothing may settle a self-contradictory challenge")
+        }
+        async fn load_delegation(
+            &self,
+            _id: &DelegationId,
+        ) -> Result<Option<townhall_authority::DelegationRecord>, townhall_authority::StoreError>
+        {
+            Ok(None)
+        }
+        async fn revoke_delegation(
+            &self,
+            _id: &DelegationId,
+            _at_ms: u64,
+        ) -> Result<bool, townhall_authority::StoreError> {
+            Ok(false)
+        }
+    }
+
+    let service = AuthorityService::new(
+        Arc::new(ForgedStore),
+        FixedEntropy::new("7312"),
+        AuthorityPolicy::default(),
+    );
+
+    // The right code, from the right channel, inside the window — and still no
+    // grant, because the challenge contradicts itself.
+    assert_eq!(
+        service
+            .submit(
+                &ApprovalChallengeId::new("forged"),
+                "7312",
+                &lucys_binding(),
+                AssuranceLevel::SmsReply,
+                NOW + 1_000
+            )
+            .await,
+        Err(ApprovalDenied::Unreadable)
+    );
+
+    // And `NO` cannot settle it either — the check precedes both paths.
+    assert_eq!(
+        service
+            .reject(
+                &ApprovalChallengeId::new("forged"),
+                "7312",
+                &lucys_binding(),
+                NOW + 1_000
+            )
+            .await,
+        Err(ApprovalDenied::Unreadable)
+    );
 }

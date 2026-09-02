@@ -499,7 +499,7 @@ pub mod issuer {
     #[must_use]
     pub async fn issue(spec: &GrantSpec) -> VerifiedAuthority {
         let service = AuthorityService::new(
-            MemoryApprovalStore::new(),
+            std::sync::Arc::new(MemoryApprovalStore::new()),
             OneCode,
             AuthorityPolicy {
                 reply_window_ms: 600_000,

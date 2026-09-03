@@ -16,7 +16,7 @@
 //!    flag is unavailable in a build without the feature, and the running real
 //!    resolver refuses a `dev-*` token.
 
-use std::io::{BufRead as _, BufReader};
+use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 
 const COUNCIL_KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
@@ -51,23 +51,72 @@ fn build_binaries() {
     assert!(status.success(), "the council binary must build");
 }
 
+/// Wait for `READY <port>`, or fail loudly with everything the child said.
+///
+/// # Why a deadline exists at all
+///
+/// It did not, and codex named the consequence before it happened: "any live
+/// startup stall will hang indefinitely". It then happened — twice — as CI runs
+/// that sat silent for twenty and ninety minutes on a check that takes
+/// microseconds locally. A harness that can hang converts an unknown bug into
+/// an unknowable one: the step times out with no output and the cause dies with
+/// the runner.
+///
+/// Thirty seconds is generous for a process whose job is to print one line
+/// after binding a port, and the panic carries the child's stderr, so the next
+/// stall names itself in the CI log instead of being reconstructed from
+/// timestamps.
 fn spawn_ready(mut command: Command) -> (Child, u16) {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+
     let mut child = command
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the binary spawns");
     let stdout = child.stdout.take().expect("piped stdout");
-    let line = BufReader::new(stdout)
-        .lines()
-        .next()
-        .expect("a line")
-        .expect("readable");
-    let port = line
-        .strip_prefix("READY ")
-        .unwrap_or_else(|| panic!("expected READY, got {line:?}"))
-        .parse()
-        .expect("a port");
-    (child, port)
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // The read happens on its own thread so the deadline is real: a blocked
+    // read on the main thread IS the hang this function exists to prevent.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines.next().map(|line| line.expect("readable stdout"));
+        let _ = sender.send(first);
+        // Keep draining so the child never blocks on a full stdout pipe.
+        for _ in lines {}
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Some(line)) => {
+            let port = line
+                .strip_prefix("READY ")
+                .unwrap_or_else(|| panic!("expected READY, got {line:?}"))
+                .parse()
+                .expect("a port");
+            (child, port)
+        }
+        Ok(None) => {
+            // The child exited without a READY line: stdout hit EOF. Its
+            // stderr says why, and that is the error worth reading.
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("the child exited before READY. stderr:\n{said}");
+        }
+        Err(_) => {
+            // Still alive, still silent. Kill it, then report everything it
+            // wrote — the difference between this panic and a hung CI step is
+            // the entire reason this arm exists.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("no READY within 30s from a live child. stderr so far:\n{said}");
+        }
+    }
 }
 
 /// A world with the REAL resolver: no `--dev-authority`, so nothing can mint.
@@ -494,24 +543,27 @@ fn the_real_resolver_refuses_a_dev_token() {
 #[test]
 fn the_dev_authority_flag_does_not_exist_in_this_build() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(env!("CARGO_BIN_EXE_townhall-server"))
-        .arg("--db")
-        .arg(dir.path().join("townhall.sqlite"))
-        .arg("--denials-db")
-        .arg(dir.path().join("denials.sqlite"))
-        .args([
-            "--council-url",
-            "http://127.0.0.1:1",
-            "--key-hex",
-            COUNCIL_KEY_HEX,
-            "--authority-key",
-            AUTHORITY_KEY_HEX,
-            "--port",
-            "0",
-            "--dev-authority",
-        ])
-        .output()
-        .expect("the binary runs");
+    // `.output()` waits forever, and this exact test hung CI twice while its
+    // subject — a refusal — takes microseconds. So the wait has a deadline and
+    // the failure carries whatever the child wrote.
+    let output = run_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_townhall-server"))
+            .arg("--db")
+            .arg(dir.path().join("townhall.sqlite"))
+            .arg("--denials-db")
+            .arg(dir.path().join("denials.sqlite"))
+            .args([
+                "--council-url",
+                "http://127.0.0.1:1",
+                "--key-hex",
+                COUNCIL_KEY_HEX,
+                "--authority-key",
+                AUTHORITY_KEY_HEX,
+                "--port",
+                "0",
+                "--dev-authority",
+            ]),
+    );
 
     assert!(
         !output.status.success(),
@@ -547,6 +599,67 @@ fn the_dev_authority_flag_does_not_exist_in_this_build() {
         created.is_empty(),
         "refusing an argument must not create a database: found {created:?}"
     );
+}
+
+/// Run a command that must exit promptly, or kill it and say what it said.
+///
+/// Gated with its only caller: under `--all-features` the flag test does not
+/// exist, and a helper nothing calls would fail the dead-code lint there.
+///
+/// The kill happens BEFORE the panic, in this thread, while the handle is still
+/// ours. A deadline that panics and leaves the child running would orphan a
+/// process that inherited the CI step's pipes — and a step whose pipes never
+/// close never ends, which is indistinguishable from the hang this exists to
+/// diagnose.
+#[cfg(not(feature = "dev-authority"))]
+fn run_with_deadline(command: &mut Command) -> std::process::Output {
+    use std::io::Read as _;
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary spawns");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Drained on their own threads so a chatty child cannot block on a full
+    // pipe while we poll its exit.
+    let out_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("the child is waitable") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let said =
+                    String::from_utf8_lossy(&err_thread.join().expect("the drain did not panic"))
+                        .into_owned();
+                panic!(
+                    "the server did not exit within 30s of being told its \
+                     arguments are unusable — the hang CI reported, now with a \
+                     name. stderr so far:\n{said}"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+
+    std::process::Output {
+        status,
+        stdout: out_thread.join().expect("the drain did not panic"),
+        stderr: err_thread.join().expect("the drain did not panic"),
+    }
 }
 
 fn create_body(id: &str) -> serde_json::Value {

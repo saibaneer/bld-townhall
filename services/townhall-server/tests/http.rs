@@ -38,23 +38,72 @@ impl Drop for World {
     }
 }
 
+/// Wait for `READY <port>`, or fail loudly with everything the child said.
+///
+/// # Why a deadline exists at all
+///
+/// It did not, and codex named the consequence before it happened: "any live
+/// startup stall will hang indefinitely". It then happened — twice — as CI runs
+/// that sat silent for twenty and ninety minutes on a check that takes
+/// microseconds locally. A harness that can hang converts an unknown bug into
+/// an unknowable one: the step times out with no output and the cause dies with
+/// the runner.
+///
+/// Thirty seconds is generous for a process whose job is to print one line
+/// after binding a port, and the panic carries the child's stderr, so the next
+/// stall names itself in the CI log instead of being reconstructed from
+/// timestamps.
 fn spawn_ready(mut command: Command) -> (Child, u16) {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+
     let mut child = command
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("the binary spawns");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut lines = std::io::BufReader::new(stdout).lines();
-    let ready = lines.next().expect("a line").expect("readable");
-    let port: u16 = ready
-        .strip_prefix("READY ")
-        .unwrap_or_else(|| panic!("expected READY, got {ready:?}"))
-        .parse()
-        .expect("a port");
-    // Keep draining stdout so the child never blocks on a full pipe.
-    std::thread::spawn(move || for _ in lines {});
-    (child, port)
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // The read happens on its own thread so the deadline is real: a blocked
+    // read on the main thread IS the hang this function exists to prevent.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines.next().map(|line| line.expect("readable stdout"));
+        let _ = sender.send(first);
+        // Keep draining so the child never blocks on a full stdout pipe.
+        for _ in lines {}
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Some(line)) => {
+            let port = line
+                .strip_prefix("READY ")
+                .unwrap_or_else(|| panic!("expected READY, got {line:?}"))
+                .parse()
+                .expect("a port");
+            (child, port)
+        }
+        Ok(None) => {
+            // The child exited without a READY line: stdout hit EOF. Its
+            // stderr says why, and that is the error worth reading.
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("the child exited before READY. stderr:\n{said}");
+        }
+        Err(_) => {
+            // Still alive, still silent. Kill it, then report everything it
+            // wrote — the difference between this panic and a hung CI step is
+            // the entire reason this arm exists.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("no READY within 30s from a live child. stderr so far:\n{said}");
+        }
+    }
 }
 
 fn build_binaries() {

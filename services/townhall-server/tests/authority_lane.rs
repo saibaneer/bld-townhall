@@ -161,14 +161,30 @@ fn bind_lucy(lane: &Lane) {
     .expect("the binding thread did not panic");
 }
 
-/// The whole approval flow, with nobody's authority assumed.
+/// A change requires a challenge, answered against a live binding.
 ///
-/// # What this proves that the dev lane cannot
+/// # What this proves, and what it does NOT
 ///
-/// The dev lane mints a grant per request over whatever booking was named, so
-/// it can never show that a grant came from an approval. Here the reference is
-/// produced by answering a challenge with the code that was inside the
-/// preview — and until that happens, the same client cannot create anything.
+/// It was called `a_booking_needs_an_approval_that_somebody_actually_answered`,
+/// and review was right that it showed no such thing: it reads the code out of
+/// the HTTP response to its OWN request and posts it back with the same
+/// credential. That is a workload approving its own request — the opposite of
+/// what the old name claimed.
+///
+/// What it does prove, and what is worth proving:
+///
+/// - a change with no delegation is refused, first, before anything else;
+/// - the reference is produced by a challenge and is NOT the booking id;
+/// - the same grant is reused across the whole workflow, once;
+/// - revocation stops the next change and does not unmake the last one.
+///
+/// What it cannot prove, because M7B has no channel: that a PERSON answered.
+/// The verifier now checks the claimed binding against a live row rather than
+/// against the caller's own earlier claim, so a binding cannot be invented —
+/// but the code still travels through this workload, and a workload holding the
+/// credential can still relay it to itself. Closing that needs evidence from
+/// the channel adapter, which arrives with M7C, and is named in the M7B
+/// acceptance record.
 #[test]
 // One sweep, deliberately. Each step depends on the one before it — a reference
 // cannot be presented before it has been issued, and a revocation cannot be
@@ -176,7 +192,7 @@ fn bind_lucy(lane: &Lane) {
 // them would have to re-do the approval, and the ordering they exist to prove
 // would stop being visible in one place.
 #[allow(clippy::too_many_lines)]
-fn a_booking_needs_an_approval_that_somebody_actually_answered() {
+fn a_change_requires_a_challenge_answered_against_a_live_binding() {
     let lane = lane();
     bind_lucy(&lane);
     let client = http();
@@ -222,9 +238,9 @@ fn a_booking_needs_an_approval_that_somebody_actually_answered() {
     let challenge = raised["challenge"].as_str().expect("a challenge id");
     let preview = raised["preview"].as_str().expect("a preview");
 
-    // The preview is what Lucy would read, and the code is inside it — which is
-    // the only place the code appears. Reading it back out here is exactly what
-    // she does.
+    // The preview is what Lucy would read, and the code is inside it. Reading it
+    // back out HERE is not what she does — she reads it off a phone — and that
+    // difference is the limit this test cannot cross (see the header).
     assert!(
         preview.contains("Maximum booking fee: £50.00"),
         "the preview must state the ceiling she is approving: {preview}"
@@ -367,6 +383,9 @@ fn a_booking_needs_an_approval_that_somebody_actually_answered() {
 #[test]
 fn a_declined_request_cannot_be_approved_afterwards() {
     let lane = lane();
+    // Bound, because declining is still ANSWERING: the verifier checks the
+    // claimed binding against a row before it reads the answer at all.
+    bind_lucy(&lane);
     let client = http();
 
     let raised = client

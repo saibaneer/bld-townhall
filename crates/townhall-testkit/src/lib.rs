@@ -460,6 +460,12 @@ pub mod issuer {
         pub booking: BookingId,
         pub behaviours: Vec<Behaviour>,
         pub max_fee: Money,
+        /// The headcount ceiling the grant approves.
+        ///
+        /// Defaults to the fixture requirements' own 20, which is what a real
+        /// approval would carry. A test whose subject is CHANGING the headcount
+        /// raises it deliberately — see [`GrantSpec::seating`].
+        pub max_attendees: u16,
     }
 
     /// Everything a booking walk needs, end to end.
@@ -508,6 +514,7 @@ pub mod issuer {
                 booking: BookingId::new(booking),
                 behaviours: WALK.to_vec(),
                 max_fee: Money::from_pence(max_fee_pence),
+                max_attendees: 20,
             }
         }
 
@@ -520,6 +527,7 @@ pub mod issuer {
                 booking: BookingId::new(booking),
                 behaviours: vec![Behaviour::Cancel],
                 max_fee: Money::from_pence(max_fee_pence),
+                max_attendees: 20,
             }
         }
 
@@ -527,6 +535,18 @@ pub mod issuer {
         #[must_use]
         pub fn permitting(mut self, behaviours: &[Behaviour]) -> Self {
             self.behaviours = behaviours.to_vec();
+            self
+        }
+
+        /// Approve a different headcount ceiling.
+        ///
+        /// For fixtures whose subject IS changing the headcount — the domain's
+        /// characterization suite raises attendees to prove revalidation
+        /// happens, and would otherwise be refused by the approval ceiling for a
+        /// reason it is not about.
+        #[must_use]
+        pub fn seating(mut self, attendees: u16) -> Self {
+            self.max_attendees = attendees;
             self
         }
     }
@@ -552,8 +572,17 @@ pub mod issuer {
     /// and every test resting on it should say so loudly rather than proceed.
     #[must_use]
     pub async fn issue(spec: &GrantSpec) -> VerifiedAuthority {
+        let store = std::sync::Arc::new(MemoryApprovalStore::new());
+        // The grantor's channel is BOUND before the challenge is answered.
+        //
+        // Not scaffolding. Review found the verifier comparing the caller's
+        // claimed binding against the caller's own earlier claim, so it checks
+        // against a row now — which means a test grant needs a binding to
+        // exist, exactly as a real approval does. Every grant in the workspace
+        // therefore travels the path a person's approval travels.
+        store.bind(&spec.grantor, 1);
         let service = AuthorityService::new(
-            std::sync::Arc::new(MemoryApprovalStore::new()),
+            std::sync::Arc::clone(&store),
             OneCode,
             AuthorityPolicy {
                 reply_window_ms: 600_000,
@@ -583,7 +612,7 @@ pub mod issuer {
                                 from: "13:00".to_owned(),
                                 to: "17:00".to_owned(),
                             },
-                            attendees: 20,
+                            attendees: spec.max_attendees,
                             wheelchair_accessible: true,
                             max_fee: spec.max_fee,
                         },

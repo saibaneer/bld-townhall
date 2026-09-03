@@ -862,6 +862,14 @@ pub enum BookingError {
     AccessibilityRequired,
     #[error("venue fee exceeds effective maximum")]
     FeeExceeded { ceiling: FeeCeiling },
+    /// The change would seat more people than the grant approved.
+    ///
+    /// A GRANT story, so 403 beside the authority ceiling rather than 422 beside
+    /// the data guards: the booking's own requirements are irrelevant here, and
+    /// what refused is that the person was shown a smaller number and agreed to
+    /// that one.
+    #[error("the change would seat {wanted}, and {approved} were approved")]
+    AttendeesExceedApproval { approved: u16, wanted: u16 },
     /// The availability provider could not be asked at all — distinct from
     /// [`Self::VenueFactsMissing`], which is an ANSWER (ADR-021).
     #[error("the availability provider could not be asked")]
@@ -911,6 +919,7 @@ impl BookingError {
             Self::FeeExceeded {
                 ceiling: FeeCeiling::Requirement,
             } => "FeeExceededRequirement",
+            Self::AttendeesExceedApproval { .. } => "AttendeesExceedApproval",
             Self::FactsUnavailable => "FactsUnavailable",
             Self::EffectIdentityMissing => "EffectIdentityMissing",
             Self::EffectPlanMissing => "EffectPlanMissing",
@@ -2235,6 +2244,14 @@ impl BoundaryDomain for TownHallDomain {
         // EXISTS must not depend on authority (the topology suite's whole
         // point).
         let needed = proposal.behaviour();
+        // Read before the proposal moves. A headcount change is the one
+        // proposal that can widen what a person approved WITHOUT touching a
+        // behaviour they did not grant, so the behaviour check alone never saw
+        // it (found in review).
+        let wanted_attendees = match &proposal {
+            BookingProposal::UpdateRequirements { attendees } => *attendees,
+            _ => None,
+        };
         let resolution = Self::resolve_proposal_cell(booking, proposal, authority, context);
 
         // Whether a behaviour EXISTS depends on (state, proposal) alone, so an
@@ -2258,6 +2275,23 @@ impl BoundaryDomain for TownHallDomain {
                 | Behaviour::RevalidateVenue
                 | Behaviour::Book => BookingError::BookingAuthorityRequired,
             });
+        }
+
+        // The grant's CONSTRAINTS, not only its behaviours.
+        //
+        // The preview says `Attendees: <= 20`; without this, a grant naming
+        // `UpdateRequirements` could take the booking to 500 and carry on under
+        // the same approval — the money bounded by the fee ceiling and the
+        // booking not bounded by anything. A ceiling, so asking for fewer
+        // people than were approved is not a widening.
+        if let Some(wanted) = wanted_attendees {
+            let approved = authority.max_attendees();
+            if wanted > approved {
+                return Resolution::Denied(BookingError::AttendeesExceedApproval {
+                    approved,
+                    wanted,
+                });
+            }
         }
 
         // For a cell that does exist: the same self-consistency step as the
@@ -2516,7 +2550,16 @@ mod test_grants {
 
     /// A grant over this crate's fixture booking, naming exactly `behaviours`.
     pub(crate) fn issued(behaviours: &[Behaviour], max_fee_pence: u64) -> VerifiedAuthority {
-        issue_blocking(&GrantSpec::own("lucy", "BKG-1001", max_fee_pence).permitting(behaviours))
+        issue_blocking(
+            &GrantSpec::own("lucy", "BKG-1001", max_fee_pence)
+                .permitting(behaviours)
+                // No headcount ceiling worth speaking of. This crate's suites
+                // pin the state machine, and several RAISE the headcount to
+                // prove revalidation happens — an approval ceiling would refuse
+                // them for a reason they are not about. The ceiling's own
+                // witness lives in `townhall-service`.
+                .seating(u16::MAX),
+        )
     }
 }
 
@@ -4732,6 +4775,7 @@ mod fact_topology {
             BookingError::SlotUnavailable => "SlotUnavailable",
             BookingError::CapacityInsufficient { .. } => "CapacityInsufficient",
             BookingError::AccessibilityRequired => "AccessibilityRequired",
+            BookingError::AttendeesExceedApproval { .. } => "AttendeesExceedApproval",
             BookingError::FeeExceeded {
                 ceiling: FeeCeiling::Authority,
             } => "FeeExceededAuthority",

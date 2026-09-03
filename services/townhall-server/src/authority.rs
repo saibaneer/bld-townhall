@@ -192,11 +192,21 @@ impl AuthorityResolver for RealAuthority {
         // serves that particular channel, because a binding records
         // (address → principal) and nothing about workloads.
         //
-        // So the bounded consequence, stated rather than implied: a stolen
-        // workload credential can discover WHOSE bookings exist. It cannot
-        // change one — that needs a grant, and a grant needs a code answered
-        // from the bound phone. M7C's read grant, issued at binding time,
-        // closes the gap by making reading revocable in its own right.
+        // The bounded consequence, corrected. An earlier version of this
+        // comment said a stolen workload credential "can discover WHOSE
+        // bookings exist", and review showed that badly understates it. Naming
+        // any bound principal yields their cancellable bookings, full
+        // projections, council references, purposes, dates, times, headcounts,
+        // venue and status data, and audit histories. Everything a read
+        // returns, which is everything.
+        //
+        // What it still cannot do is CHANGE one: that needs a grant, a grant
+        // needs a challenge answered against a live binding, and this
+        // credential's own actor is checked against the grant it presents.
+        //
+        // M7C's read grant, issued at binding time, is what closes this — by
+        // making reading revocable in its own right rather than implied by a
+        // binding existing at all.
         let store = Arc::clone(&self.store);
         let wanted = principal.clone();
         let _ = actor;

@@ -237,9 +237,27 @@ async fn revoke_delegation(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(refused) = crate::authenticated(state.authority.as_ref(), &headers) {
-        return refused;
+    let actor = match crate::authenticated(state.authority.as_ref(), &headers) {
+        Ok(actor) => actor,
+        Err(refused) => return refused,
+    };
+
+    // Only the actor a delegation NAMES may revoke it.
+    //
+    // Without this, any workload the resolver knows could revoke any
+    // delegation whose id it could guess or had seen — no widening, but an
+    // authorization-free way to break other people's bookings. Found in review.
+    //
+    // "Not yours" and "no such delegation" answer identically, for the reason
+    // ADR-022 recorded about 404-not-403: distinguishing them would tell a
+    // caller which references exist.
+    if state.authority.resolve_delegation(&id, &actor).is_none() {
+        return mapping::plain_error(
+            StatusCode::UNAUTHORIZED,
+            "no live delegation for that reference",
+        );
     }
+
     match state.issuer.revoke(&id).await {
         // Idempotent: `false` means already revoked or never issued, and both
         // answer 200. A safety exit that errors on a second attempt teaches

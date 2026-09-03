@@ -120,8 +120,15 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
+    let store = std::sync::Arc::new(MemoryApprovalStore::new());
+    // The driver's own channel, bound before it answers its own challenge.
+    //
+    // The verifier checks a claimed binding against a row rather than against
+    // the caller's earlier claim, so even a demo that asks nobody has to have
+    // the row — which is the point: the check is not skippable by being a demo.
+    store.bind(&PrincipalId::new("lucy"), 1);
     let service = AuthorityService::new(
-        std::sync::Arc::new(MemoryApprovalStore::new()),
+        std::sync::Arc::clone(&store),
         DemoCode,
         AuthorityPolicy::default(),
         // This driver issues and resolves within one process and one run, so

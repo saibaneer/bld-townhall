@@ -466,7 +466,37 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         if challenge.has_expired(now_ms) {
             return Err(ApprovalDenied::ChallengeExpired);
         }
+        // The claimed binding is checked against a ROW, not against itself.
+        //
+        // # The defect this closes, and the one it does not
+        //
+        // Before this, both sides of the comparison came from the caller: the
+        // binding it named when raising the challenge, and the binding it named
+        // when answering. A caller sending the same pair twice passed — so the
+        // "wrong channel" refusal was a formality, and possession of a workload
+        // credential was enough to mint an in-policy grant with no phone
+        // involved at all. Review found it after M7B was written.
+        //
+        // Three comparisons now, and all three must hold: the reply names the
+        // challenge's binding, that principal is CURRENTLY bound, and the
+        // revision matches. A binding that has been withdrawn or re-verified
+        // since the challenge was raised no longer answers it.
+        //
+        // What this still does not prove is that a PERSON answered. That needs
+        // evidence from the channel — an inbound message the adapter
+        // received — and the channel arrives with M7C. Until then this is a
+        // well-formedness check against durable state, which is more than it
+        // was and less than it needs to be. Named in the M7B acceptance record
+        // rather than papered over.
         if &challenge.binding != from {
+            return Err(ApprovalDenied::WrongChannel);
+        }
+        let live = self
+            .store
+            .live_binding(&from.principal)
+            .await
+            .map_err(|error| ApprovalDenied::Unavailable(error.to_string()))?;
+        if live.as_ref() != Some(from) {
             return Err(ApprovalDenied::WrongChannel);
         }
         Ok(challenge)

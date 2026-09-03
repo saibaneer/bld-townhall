@@ -15,7 +15,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The DEFAULT-feature lane. `dev-authority` is not a default feature, so
+      # this is the build a deployment makes: the real resolver, and
+      # `tests/authority_lane.rs` walking a real approval end to end. It is also
+      # the only lane in which `the_dev_authority_flag_does_not_exist_in_this_build`
+      # compiles at all — under `--all-features` that test is cfg'd out, which
+      # is the point of it.
       - run: cargo test --workspace
+      # The FEATURE lane, and the reason it is a separate step.
+      #
+      # `services/townhall-server/tests/http.rs` carries
+      # `#![cfg(feature = "dev-authority")]` on line 1, so the whole file — 21
+      # tests, including `the_whole_journey_is_possible_with_curl_alone`, which
+      # IS M5's acceptance gate — vanishes from the step above. It had done
+      # since the day it was written (8d3dabc, M5), and nobody noticed because
+      # the suite passes whenever anyone runs it by hand.
+      #
+      # A gate that only runs when somebody remembers to run it is not a gate.
+      - run: cargo test -p townhall-server --features dev-authority
       # The deterministic concurrency lane: loom explores every interleaving of
       # the replay window's lock. A probabilistic race passes a broken
       # check-then-insert by scheduler mood; this cannot.

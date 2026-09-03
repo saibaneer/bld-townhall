@@ -24,7 +24,8 @@ pub fn denial_status(error: &BookingError) -> StatusCode {
         | BookingError::CancellationAuthorityRequired
         | BookingError::FeeExceeded {
             ceiling: FeeCeiling::Authority,
-        } => StatusCode::FORBIDDEN,
+        }
+        | BookingError::AttendeesExceedApproval { .. } => StatusCode::FORBIDDEN,
         BookingError::FactsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         BookingError::VenueFactsMissing
         | BookingError::SlotUnavailable

@@ -77,6 +77,7 @@ fn body(authority: &VerifiedAuthority) -> Vec<u8> {
 
     let constraints = authority.constraints();
     push_field(&mut out, &constraints.max_fee().pence().to_be_bytes());
+    push_field(&mut out, &constraints.max_attendees().to_be_bytes());
     let resources = constraints.resources();
     push_field(&mut out, &(resources.len() as u64).to_be_bytes());
     for resource in resources {
@@ -132,6 +133,7 @@ pub(crate) fn decode(bytes: &[u8], key: &EnvelopeKey) -> Option<VerifiedAuthorit
     }
 
     let max_fee = Money::from_pence(reader.u64()?);
+    let max_attendees = u16::from_be_bytes(reader.field()?.try_into().ok()?);
     let resource_count = usize::try_from(reader.u64()?).ok()?;
     // Untrusted count, as above.
     let mut resources = Vec::new();
@@ -157,7 +159,7 @@ pub(crate) fn decode(bytes: &[u8], key: &EnvelopeKey) -> Option<VerifiedAuthorit
         actor,
         service,
         BehaviourSet::new(behaviours),
-        AuthorityConstraints::new(max_fee, resources),
+        AuthorityConstraints::new(max_fee, max_attendees, resources),
         scope_hash,
         issued_at_ms,
         expires_at_ms,

@@ -547,6 +547,19 @@ impl ApprovalStore for SqlApprovalStore {
         }))
     }
 
+    async fn live_binding(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<BindingRef>, AuthorityStoreError> {
+        // The inherent `live_binding_for` already answers this against a row;
+        // the port simply exposes it to the verifier, which needs it to check a
+        // claimed binding against something other than the claim itself.
+        Self::live_binding_for(self, principal)
+            .await
+            .map(|found| found.map(|binding| binding.reference()))
+            .map_err(|error| AuthorityStoreError::Unavailable(error.to_string()))
+    }
+
     async fn revoke_delegation(
         &self,
         id: &DelegationId,

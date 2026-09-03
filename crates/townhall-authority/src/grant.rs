@@ -58,6 +58,20 @@ pub struct BindingRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityConstraints {
     max_fee: Money,
+    /// The headcount the person was shown, and approved.
+    ///
+    /// # Why the grant carries this and not only the fee
+    ///
+    /// The preview says `Attendees: <= 20`. Until review found it, the grant
+    /// kept only the fee ceiling and the booking id — so a holder of that grant
+    /// could send `UpdateRequirements` with 500 attendees and carry on under
+    /// the same approval. The money was bounded and the booking was not: Lucy
+    /// approved a room for twenty people and could end up with a booking for
+    /// five hundred.
+    ///
+    /// A ceiling rather than an exact value, matching what the preview
+    /// promises: fewer people than approved is not a widening.
+    max_attendees: u16,
     /// The exact resources this grant reaches.
     ///
     /// # Why "one booking" is not a boolean
@@ -76,9 +90,14 @@ pub struct AuthorityConstraints {
 
 impl AuthorityConstraints {
     #[must_use]
-    pub fn new(max_fee: Money, resources: impl IntoIterator<Item = BookingId>) -> Self {
+    pub fn new(
+        max_fee: Money,
+        max_attendees: u16,
+        resources: impl IntoIterator<Item = BookingId>,
+    ) -> Self {
         Self {
             max_fee,
+            max_attendees,
             resources: resources.into_iter().collect(),
         }
     }
@@ -86,6 +105,12 @@ impl AuthorityConstraints {
     #[must_use]
     pub fn max_fee(&self) -> Money {
         self.max_fee
+    }
+
+    /// The headcount ceiling the person approved.
+    #[must_use]
+    pub fn max_attendees(&self) -> u16 {
+        self.max_attendees
     }
 
     #[must_use]
@@ -215,6 +240,7 @@ impl VerifiedAuthority {
             behaviours: scope.behaviours.clone(),
             constraints: AuthorityConstraints::new(
                 scope.requirements.max_fee,
+                scope.requirements.attendees,
                 [scope.booking.clone()],
             ),
             scope_hash: scope.digest(),
@@ -328,6 +354,12 @@ impl VerifiedAuthority {
     #[must_use]
     pub fn max_fee(&self) -> Money {
         self.constraints.max_fee()
+    }
+
+    /// The headcount ceiling this grant permits.
+    #[must_use]
+    pub fn max_attendees(&self) -> u16 {
+        self.constraints.max_attendees()
     }
 
     /// Whether this grant names `behaviour` over `booking`.

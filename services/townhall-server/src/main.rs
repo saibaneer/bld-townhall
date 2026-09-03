@@ -261,8 +261,14 @@ impl DevAuthority {
         }
 
         let (principal, max_fee_pence, behaviours) = Self::allowed(bearer)?;
+        let store = std::sync::Arc::new(MemoryApprovalStore::new());
+        // Bound, because the verifier checks a claimed binding against a row.
+        // Even a lane where nobody is asked cannot skip the check — it just
+        // supplies the row itself, which is exactly what makes it a stand-in
+        // rather than a bypass.
+        store.bind(&PrincipalId::new(principal), 1);
         let service = AuthorityService::new(
-            std::sync::Arc::new(MemoryApprovalStore::new()),
+            std::sync::Arc::clone(&store),
             DevCode,
             AuthorityPolicy {
                 reply_window_ms: 60_000,

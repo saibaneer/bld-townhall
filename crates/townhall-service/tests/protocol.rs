@@ -2730,8 +2730,13 @@ async fn a_cas_loss_mid_turn_is_refused_as_stale() {
         .propose_at(
             &id,
             loaded.version,
+            // Fewer than the fixture's approved 20, deliberately. This test is
+            // about a CAS race and nothing else; asking for MORE than was
+            // approved would now be refused by the headcount guard before the
+            // race could happen, and the test would pass while witnessing the
+            // wrong refusal.
             BookingProposal::UpdateRequirements {
-                attendees: Some(25),
+                attendees: Some(12),
             },
             &authority_amending(&id),
         )
@@ -3545,5 +3550,78 @@ async fn a_booking_created_under_delegation_belongs_to_the_grantor() {
         ),
         "a delegate's own visibility must not include the booking he acted on \
          — 404, not 403, because 403 confirms it exists (ADR-022)"
+    );
+}
+
+/// A grant approved for twenty people cannot seat five hundred.
+///
+/// # The defect this witnesses
+///
+/// The preview a person reads says `Attendees: <= 20`. Until review found it,
+/// the grant carried only the fee ceiling and the booking id — so a holder of
+/// that grant could send `UpdateRequirements` with 500 attendees and carry on
+/// under the same approval. The money stayed bounded by the fee ceiling and the
+/// booking did not stay bounded by anything: Lucy approves a room for twenty
+/// and ends up with a booking for five hundred.
+///
+/// The behaviour check could never catch it. `UpdateRequirements` is a
+/// behaviour a grant may legitimately name; what it must not do is exceed the
+/// number the person was shown. So this is a CONSTRAINT test, and the fixture
+/// deliberately grants the behaviour — otherwise it would pass for the wrong
+/// reason, refused as an unapproved behaviour rather than an unapproved number.
+#[tokio::test]
+async fn a_grant_cannot_seat_more_people_than_were_approved() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-HEADCOUNT");
+    awaiting(&h, &id, requirements()).await;
+
+    // Approved for 20, and permitted to change requirements.
+    let approved = issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(townhall_testkit::issuer::ALL),
+    );
+    assert_eq!(
+        approved.max_attendees(),
+        20,
+        "the fixture's requirements say 20, so the grant's ceiling must too"
+    );
+
+    let refused = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::UpdateRequirements {
+                attendees: Some(500),
+            },
+            &approved,
+        )
+        .await
+        .expect("no service error");
+
+    let BoundaryOutcome::Denied(error) = refused else {
+        panic!("500 attendees under a grant for 20 must be refused, got {refused:?}");
+    };
+    assert_eq!(
+        error.name(),
+        "AttendeesExceedApproval",
+        "the refusal must name the number, not the behaviour — a grant that \
+         permits UpdateRequirements is being refused for what it asked, not \
+         for asking"
+    );
+
+    // Fewer than approved is not a widening, so it commits.
+    let allowed = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::UpdateRequirements {
+                attendees: Some(12),
+            },
+            &approved,
+        )
+        .await
+        .expect("no service error");
+    assert!(
+        matches!(allowed, BoundaryOutcome::Committed(_)),
+        "asking for fewer people than were approved must be allowed: {allowed:?}"
     );
 }

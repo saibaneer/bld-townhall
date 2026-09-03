@@ -2016,3 +2016,340 @@ twenty-four sites, argued for at length above, and unobserved.
 Recorded as the ADR's own lesson: a design argument is not a witness, and a
 reviewer reading a plan cannot tell you which of its claims your tests would
 notice losing. Only mutating the implementation can.
+
+## ADR-026 — The receipt closes the model seat, and the model seat is the honest scope
+
+Plans M7C (the SMS half of Approval + VerifiedAuthority). This is the third
+version. The first was reviewed unanimously broken — its evidence was forgeable
+by the untrusted side. The second adopted the store-mediated receipt (Option A,
+with the owner) and was reviewed again — by codex gpt-5.6-sol and a three-lens
+in-house pass — as *right in mechanism but overclaiming its scope*: it presented
+the receipt as structural against a "hostile orchestrator process" when, against
+that adversary, it is only convention, and it miscredited a compile-time
+crate-graph tripwire for a runtime property. This version scopes the claim to
+exactly what the code delivers, pins the store and migration work the second
+draft stated as bare properties, and records the owner's decision on the one fork
+the second review surfaced.
+
+### What the first draft got wrong, kept as the lesson
+
+The first draft claimed an inbound `YES 7312` proves a PERSON answered, because
+`InboundMessage` already carries `TransportEvidence` (provider, claimed_sender,
+verified) and the verifier would check it against the recorded binding. Every
+reviewer said the same thing: that is not proof, it is the untrusted side's word.
+`TransportEvidence::new` is a public constructor with a plain `verified: bool`
+and an unchecked `signature`; the untrusted side raises the challenge (so it
+knows the code it sent in the preview) and presents the evidence to the verifier
+authenticated as itself. Nothing crossed a boundary the verifier could check. A
+hostile caller submits `code + TransportEvidence { claimed_sender: Lucy's number,
+verified: true }` with no SMS ever sent, and mints a grant — M7B's hole, rebuilt
+one layer out. The synthesis judge's sharpest point: the draft's own tests would
+have PASSED against that hostile implementation, so by this project's never-fake-
+tests rule they were not witnesses at all.
+
+The lesson, recorded: "the channel is trusted" is a property of code STRUCTURE
+or it is nothing. In one process, between two components sharing memory, a
+comment that says "the proposer does not touch this" is not a boundary.
+
+### The seat we close structurally, and the seat we do not
+
+The second review's decisive finding: "is the receipt structural?" has two
+answers, because there are two adversaries, and honesty means naming which one we
+close.
+
+**The model seat — the probabilistic proposer — is closed structurally.** Two
+code facts, not one, and stated precisely (the review caught the second draft
+overreaching here): the model implementor is HANDED no capability —
+`Proposer::propose` receives only `&ProjectedContext` and the reduced message, no
+gateway, no channel, no store handle, no HTTP client
+(`crates/townhall-orchestrator/src/ports.rs:122`) — and its RETURN type
+`Proposed::{Typed(Request), Unclear}` over a closed `Request` enum cannot carry an
+evidence row, an effect, or a grant back out. (A return type governs output, not
+side effects — so the claim rests on the withheld capability, and the return type
+only closes the exfiltration path; together they leave the model nothing to
+forge with and nothing to forge into.) A forged receipt would name a row the
+model cannot have written, and is refused. This is the seat BLD exists to
+contain — the *probabilistic* component that proposes — and against it the
+receipt is a code fact, not an honor rule.
+
+**The orchestrator process — deterministic host code — is not, and this draft no
+longer claims it is.** Three facts from the review: (a) the inbound evidence
+originates *inside* the orchestrator crate today — `journey.rs:139` mints
+`TransportEvidence::new("sim", from, true)`; (b) there is no distinct writer
+principal — every dev token resolves to a per-user actor
+(`services/townhall-server/src/main.rs:196-201`), and the orchestrator process
+already holds such a token; (c) the row is written at runtime over HTTP, which a
+compile-time crate-graph fact cannot govern. So a *compromised orchestrator
+process* can still deposit a forged evidence row. We accept that and scope the
+claim accordingly.
+
+**Why that scope is the right one, decided with the owner.** BLD's thesis is that
+a probabilistic component proposes and a deterministic boundary disposes. The
+adversary the thesis is about is the probabilistic seat — and that seat is
+closed. A compromised *deterministic host* is a different, larger failure: if the
+orchestrator process itself is subverted, the deterministic boundary is already
+lost, which is not the property M7C is asked to prove. It is precisely the "SMS
+approval has a defined assurance level, suitable for the town-hall demo risk
+profile" that §13.1 names, and M12's signed-carrier-webhook closes it
+structurally by moving the verification key out of the process. The assurance
+level rises at M12; the receipt seam it drops into is built here. (The airtight
+alternative — a distinct carrier principal in its own ingress crate the
+orchestrator cannot name, writing under a credential the write endpoint requires
+and the agent token is refused — was weighed and declined: it is more than the
+demo needs, and closing the model seat is the milestone's actual charge.)
+
+**The tripwire is defense-in-depth, not the boundary — and it is corrected.** The
+second draft credited "the orchestrator may not name `townhall-authority`" as
+what stops the write. That crate-graph fact
+(`crates/townhall-orchestrator/tests/boundary.rs`) stops the *model-seat code,
+in-crate,* from even naming the write path — real defense in depth — but it is a
+compile-time property and cannot govern a runtime HTTP POST from a compromised
+process. The review also found the tripwire checks only a node's *direct*
+dependencies, not the transitive/re-export closure its comment claims
+(`crates/townhall-testkit/src/lib.rs:449`); nothing slips today, but the guard is
+softer than the second draft leaned on. Both the ADR text and the server-main
+comment that over-credited it are corrected in M7C-1.
+
+### The mechanism: the claim-check receipt
+
+Decided with the owner (Option A of three). The proof stops being *what the
+untrusted proposer emits* and becomes *which row the trusted verifier reads*:
+
+1. `YES 7312` arrives at intake carrying its provider evidence. The inbound
+   identity is provider/account/message-id — set by the transport, NOT the
+   caller-chosen sender — so the model seat cannot name a row into being by
+   picking a number.
+2. The ingress resolves which challenge this reply answers (the durable
+   correlation below) and writes that `TransportEvidence` to the shared authority
+   store under an opaque, one-use RECEIPT, BOUND to that challenge id. Binding the
+   row to its challenge at deposit is what makes the receipt sound — see the
+   cross-challenge note below — and it is why the correlation and the receipt
+   cannot be sliced apart.
+3. The proposer is handed a reduced view and never sees the evidence; the
+   workload forwards `challenge id + code + receipt` — NEVER the evidence fields.
+4. The verifier loads the challenge AND the evidence row the receipt names,
+   checks that the row's bound `challenge_id` EQUALS the submitted challenge,
+   checks the recorded `claimed_sender` against the challenge's binding at its
+   recorded assurance, and — in ONE transaction with settlement — consumes the
+   one-use receipt and issues the grant.
+
+**Why the row is bound to its challenge, and consumed atomically.** An
+identity-only row would not be enough: a person with two live challenges (a £45
+and a £5000, say) who answers the £45 produces a valid evidence row for their
+number, and the workload — which raised both challenges and knows both codes —
+could present that row with the £5000 challenge. Its number matches that binding
+too, and it holds the code. One-use consumption alone loses the race (submit the
+big one first). So the row carries the `challenge_id` it was deposited for and the
+verifier requires equality; consumption is in the settlement transaction so a
+row is spent exactly once. This is the receipt's failure semantics the second
+review found missing.
+
+This is the same store-mediated move ADR-025 made for delegations: a row written
+by the ingress and read back by the verifier. Against the model seat it is
+structural — the model is handed no store handle and no HTTP client and its
+return type cannot carry evidence out, so it cannot author the row and cannot
+compose a byte-identical fake, which is what finally gives the M7C-1 test a real
+witness. Against a compromised process it is the demo assurance level named
+above — no more, and the ADR no longer claims more.
+
+### Why the binding is a good anchor — an incentive argument, not a control
+
+The owner supplied the reason the channel binding is the right thing to anchor
+authorization to, and it belongs beside the receipt, not in place of it. Users
+fund a prepaid account; **a phone number is pre-linked to its funded account**;
+message costs and agent billing draw down on that balance. So the
+`channel_bindings` row (phone → principal) is also an economic binding
+(phone → the account that pays). This does not *prevent* a forgery — the
+receipt's provenance does that — but it bounds the blast radius and removes the
+motive: a forged approval naming Lucy's number would draw on Lucy's balance, not
+the attacker's, so a forger gains nothing spendable. It is why anchoring to the
+channel binding is well-chosen, not a claim that the economics stop the attack.
+(Funded accounts and billing are M8-and-later; recorded as the intent that
+justifies the anchor, not as an M7C control.)
+
+### The residual, stated honestly — and why not the other two options
+
+The model seat cannot forge; a compromised orchestrator process can deposit a
+forged evidence row, because it originates the evidence and holds a user token
+today. That is the SMS demo's assurance level — §13.1's named risk profile — and
+M12's signed-carrier-webhook closes it by verifying a carrier signature against a
+key the process does not hold, dropping into this same receipt seam.
+
+- **Rejected — route replies straight to the server (topology inversion).** The
+  most airtight answer, and spec §13.1 step 4's literal path, but it moves
+  inbound handling out of the orchestrator. The orchestrator is where a vague
+  natural-language request becomes a well-formed proposal (the model seat, M11);
+  §5 places conversation and routing there deliberately. Dragging that across the
+  trust line for a week-long milestone costs more than it buys.
+- **Rejected — keep the forgeable path and document the limit.** Honest and
+  cheap, but it leaves the milestone's headline property ("a person approved") on
+  the honor system even for the model seat, when the receipt delivers it
+  structurally there for a medium, proven cost.
+
+### Approve-first precedes the booking (§23.1), and its hazards are real store work
+
+The walk moves to after approval: `BOOK` raises a challenge and creates nothing;
+`YES` issues the grant; only then does the booking walk run under the returned
+reference. The review found this is not a dispatcher tweak — it is four durable-
+store items the second draft stated as properties. Each is named here as the
+work it is:
+
+- **Idempotent challenge creation, keyed on the inbound intent, enforced in the
+  store.** Approve-first removes ADR-024's incidental dedupe (a redelivered
+  `BOOK` used to hit `create` and return `Existing`). So challenge creation gains
+  a durable UNIQUE key derived from the inbound booking id, covering the
+  challenge's WHOLE lifecycle — a `BOOK` redelivered after its challenge has been
+  approved, rejected, OR expired must not mint a fresh challenge with a fresh
+  code. `begin()` returns the existing id+code on conflict (transactional
+  insert-or-return), not a new one. This dedupes honest carrier retries; it is
+  not an adversarial control.
+- **Durable challenge↔channel correlation (migration 0008).** `YES 7312` carries
+  only the code; the store loads a challenge by id only; the in-memory session
+  holds booking ids and is wiped on restart; two live challenges on one channel
+  can draw the same four-digit code. So migration 0008 adds a channel-scoped,
+  UNIQUE "awaiting reply" record the ingress resolves reply→challenge, and the
+  store gains the lookup. A restart between preview and `YES` recovers it. A
+  session field would violate §2's "durable state is not conversational memory".
+- **Idempotent settlement, tied to the actor.** The delegation reference is
+  returned once; a retried `YES` currently gets `Replay`
+  (`crates/townhall-authority/src/service.rs:464`, inside `pending()`, shared
+  with reject and fired before the code is even read). So settlement gains a
+  branch — NOT inside `pending()` — that on a settled challenge loads the
+  existing delegation by `challenge_id` (a new `load_delegation_by_challenge`;
+  the column and its UNIQUE index already exist, so no migration) and returns the
+  EXISTING reference; and `submit` gains an actor argument so "returned to the
+  same actor" is a real check, not trivially true.
+- **Durable continuation + a resume runner.** Today the post-approval follow-up
+  lives in a `Mutex<Vec>` wiped on restart; a crash between `YES` and `create`
+  leaves the person approved, a live grant minted, and nothing booked. So an
+  "approved-but-unbooked" record is persisted and a resume runner completes it,
+  extending ADR-014's persist-before-effect to the approval boundary.
+
+### REVOKE stops being a lie — at an honest scope, time, and evidence
+
+The dispatcher answers REVOKE with "Delegations arrive with M7; there is nothing
+to revoke yet" — false since M7B. Three review corrections shape the fix:
+
+- **Evidence.** REVOKE answers no challenge, so it has no challenge-BOUND row to
+  read — and the second draft would silently fall back to
+  `message.transport_evidence`, the forgeable field the first draft died on
+  (a hostile REVOKE with fabricated evidence would then DoS Lucy's live grant).
+  So a control-command inbound gets its own evidence row: identity-keyed
+  (provider/account/message-id, transport-set, not caller-chosen), written by the
+  same ingress under a one-use receipt, consumed by the REVOKE and given a short
+  TTL so no unbounded backlog accrues. REVOKE reads that row for its own inbound
+  and checks it against the binding. Against the model seat this is as structural
+  as the `YES` path — the model still cannot author the row; against a compromised
+  process it is the same conceded limit — no worse, and no secret honor-path
+  smuggled in. (Answer rows, by contrast, are challenge-bound and consumed at
+  settlement or die with their challenge — so neither kind of row is durable
+  litter.)
+- **Scope — correcting this ADR's own earlier error.** The second draft argued a
+  principal has one live binding (`live_binding` returns one `Option`), so
+  principal-scoped revocation is co-extensive with "this principal/channel". The
+  review refuted it: binding-uniqueness is NOT delegation-uniqueness.
+  `live_binding` returns the one channel binding, but delegations are separate
+  rows and every `YES` mints a fresh `DelegationId`; a principal who approved two
+  bookings holds two live delegations, and the only primitive is
+  `revoke_delegation(id)` (`crates/townhall-authority/src/store.rs:167`). §14.1's
+  "this principal/channel" therefore needs a real bulk op: revoke ALL live
+  delegations reachable from the principal's current channel binding, joined back
+  through `delegations.challenge_id`. That store primitive and its endpoint are
+  named as M7C-2 work; the one-binding cardinality claim is withdrawn.
+- **Timing.** REVOKE is a control command, answered before the proposer
+  (ADR-024's ordering), but verifying the binding needs identity resolution,
+  which currently runs AFTER control handling, and `answer_control` is sync while
+  `revoke`/`live_binding` are async. So REVOKE's control path gains its own async
+  identity-and-evidence step — resolve the principal, read the receipt-named row,
+  check it against the binding — reached over an authority port the dispatcher
+  does not hold today. It requires no grant (you do not need permission to
+  withdraw permission) and is idempotent (§2's safety exit).
+
+### The credential swap ships WITH the journey — in one slice, this time
+
+ADR-025 required the credential replacement and the real journey in ONE
+independently-runnable slice, so a dev credential cannot make approval
+decorative. The second draft split them across B and C — the exact window
+ADR-025 forbids, and the review flagged it. Corrected: `CredentialSource::
+token_for` is replaced by the workload's own fixed credential for authentication
+plus the approval's delegation reference for authorization, held durably against
+the continuation — and that swap ships in the SAME slice as the live £45 journey
+it must prove. A turn with no approved reference reads and cannot change —
+§23.1's ordering enforced by the server.
+
+### The proposer's view shrinks
+
+Codex found `Proposer::propose` receives the whole `InboundMessage`, transport
+evidence included (`crates/townhall-orchestrator/src/ports.rs:129`) — so "the
+proposer never touches evidence" was false. M7C gives the proposer a REDUCED
+view: the bounded utterance and safe routing context, not the raw message and not
+the evidence. This is what makes the model seat structural for READING too, not
+only for writing: the evidence has exactly one reader, the ingress, and one home,
+the store.
+
+### The slices — two, because the receipt and the correlation cannot be split
+
+The second draft cut three slices (A receipt / B approve-first / C REVOKE); both
+review rounds found A depends on B, and the final check showed why the dependency
+is irreducible. A SOUND receipt binds each evidence row to the challenge it
+answers *at deposit time* (the cross-challenge note above) — and knowing which
+challenge a bare `YES 7312` answers IS the durable reply→challenge correlation
+that was slice B. Writing a generic per-inbound row does not escape this: it gives
+the verifier a row it cannot bind to a specific challenge, so the receipt stops
+being sound. The receipt contract and the correlation are one piece of work.
+Hence two slices, ordered M7C-1 → M7C-2:
+
+- **M7C-1 — the sound approve-first SMS journey.** The whole probabilistic-to-
+  boundary path, end to end, so no dev credential can make it decorative
+  (ADR-025's one-slice rule). Contents: migration 0008 (the challenge-BOUND
+  inbound-evidence row + one-use receipt, AND the channel-scoped unique
+  "awaiting reply" correlation record — one migration, one slice, so nothing
+  re-opens an applied migration); the ingress that resolves reply→challenge and
+  writes the bound row; the reduced proposer view; the verifier reply path taking
+  `challenge + code + receipt`, checking `challenge_id` equality and the binding,
+  consuming the receipt atomically with settlement; idempotent settlement (the
+  `load_delegation_by_challenge` branch outside `pending()` + `submit`'s actor
+  arg); `YES`/`NO` grammar; challenge-before-booking with idempotent challenge
+  creation (durable inbound-intent key, whole lifecycle, `begin()` returns the
+  existing id+code on conflict); durable continuation + resume runner; the
+  `CredentialSource` swap AND Lucy's live £45 journey together; `CONFIRM` retired;
+  the miscited tripwire text and server comment corrected. Witness: a receipt
+  naming no row is refused; a receipt bound to a DIFFERENT challenge than the one
+  submitted is refused; a receipt whose evidence names the wrong number is
+  refused; a second `YES` returns the existing reference, not `Replay`; the reply
+  path never accepts composed evidence — so a MODEL-seat caller cannot mint, the
+  witness real for the seat we claim.
+- **M7C-2 — REVOKE and the full gate.** The bulk revoke-by-binding store op + its
+  endpoint (the join `delegations.challenge_id → approval_challenges.id →
+  channel_bindings` via `binding_principal`/`binding_version`, confirmed
+  expressible in the current schema); REVOKE's async identity-and-evidence control
+  step at the corrected scope and time, reading a receipt-named row like every
+  other inbound; the hostile battery run to the gate — wrong code, expired,
+  replayed, tampered, wrong channel, out of attempts, terminal-challenge
+  redelivery, and a forged receipt from the MODEL seat — each denial provable in
+  isolation, which is the gate's "independently of prompt".
+
+### What M7 can finally claim
+
+With the receipt, the gate holds at a stated scope: the denial checks
+(wrong/expired/replayed/tampered) were already sound in M7A; the affirmative "a
+person approved" now rests on a row the PROBABILISTIC PROPOSER cannot write,
+anchored to a binding with economic weight, at the SMS demo assurance level
+§13.1 names. A compromised deterministic host can still forge that row — out of
+scope for M7C by the owner's decision, and closed structurally by M12's signed
+webhook dropping into this seam. The milestone's gate is claimable for the seat
+BLD exists to contain — the first time in M7 that it is.
+
+### Costs accepted
+
+A second store migration (0008) and a receipt seam that did not exist; a new bulk
+revoke-by-binding store op; `submit` gains an actor argument and an idempotent-
+recovery branch; the dispatcher gains an async authority port for control-time
+REVOKE; the RAM follow-up becomes a durable continuation with a resume runner.
+The dispatcher's booking paths are rewritten, not extended, and M6's scripted
+journey changes visibly. The simulator gains the ability to assert transport
+evidence into the store — the honesty the demo risk profile is built on, and the
+one line M12 replaces. Three ADRs and two ordered slices for a milestone the
+roadmap gives a week — the price of keeping the probabilistic component
+structurally away from the commit path, paid at the one seam where a person's yes
+becomes a grant, and claimed only for the seat where the code makes it true.

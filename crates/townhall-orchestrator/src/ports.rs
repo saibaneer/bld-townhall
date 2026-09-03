@@ -9,7 +9,8 @@
 
 use async_trait::async_trait;
 use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, PrincipalId};
-use townhall_channel::{ChannelAddress, InboundMessage};
+use serde::{Deserialize, Serialize};
+use townhall_channel::{ChannelAddress, Utterance};
 use townhall_gateway::{Gateway, GatewayError, Projection, Turn, VenueRow};
 
 /// Which principal an address is bound to, if any.
@@ -61,21 +62,29 @@ pub enum Proposed {
     Unclear,
 }
 
-/// The typed requests M6's conversations can express.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The typed requests the conversation can express.
+///
+/// Serde-able because a `Book` request is persisted in the durable continuation
+/// while its challenge awaits a human answer (ADR-026 approve-first).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
-    /// Start a booking: create the intent and walk it to `AwaitingBooking`.
+    /// Start a booking: raise a challenge and create NOTHING until it is
+    /// approved (§23.1). Approve-first replaces M6's book-then-confirm.
     Book(BookingRequest),
-    /// Finish the most recent booking: walk it from wherever it stands to
-    /// `Book`. (M7 replaces the bare word with its challenge flow — the M6
-    /// trigger is deliberately a stand-in, and says so.)
-    Confirm,
+    /// `YES` — approve the pending challenge. A UNIT variant: the classifier
+    /// only decides "this is an approval"; the deterministic dispatcher extracts
+    /// the code from the message body, so the probabilistic seat never carries
+    /// it.
+    Approve,
+    /// `NO` — decline the pending challenge, terminally. Same split as
+    /// [`Self::Approve`]: the code is the dispatcher's to read.
+    Decline,
     /// "Cancel it" — a cancellation with the referent left to authoritative
     /// resolution, where ambiguity can be ASKED about (spec §14.1).
     CancelIntent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookingRequest {
     pub date: String,
     pub from: String,
@@ -110,6 +119,17 @@ impl BookingRequest {
 pub struct ProjectedContext {
     /// The caller's currently cancellable bookings, for referent talk.
     pub cancellable: Vec<CandidateSummary>,
+    /// The pending challenge awaiting this caller's `YES`/`NO`, if any — so a
+    /// real proposer can tell an approval from a fresh request. An OPAQUE state
+    /// string only: never a receipt, a challenge id, or any authority type the
+    /// proposer could act on.
+    pub pending: Option<PendingSummary>,
+}
+
+/// That a challenge is awaiting a reply, and nothing a proposer could act with.
+#[derive(Clone, Debug)]
+pub struct PendingSummary {
+    pub state: String,
 }
 
 #[derive(Clone, Debug)]
@@ -126,7 +146,168 @@ pub struct CandidateSummary {
 /// gateway, no channel, no port.
 #[async_trait]
 pub trait Proposer: Send + Sync {
-    async fn propose(&self, context: &ProjectedContext, message: &InboundMessage) -> Proposed;
+    /// Classify one utterance. The proposer sees the reduced [`Utterance`], never
+    /// the full `InboundMessage` — no transport evidence reaches the one seat BLD
+    /// cannot trust (ADR-026).
+    async fn propose(&self, context: &ProjectedContext, utterance: &Utterance) -> Proposed;
+}
+
+/// One inbound reply's transport evidence, as the dispatcher hands it to the
+/// deposit port — primitives only, so this crate names no authority type.
+///
+/// The identity triple is transport-set (from `InboundIdentity`), which is what
+/// stops the model seat naming an evidence row into being by choosing a sender.
+#[derive(Clone, Debug)]
+pub struct InboundEvidence {
+    pub provider: String,
+    pub account: String,
+    pub message_id: String,
+    pub address: String,
+    pub verified: bool,
+    pub signature: Option<String>,
+}
+
+/// What a deposit returned: the challenge the reply answers, and its receipt.
+#[derive(Clone, Debug)]
+pub struct Deposited {
+    pub challenge: String,
+    pub receipt: String,
+}
+
+/// What the dispatcher asks the authority to raise a challenge over — primitives
+/// only (the wire body the server's `/approvals` endpoint expects).
+#[derive(Clone, Debug)]
+pub struct BeginApproval {
+    pub booking: String,
+    pub grantor: String,
+    pub subject: String,
+    pub binding_principal: String,
+    pub binding_version: u64,
+    pub behaviours: Vec<String>,
+    pub purpose: String,
+    pub requested_date: String,
+    pub from: String,
+    pub to: String,
+    pub attendees: u16,
+    pub wheelchair_accessible: bool,
+    pub max_fee_pence: u64,
+}
+
+/// A raised challenge: its id, and the preview to send the person verbatim.
+#[derive(Clone, Debug)]
+pub struct Raised {
+    pub challenge: String,
+    pub preview: String,
+}
+
+/// Why an approval call did not produce a reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalError {
+    /// The code was wrong; this many tries remain. The person may retry.
+    WrongCode { tries_left: u8 },
+    /// The challenge is gone — expired, replayed, or already settled.
+    Gone(String),
+    /// The transport itself failed. Not a denial — a call that never got an
+    /// answer, which must not read as "the person said no".
+    Transport(String),
+}
+
+/// A parked, approved, or booked booking, durable across a restart (ADR-026).
+///
+/// Its lifecycle, in three states:
+/// - `reference: None` — a challenge awaiting a human `YES`. A `YES` moves it on;
+///   a `NO`, expiry, or restart-then-`YES` resolves it.
+/// - `reference: Some`, `booked: false` — approved, its booking not yet walked to
+///   `Booked`. This is the resume runner's target: a crash here left a live grant
+///   with a booking owed.
+/// - `reference: Some`, `booked: true` — the booking is `Booked`, and the row is
+///   RETAINED as the live grant that permits cancelling it. The booking approval
+///   grants `Cancel` over the booking, so `CANCEL` reuses this reference rather
+///   than raising a second challenge. Cleared when the booking is cancelled.
+///
+/// The address is stored revealed plus its region so it can be reparsed after a
+/// restart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Continuation {
+    pub principal: PrincipalId,
+    pub challenge_id: String,
+    pub booking_id: BookingId,
+    pub request: Request,
+    pub address_revealed: String,
+    pub region: String,
+    pub reference: Option<String>,
+    /// Whether the booking has reached `Booked`. A resume target is
+    /// `reference: Some` AND `booked: false`; a `booked: true` row is kept only
+    /// so its grant can cancel the booking.
+    pub booked: bool,
+}
+
+/// Deposit an inbound reply's transport evidence, getting a one-use receipt.
+///
+/// The dispatcher calls this ONLY on a reply (`YES`/`NO`) — never on a fresh
+/// `BOOK`, which answers no challenge and whose deposit the authority would
+/// refuse. Every type here is orchestrator-local: this crate cannot name
+/// `townhall-authority`.
+#[async_trait]
+pub trait EvidenceDeposit: Send + Sync {
+    /// # Errors
+    /// The reply's number is awaiting no challenge, or the transport failed.
+    async fn deposit(&self, evidence: &InboundEvidence) -> Result<Deposited, ApprovalError>;
+}
+
+/// Raise a challenge, and answer one with a forwarded receipt.
+#[async_trait]
+pub trait ApprovalPort: Send + Sync {
+    /// # Errors
+    /// The transport failed. (A reused challenge is not an error — the server
+    /// returns the same id.)
+    async fn begin(&self, request: &BeginApproval) -> Result<Raised, ApprovalError>;
+
+    /// Answer `challenge` with `answer` (`"YES"`/`"NO"`), the person's `code`,
+    /// and the forwarded `receipt`. `Some(reference)` on approval, `None` on a
+    /// recorded decline.
+    ///
+    /// # Errors
+    /// Wrong code (with tries left), the challenge gone, or a transport failure.
+    async fn reply(
+        &self,
+        challenge: &str,
+        answer: &str,
+        code: &str,
+        receipt: &str,
+    ) -> Result<Option<String>, ApprovalError>;
+}
+
+/// Where parked and approved bookings wait durably — the approve-first analogue
+/// of [`townhall_channel::SuppressionStore`], and sync for the same reason (it
+/// is `std::fs`, persist-first).
+pub trait ContinuationStore: Send + Sync {
+    /// The continuation this principal's channel is currently in, if any (the
+    /// most recent, so a later `BOOK` supersedes an earlier one for the next
+    /// `YES`).
+    fn load(&self, principal: &PrincipalId) -> Option<Continuation>;
+
+    /// The continuation for a specific booking, if one is held — how `CANCEL`
+    /// finds the grant that permits cancelling a booking it named by reference.
+    fn load_for_booking(&self, booking: &BookingId) -> Option<Continuation>;
+
+    /// Upsert by booking id, persisting BEFORE the in-memory change — a crash
+    /// must never leave a live grant with no durable record of the booking owed.
+    ///
+    /// # Errors
+    /// The change could not be made durable.
+    fn record(&self, continuation: Continuation) -> Result<(), String>;
+
+    /// Forget a settled challenge's continuation, persist-first.
+    ///
+    /// # Errors
+    /// The change could not be made durable.
+    fn clear(&self, challenge_id: &str) -> Result<(), String>;
+
+    /// Every approved-but-unbooked continuation (`reference: Some`), for the
+    /// resume runner. A parked challenge (`reference: None`) is left in place so
+    /// a later `YES` still finds it.
+    fn take_resumable(&self) -> Vec<Continuation>;
 }
 
 /// The wire, as the dispatcher sees it — an abstraction over [`Gateway`] so

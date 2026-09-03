@@ -9,15 +9,15 @@
 use crate::ports::{BookingRequest, ProjectedContext, Proposed, Proposer, Request};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use townhall_channel::InboundMessage;
+use townhall_channel::Utterance;
 
 /// The strict grammar:
 ///
 /// - `BOOK date=YYYY-MM-DD from=HH:MM to=HH:MM people=N accessible=yes|no
 ///   max=PENCE` — all six keys, any order, nothing else.
-/// - `CONFIRM` — finish the most recent booking. Deliberately a bare word M7
-///   will replace with its challenge flow; the doc on [`Request::Confirm`] says
-///   so, so nobody mistakes the stand-in for the design.
+/// - `YES <code>` / `NO <code>` — approve or decline a pending challenge. The
+///   grammar only CLASSIFIES; the code after the word is the deterministic
+///   dispatcher's to read, so this seat never carries it (ADR-026).
 /// - `cancel it` — case-insensitive, exactly — the cancel-intent phrase whose
 ///   referent is resolved authoritatively downstream.
 ///
@@ -30,14 +30,22 @@ pub struct ScriptedProposer;
 
 #[async_trait]
 impl Proposer for ScriptedProposer {
-    async fn propose(&self, _context: &ProjectedContext, message: &InboundMessage) -> Proposed {
-        let text = message.body.revealed().trim();
+    async fn propose(&self, _context: &ProjectedContext, utterance: &Utterance) -> Proposed {
+        let text = utterance.body.revealed().trim();
 
-        if text.eq_ignore_ascii_case("confirm") {
-            return Proposed::Typed(Request::Confirm);
-        }
         if text.eq_ignore_ascii_case("cancel it") {
             return Proposed::Typed(Request::CancelIntent);
+        }
+        // A reply to a challenge: the first word decides YES or NO. The code that
+        // may follow it is not this seat's business.
+        match text.split_whitespace().next() {
+            Some(word) if word.eq_ignore_ascii_case("yes") => {
+                return Proposed::Typed(Request::Approve);
+            }
+            Some(word) if word.eq_ignore_ascii_case("no") => {
+                return Proposed::Typed(Request::Decline);
+            }
+            _ => {}
         }
 
         let mut words = text.split_whitespace();

@@ -97,6 +97,13 @@ impl TransportEvidence {
     pub fn verified(&self) -> bool {
         self.verified
     }
+
+    /// The provider's opaque signature, where it offers one, for depositing to
+    /// the authority store — never for logging (the `Debug` above hides it).
+    #[must_use]
+    pub fn signature(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
 }
 
 /// `TransportEvidence { provider: "sim", verified: true }` — never the raw
@@ -153,6 +160,45 @@ pub struct InboundMessage {
     pub received_at_ms: i64,
     pub body: InboundBody,
     pub transport_evidence: TransportEvidence,
+}
+
+/// The reduced view the untrusted proposer receives: everything an inbound
+/// message is, MINUS the transport evidence.
+///
+/// # Why the model seat sees this and not `InboundMessage`
+///
+/// ADR-026: the probabilistic proposer must have exactly one job — turn an
+/// utterance into a typed `Request` — and no way to touch the evidence a person's
+/// approval rests on. `InboundMessage` carries `transport_evidence`; handing that
+/// to the proposer would let the one seat BLD cannot trust read the very thing
+/// the receipt seam exists to keep it away from. So the dispatcher borrows this
+/// projection for the proposer and keeps the full message for the deposit path.
+///
+/// Every field self-redacts in `Debug` (the body prints its length, the address
+/// masks), so there is no un-redaction trap here — and there is deliberately no
+/// raw `String` field, which is what reopened one on `RawInbound`.
+#[derive(Clone, Debug)]
+pub struct Utterance {
+    pub identity: InboundIdentity,
+    pub channel: ChannelKind,
+    pub address: ChannelAddress,
+    pub received_at_ms: i64,
+    pub body: InboundBody,
+}
+
+impl InboundMessage {
+    /// Borrow the reduced, evidence-free view for the proposer, keeping the full
+    /// message (and its evidence) for the deposit path that follows.
+    #[must_use]
+    pub fn utterance(&self) -> Utterance {
+        Utterance {
+            identity: self.identity.clone(),
+            channel: self.channel,
+            address: self.address.clone(),
+            received_at_ms: self.received_at_ms,
+            body: self.body.clone(),
+        }
+    }
 }
 
 /// Why an outbound message exists — which decides whether STOP silences it.

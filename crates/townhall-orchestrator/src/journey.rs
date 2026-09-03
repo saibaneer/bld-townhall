@@ -45,6 +45,14 @@ enum Step {
     Followups,
 }
 
+/// The approval code out of a preview reply — the digits after `Reply YES `,
+/// mirroring the server's own `code_from`. `None` for any other reply.
+fn code_from_preview(text: &str) -> Option<String> {
+    let after = text.split("Reply YES ").nth(1)?;
+    let code: String = after.chars().take_while(char::is_ascii_digit).collect();
+    (!code.is_empty()).then_some(code)
+}
+
 /// A parsed script.
 #[derive(Debug)]
 pub struct Script {
@@ -111,10 +119,19 @@ pub async fn run(
     let mut consumed = channel.outbox().len();
     let mut turn = 0_usize;
     let mut sender: Option<ChannelAddress> = None;
+    // The approval code is a random PIN the server puts in the preview, so a
+    // script cannot hardcode it. It is captured from the preview reply and
+    // substituted into a later `YES {code}` inbound — which exercises the real
+    // random-code path rather than a fixture that pretends the code is known.
+    let mut captured_code: Option<String> = None;
 
     for step in &script.steps {
         match step {
             Step::Inbound { from, body } => {
+                let body = match &captured_code {
+                    Some(code) => body.replace("{code}", code),
+                    None => body.clone(),
+                };
                 // Every previous turn's replies must have been consumed before
                 // the next inbound — an unconsumed message is an EXTRA reply,
                 // and letting it slide would let the shape drift.
@@ -178,6 +195,11 @@ pub async fn run(
                             sent.to
                         ));
                     }
+                }
+                // Capture the code out of the preview so a later `YES {code}` can
+                // send it back.
+                if let Some(code) = code_from_preview(&sent.text) {
+                    captured_code = Some(code);
                 }
                 consumed += 1;
             }

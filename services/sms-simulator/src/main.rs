@@ -7,17 +7,30 @@
 //! sms-simulator --server http://127.0.0.1:PORT --script scripts/lucy-journey.txt
 //! ```
 //!
-//! The dev bindings here mirror the server's dev-authority allowlist: this
-//! binary is a composition root for a DEMO, and it composes the same parts the
-//! tests exercise — which is the point of it.
+//! # M7C: the real authority lane
+//!
+//! Approve-first books nothing until a person answers a challenge, and the
+//! delegation their `YES` produces is what authorizes the booking. So this
+//! composes against the REAL resolver, not the dev lane: one fixed workload
+//! credential (`agent-townhall`) authenticates the caller and authorizes
+//! nothing, and every change presents a reference an approval issued. The
+//! approval and evidence ports reach the server over HTTP, exactly as the
+//! booking gateway does — the dispatcher names only the traits.
 
+use async_trait::async_trait;
 use std::process::ExitCode;
 use std::sync::Arc;
 use townhall_channel::{ChannelAddress, ChannelConfig, Region, SmsSimulator, SuppressionStore};
 use townhall_orchestrator::{
-    CredentialSource, Dispatcher, FileSuppression, GatewayFactory, NoLedgerYet, PrincipalDirectory,
-    ScriptedProposer, journey,
+    ApprovalError, ApprovalPort, BeginApproval, ContinuationStore, CredentialSource, Deposited,
+    Dispatcher, EvidenceDeposit, FileContinuation, FileSuppression, GatewayFactory,
+    InboundEvidence, NoLedgerYet, PrincipalDirectory, Raised, ScriptedProposer, journey,
 };
+
+/// The one workload credential the real resolver knows — a WORKLOAD, not a
+/// person. It authenticates the caller and authorizes nothing; authority rides
+/// the delegation reference an approval issues, never the token.
+const WORKLOAD: &str = "agent-townhall";
 
 struct DevDirectory;
 
@@ -31,26 +44,176 @@ impl PrincipalDirectory for DevDirectory {
     }
 }
 
-struct DevCredentials;
+/// The credential swap (ADR-025/026): every recognized principal presents the
+/// SAME fixed workload credential. It cannot widen authority even in principle —
+/// a change is refused unless a delegation reference an approval produced rides
+/// with it.
+struct WorkloadCredential;
 
-impl CredentialSource for DevCredentials {
+impl CredentialSource for WorkloadCredential {
     fn token_for(&self, principal: &bld_types::PrincipalId) -> Option<String> {
-        match principal.as_str() {
-            "lucy" => Some("dev-lucy".to_owned()),
-            "priya" => Some("dev-priya-nobook".to_owned()),
-            _ => None,
+        matches!(principal.as_str(), "lucy" | "priya").then(|| WORKLOAD.to_owned())
+    }
+}
+
+/// Reaches the server's approval endpoints over HTTP, holding the workload
+/// credential — the same way the booking gateway reaches `/booking-intents`.
+/// Owns its request bodies (this crate cannot name `townhall-http`).
+struct HttpApprovals {
+    base: String,
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl ApprovalPort for HttpApprovals {
+    async fn begin(&self, request: &BeginApproval) -> Result<Raised, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/approvals", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "booking": request.booking,
+                "grantor": request.grantor,
+                "subject": request.subject,
+                "binding_principal": request.binding_principal,
+                "binding_version": request.binding_version,
+                "behaviours": request.behaviours,
+                "purpose": request.purpose,
+                "requested_date": request.requested_date,
+                "from": request.from,
+                "to": request.to,
+                "attendees": request.attendees,
+                "wheelchair_accessible": request.wheelchair_accessible,
+                "max_fee_pence": request.max_fee_pence,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        // 201 created, 200 reused — both carry the challenge and preview.
+        if response.status().is_success() {
+            let body = json(response).await?;
+            Ok(Raised {
+                challenge: field(&body, "challenge"),
+                preview: field(&body, "preview"),
+            })
+        } else {
+            Err(ApprovalError::Transport(format!(
+                "approvals begin: {}",
+                response.status()
+            )))
         }
     }
+
+    async fn reply(
+        &self,
+        challenge: &str,
+        answer: &str,
+        code: &str,
+        receipt: &str,
+    ) -> Result<Option<String>, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/approvals/{challenge}/reply", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({ "answer": answer, "code": code, "receipt": receipt }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            201 => Ok(Some(field(&json(response).await?, "delegation"))),
+            200 => Ok(None), // a recorded decline (NO).
+            403 => {
+                // Wrong code, or out of attempts — both 403. The tries-left count
+                // rides in the server's message; parse it, defaulting to 0
+                // (exhausted) when there is none.
+                let text = response.text().await.unwrap_or_default();
+                Err(ApprovalError::WrongCode {
+                    tries_left: first_number(&text),
+                })
+            }
+            404 | 410 => Err(ApprovalError::Gone(
+                response.text().await.unwrap_or_default(),
+            )),
+            other => Err(ApprovalError::Transport(format!("reply: {other}"))),
+        }
+    }
+}
+
+/// Deposits an inbound reply's evidence at the ingress endpoint, holding the
+/// workload credential, and returns the challenge + receipt.
+struct HttpEvidence {
+    base: String,
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl EvidenceDeposit for HttpEvidence {
+    async fn deposit(&self, evidence: &InboundEvidence) -> Result<Deposited, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/inbound-evidence", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "provider": evidence.provider,
+                "account": evidence.account,
+                "message_id": evidence.message_id,
+                "address": evidence.address,
+                "verified": evidence.verified,
+                "signature": evidence.signature,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            code if (200..300).contains(&code) => {
+                let body = json(response).await?;
+                Ok(Deposited {
+                    challenge: field(&body, "challenge"),
+                    receipt: field(&body, "receipt"),
+                })
+            }
+            // The number is awaiting no challenge — a reply to nothing.
+            404 | 410 => Err(ApprovalError::Gone(
+                response.text().await.unwrap_or_default(),
+            )),
+            other => Err(ApprovalError::Transport(format!("deposit: {other}"))),
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn transport(error: reqwest::Error) -> ApprovalError {
+    ApprovalError::Transport(error.to_string())
+}
+
+async fn json(response: reqwest::Response) -> Result<serde_json::Value, ApprovalError> {
+    response.json().await.map_err(transport)
+}
+
+fn field(body: &serde_json::Value, key: &str) -> String {
+    body[key].as_str().unwrap_or_default().to_owned()
+}
+
+/// The first run of ASCII digits in `text`, as a `u8` — how many tries remain,
+/// read out of the server's denial message. `0` when there is none.
+fn first_number(text: &str) -> u8 {
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap_or(0)
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (mut server, mut script_path) = (None, None);
-    // The stop list defaults beside the process, not in the SHARED temp dir —
+    // The durable files default BESIDE the process, not in the SHARED temp dir —
     // the review's point: a predictable path under /tmp is world-guessable and
     // holds phone numbers.
     let mut stop_file = "sms-simulator-stop.list".to_owned();
+    let mut continuation_file = "sms-simulator-continuation.jsonl".to_owned();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--server" => server = args.next(),
@@ -58,6 +221,11 @@ async fn main() -> ExitCode {
             "--stop-file" => {
                 if let Some(path) = args.next() {
                     stop_file = path;
+                }
+            }
+            "--continuation-file" => {
+                if let Some(path) = args.next() {
+                    continuation_file = path;
                 }
             }
             other => {
@@ -94,27 +262,47 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+    let continuations: Arc<dyn ContinuationStore> =
+        match FileContinuation::open(std::path::PathBuf::from(continuation_file)) {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                eprintln!("sms-simulator: continuation store: {error}");
+                return ExitCode::from(2);
+            }
+        };
     let channel = Arc::new(SmsSimulator::new(
         ChannelConfig::default(),
         Arc::clone(&suppression),
     ));
+    let http = reqwest::Client::new();
     let dispatcher = Dispatcher::new(
         Arc::clone(&channel),
         Arc::new(DevDirectory),
-        Arc::new(DevCredentials),
+        Arc::new(WorkloadCredential),
         Arc::new(NoLedgerYet),
         Arc::new(ScriptedProposer),
         suppression,
-        Arc::new(GatewayFactory { base: server }),
+        Arc::new(GatewayFactory {
+            base: server.clone(),
+        }),
+        Arc::new(HttpApprovals {
+            base: server.clone(),
+            http: http.clone(),
+        }),
+        Arc::new(HttpEvidence { base: server, http }),
+        continuations,
     );
+
+    // Complete anything a prior crashed run left approved-but-unbooked, before
+    // the journey — a booking owed is a booking made (ADR-026, W7).
+    dispatcher.resume().await;
 
     match journey::run(&dispatcher, &channel, &script, Region::Gb).await {
         Ok(()) => {
-            // The transcript IS the demo — a demo of an SMS conversation
-            // that hid the SMS would demonstrate nothing. The address is
-            // masked by its own Debug; the text is fixture conversation from
-            // the script, never live user data, and that boundary is what this
-            // print relies on.
+            // The transcript IS the demo — a demo of an SMS conversation that hid
+            // the SMS would demonstrate nothing. The address is masked by its own
+            // Debug; the text is fixture conversation from the script, never live
+            // user data, and that boundary is what this print relies on.
             for sent in channel.outbox() {
                 println!("BLD -> {:?}: {}", sent.to, sent.text);
             }

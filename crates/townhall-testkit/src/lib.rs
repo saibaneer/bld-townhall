@@ -88,11 +88,25 @@ fn spawn_ready(mut command: Command) -> (Child, u16) {
     use std::io::Read as _;
     use std::sync::mpsc;
 
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the binary spawns");
+    // Retry a TRANSIENT spawn failure. A full-workspace run spawns many servers
+    // at once, and the OS can refuse a fork with EAGAIN ("resource temporarily
+    // unavailable") when it does — a load symptom, not a broken binary, so a
+    // short backoff clears it. A genuinely missing binary fails every attempt.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                    let _ = error;
+                }
+                Err(error) => panic!("the binary spawns: {error}"),
+            }
+        }
+    };
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
@@ -154,6 +168,12 @@ fn target_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug")
 }
 
+/// The one workload credential the REAL resolver knows (main.rs:513) — a
+/// workload, not a person. Authenticates the caller and authorizes nothing.
+pub const WORKLOAD: &str = "agent-townhall";
+/// The number Lucy's channel binds to in a real-authority world.
+pub const LUCY_ADDR: &str = "+447700900123";
+
 pub fn world() -> World {
     world_with(&[])
 }
@@ -161,6 +181,21 @@ pub fn world() -> World {
 /// A world whose server takes extra flags — the deterministic-429 seam
 /// (`--reclassify-attempts`) is the caller that needs this.
 pub fn world_with(extra: &[&str]) -> World {
+    spawn_world(true, extra)
+}
+
+/// A world on the REAL authority resolver (no dev lane), with Lucy's channel
+/// bound — for the M7C approve-first journey, where a booking needs a delegation
+/// a person's `YES` issued, and the fixed workload token authorizes nothing.
+///
+/// The binding is written straight into the server's store the same way
+/// `authority_lane.rs` binds it, but through the `sqlite3` CLI this crate already
+/// shells out to — after the server has run its migrations, so the table exists.
+pub fn world_real() -> World {
+    spawn_world(false, &[])
+}
+
+fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
     build_binaries();
     let dir = tempfile::tempdir().expect("tempdir");
     let council_db = dir.path().join("council.sqlite");
@@ -173,10 +208,11 @@ pub fn world_with(extra: &[&str]) -> World {
     let (council, council_port) = spawn_ready(command);
     let council_url = format!("http://127.0.0.1:{council_port}");
 
+    let townhall_db = dir.path().join("townhall.sqlite");
     let mut command = Command::new(target_dir().join("townhall-server"));
     command
         .arg("--db")
-        .arg(dir.path().join("townhall.sqlite"))
+        .arg(&townhall_db)
         .arg("--denials-db")
         .arg(dir.path().join("denials.sqlite"))
         .args([
@@ -193,14 +229,20 @@ pub fn world_with(extra: &[&str]) -> World {
             // accident.
             "--authority-key",
             AUTHORITY_KEY_HEX,
-            "--dev-authority",
             "--retry-cadence-ms",
             "200",
             "--reconcile-interval-ms",
             "100",
-        ])
-        .args(extra);
+        ]);
+    if dev_authority {
+        command.arg("--dev-authority");
+    }
+    command.args(extra);
     let (server, server_port) = spawn_ready(command);
+
+    if !dev_authority {
+        bind_channels(&townhall_db);
+    }
 
     World {
         dir,
@@ -210,6 +252,40 @@ pub fn world_with(extra: &[&str]) -> World {
         server: Some(server),
         server_url: format!("http://127.0.0.1:{server_port}"),
     }
+}
+
+/// Bind Lucy's and Priya's channels in a real-authority world's store, so a
+/// challenge raised against either number can be answered. `sms-reply` is
+/// `AssuranceLevel::SmsReply.name()`, and the row shape is migration 0006's.
+///
+/// Both rows go in ONE `sqlite3` invocation — the CLI this crate already shells
+/// out to — after the server has run its migrations (so the table exists) and in
+/// a single process, because a full-workspace run already spawns many.
+fn bind_channels(townhall_db: &std::path::Path) {
+    let row = |id: &str, address: &str, principal: &str| {
+        format!(
+            "INSERT INTO channel_bindings \
+             (id, address, principal, version, status, assurance, evidence, \
+              verified_at_ms, created_at_ms, updated_at_ms) \
+             VALUES ('{id}', '{address}', '{principal}', 1, 'active', 'sms-reply', \
+              NULL, 1700000000000, 1700000000000, 1700000000000);"
+        )
+    };
+    let sql = format!(
+        "{}{}",
+        row("binding-lucy", "+447700900123", "lucy"),
+        row("binding-priya", "+447700900456", "priya"),
+    );
+    let output = Command::new("sqlite3")
+        .arg(townhall_db)
+        .arg(&sql)
+        .output()
+        .expect("sqlite3 runs");
+    assert!(
+        output.status.success(),
+        "binding channels failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A count from the council's own database.

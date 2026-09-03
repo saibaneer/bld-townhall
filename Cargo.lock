@@ -1610,7 +1610,10 @@ dependencies = [
 name = "sms-simulator"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bld-types",
+ "reqwest",
+ "serde_json",
  "tokio",
  "townhall-channel",
  "townhall-orchestrator",
@@ -2129,6 +2132,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bld-types",
+ "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

@@ -10,7 +10,10 @@ rust-version.workspace = true
 # acceptance test calls the SAME runner function this binary calls, so the demo
 # and the test cannot drift (PLAN-M6B §4).
 [dependencies]
+async-trait = { workspace = true }
 bld-types = { path = "../../crates/bld-types" }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 townhall-channel = { path = "../../crates/townhall-channel" }
 townhall-orchestrator = { path = "../../crates/townhall-orchestrator" }

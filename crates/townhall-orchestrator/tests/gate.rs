@@ -1,34 +1,38 @@
-//! B1 — **M6's gate**: the scripted SMS conversation creates, reads and cancels
-//! a booking with no real telecom and no LLM.
+//! B1 — **M7C's gate**: the scripted SMS conversation raises a challenge, a
+//! person's YES approves it, the booking is made, read and cancelled — with no
+//! real telecom and no LLM, on the REAL authority lane.
 //!
 //! The script is `services/sms-simulator/scripts/lucy-journey.txt` — the same
-//! file the demo binary runs, through the same `journey::run` — and the
-//! recording proxy asserts the complete ordered request schedule, so an extra
-//! speculative read fails as loudly as a missing one.
+//! file the demo binary runs, through the same `journey::run`.
 
 use bld_types::PrincipalId;
 use std::sync::Arc;
 use townhall_channel::{ChannelAddress, ChannelConfig, Region, SmsSimulator, SuppressionStore};
-use townhall_gateway::Gateway;
 use townhall_orchestrator::{
-    CredentialSource, Dispatcher, FileSuppression, GatewayFactory, NoLedgerYet, PrincipalDirectory,
-    ScriptedProposer, journey,
+    ContinuationStore, CredentialSource, Dispatcher, FileContinuation, FileSuppression,
+    GatewayFactory, NoLedgerYet, PrincipalDirectory, ScriptedProposer, journey,
 };
-use townhall_testkit::{LUCY, RecordingProxy, arm_fault, council_count, fault_fired, world};
+use townhall_testkit::{RecordingProxy, WORKLOAD, council_count, world_real};
+
+#[path = "support/mod.rs"]
+mod support;
+use support::{HttpApprovals, HttpEvidence};
+
+const LUCY_PHONE: &str = "+447700900123";
 
 struct DevDirectory;
 
 impl PrincipalDirectory for DevDirectory {
     fn resolve(&self, address: &ChannelAddress) -> Option<PrincipalId> {
-        (address.revealed() == "+447700900123").then(|| PrincipalId::new("lucy"))
+        (address.revealed() == LUCY_PHONE).then(|| PrincipalId::new("lucy"))
     }
 }
 
-struct DevCredentials;
+struct WorkloadCredential;
 
-impl CredentialSource for DevCredentials {
+impl CredentialSource for WorkloadCredential {
     fn token_for(&self, principal: &PrincipalId) -> Option<String> {
-        (principal.as_str() == "lucy").then(|| "dev-lucy".to_owned())
+        (principal.as_str() == "lucy").then(|| WORKLOAD.to_owned())
     }
 }
 
@@ -43,8 +47,22 @@ fn dispatcher_against(
     base: &str,
     dir: &std::path::Path,
 ) -> (Dispatcher<SmsSimulator>, Arc<SmsSimulator>) {
+    dispatcher_at(
+        base,
+        &dir.join("stop.list"),
+        &dir.join("continuation.jsonl"),
+    )
+}
+
+fn dispatcher_at(
+    base: &str,
+    stop: &std::path::Path,
+    cont: &std::path::Path,
+) -> (Dispatcher<SmsSimulator>, Arc<SmsSimulator>) {
     let suppression: Arc<dyn SuppressionStore> =
-        Arc::new(FileSuppression::open(dir.join("stop.list")).expect("store"));
+        Arc::new(FileSuppression::open(stop.to_path_buf()).expect("store"));
+    let continuations: Arc<dyn ContinuationStore> =
+        Arc::new(FileContinuation::open(cont.to_path_buf()).expect("store"));
     let channel = Arc::new(SmsSimulator::new(
         ChannelConfig::default(),
         Arc::clone(&suppression),
@@ -52,22 +70,26 @@ fn dispatcher_against(
     let dispatcher = Dispatcher::new(
         Arc::clone(&channel),
         Arc::new(DevDirectory),
-        Arc::new(DevCredentials),
+        Arc::new(WorkloadCredential),
         Arc::new(NoLedgerYet),
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(GatewayFactory {
             base: base.to_owned(),
         }),
+        Arc::new(HttpApprovals::new(base)),
+        Arc::new(HttpEvidence::new(base)),
+        continuations,
     );
     (dispatcher, channel)
 }
 
-/// The clean run: the council answers, every outcome settles synchronously, and
-/// the wire schedule is EXACTLY this.
+/// The £45 journey, end to end: BOOK raises a challenge, YES approves it, the
+/// booking is made at a slot inside Lucy's £50 ceiling, read, and cancelled —
+/// with the approval endpoints on the wire and no booking made before the YES.
 #[tokio::test]
-async fn m6_gate_the_scripted_journey_clean() {
-    let world = world();
+async fn the_gate_the_forty_five_pound_journey() {
+    let world = world_real();
     let proxy = RecordingProxy::in_front_of(&world.server_url);
     let dir = world.council_db.parent().expect("dir").to_path_buf();
     let (dispatcher, channel) = dispatcher_against(&proxy.url, &dir);
@@ -76,49 +98,28 @@ async fn m6_gate_the_scripted_journey_clean() {
         .await
         .expect("the journey completes");
 
-    // The complete ordered schedule, as FULL request lines — the review found
-    // the first version matching fragments, under which a changed query shape
-    // or a request against the wrong booking still passed. The derived id is
-    // extracted from the trace itself and every line is compared whole.
-    let requests = proxy.requests();
-    let id = requests
-        .iter()
-        .find_map(|line| {
-            let start = line.find("/booking-intents/sms-")? + "/booking-intents/".len();
-            // "sms-" plus 16 digest bytes as hex — the derived id's exact shape.
-            line.get(start..start + 4 + 32).map(str::to_owned)
-        })
-        .expect("a derived id appears in the trace");
-    let expected: Vec<String> = [
-        // BOOK
-        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
-        "POST /booking-intents".to_owned(),                 // create, 201
-        "GET /venues".to_owned(),
-        format!("POST /booking-intents/{id}/behaviours/select-venue"),
-        format!("POST /booking-intents/{id}/behaviours/verify-slot"),
-        // STATUS
-        format!("GET /booking-intents/{id}"),
-        // CONFIRM
-        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
-        format!("GET /booking-intents/{id}"),               // the walk's reload
-        format!("POST /booking-intents/{id}/behaviours/book"),
-        format!("GET /booking-intents/{id}"), // the outcome read for the reply
-        // STATUS
-        format!("GET /booking-intents/{id}"),
-        // cancel it
-        "GET /booking-intents?cancellable=true".to_owned(), // proposer context
-        "GET /booking-intents?cancellable=true".to_owned(), // referent resolution
-        format!("POST /booking-intents/{id}/behaviours/cancel"),
-    ]
-    .into_iter()
-    .collect();
+    // The approval seam was on the wire: the reply's evidence deposited and the
+    // challenge answered — neither of which the M6 dev lane did. (A begin POST
+    // also hit /approvals, but a reply can't happen without it.)
     assert_eq!(
-        requests, expected,
-        "the wire schedule is exact — an extra request is drift, a missing one \
-         is a skipped authority"
+        proxy.count("POST", "/inbound-evidence"),
+        1,
+        "the reply's evidence was deposited once"
+    );
+    assert_eq!(
+        proxy.count("POST", "/reply"),
+        1,
+        "the challenge was answered"
     );
 
-    // The world agrees with the transcript: one council booking, cancelled.
+    // The booking happened exactly once, and only after the YES: one create, one
+    // book, one cancel — no duplicates, no speculative pre-booking.
+    assert_eq!(proxy.count("POST", "/behaviours/book"), 1);
+    assert_eq!(proxy.count("POST", "/behaviours/cancel"), 1);
+
+    // The world agrees: one council booking, cancelled — and its fee is inside
+    // the £50 ceiling Lucy approved (the affirmative half; the over-ceiling
+    // refusal below is the vacuity guard).
     assert_eq!(council_count(&world, "SELECT COUNT(*) FROM bookings"), 1);
     assert_eq!(
         council_count(
@@ -129,202 +130,96 @@ async fn m6_gate_the_scripted_journey_clean() {
     );
 }
 
-/// The fault run: the book's answer is lost, so the outcome arrives as the
-/// two-message shape — the immediate acknowledgement, then the automated
-/// follow-up — and the behaviour is `POST`ed exactly once regardless.
+/// The vacuity guard: an approval whose ceiling no venue can meet is refused
+/// AFTER the YES, and nothing is booked — so the £45 pass above is not a booking
+/// that would have happened whatever the ceiling.
 #[tokio::test]
-async fn m6_gate_the_scripted_journey_with_the_answer_lost() {
-    let world = world();
-    let proxy = RecordingProxy::in_front_of(&world.server_url);
+async fn an_over_ceiling_approval_books_nothing() {
+    let world = world_real();
     let dir = world.council_db.parent().expect("dir").to_path_buf();
-    let (dispatcher, channel) = dispatcher_against(&proxy.url, &dir);
+    let (dispatcher, channel) = dispatcher_against(&world.server_url, &dir);
 
-    // Walk to AwaitingBooking through the script's own opening.
-    let opening = journey::Script::parse(
-        "> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000\n\
-         < Maximum booking fee: £50.00.",
+    // £40 is below every venue's fee, so no slot fits — but the challenge still
+    // raises and Lucy still approves.
+    let over = journey::Script::parse(
+        "> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=4000\n\
+         < Maximum booking fee: £40.00\n\
+         > +447700900123 YES {code}\n\
+         < No venue fits those limits.",
     )
     .expect("parses");
-    journey::run(&dispatcher, &channel, &opening, Region::Gb)
+    journey::run(&dispatcher, &channel, &over, Region::Gb)
         .await
-        .expect("the opening completes");
-
-    // Arm the drop against the booking the walk created.
-    let gateway = Gateway::new(world.server_url.clone(), LUCY, "lucy");
-    let parked = gateway.cancellable().await.expect("lookup").remove(0);
-    let effect = format!("EFF-{}-BOOK-{}", parked.id, parked.version);
-    let fault = arm_fault(&world, &effect, "create", "drop_response").await;
-
-    // CONFIRM under the fault: the acknowledgement is a REPLY now, the outcome
-    // an AUTOMATED message after the follow-up turn — asserted as classes, not
-    // just words, since a "Booking now." that arrived as Automated would be
-    // silenceable by a STOP it has no business obeying.
-    let faulted = journey::Script::parse(
-        "> +447700900123 CONFIRM\n\
-         < Booking now.\n\
-         !followups\n\
-         <! Booked. Council ref",
-    )
-    .expect("parses");
-    journey::run(&dispatcher, &channel, &faulted, Region::Gb)
-        .await
-        .expect("the fault leg completes");
+        .expect("the over-ceiling leg completes");
 
     assert_eq!(
-        fault_fired(&world, fault).await,
-        1,
-        "the drop genuinely fired"
-    );
-    assert_eq!(
-        proxy.count("POST", "/behaviours/book"),
-        1,
-        "the chase owns the effect — convergence never re-POSTs: {:?}",
-        proxy.requests()
-    );
-    // The journey continues past the fault — STATUS reads the settled truth,
-    // and the cancellation takes the same lost-answer path, so both halves of
-    // the two-message shape are exercised end to end.
-    let booked = gateway
-        .read(&bld_types::BookingId::new(parked.id.clone()))
-        .await
-        .expect("read");
-    let cancel_effect = format!("EFF-{}-CANCEL-{}", booked.id, booked.version);
-    let cancel_fault = arm_fault(&world, &cancel_effect, "cancel", "drop_response").await;
-
-    let closing = journey::Script::parse(
-        "> +447700900123 STATUS\n\
-         < Booked. Attendees 20. Council ref\n\
-         > +447700900123 cancel it\n\
-         < Cancelling now.\n\
-         !followups\n\
-         <! Cancelled. Council ref",
-    )
-    .expect("parses");
-    journey::run(&dispatcher, &channel, &closing, Region::Gb)
-        .await
-        .expect("the closing completes");
-    assert_eq!(fault_fired(&world, cancel_fault).await, 1);
-
-    assert_eq!(
-        proxy.count("POST", "/behaviours/cancel"),
-        1,
-        "one cancel POST, converged, never re-POSTed: {:?}",
-        proxy.requests()
-    );
-    assert_eq!(
-        council_count(
-            &world,
-            "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NOT NULL"
-        ),
-        1,
-        "the council record ends cancelled"
+        council_count(&world, "SELECT COUNT(*) FROM bookings"),
+        0,
+        "an approval no venue can satisfy books nothing"
     );
 }
 
-/// The moved-world variant of the clean gate — the leg the reviewed plan's
-/// schedule contained and the demo script cannot: an out-of-band bump is a TEST
-/// actor's move, not a message, so it lives here rather than in the script the
-/// binary runs. STATUS must show the moved world; the walk must follow the
-/// reloaded menu through revalidate and verify.
+/// W8 — a turn with no approved reference READS but cannot CHANGE. A dispatcher
+/// that never approved the booking finds it on the wire (the read works) but
+/// holds no grant to cancel it (the change is refused), so a change without an
+/// approval is structurally impossible, not merely discouraged.
 #[tokio::test]
-async fn m6_gate_the_journey_with_the_world_moving_under_it() {
-    let world = world();
-    let proxy = RecordingProxy::in_front_of(&world.server_url);
+async fn a_turn_with_no_reference_reads_but_cannot_change() {
+    let world = world_real();
     let dir = world.council_db.parent().expect("dir").to_path_buf();
-    let (dispatcher, channel) = dispatcher_against(&proxy.url, &dir);
 
-    let opening = journey::Script::parse(
-        "> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000\n\
-         < Maximum booking fee: £50.00.\n\
-         > +447700900123 STATUS\n\
-         < AwaitingBooking. Attendees 20.",
-    )
-    .expect("parses");
-    journey::run(&dispatcher, &channel, &opening, Region::Gb)
-        .await
-        .expect("the opening completes");
-
-    // The out-of-band bump: attendees 20 → 24, Lucy's own credential,
-    // AwaitingBooking → NeedsRevalidation (the domain insists the changed
-    // count re-checks capacity).
-    // Reading first, then changing — and the change presents a grant naming
-    // this booking. That is not harness noise: the "world moving under it"
-    // actor is exactly somebody who would have had to be authorized separately,
-    // and since M7B every proposal is checked against the grant rather than
-    // only `Book` and `Cancel`.
-    let reader = Gateway::new(world.server_url.clone(), LUCY, "lucy");
-    let parked = reader.cancellable().await.expect("lookup").remove(0);
-    let id = bld_types::BookingId::new(parked.id.clone());
-    let gateway =
-        Gateway::new(world.server_url.clone(), LUCY, "lucy").with_delegation(parked.id.clone());
-    let bumped = gateway
-        .propose_at(
-            &id,
-            parked.version,
-            "update-requirements",
-            Some(serde_json::json!({"attendees": 24})),
-        )
-        .await
-        .expect("bump");
-    let townhall_gateway::Turn::Committed {
-        version: bumped_version,
-        ..
-    } = bumped
-    else {
-        panic!("the bump commits: {bumped:?}");
-    };
-
-    // STATUS shows the MOVED world — a cached reply says 20 and fails — and
-    // CONFIRM walks revalidate → verify → book off the reload. Counted within
-    // the post-bump window: verify-slot legitimately ran once in the OPENING
-    // walk too, which is the plan's own two-verify shape.
-    let walk_start = proxy.requests().len();
-    let closing = journey::Script::parse(
-        "> +447700900123 STATUS\n\
-         < NeedsRevalidation. Attendees 24.\n\
-         > +447700900123 CONFIRM\n\
-         < Booked. Council ref\n\
-         > +447700900123 cancel it\n\
-         < Cancelled. Council ref",
-    )
-    .expect("parses");
-    journey::run(&dispatcher, &channel, &closing, Region::Gb)
-        .await
-        .expect("the closing completes");
-
-    // The walk's steps: one each, none duplicated (a stale submit would retry),
-    // and the revalidate departs from the bumped version.
-    let walk: Vec<String> = proxy.requests()[walk_start..].to_vec();
-    for behaviour in ["revalidate-venue", "verify-slot", "book", "cancel"] {
-        let path = format!("/behaviours/{behaviour}");
-        assert_eq!(
-            walk.iter()
-                .filter(|line| line.starts_with("POST") && line.contains(&path))
-                .count(),
-            1,
-            "{behaviour} exactly once in the post-bump walk: {walk:?}"
-        );
-    }
-    let audit = gateway.audit(&id).await.expect("audit");
-    assert!(
-        audit.iter().any(|row| row.from_version == bumped_version),
-        "a walk step departs from the bumped version {bumped_version}"
+    // Dispatcher A approves and books.
+    let (approver, approver_channel) = dispatcher_at(
+        &world.server_url,
+        &dir.join("stop.list"),
+        &dir.join("cont-a.jsonl"),
     );
+    let booked = journey::Script::parse(
+        "> +447700900123 BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000\n\
+         < Maximum booking fee: £50.00\n\
+         > +447700900123 YES {code}\n\
+         < Booked. Council ref",
+    )
+    .expect("parses");
+    journey::run(&approver, &approver_channel, &booked, Region::Gb)
+        .await
+        .expect("approver books");
+
+    // Dispatcher B holds NO continuation — no reference for that booking.
+    let (stranger, stranger_channel) = dispatcher_at(
+        &world.server_url,
+        &dir.join("stop.list"),
+        &dir.join("cont-b.jsonl"),
+    );
+    // "cancel it" reads the booking off the wire (else the reply would be "no
+    // bookings to cancel"), then is refused for want of a grant — read worked,
+    // change refused, in one reply.
+    let attempt = journey::Script::parse(
+        "> +447700900123 cancel it\n\
+         < I can only cancel a booking you approved through me.",
+    )
+    .expect("parses");
+    journey::run(&stranger, &stranger_channel, &attempt, Region::Gb)
+        .await
+        .expect("the read succeeds and the change is refused");
+
     assert_eq!(
         council_count(
             &world,
             "SELECT COUNT(*) FROM bookings WHERE cancelled_by IS NOT NULL"
         ),
-        1
+        0,
+        "no reference, no cancellation — the booking stands"
     );
 }
 
 /// The demo binary runs the same script through the same runner — asserted by
-/// actually running it, so the "demo and test are one file" claim is a fact
-/// with an exit code rather than a sentence in a doc.
+/// actually running it, so the "demo and test are one file" claim is a fact with
+/// an exit code rather than a sentence in a doc.
 #[tokio::test]
 async fn the_demo_binary_is_the_same_journey() {
-    let world = world();
+    let world = world_real();
+    let dir = world.council_db.parent().expect("dir");
     let status = std::process::Command::new(env!("CARGO"))
         .args([
             "run",
@@ -334,8 +229,12 @@ async fn the_demo_binary_is_the_same_journey() {
             "--",
             "--server",
             &world.server_url,
-            "--script",
+            "--stop-file",
         ])
+        .arg(dir.join("demo-stop.list"))
+        .arg("--continuation-file")
+        .arg(dir.join("demo-continuation.jsonl"))
+        .arg("--script")
         .arg(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../services/sms-simulator/scripts/lucy-journey.txt"),

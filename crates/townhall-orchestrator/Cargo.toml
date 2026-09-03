@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 bld-types = { path = "../bld-types" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -20,6 +21,7 @@ townhall-channel = { path = "../townhall-channel" }
 townhall-gateway = { path = "../townhall-gateway" }
 
 [dev-dependencies]
+reqwest = { workspace = true }
 tempfile = { workspace = true }
 townhall-testkit = { path = "../townhall-testkit" }
 

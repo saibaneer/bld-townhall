@@ -18,16 +18,20 @@
 //! session memory holds ids and nothing else, so a stale-version bug has
 //! nothing to be built from.
 
+pub mod continuation;
 pub mod dispatcher;
 pub mod journey;
 pub mod ports;
 pub mod scripted;
 pub mod suppression;
 
+pub use continuation::FileContinuation;
 pub use dispatcher::Dispatcher;
 pub use ports::{
-    BookingRequest, BookingWire, CandidateSummary, CredentialSource, GatewayFactory, NoLedgerYet,
-    PrincipalDirectory, ProjectedContext, Proposed, Proposer, Request, UsageBalance, WireFactory,
+    ApprovalError, ApprovalPort, BeginApproval, BookingRequest, BookingWire, CandidateSummary,
+    Continuation, ContinuationStore, CredentialSource, Deposited, EvidenceDeposit, GatewayFactory,
+    InboundEvidence, NoLedgerYet, PendingSummary, PrincipalDirectory, ProjectedContext, Proposed,
+    Proposer, Raised, Request, UsageBalance, WireFactory,
 };
 pub use scripted::ScriptedProposer;
 pub use suppression::FileSuppression;

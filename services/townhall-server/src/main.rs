@@ -643,3 +643,63 @@ async fn main() -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+/// ADR-025's amendment, second property: the flag is unavailable without the
+/// feature.
+///
+/// # Why this is a unit test and not a spawned binary
+///
+/// It was a spawned binary, and that cost an afternoon. The test ran
+/// `CARGO_BIN_EXE_townhall-server --dev-authority` and asserted a refusal — but
+/// that path is `target/debug/townhall-server`, a single file every
+/// feature-build overwrites and CI's cache leaves pointing at the FEATURE lane's
+/// binary. So the test spawned a feature-enabled server, which accepted the flag
+/// and served, and the whole run hung. Every fix that kept the spawn — asking
+/// cargo for the path (still the shared path), an isolated rebuild (a nested
+/// `cargo build` that starved for CPU under the parallel workspace run) — traded
+/// one flavour of the same fragility for another.
+///
+/// The property is a COMPILE-TIME fact: in a build without the feature,
+/// `dev_authority_available` returns `Err`. So it is tested where it is decided,
+/// with no process, no path, no cache, and no chance of checking the wrong
+/// binary. `main` acts on that `Err` by refusing to start (one visible line
+/// above), which is the part a subprocess was never really needed to prove.
+///
+/// Compiled only WITHOUT the feature — under `--dev-authority` the function can
+/// only return `Ok`, and asserting a refusal there would assert the build's own
+/// configuration back at itself.
+#[cfg(all(test, not(feature = "dev-authority")))]
+mod feature_gate {
+    use super::{Args, dev_authority_available};
+
+    fn args(dev_authority: bool) -> Args {
+        Args {
+            db: "/tmp/unused".to_owned(),
+            authority_key: None,
+            denials_db: "/tmp/unused".to_owned(),
+            council_url: "http://127.0.0.1:1".to_owned(),
+            key_hex: "0".repeat(64),
+            port: 0,
+            dev_authority,
+            retry_cadence_ms: 0,
+            reconcile_interval_ms: 1,
+            reclassify_attempts: None,
+        }
+    }
+
+    #[test]
+    fn dev_authority_is_refused_without_the_feature() {
+        assert!(
+            dev_authority_available(&args(true)).is_err(),
+            "a build without the dev-authority feature must refuse --dev-authority"
+        );
+    }
+
+    #[test]
+    fn no_flag_is_fine_without_the_feature() {
+        assert!(
+            dev_authority_available(&args(false)).is_ok(),
+            "not asking for the dev lane is always allowed"
+        );
+    }
+}

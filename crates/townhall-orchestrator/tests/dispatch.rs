@@ -10,14 +10,19 @@ use bld_types::{BookingId, BookingRequirements, CouncilBookingRef, PrincipalId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use townhall_channel::{
-    ChannelAddress, ChannelConfig, ChannelKind, InboundIdentity, InboundMessage, MessageReceipt,
-    RawInbound, SmsSimulator, SuppressionStore, TransportEvidence, simulator::InMemorySuppression,
+    ChannelAddress, ChannelConfig, ChannelKind, InboundIdentity, MessageReceipt, RawInbound,
+    SmsSimulator, SuppressionStore, TransportEvidence, Utterance, simulator::InMemorySuppression,
 };
 use townhall_gateway::{GatewayError, Projection, Turn, VenueRow};
 use townhall_orchestrator::{
-    BookingWire, CredentialSource, Dispatcher, NoLedgerYet, PrincipalDirectory, ProjectedContext,
-    Proposed, Proposer, ScriptedProposer, UsageBalance, WireFactory,
+    BookingRequest, BookingWire, Continuation, CredentialSource, Dispatcher, NoLedgerYet,
+    PrincipalDirectory, ProjectedContext, Proposed, Proposer, Request, ScriptedProposer,
+    UsageBalance, WireFactory,
 };
+
+#[path = "support/mod.rs"]
+mod support;
+use support::{MemoryContinuation, StubApprovals, StubEvidence};
 
 // ------------------------------------------------------------------ fakes
 
@@ -45,7 +50,7 @@ struct PanickingProposer;
 
 #[async_trait]
 impl Proposer for PanickingProposer {
-    async fn propose(&self, _: &ProjectedContext, _: &InboundMessage) -> Proposed {
+    async fn propose(&self, _: &ProjectedContext, _: &Utterance) -> Proposed {
         panic!("a control command reached the proposer");
     }
 }
@@ -57,7 +62,7 @@ struct UnclearProposer(AtomicUsize);
 
 #[async_trait]
 impl Proposer for UnclearProposer {
-    async fn propose(&self, _: &ProjectedContext, _: &InboundMessage) -> Proposed {
+    async fn propose(&self, _: &ProjectedContext, _: &Utterance) -> Proposed {
         self.0.fetch_add(1, Ordering::SeqCst);
         Proposed::Unclear
     }
@@ -238,6 +243,9 @@ fn bench(proposer: &ProposerChoice) -> Bench {
         proposer_arc,
         suppression,
         Arc::new(FixedWireFactory(Arc::clone(&wire))),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        Arc::new(MemoryContinuation::new()),
     );
     Bench {
         dispatcher,
@@ -301,12 +309,15 @@ async fn b11_control_commands_reach_nothing() {
         Arc::new(PanickingProposer),
         suppression,
         Arc::new(PanickingFactory),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        Arc::new(MemoryContinuation::new()),
     );
     let counter = AtomicUsize::new(0);
     for (text, expect) in [
         ("HELP", "BOOK date="),
-        ("STOP", "Automated messages stopped"),
-        ("START", "Automated messages resumed"),
+        ("STOP", "Stopped."),
+        ("START", "Resumed."),
         ("REVOKE", "M7"),
     ] {
         let n = counter.fetch_add(1, Ordering::SeqCst);
@@ -396,6 +407,9 @@ async fn b9_an_unbound_address_is_refused_before_any_wire_call() {
         Arc::new(PanickingProposer),
         Arc::new(InMemorySuppression::default()),
         Arc::new(FixedWireFactory(panicking)),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        Arc::new(MemoryContinuation::new()),
     );
 
     // A number the directory does not know — STATUS needs identity and a wire,
@@ -483,7 +497,8 @@ async fn the_scripted_grammar_refuses_near_misses() {
         "a half-understood BOOK must never create anything"
     );
 
-    // And the well-formed one, keys shuffled, DOES reach the wire.
+    // And the well-formed one, keys shuffled, raises a challenge to approve — and
+    // still creates NOTHING (approve-first: the booking waits for YES).
     bench
         .dispatcher
         .handle(bench.raw(
@@ -492,10 +507,15 @@ async fn the_scripted_grammar_refuses_near_misses() {
         ))
         .await
         .expect("handled");
+    assert!(
+        bench.last_reply().contains("Reply YES"),
+        "the complete request, in any key order, raises a challenge: {}",
+        bench.last_reply()
+    );
     assert_eq!(
         bench.wire.mutation_count(),
-        1,
-        "the complete request, in any key order, creates"
+        0,
+        "BOOK creates nothing — approve-first books only after a YES"
     );
 }
 
@@ -536,6 +556,9 @@ async fn a_failed_stop_is_reported_as_not_stopped() {
         Arc::new(PanickingProposer),
         Arc::new(BrokenSuppression),
         Arc::new(PanickingFactory),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        Arc::new(MemoryContinuation::new()),
     );
     dispatcher
         .handle(RawInbound {
@@ -555,7 +578,7 @@ async fn a_failed_stop_is_reported_as_not_stopped() {
         "a failed persist must not be confirmed as stopped: {reply}"
     );
     assert!(
-        !reply.contains("Automated messages stopped."),
+        !reply.contains("I won't act on your behalf"),
         "the success text must be absent: {reply}"
     );
 }
@@ -704,6 +727,28 @@ async fn a_drifted_binding_drops_the_followup_before_any_wire() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("lucy");
 
+    // The booking "cancel it" resolves to was approved through this dispatcher —
+    // seed the grant that lets it be cancelled, since cancellation now presents a
+    // reference an approval issued (§23.1).
+    let continuations = Arc::new(MemoryContinuation::new());
+    continuations.seed(Continuation {
+        principal: PrincipalId::new("lucy"),
+        challenge_id: "ch-drift".to_owned(),
+        booking_id: BookingId::new("sms-test"),
+        request: Request::Book(BookingRequest {
+            date: "2026-09-10".to_owned(),
+            from: "14:00".to_owned(),
+            to: "17:00".to_owned(),
+            people: 20,
+            accessible: true,
+            max_pence: 5_000,
+        }),
+        address_revealed: "+447700900123".to_owned(),
+        region: "Gb".to_owned(),
+        reference: Some("ref-drift".to_owned()),
+        booked: true,
+    });
+
     let dispatcher = Dispatcher::new(
         Arc::clone(&channel),
         Arc::clone(&directory) as Arc<dyn PrincipalDirectory>,
@@ -712,6 +757,9 @@ async fn a_drifted_binding_drops_the_followup_before_any_wire() {
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(AcceptingFactory),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        continuations,
     );
 
     // "cancel it" → one candidate → Accepted → a follow-up is queued.

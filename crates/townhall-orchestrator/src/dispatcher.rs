@@ -322,19 +322,23 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 Some(principal) => self.balance.describe(&principal),
                 None => "I don't recognize this number.".to_owned(),
             },
-            // A failed persist is a failed STOP, and saying otherwise is the
-            // failure mode the review named: a confirmation that lasts exactly
-            // until the next restart. The human hears the truth and can retry.
+            // STOP TERMINATES the agent's action — it does not merely mute it.
+            // While stopped, no automated message is sent AND no owed booking is
+            // completed on your behalf (§14.1: automated messaging AND scheduled
+            // agent turns). It does not undo a booking you already have — that is
+            // CANCEL. A failed persist is a failed STOP, said plainly: a
+            // confirmation that lasts until the next restart is the lie the
+            // review named.
             ControlCommand::Stop => match self.suppression.suppress(&message.address) {
-                Ok(()) => "Automated messages stopped. Reply START to resume. \
-                 This does not cancel bookings."
+                Ok(()) => "Stopped. I won't act on your behalf or message you until you reply \
+                 START. This does not remove bookings you already have — reply CANCEL <ref> \
+                 for that."
                     .to_owned(),
-                Err(_) => "I couldn't make that stick — automated messages are NOT \
-                 stopped. Reply STOP to try again."
+                Err(_) => "I couldn't make that stick — I am NOT stopped. Reply STOP to try again."
                     .to_owned(),
             },
             ControlCommand::Start => match self.suppression.allow(&message.address) {
-                Ok(()) => "Automated messages resumed.".to_owned(),
+                Ok(()) => "Resumed. I'll pick up anything that was owed.".to_owned(),
                 Err(_) => "I couldn't make that stick — reply START to try again.".to_owned(),
             },
             ControlCommand::Revoke => {
@@ -690,6 +694,15 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
     /// approved effect that was never submitted, where the follow-up converges
     /// one that was (ADR-019). A `reference: None` row (a parked challenge) is
     /// left alone: only a later human `YES` may act on it.
+    ///
+    /// # STOP halts this, it does not merely mute it
+    ///
+    /// §14.1: STOP stops automated messaging AND scheduled agent turns. This
+    /// runner IS a scheduled agent turn — it commits a booking on its own — so a
+    /// suppressed number's owed booking is NOT completed here. Muting only the
+    /// outcome would leave the agent quietly booking after a person said stop;
+    /// STOP has to actually stop it. The booking is not cancelled: it stays
+    /// durable and owed, and `START` re-enables the agent to finish it.
     pub async fn resume(&self) {
         for continuation in self.continuations.take_resumable() {
             if continuation.booked {
@@ -706,6 +719,13 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             else {
                 continue;
             };
+            // STOP halts the agent's autonomous work: while this number is
+            // suppressed, its owed booking is left in place, not completed. START
+            // lets a later resume finish it. This is the whole point of STOP
+            // meaning "stop", not "carry on silently".
+            if self.suppression.is_suppressed(&address) {
+                continue;
+            }
             // Re-resolve the binding at resume time, and drop on drift — the same
             // guard `run_followups` applies, for the same reason.
             if self.directory.resolve(&address).as_ref() != Some(&continuation.principal) {

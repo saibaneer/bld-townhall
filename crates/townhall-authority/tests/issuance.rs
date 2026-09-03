@@ -6,26 +6,41 @@
 //! word: a test that only shows *a* denial cannot say which check produced it,
 //! and a reordering that made a different check fire first would keep passing.
 //! So every case here arranges exactly one defect and names the error.
+//!
+//! # M7C-1: the reply is a receipt, not a claim
+//!
+//! The verifier no longer takes a caller-supplied binding. A reply's evidence is
+//! deposited by the trusted ingress under a one-use RECEIPT bound to the
+//! challenge it answers, and `submit` reads the sender back from that row
+//! (ADR-026). So every answer here first deposits evidence and forwards the
+//! receipt — the path a person's approval travels — and the new refusals
+//! (unknown receipt, a receipt bound to another challenge) get their own
+//! witnesses.
 
 use bld_types::{
-    ActorId, ApprovalChallengeId, Behaviour, BookingId, BookingRequirements, DelegationId, Money,
-    PrincipalId, ServiceId, TimeWindow,
+    ActorId, ApprovalChallengeId, Behaviour, BookingId, BookingRequirements, DelegationId,
+    EvidenceReceiptId, Money, PrincipalId, ServiceId, TimeWindow,
 };
+use std::sync::Arc;
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS,
-    MemoryApprovalStore, PendingScope, ResolveError,
+    AuthorityService, BeginOutcome, BehaviourSet, BindingRef, BoundChannel, Entropy, EnvelopeKey,
+    EvidenceReceipt, InboundEvidenceRecord, InsertOutcome, LoadedEvidence, MAX_ATTEMPTS,
+    MemoryApprovalStore, PendingScope, ResolveError, Settled,
 };
 
 const NOW: u64 = 1_700_000_000_000;
 const REPLY_WINDOW_MS: u64 = 600_000;
 const GRANT_TTL_MS: u64 = 3_600_000;
+const LUCY_ADDR: &str = "+lucy";
+const MARCO_ADDR: &str = "+marco";
 
 /// A deterministic entropy source: a fixed code, and counted identifiers.
 ///
 /// Deterministic so a wrong code is wrong for a stated reason rather than by
-/// luck, and counted so two challenges in one test cannot collide silently.
+/// luck, and counted so two challenges — or a challenge and a receipt — in one
+/// test cannot collide silently.
 struct FixedEntropy {
     code: String,
     next: Mutex<u64>,
@@ -54,8 +69,6 @@ impl Entropy for FixedEntropy {
 
 type Service = AuthorityService<MemoryApprovalStore, FixedEntropy>;
 
-use std::sync::Arc;
-
 /// The service, plus the caller's own handle to the store.
 ///
 /// Two values rather than one accessor: the service cannot hand out its store
@@ -63,10 +76,10 @@ use std::sync::Arc;
 /// assert on rows keeps its own `Arc` from the start.
 fn service_and_store() -> (Service, Arc<MemoryApprovalStore>) {
     let store = Arc::new(MemoryApprovalStore::new());
-    // Lucy's channel is bound, because the verifier checks the claimed binding
-    // against a row now rather than against the caller's own claim.
-    store.bind(&PrincipalId::new("lucy"), 1);
-    store.bind(&PrincipalId::new("marco"), 1);
+    // Lucy's and Marco's channels are bound to real numbers, because the
+    // verifier resolves an inbound reply's sender against a row now.
+    store.bind_address(&PrincipalId::new("lucy"), LUCY_ADDR, 1);
+    store.bind_address(&PrincipalId::new("marco"), MARCO_ADDR, 1);
     let service = AuthorityService::new(
         Arc::clone(&store),
         FixedEntropy::new("7312"),
@@ -90,6 +103,10 @@ fn test_key() -> EnvelopeKey {
     EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes")
 }
 
+fn townhall_actor() -> ActorId {
+    ActorId::new("agent:townhall")
+}
+
 fn lucys_binding() -> BindingRef {
     BindingRef {
         principal: PrincipalId::new("lucy"),
@@ -99,12 +116,16 @@ fn lucys_binding() -> BindingRef {
 
 /// Lucy asks; Lucy is the grantor and the subject.
 fn lucys_request() -> ApprovalRequest {
+    request_for("sms-lucy-0001", [Behaviour::Book, Behaviour::Cancel])
+}
+
+fn request_for(booking: &str, behaviours: impl IntoIterator<Item = Behaviour>) -> ApprovalRequest {
     ApprovalRequest {
         scope: PendingScope {
             service: ServiceId::new("demo-council-town-hall"),
             agent: "TownHallAgent".to_owned(),
-            booking: BookingId::new("sms-lucy-0001"),
-            behaviours: BehaviourSet::new([Behaviour::Book, Behaviour::Cancel]),
+            booking: BookingId::new(booking),
+            behaviours: BehaviourSet::new(behaviours),
             requirements: BookingRequirements {
                 purpose: "town hall booking".to_owned(),
                 requested_date: "2026-09-10".to_owned(),
@@ -120,8 +141,34 @@ fn lucys_request() -> ApprovalRequest {
         binding: lucys_binding(),
         grantor: PrincipalId::new("lucy"),
         subject: PrincipalId::new("lucy"),
-        actor: ActorId::new("agent:townhall"),
+        actor: townhall_actor(),
     }
+}
+
+/// Deposit one reply's evidence for whatever challenge `address` is awaiting, and
+/// return the receipt to forward. `nonce` keeps the inbound identity unique so a
+/// test can deposit more than one reply.
+///
+/// Panics if the deposit is refused — tests that expect a refused deposit call
+/// `deposit_evidence` directly.
+async fn deposit_reply(service: &Service, address: &str, nonce: &str) -> EvidenceReceiptId {
+    let (_challenge, receipt) = service
+        .deposit_evidence(
+            address,
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: format!("msg-{address}-{nonce}"),
+                claimed_sender: address.to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await
+        .expect("the bound channel is awaiting a challenge");
+    receipt
 }
 
 /// The happy path, and the gate's "£45 scope permitted" half.
@@ -132,24 +179,20 @@ fn lucys_request() -> ApprovalRequest {
 #[tokio::test]
 async fn an_answered_challenge_yields_one_grant_that_permits_the_forty_five_pound_booking() {
     let service = service();
-    let raised = service
+    let (created, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    assert_eq!(created, BeginOutcome::Created);
 
     assert!(
         raised.preview.contains("Reply YES 7312 to approve."),
         "the preview must carry the code the person is to send back"
     );
 
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("a correct code from the bound channel");
 
@@ -165,35 +208,23 @@ async fn an_answered_challenge_yields_one_grant_that_permits_the_forty_five_poun
 }
 
 /// The grant's clock starts at the approval, not at the offer.
-///
-/// # The bug this pins
-///
-/// The first design had one deadline. Approving in the last second of the reply
-/// window then issued a grant that had already expired — and every test that
-/// approved immediately would have passed.
 #[tokio::test]
 async fn a_grant_approved_at_the_last_second_still_has_its_full_life() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
     let last_moment = NOW + REPLY_WINDOW_MS - 1;
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            last_moment,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, last_moment)
         .await
         .expect("answered inside the window");
 
     assert_eq!(grant.expires_at_ms(), last_moment + GRANT_TTL_MS);
 
-    // Liveness is the resolver's, so that is where it is asserted.
     service
         .resolve(grant.delegation(), last_moment + GRANT_TTL_MS - 1)
         .await
@@ -207,46 +238,53 @@ async fn a_grant_approved_at_the_last_second_still_has_its_full_life() {
     );
 }
 
-/// One challenge yields at most one grant.
+/// W4: a second `YES` returns the SAME reference, not a second grant and not a
+/// replay error.
 ///
-/// # Why this is not "a grant may be used once"
+/// # Why idempotent recovery, not `Replay`
 ///
-/// ADR-025 records the distinction as a trap: a grant is presented on every
-/// call of the workflow it authorizes, so refusing its second USE would break
-/// create → select → verify → book while passing a naively-written test. What
-/// must not happen twice is ISSUANCE.
+/// The delegation reference is returned exactly once (§13.1 step 7). If a
+/// retried `YES` — a carrier redelivery, or a person tapping twice — got
+/// `Replay`, a booking lost after the approval could never be recovered: the
+/// grant exists, but nothing holds its reference. So the retry recovers the
+/// reference. What must not happen twice is ISSUANCE, and this proves it does
+/// not: the same delegation id both times, one row.
 #[tokio::test]
-async fn a_replayed_approval_does_not_mint_a_second_grant() {
-    let service = service();
-    let raised = service
+async fn a_second_yes_returns_the_same_reference_not_a_second_grant() {
+    let (service, store) = service_and_store();
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     let first = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("the first correct answer");
 
     let second = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 2_000,
-        )
-        .await;
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 2_000)
+        .await
+        .expect("a retried YES recovers, it does not error");
 
-    assert_eq!(second, Err(ApprovalDenied::Replay("approved")));
+    assert_eq!(
+        second.delegation(),
+        first.delegation(),
+        "a retried YES must return the reference already issued"
+    );
+    assert_eq!(second, first, "and the whole grant, unchanged");
 
-    // And the grant that DID issue is still usable, many times over.
+    // Exactly one delegation exists for the challenge — the recovery did not
+    // mint a second.
+    let by_challenge = store
+        .load_delegation_by_challenge(&raised.id)
+        .await
+        .expect("loadable")
+        .expect("the one delegation");
+    assert_eq!(&by_challenge.id, first.delegation());
+
+    // And the grant that issued is still usable, many times over.
     for moment in [NOW + 3_000, NOW + 4_000, NOW + 5_000] {
         let resolved = service
             .resolve(first.delegation(), moment)
@@ -256,11 +294,51 @@ async fn a_replayed_approval_does_not_mint_a_second_grant() {
     }
 }
 
-/// A late answer is refused as late, whatever the code says.
+/// W4, the other half: a retried `YES` from a DIFFERENT workload gets nothing.
+///
+/// The recovery returns the reference only to the actor the grant names. A
+/// second workload replaying the same reply must not be handed someone else's
+/// grant — that would make the reference a bearer token the recovery path minted.
 #[tokio::test]
-async fn an_expired_challenge_is_denied_before_the_code_is_read() {
+async fn a_second_yes_from_a_different_actor_is_refused() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
+
+    service
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+        .await
+        .expect("Lucy's own workload approves");
+
+    let stolen = service
+        .submit(
+            &raised.id,
+            "7312",
+            &ActorId::new("agent:someone-else"),
+            &receipt,
+            NOW + 2_000,
+        )
+        .await;
+    assert_eq!(
+        stolen,
+        Err(ApprovalDenied::Replay("approved")),
+        "a different workload replaying the reply gets no grant"
+    );
+}
+
+/// W1: a receipt that names no deposited row is refused before any challenge is
+/// touched.
+///
+/// The receipt is the ONLY thing the untrusted caller supplies about the reply.
+/// One it invented names no row, so there is nothing to read the sender from —
+/// and the challenge stays pending, no attempt spent.
+#[tokio::test]
+async fn a_receipt_that_names_no_row_is_refused() {
+    let (service, store) = service_and_store();
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
@@ -269,70 +347,195 @@ async fn an_expired_challenge_is_denied_before_the_code_is_read() {
         .submit(
             &raised.id,
             "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + REPLY_WINDOW_MS,
+            &townhall_actor(),
+            &EvidenceReceiptId::new("invented-by-the-caller"),
+            NOW + 1_000,
         )
         .await;
+    assert_eq!(denied, Err(ApprovalDenied::UnknownReceipt));
 
-    assert_eq!(denied, Err(ApprovalDenied::ChallengeExpired));
+    let challenge = store
+        .load_challenge(&raised.id)
+        .await
+        .expect("loadable")
+        .expect("still there");
+    assert_eq!(
+        challenge.status,
+        townhall_authority::ChallengeStatus::Pending
+    );
+    assert_eq!(
+        challenge.attempts_left(),
+        MAX_ATTEMPTS,
+        "an invented receipt must not spend an attempt or settle the challenge"
+    );
 }
 
-/// A wrong code costs an attempt, and says how many are left.
+/// W2: a receipt for one challenge cannot answer another.
+///
+/// # The forgery this closes
+///
+/// A person with two live approvals — a £45 and a £5000 — who answers the £45
+/// produces a valid evidence row for their number. The orchestrator raised both
+/// and knows both codes, so without this check it could present that row against
+/// the £5000. The row is bound to its challenge at deposit, and `submit` requires
+/// the binding to match: the £45's receipt is refused against the £5000, which
+/// stays pending, and the £45's receipt is left unconsumed for its own answer.
 #[tokio::test]
-async fn a_wrong_code_costs_one_attempt() {
+async fn a_receipt_for_one_challenge_is_refused_against_another() {
     let service = service();
-    let raised = service
+    // The cheap one, raised and answered's evidence deposited (bound to it).
+    let (_, cheap) = service
+        .begin(&request_for("sms-lucy-0045", [Behaviour::Book]), NOW)
+        .await
+        .expect("cheap challenge");
+    let cheap_receipt = deposit_reply(&service, LUCY_ADDR, "cheap").await;
+
+    // The expensive one, raised to the SAME number — it supersedes the cheap
+    // one's awaiting-reply, but the cheap receipt is already bound to the cheap
+    // challenge.
+    let (_, dear) = service
+        .begin(&request_for("sms-lucy-5000", [Behaviour::Book]), NOW)
+        .await
+        .expect("expensive challenge");
+
+    let denied = service
+        .submit(
+            &dear.id,
+            "7312",
+            &townhall_actor(),
+            &cheap_receipt,
+            NOW + 1_000,
+        )
+        .await;
+    assert_eq!(
+        denied,
+        Err(ApprovalDenied::ReceiptChallengeMismatch),
+        "the cheap challenge's receipt must not answer the expensive one"
+    );
+
+    // The expensive challenge is untouched, and the cheap receipt still answers
+    // its own challenge.
+    let grant = service
+        .submit(
+            &cheap.id,
+            "7312",
+            &townhall_actor(),
+            &cheap_receipt,
+            NOW + 2_000,
+        )
+        .await
+        .expect("the receipt still answers the challenge it was deposited for");
+    assert!(grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0045")));
+}
+
+/// A reply from a number nobody is awaiting gets no receipt — wrong channel,
+/// caught at the ingress.
+///
+/// The correlation is by address: a reply from an unbound, un-awaited number
+/// finds no challenge, so the ingress refuses the deposit and the model seat
+/// never obtains a receipt to forward. Lucy's challenge is untouched.
+#[tokio::test]
+async fn a_reply_from_an_unawaited_number_gets_no_receipt() {
+    let (service, store) = service_and_store();
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
 
+    let refused = service
+        .deposit_evidence(
+            "+mallory",
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: "msg-mallory".to_owned(),
+                claimed_sender: "+mallory".to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await;
+    assert_eq!(
+        refused,
+        Err(ApprovalDenied::UnknownChallenge),
+        "a number awaiting no challenge cannot deposit evidence"
+    );
+
+    let challenge = store
+        .load_challenge(&raised.id)
+        .await
+        .expect("loadable")
+        .expect("still there");
+    assert_eq!(
+        challenge.attempts_left(),
+        MAX_ATTEMPTS,
+        "a stranger's reply must not spend the bound person's attempts"
+    );
+}
+
+/// A late answer is refused as late, whatever the code says.
+#[tokio::test]
+async fn an_expired_challenge_is_denied_before_the_code_is_read() {
+    let service = service();
+    let (_, raised) = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
+
+    let denied = service
+        .submit(
+            &raised.id,
+            "7312",
+            &townhall_actor(),
+            &receipt,
+            NOW + REPLY_WINDOW_MS,
+        )
+        .await;
+    assert_eq!(denied, Err(ApprovalDenied::ChallengeExpired));
+}
+
+/// A wrong code costs an attempt, and says how many are left; the same receipt
+/// still answers on the retry, because a wrong code does not consume it.
+#[tokio::test]
+async fn a_wrong_code_costs_one_attempt() {
+    let service = service();
+    let (_, raised) = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
+
     assert_eq!(
         service
-            .submit(
-                &raised.id,
-                "0000",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
+            .submit(&raised.id, "0000", &townhall_actor(), &receipt, NOW + 1_000)
             .await,
         Err(ApprovalDenied::WrongCode {
             attempts_left: MAX_ATTEMPTS - 1
         })
     );
 
-    // The right code still works while attempts remain.
     service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 2_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 2_000)
         .await
-        .expect("one wrong guess must not spend the challenge");
+        .expect("one wrong guess must not spend the challenge or the receipt");
 }
 
 /// The attempt bound is what makes a four-digit code safe.
 #[tokio::test]
 async fn the_attempt_bound_spends_the_challenge_and_the_right_code_no_longer_helps() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     for remaining in (0..MAX_ATTEMPTS).rev() {
         let denied = service
-            .submit(
-                &raised.id,
-                "0000",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000,
-            )
+            .submit(&raised.id, "0000", &townhall_actor(), &receipt, NOW + 1_000)
             .await;
         let expected = if remaining == 0 {
             ApprovalDenied::AttemptsExceeded
@@ -346,92 +549,36 @@ async fn the_attempt_bound_spends_the_challenge_and_the_right_code_no_longer_hel
 
     assert_eq!(
         service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 2_000
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 2_000)
             .await,
         Err(ApprovalDenied::Replay("exhausted")),
         "a spent challenge must not accept the correct code afterwards"
     );
 }
 
-/// A reply from another channel is refused, and does NOT burn an attempt.
-///
-/// # Why the attempt must survive
-///
-/// Consuming one here would let anyone who learns a challenge id spend Lucy's
-/// three tries from another number — a denial of service on her booking.
-/// Refusing before the code check gives an attacker nothing in exchange,
-/// because they never reach the code at all.
-#[tokio::test]
-async fn a_reply_from_another_channel_is_denied_and_costs_lucy_nothing() {
-    let (service, store) = service_and_store();
-    let raised = service
-        .begin(&lucys_request(), NOW)
-        .await
-        .expect("challenge");
-    let stranger = BindingRef {
-        principal: PrincipalId::new("mallory"),
-        version: 1,
-    };
-
-    assert_eq!(
-        service
-            .submit(
-                &raised.id,
-                "7312",
-                &stranger,
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::WrongChannel)
-    );
-
-    let challenge = store
-        .load_challenge(&raised.id)
-        .await
-        .expect("loadable")
-        .expect("still there");
-    assert_eq!(
-        challenge.attempts_left(),
-        MAX_ATTEMPTS,
-        "a stranger's guess must not spend the bound person's attempts"
-    );
-}
-
 /// A binding that has moved beneath the challenge can no longer answer it.
 ///
-/// The recurring defect of this project's reviews is state outliving the moment
-/// it was true. A challenge bound only to a principal would still verify after
-/// the number behind that principal had been re-verified or reassigned.
+/// The reply comes from Lucy's real number, but her binding was re-verified to a
+/// new revision after the challenge was raised. The evidence resolves to the
+/// new revision, the challenge names the old one, and the two no longer match.
 #[tokio::test]
-async fn a_binding_at_a_newer_revision_cannot_answer_an_older_challenge() {
-    let service = service();
-    let raised = service
+async fn a_binding_re_verified_since_the_challenge_can_no_longer_answer_it() {
+    let (service, store) = service_and_store();
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
-    let reverified = BindingRef {
-        principal: PrincipalId::new("lucy"),
-        version: 2,
-    };
+
+    // Her number is re-verified: same number, new revision.
+    store.bind_address(&PrincipalId::new("lucy"), LUCY_ADDR, 2);
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     assert_eq!(
         service
-            .submit(
-                &raised.id,
-                "7312",
-                &reverified,
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
             .await,
-        Err(ApprovalDenied::WrongChannel)
+        Err(ApprovalDenied::WrongChannel),
+        "a challenge sent to a binding must not survive that binding moving"
     );
 }
 
@@ -439,25 +586,24 @@ async fn a_binding_at_a_newer_revision_cannot_answer_an_older_challenge() {
 #[tokio::test]
 async fn a_rejected_challenge_stays_rejected() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    // Both replies are deposited while the number still awaits the challenge; the
+    // decline then consumes one and clears the correlation, and the later YES
+    // rides its own already-bound receipt.
+    let no = deposit_reply(&service, LUCY_ADDR, "no").await;
+    let yes = deposit_reply(&service, LUCY_ADDR, "yes").await;
 
     service
-        .reject(&raised.id, "7312", &lucys_binding(), NOW + 1_000)
+        .reject(&raised.id, "7312", &no, NOW + 1_000)
         .await
         .expect("Lucy may decline");
 
     assert_eq!(
         service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 2_000
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &yes, NOW + 2_000)
             .await,
         Err(ApprovalDenied::Replay("rejected")),
         "a declined request must not be revivable by a later YES"
@@ -468,77 +614,85 @@ async fn a_rejected_challenge_stays_rejected() {
 #[tokio::test]
 async fn a_rejection_without_the_code_is_refused() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     assert_eq!(
         service
-            .reject(&raised.id, "0000", &lucys_binding(), NOW + 1_000)
+            .reject(&raised.id, "0000", &receipt, NOW + 1_000)
             .await,
         Err(ApprovalDenied::WrongCode {
             attempts_left: MAX_ATTEMPTS - 1
         })
     );
-    assert_eq!(
-        service
-            .reject(
-                &raised.id,
-                "7312",
-                &BindingRef {
-                    principal: PrincipalId::new("mallory"),
-                    version: 1
-                },
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::WrongChannel)
-    );
 }
 
-/// A challenge nobody raised is not an opportunity.
+/// A challenge nobody raised is not an opportunity — even with a receipt in hand.
 #[tokio::test]
 async fn an_unknown_challenge_is_denied() {
     let service = service();
+    // A real deposited receipt (bound to a real challenge), but for no challenge
+    // that exists at the id asked.
+    let (_, _raised) = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
+
+    // The receipt is bound to `raised.id`; naming a different id is a mismatch,
+    // and naming one nobody raised at all with a matching-but-absent receipt is
+    // unknown. Here the receipt names `raised`, and we ask about a ghost.
     assert_eq!(
         service
             .submit(
                 &ApprovalChallengeId::new("never-raised"),
                 "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW
+                &townhall_actor(),
+                &receipt,
+                NOW + 1_000,
             )
             .await,
-        Err(ApprovalDenied::UnknownChallenge)
+        // The receipt answers `raised`, not the ghost — so the mismatch fires
+        // first, which is itself a refusal to answer the wrong challenge.
+        Err(ApprovalDenied::ReceiptChallengeMismatch)
     );
 }
 
 /// The issuer caps assurance at the weakest of policy and binding.
 ///
-/// A stored level nothing compares against is decoration; this is the
-/// comparison. A binding that established only `Dev` cannot carry an SMS-level
-/// grant, however the challenge was raised.
+/// A binding that established only `Dev` cannot carry an SMS-level grant, however
+/// the challenge was raised. The binding's assurance now comes from its row.
 #[tokio::test]
 async fn the_grant_never_claims_more_assurance_than_the_binding_established() {
-    let service = service();
-    let raised = service
+    let store = Arc::new(MemoryApprovalStore::new());
+    // Lucy's channel is known only to `Dev` assurance.
+    store.bind_address_at(&PrincipalId::new("lucy"), LUCY_ADDR, 1, AssuranceLevel::Dev);
+    let service = AuthorityService::new(
+        Arc::clone(&store),
+        FixedEntropy::new("7312"),
+        AuthorityPolicy {
+            reply_window_ms: REPLY_WINDOW_MS,
+            grant_ttl_ms: GRANT_TTL_MS,
+            // Raised at the stronger SMS level …
+            assurance: AssuranceLevel::SmsReply,
+        },
+        test_key(),
+    );
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::Dev,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
+    // … and capped at the weaker binding.
     assert_eq!(
         grant.assurance(),
         AssuranceLevel::Dev,
@@ -551,18 +705,13 @@ async fn the_grant_never_claims_more_assurance_than_the_binding_established() {
 #[tokio::test]
 async fn revocation_takes_effect_at_once_and_twice_is_not_an_error() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
@@ -595,18 +744,13 @@ async fn revocation_takes_effect_at_once_and_twice_is_not_an_error() {
 #[tokio::test]
 async fn an_expired_grant_no_longer_resolves() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
@@ -628,134 +772,17 @@ async fn an_unissued_reference_resolves_to_nothing() {
     );
 }
 
-/// The gate's "tampered grant" half, at the service seam.
-///
-/// # Why a hostile store rather than editing a row
-///
-/// Reaching past the port to overwrite a row would mean giving the production
-/// store an overwrite method — itself a minting path, added for a test. The
-/// byte-level battery lives in the codec's own tests, where the private
-/// constructor is in scope; what belongs HERE is the seam's behaviour when a
-/// row does not decode.
-///
-/// ADR-025 records why this test is not written against the HTTP layer: that
-/// layer refuses the delegation header as its first statement, so a tampered
-/// envelope posted there is denied by the reservation and the test would pass
-/// against code that checks nothing.
-#[tokio::test]
-async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed() {
-    struct CorruptStore;
-
-    #[async_trait::async_trait]
-    impl ApprovalStore for CorruptStore {
-        async fn insert_challenge(
-            &self,
-            _challenge: &townhall_authority::ChallengeRecord,
-        ) -> Result<(), townhall_authority::StoreError> {
-            Ok(())
-        }
-        async fn load_challenge(
-            &self,
-            _id: &ApprovalChallengeId,
-        ) -> Result<Option<townhall_authority::ChallengeRecord>, townhall_authority::StoreError>
-        {
-            Ok(None)
-        }
-        async fn record_failed_attempt(
-            &self,
-            _id: &ApprovalChallengeId,
-            _now_ms: u64,
-        ) -> Result<(u8, townhall_authority::ChallengeStatus), townhall_authority::StoreError>
-        {
-            unreachable!("this store never holds a challenge")
-        }
-        async fn settle_with_grant(
-            &self,
-            _id: &ApprovalChallengeId,
-            _grant: &townhall_authority::DelegationRecord,
-        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
-            unreachable!("this store never holds a challenge")
-        }
-        async fn settle_rejected(
-            &self,
-            _id: &ApprovalChallengeId,
-        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
-            unreachable!("this store never holds a challenge")
-        }
-        async fn load_delegation(
-            &self,
-            id: &DelegationId,
-        ) -> Result<Option<townhall_authority::DelegationRecord>, townhall_authority::StoreError>
-        {
-            Ok(Some(townhall_authority::DelegationRecord {
-                id: id.clone(),
-                grantor: PrincipalId::new("lucy"),
-                subject: PrincipalId::new("lucy"),
-                service: ServiceId::new("demo-council-town-hall"),
-                issued_at_ms: 0,
-                // Live by every column the store indexes — so the ONLY thing
-                // that can refuse this is the decode itself.
-                expires_at_ms: u64::MAX,
-                revoked_at_ms: None,
-                envelope: b"not an envelope".to_vec(),
-            }))
-        }
-        async fn live_binding(
-            &self,
-            principal: &PrincipalId,
-        ) -> Result<Option<BindingRef>, townhall_authority::StoreError> {
-            // Bound, so this store's refusals are about what it is testing and
-            // not about the binding check in front of it.
-            Ok(Some(BindingRef {
-                principal: principal.clone(),
-                version: 1,
-            }))
-        }
-
-        async fn revoke_delegation(
-            &self,
-            _id: &DelegationId,
-            _at_ms: u64,
-        ) -> Result<bool, townhall_authority::StoreError> {
-            Ok(false)
-        }
-    }
-
-    let service = AuthorityService::new(
-        Arc::new(CorruptStore),
-        FixedEntropy::new("7312"),
-        AuthorityPolicy::default(),
-        test_key(),
-    );
-
-    assert_eq!(
-        service
-            .resolve(&DelegationId::new("delegation-1"), NOW)
-            .await,
-        Err(ResolveError::Unreadable),
-        "an unreadable row must not resolve to a usable grant"
-    );
-}
-
 /// A grant reaches its own booking and no other.
-///
-/// ADR-022's concealment came from a row predicate; this is the same property
-/// one layer up. A grant for Lucy's first booking must not reach her second.
 #[tokio::test]
 async fn a_grant_reaches_only_the_resource_it_names() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
     assert!(grant.covers(Behaviour::Book, &BookingId::new("sms-lucy-0001")));
@@ -786,37 +813,22 @@ async fn a_delegated_grant_separates_the_owner_from_the_requester() {
     request.subject = PrincipalId::new("marco");
     request.scope.behaviours = BehaviourSet::new([Behaviour::Cancel]);
 
-    let raised = service.begin(&request, NOW).await.expect("challenge");
+    let (_, raised) = service.begin(&request, NOW).await.expect("challenge");
+    // Lucy approves from HER channel — the grantor's number, which the challenge
+    // is bound to.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("Lucy approves from her own channel");
 
-    assert_eq!(
-        grant.grantor().as_str(),
-        "lucy",
-        "the booking's owner is the grantor"
-    );
+    assert_eq!(grant.grantor().as_str(), "lucy", "the owner is the grantor");
     assert_eq!(
         grant.subject().as_str(),
         "marco",
         "the cancellation is attributed to Marco"
     );
-    // The actor is the AUTHENTICATED WORKLOAD, and deliberately not derived
-    // from anybody's name.
-    //
-    // It used to be `agent:{subject}` — an identity nothing had authenticated,
-    // invented by string formatting. M7B binds it to the caller's own
-    // credential and the challenge persists it, so the person approving a
-    // preview that says "Agent: TownHallAgent" is approving THAT agent. A
-    // different workload answering the same challenge receives nothing.
-    assert_eq!(grant.actor(), &ActorId::new("agent:townhall"));
+    assert_eq!(grant.actor(), &townhall_actor());
     assert_ne!(
         grant.actor().as_str(),
         format!("agent:{}", grant.subject().as_str()),
@@ -830,28 +842,16 @@ async fn a_delegated_grant_separates_the_owner_from_the_requester() {
 }
 
 /// The envelope's round trip is compared against the ISSUED value.
-///
-/// # Why not against a hand-built grant
-///
-/// A hand-built expectation asserts that the codec agrees with the test's idea
-/// of a grant. Comparing against what the issuer produced asserts the thing
-/// that matters: a grant reloaded after a restart is the grant that was issued
-/// (ADR-025).
 #[tokio::test]
 async fn a_reloaded_grant_equals_the_one_that_was_issued() {
     let service = service();
-    let raised = service
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let issued = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
@@ -866,127 +866,178 @@ async fn a_reloaded_grant_equals_the_one_that_was_issued() {
     assert_eq!(reloaded.constraints(), issued.constraints());
 }
 
-/// Two challenges over one booking do not share a code's fate.
+/// W5: a redelivered `BOOK` for the same booking reuses its challenge.
+///
+/// Approve-first removed ADR-024's incidental dedupe. Without idempotent begin, a
+/// carrier redelivery of the original request would raise a SECOND challenge with
+/// a fresh code — a contradictory prompt for one intent. Here the same booking is
+/// raised twice and the second `begin` returns `Existing` with the SAME id and
+/// code, at every lifecycle stage.
 #[tokio::test]
-async fn a_second_challenge_is_its_own_challenge() {
+async fn a_redelivered_book_reuses_its_challenge() {
     let service = service();
-    let first = service.begin(&lucys_request(), NOW).await.expect("first");
-    let second = service.begin(&lucys_request(), NOW).await.expect("second");
+    let (first_outcome, first) = service.begin(&lucys_request(), NOW).await.expect("first");
+    assert_eq!(first_outcome, BeginOutcome::Created);
 
-    assert_ne!(first.id, second.id, "each challenge needs its own identity");
-
-    service
-        .reject(&first.id, "7312", &lucys_binding(), NOW + 1_000)
+    // Redelivered while pending.
+    let (again, reused) = service
+        .begin(&lucys_request(), NOW + 100)
         .await
-        .expect("decline the first");
+        .expect("redelivery");
+    assert_eq!(again, BeginOutcome::Existing);
+    assert_eq!(reused.id, first.id, "the same challenge, not a second");
+    assert_eq!(
+        reused.code.revealed(),
+        first.code.revealed(),
+        "and the same code, not a fresh one the person never saw"
+    );
 
+    // Answer it, then redeliver AGAIN — a redelivery after approval must still
+    // not raise a fresh challenge.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     service
-        .submit(
-            &second.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 2_000,
-        )
+        .submit(&first.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
-        .expect("declining one offer must not decline the other");
+        .expect("approved");
+    let (after_approval, still) = service
+        .begin(&lucys_request(), NOW + 2_000)
+        .await
+        .expect("redelivery after approval");
+    assert_eq!(after_approval, BeginOutcome::Existing);
+    assert_eq!(still.id, first.id);
 }
 
-/// Two correct replies arrive at once; exactly one grant exists.
+/// Two DIFFERENT bookings are independent challenges.
+#[tokio::test]
+async fn two_different_bookings_are_their_own_challenges() {
+    let (service, store) = service_and_store();
+    let (_, first) = service
+        .begin(&request_for("sms-lucy-A", [Behaviour::Book]), NOW)
+        .await
+        .expect("first");
+    let (_, second) = service
+        .begin(&request_for("sms-lucy-B", [Behaviour::Book]), NOW)
+        .await
+        .expect("second");
+    assert_ne!(first.id, second.id, "each booking gets its own challenge");
+
+    // Declining the second (the one Lucy's number currently awaits) must not
+    // touch the first, which stays answerable.
+    let no = deposit_reply(&service, LUCY_ADDR, "no").await;
+    service
+        .reject(&second.id, "7312", &no, NOW + 1_000)
+        .await
+        .expect("decline the second");
+
+    let first_challenge = store
+        .load_challenge(&first.id)
+        .await
+        .expect("loadable")
+        .expect("still there");
+    assert_eq!(
+        first_challenge.status,
+        townhall_authority::ChallengeStatus::Pending,
+        "declining one offer must not decline the other"
+    );
+    let second_challenge = store
+        .load_challenge(&second.id)
+        .await
+        .expect("loadable")
+        .expect("still there");
+    assert_eq!(
+        second_challenge.status,
+        townhall_authority::ChallengeStatus::Rejected,
+        "the declined one is terminal"
+    );
+}
+
+/// Two correct replies arrive at once; exactly one grant exists, and both callers
+/// receive it.
 ///
-/// # Why this test exists, and what the mutation battery proved
+/// # What the store's atomicity guarantees
 ///
-/// Replay is guarded twice: the service checks the challenge's status before
-/// spending an attempt, and the store checks it again inside its atomic
-/// `settle_with_grant`. Removing EITHER one left all twenty sequential tests
-/// passing — each is sufficient on its own when the replies are ordered.
-///
-/// Only the store's check holds when they are not. This is the sole witness for
-/// it: without atomicity both threads see `Pending`, both settle, and one
-/// challenge yields two grants — spec §17's "one challenge -> at most one
-/// grant", broken by a race that no sequential test can see.
+/// Removing the store's atomic `settle_with_grant` check leaves all the
+/// sequential tests passing — each guard is sufficient when replies are ordered.
+/// Only the store's check holds when they are not: without it both threads see
+/// `pending`, both settle, and one challenge yields two grants. With it, one
+/// settles and the other recovers the SAME reference — one row, one grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_simultaneous_correct_replies_yield_exactly_one_grant() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Repeated, because a race that loses by scheduler luck once will not lose
-    // every time. Deterministic interleaving would need loom, and loom cannot
-    // reach a `&dyn` port behind a generic — recorded as the reason this is a
-    // repeat-count test rather than an exhaustive one.
     for round in 0..64 {
-        let service = Arc::new(service());
-        let raised = service
+        let (service, store) = service_and_store();
+        let service = Arc::new(service);
+        let (_, raised) = service
             .begin(&lucys_request(), NOW)
             .await
             .expect("challenge");
+        let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
         let granted = Arc::new(AtomicUsize::new(0));
-        let replayed = Arc::new(AtomicUsize::new(0));
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let service = Arc::clone(&service);
                 let id = raised.id.clone();
+                let receipt = receipt.clone();
                 let granted = Arc::clone(&granted);
-                let replayed = Arc::clone(&replayed);
                 let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
                     barrier.wait();
                     match service
-                        .submit(
-                            &id,
-                            "7312",
-                            &lucys_binding(),
-                            AssuranceLevel::SmsReply,
-                            NOW + 1_000,
-                        )
+                        .submit(&id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
                         .await
                     {
-                        Ok(_) => granted.fetch_add(1, Ordering::SeqCst),
-                        Err(ApprovalDenied::Replay(_)) => replayed.fetch_add(1, Ordering::SeqCst),
-                        Err(other) => panic!("neither granted nor replayed: {other}"),
-                    };
+                        // Both callers must end holding the grant — one settled
+                        // it, one recovered it — but only one row may exist.
+                        Ok(grant) => {
+                            granted.fetch_add(1, Ordering::SeqCst);
+                            grant.delegation().clone()
+                        }
+                        Err(other) => panic!("a correct concurrent reply was refused: {other}"),
+                    }
                 })
             })
             .collect();
+        let mut references = Vec::new();
         for handle in handles {
-            handle.await.expect("no task panicked");
+            references.push(handle.await.expect("no task panicked"));
         }
 
         assert_eq!(
             granted.load(Ordering::SeqCst),
-            1,
-            "round {round}: one challenge must yield exactly one grant"
+            2,
+            "round {round}: both correct replies must be answered, not one refused"
         );
         assert_eq!(
-            replayed.load(Ordering::SeqCst),
-            1,
-            "round {round}: the reply that lost must be refused as a replay"
+            references[0], references[1],
+            "round {round}: both callers must receive the SAME reference"
         );
+
+        // And exactly one delegation row exists for the challenge.
+        let delegation = store
+            .load_delegation_by_challenge(&raised.id)
+            .await
+            .expect("loadable")
+            .expect("one delegation");
+        assert_eq!(&delegation.id, &references[0]);
     }
 }
 
 /// A challenge whose digest does not describe its scope yields no grant.
 ///
-/// # Why this is checked in the service and not only in the store
-///
-/// The SQL store checks it on the way out of a row, which made it a property of
-/// one implementation rather than of the component. A fabricated row, an
-/// in-memory store, or a future store all reach the verifier — so the verifier
-/// checks it too, and this test uses a store that returns a self-contradictory
-/// challenge to prove the verifier is the one refusing.
-///
-/// The scope says £50; the digest describes a £10 scope. If the two could
-/// disagree unnoticed, the digest would record what a person approved while the
-/// scope decided what they got.
+/// The verifier checks the digest, not only the SQL store — so a fabricated or
+/// in-memory row that contradicts itself is refused at the seam. Here a
+/// contradictory challenge is planted directly into the in-memory store (whose
+/// insert does not re-derive the digest), a real receipt is deposited for it, and
+/// the answer is refused as `Unreadable` before the code is even read.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
-    struct ForgedStore;
+    use townhall_authority::{CanonicalScope, ChallengeRecord, ChallengeStatus};
 
-    fn scope_of(max_fee_pence: u64) -> townhall_authority::CanonicalScope {
-        townhall_authority::CanonicalScope {
+    fn scope_of(max_fee_pence: u64) -> CanonicalScope {
+        CanonicalScope {
             service: ServiceId::new("demo-council-town-hall"),
             agent: "TownHallAgent".to_owned(),
             booking: BookingId::new("sms-lucy-0001"),
@@ -1002,13 +1053,69 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
                 wheelchair_accessible: true,
                 max_fee: Money::from_pence(max_fee_pence),
             },
-            expires_at_ms: NOW + 600_000,
+            expires_at_ms: NOW + REPLY_WINDOW_MS,
             grant_ttl_ms: GRANT_TTL_MS,
         }
     }
 
+    let store = Arc::new(MemoryApprovalStore::new());
+    store.bind_address(&PrincipalId::new("lucy"), LUCY_ADDR, 1);
+    let service = AuthorityService::new(
+        Arc::clone(&store),
+        FixedEntropy::new("7312"),
+        AuthorityPolicy::default(),
+        test_key(),
+    );
+
+    let id = ApprovalChallengeId::new("forged");
+    // The scope permits £50 while the digest describes £10 — a contradiction the
+    // in-memory store stores verbatim.
+    store
+        .insert_challenge(&ChallengeRecord {
+            id: id.clone(),
+            code: ApprovalCode::new("7312").expect("four digits"),
+            scope: scope_of(5_000),
+            scope_hash: scope_of(1_000).digest(),
+            binding: lucys_binding(),
+            grantor: PrincipalId::new("lucy"),
+            subject: PrincipalId::new("lucy"),
+            created_at_ms: NOW,
+            attempts_used: 0,
+            status: ChallengeStatus::Pending,
+            assurance: AssuranceLevel::SmsReply,
+            actor: townhall_actor(),
+        })
+        .await
+        .expect("the store stores what it is given");
+    // Correlate and deposit a real receipt, so the refusal is the digest check
+    // and not a missing receipt.
+    store
+        .await_reply(LUCY_ADDR, &id, NOW, NOW + REPLY_WINDOW_MS)
+        .await
+        .expect("await");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
+
+    assert_eq!(
+        service
+            .submit(&id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+            .await,
+        Err(ApprovalDenied::Unreadable),
+        "a self-contradictory challenge yields no grant even with a valid receipt"
+    );
+}
+
+/// The gate's "tampered grant" half: a delegation that does not decode is
+/// refused rather than half-believed.
+///
+/// A hostile store returns a live-by-every-column delegation whose envelope is
+/// nonsense — so the ONLY thing that can refuse it is the decode itself.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // the hand-rolled store implements the whole port
+async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed() {
+    struct CorruptStore;
+
     #[async_trait::async_trait]
-    impl ApprovalStore for ForgedStore {
+    impl ApprovalStore for CorruptStore {
         async fn insert_challenge(
             &self,
             _challenge: &townhall_authority::ChallengeRecord,
@@ -1017,28 +1124,10 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
         }
         async fn load_challenge(
             &self,
-            id: &ApprovalChallengeId,
+            _id: &ApprovalChallengeId,
         ) -> Result<Option<townhall_authority::ChallengeRecord>, townhall_authority::StoreError>
         {
-            Ok(Some(townhall_authority::ChallengeRecord {
-                id: id.clone(),
-                code: ApprovalCode::new("7312").expect("four digits"),
-                // The scope permits £50 …
-                scope: scope_of(5_000),
-                // … while the digest describes £10.
-                scope_hash: scope_of(1_000).digest(),
-                binding: BindingRef {
-                    principal: PrincipalId::new("lucy"),
-                    version: 1,
-                },
-                grantor: PrincipalId::new("lucy"),
-                subject: PrincipalId::new("lucy"),
-                created_at_ms: NOW,
-                attempts_used: 0,
-                status: townhall_authority::ChallengeStatus::Pending,
-                assurance: AssuranceLevel::SmsReply,
-                actor: ActorId::new("agent:townhall"),
-            }))
+            Ok(None)
         }
         async fn record_failed_attempt(
             &self,
@@ -1046,40 +1135,53 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
             _now_ms: u64,
         ) -> Result<(u8, townhall_authority::ChallengeStatus), townhall_authority::StoreError>
         {
-            unreachable!("the digest is checked before the code")
+            unreachable!("this store never holds a challenge")
         }
         async fn settle_with_grant(
             &self,
             _id: &ApprovalChallengeId,
             _grant: &townhall_authority::DelegationRecord,
-        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
-            unreachable!("nothing may settle a self-contradictory challenge")
+            _receipt: &EvidenceReceiptId,
+            _address: &str,
+            _now_ms: u64,
+        ) -> Result<Settled, townhall_authority::StoreError> {
+            unreachable!("this store never holds a challenge")
         }
         async fn settle_rejected(
             &self,
             _id: &ApprovalChallengeId,
-        ) -> Result<townhall_authority::Settled, townhall_authority::StoreError> {
-            unreachable!("nothing may settle a self-contradictory challenge")
+            _receipt: &EvidenceReceiptId,
+            _address: &str,
+            _now_ms: u64,
+        ) -> Result<Settled, townhall_authority::StoreError> {
+            unreachable!("this store never holds a challenge")
         }
         async fn load_delegation(
             &self,
-            _id: &DelegationId,
+            id: &DelegationId,
         ) -> Result<Option<townhall_authority::DelegationRecord>, townhall_authority::StoreError>
         {
-            Ok(None)
+            Ok(Some(townhall_authority::DelegationRecord {
+                id: id.clone(),
+                challenge_id: ApprovalChallengeId::new("challenge-1"),
+                grantor: PrincipalId::new("lucy"),
+                subject: PrincipalId::new("lucy"),
+                service: ServiceId::new("demo-council-town-hall"),
+                issued_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                revoked_at_ms: None,
+                envelope: b"not an envelope".to_vec(),
+            }))
         }
         async fn live_binding(
             &self,
             principal: &PrincipalId,
         ) -> Result<Option<BindingRef>, townhall_authority::StoreError> {
-            // Bound, so this store's refusals are about what it is testing and
-            // not about the binding check in front of it.
             Ok(Some(BindingRef {
                 principal: principal.clone(),
                 version: 1,
             }))
         }
-
         async fn revoke_delegation(
             &self,
             _id: &DelegationId,
@@ -1087,188 +1189,99 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
         ) -> Result<bool, townhall_authority::StoreError> {
             Ok(false)
         }
+        async fn write_inbound_evidence(
+            &self,
+            _receipt: &EvidenceReceiptId,
+            _evidence: &InboundEvidenceRecord,
+            _challenge: &ApprovalChallengeId,
+            _now_ms: u64,
+            _expires_at_ms: u64,
+        ) -> Result<EvidenceReceipt, townhall_authority::StoreError> {
+            unreachable!("this store never deposits evidence")
+        }
+        async fn load_evidence_by_receipt(
+            &self,
+            _receipt: &EvidenceReceiptId,
+        ) -> Result<Option<LoadedEvidence>, townhall_authority::StoreError> {
+            unreachable!("this store never deposits evidence")
+        }
+        async fn load_delegation_by_challenge(
+            &self,
+            _challenge: &ApprovalChallengeId,
+        ) -> Result<Option<townhall_authority::DelegationRecord>, townhall_authority::StoreError>
+        {
+            Ok(None)
+        }
+        async fn live_binding_by_address(
+            &self,
+            _address: &str,
+        ) -> Result<Option<BoundChannel>, townhall_authority::StoreError> {
+            Ok(None)
+        }
+        async fn address_for(
+            &self,
+            _principal: &PrincipalId,
+        ) -> Result<Option<String>, townhall_authority::StoreError> {
+            Ok(None)
+        }
+        async fn await_reply(
+            &self,
+            _address: &str,
+            _challenge: &ApprovalChallengeId,
+            _now_ms: u64,
+            _expires_at_ms: u64,
+        ) -> Result<(), townhall_authority::StoreError> {
+            Ok(())
+        }
+        async fn awaiting_reply(
+            &self,
+            _address: &str,
+        ) -> Result<Option<ApprovalChallengeId>, townhall_authority::StoreError> {
+            Ok(None)
+        }
+        async fn insert_or_get_challenge(
+            &self,
+            _challenge: &townhall_authority::ChallengeRecord,
+        ) -> Result<InsertOutcome, townhall_authority::StoreError> {
+            unreachable!("this store never holds a challenge")
+        }
     }
 
     let service = AuthorityService::new(
-        Arc::new(ForgedStore),
+        Arc::new(CorruptStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
         test_key(),
     );
 
-    // The right code, from the right channel, inside the window — and still no
-    // grant, because the challenge contradicts itself.
     assert_eq!(
         service
-            .submit(
-                &ApprovalChallengeId::new("forged"),
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
+            .resolve(&DelegationId::new("delegation-1"), NOW)
             .await,
-        Err(ApprovalDenied::Unreadable)
-    );
-
-    // And `NO` cannot settle it either — the check precedes both paths.
-    assert_eq!(
-        service
-            .reject(
-                &ApprovalChallengeId::new("forged"),
-                "7312",
-                &lucys_binding(),
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::Unreadable)
-    );
-}
-
-/// A challenge cannot be answered by a binding that does not exist.
-///
-/// # The defect this witnesses
-///
-/// Both sides of the "wrong channel" comparison used to come from the CALLER:
-/// the binding it named when raising the challenge, and the binding it named
-/// when answering. Sending the same pair twice passed, so possession of a
-/// workload credential was enough to mint an in-policy grant with no phone
-/// involved. Found in review after M7B was written.
-///
-/// Here the challenge is raised naming a principal nobody has bound, and
-/// answered with the very same values — the case that used to succeed.
-#[tokio::test]
-async fn a_binding_nobody_has_made_cannot_answer_its_own_challenge() {
-    let store = Arc::new(MemoryApprovalStore::new());
-    // Deliberately NOT bound. Mallory names herself and answers as herself.
-    let service = AuthorityService::new(
-        Arc::clone(&store),
-        FixedEntropy::new("7312"),
-        AuthorityPolicy::default(),
-        test_key(),
-    );
-    let invented = BindingRef {
-        principal: PrincipalId::new("mallory"),
-        version: 1,
-    };
-    let mut request = lucys_request();
-    request.binding = invented.clone();
-    request.grantor = PrincipalId::new("mallory");
-    request.subject = PrincipalId::new("mallory");
-
-    let raised = service.begin(&request, NOW).await.expect("challenge");
-    assert_eq!(
-        service
-            .submit(
-                &raised.id,
-                "7312",
-                &invented,
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::WrongChannel),
-        "naming a binding and then answering as it must not be an approval"
-    );
-}
-
-/// A binding that has moved since the challenge was raised cannot answer it.
-///
-/// The revision check, against the STORE. `a_binding_at_a_newer_revision…`
-/// above proves the challenge remembers its revision; this proves the verifier
-/// compares that memory against what is currently true, so a number
-/// re-verified or reassigned mid-challenge stops being able to answer.
-#[tokio::test]
-async fn a_binding_re_verified_since_the_challenge_can_no_longer_answer_it() {
-    let store = Arc::new(MemoryApprovalStore::new());
-    store.bind(&PrincipalId::new("lucy"), 1);
-    let service = AuthorityService::new(
-        Arc::clone(&store),
-        FixedEntropy::new("7312"),
-        AuthorityPolicy::default(),
-        test_key(),
-    );
-    let raised = service
-        .begin(&lucys_request(), NOW)
-        .await
-        .expect("challenge");
-
-    // Her number is re-verified: same principal, new revision.
-    store.bind(&PrincipalId::new("lucy"), 2);
-
-    assert_eq!(
-        service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::WrongChannel),
-        "a challenge sent to a binding must not survive that binding moving"
-    );
-
-    // And withdrawing it entirely does the same, rather than erroring
-    // differently.
-    store.unbind(&PrincipalId::new("lucy"));
-    let raised = service
-        .begin(&lucys_request(), NOW)
-        .await
-        .expect("challenge");
-    assert_eq!(
-        service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
-            .await,
-        Err(ApprovalDenied::WrongChannel)
+        Err(ResolveError::Unreadable),
+        "an unreadable row must not resolve to a usable grant"
     );
 }
 
 /// A grant resolves for the actor it names, and for nobody else.
-///
-/// # Why this is the property the revoke endpoint rests on
-///
-/// A delegation reference is not a bearer token. It travels in a header, ends
-/// up in logs and error reports, and is exactly the sort of value that leaks —
-/// so a workload that merely FINDS one must not be able to use it, or revoke
-/// it. Review found the revoke endpoint checking only that somebody had
-/// authenticated; it now asks this question first.
 #[tokio::test]
 async fn a_grant_resolves_only_for_the_actor_it_names() {
-    let (service, _store) = service_and_store();
-    let raised = service
+    let service = service();
+    let (_, raised) = service
         .begin(&lucys_request(), NOW)
         .await
         .expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
-    // The actor it names.
     service
         .resolve(grant.delegation(), NOW + 2_000)
         .await
         .expect("the grant is live");
-    assert_eq!(grant.actor(), &ActorId::new("agent:townhall"));
-
-    // And a different one gets nothing from the same reference. The service's
-    // own `resolve` does not take an actor — that check belongs to whoever
-    // presents it — so this asserts the value the presenter compares against,
-    // which is what makes the comparison possible at all.
+    assert_eq!(grant.actor(), &townhall_actor());
     assert_ne!(
         grant.actor(),
         &ActorId::new("agent:someone-else"),

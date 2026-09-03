@@ -43,7 +43,10 @@ pub use grant::{AuthorityConstraints, BindingRef, VerifiedApproval, VerifiedAuth
 pub use key::{EnvelopeKey, KeyTooShort};
 pub use scope::{BehaviourSet, CanonicalScope, ScopeHash};
 pub use service::{
-    ApprovalDenied, ApprovalRequest, AuthorityPolicy, AuthorityService, Entropy, PendingScope,
-    RaisedChallenge, ResolveError,
+    ApprovalDenied, ApprovalRequest, AuthorityPolicy, AuthorityService, BeginOutcome, Entropy,
+    PendingScope, RaisedChallenge, ResolveError,
 };
-pub use store::{ApprovalStore, DelegationRecord, MemoryApprovalStore, Settled, StoreError};
+pub use store::{
+    ApprovalStore, BoundChannel, DelegationRecord, EvidenceReceipt, InboundEvidenceRecord,
+    InsertOutcome, LoadedEvidence, MemoryApprovalStore, Settled, StoreError,
+};

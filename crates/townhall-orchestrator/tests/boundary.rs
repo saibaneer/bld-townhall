@@ -12,6 +12,13 @@ fn the_orchestrator_cannot_name_the_servers_insides() {
         "townhall-service",
         "townhall-store",
         "townhall-http",
+        // The issuer/verifier. The orchestrator holds the untrusted proposer
+        // seat, so it must reach authority only through the wire, never by
+        // naming the crate that mints grants (ADR-025). This was DOCUMENTED as
+        // enforced by `townhall-http`'s approvals module — and it was not, until
+        // this line: the list forbade everything but the one crate the claim
+        // was about. Found reviewing the M7C plan, in already-merged code.
+        "townhall-authority",
         "bld-kernel",
         "sqlx",
     ];

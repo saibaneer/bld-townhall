@@ -247,7 +247,8 @@ impl DevAuthority {
         use bld_types::{PrincipalId, ServiceId};
         use townhall_authority::{
             ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-            BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
+            BehaviourSet, BindingRef, Entropy, EnvelopeKey, InboundEvidenceRecord,
+            MemoryApprovalStore, PendingScope,
         };
 
         struct DevCode;
@@ -331,19 +332,38 @@ impl DevAuthority {
             // grant this mints is presentable by the caller that asked for it.
             actor: bld_types::ActorId::new(format!("dev:{principal}")),
         };
+        let actor = bld_types::ActorId::new(format!("dev:{principal}"));
+        let address = format!("+{principal}");
 
         // Blocking on a fresh runtime in a thread: this resolver is called from
-        // inside the server's runtime, where `block_on` panics. The whole dance
-        // disappears in M7B, when the resolver reads a delegation the approval
-        // path already issued instead of minting one per request.
+        // inside the server's runtime, where `block_on` panics. Even the dev lane
+        // travels the receipt seam a real approval travels — it deposits its own
+        // evidence and forwards the receipt — because a stand-in that skipped the
+        // seam would prove the wrong path is sound.
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("a dev runtime")
                 .block_on(async move {
-                    let raised = service.begin(&request, now).await.ok()?;
+                    let (_, raised) = service.begin(&request, now).await.ok()?;
+                    let (_challenge, receipt) = service
+                        .deposit_evidence(
+                            &address,
+                            &InboundEvidenceRecord {
+                                provider: "dev".to_owned(),
+                                provider_account: "dev".to_owned(),
+                                provider_message_id: raised.id.as_str().to_owned(),
+                                claimed_sender: address.clone(),
+                                verified: true,
+                                signature: None,
+                            },
+                            now,
+                            60_000,
+                        )
+                        .await
+                        .ok()?;
                     service
-                        .submit(&raised.id, "0000", &binding, AssuranceLevel::Dev, now + 1)
+                        .submit(&raised.id, "0000", &actor, &receipt, now + 1)
                         .await
                         .ok()
                 })
@@ -604,11 +624,20 @@ async fn main() -> ExitCode {
     // Two routers, one listener.
     //
     // The booking API and the trusted approval endpoints are separate surfaces
-    // that happen to share a port. What keeps the untrusted proposer away from
-    // the second is not the network — it is that `Gateway` has no method naming
-    // any of these paths and `townhall-orchestrator` cannot name
-    // `townhall-authority` at all (ADR-025, asserted by that crate's
-    // resolved-dependency test).
+    // that happen to share a port. What keeps the untrusted MODEL seat away from
+    // the second is the client surface and the crate graph together: `Gateway`
+    // has no method naming any of these paths, and `townhall-orchestrator` cannot
+    // name `townhall-authority` at all (ADR-025, asserted by that crate's
+    // resolved-dependency test) — so the code that forms proposals holds no way
+    // to write an evidence row or a grant.
+    //
+    // What this does NOT do is stop a runtime HTTP POST. The crate-graph ban is a
+    // COMPILE-time fact; these endpoints answer over TCP, and a compromised
+    // orchestrator PROCESS holds a workload token and could reach them. That is
+    // the residual ADR-026 scopes to the model seat and names honestly as the
+    // SMS-demo assurance level — the crate ban is defence-in-depth for that seat,
+    // not the boundary against a subverted process, which M12's signed webhook
+    // closes.
     let approvals =
         townhall_http::approvals::approval_router(townhall_http::approvals::ApprovalState {
             issuer: Arc::new(authority::ServiceIssuer(issuer)),

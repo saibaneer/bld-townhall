@@ -12,9 +12,10 @@
 //!
 //! Not the network — these share a listener with the booking API. The
 //! guarantee is the crate graph and the client surface: `Gateway` has no method
-//! that names any of these paths, `townhall-orchestrator` has no dependency on
-//! `townhall-authority`, and its resolved-dependency test forbids one. A crate
-//! that cannot name an issuer cannot call one, whatever it can reach over TCP.
+//! that names any of these paths, and `townhall-orchestrator` may not depend on
+//! `townhall-authority` — forbidden by its resolved-dependency test
+//! (`crates/townhall-orchestrator/tests/boundary.rs`). A crate that cannot name
+//! an issuer cannot call one, whatever it can reach over TCP.
 //!
 //! # What is deliberately NOT here
 //!
@@ -32,14 +33,12 @@ use axum::{
     routing::post,
 };
 use bld_types::{
-    Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId, ServiceId,
-    TimeWindow,
+    ActorId, Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId,
+    ServiceId, TimeWindow,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use townhall_authority::{
-    ApprovalDenied, ApprovalRequest, AssuranceLevel, BehaviourSet, BindingRef, PendingScope,
-};
+use townhall_authority::{ApprovalDenied, ApprovalRequest, BehaviourSet, BindingRef, PendingScope};
 
 /// What the endpoints need, without naming a concrete issuer.
 ///
@@ -48,22 +47,55 @@ use townhall_authority::{
 /// and so a test can answer these three questions without a database.
 #[async_trait::async_trait]
 pub trait ApprovalIssuer: Send + Sync {
-    /// Raise a challenge. Returns the id and the preview to send verbatim.
-    async fn begin(&self, request: &ApprovalRequest) -> Result<(String, String), String>;
+    /// Raise a challenge, or return the one this inbound intent already has.
+    ///
+    /// `created` is false when a redelivered `BOOK` reused an existing
+    /// challenge — same id, same code — so the caller can answer `200` rather
+    /// than `201` without raising a second, contradictory prompt.
+    async fn begin(&self, request: &ApprovalRequest) -> Result<(bool, String, String), String>;
 
-    /// Answer it. `approve` false is a rejection, which is terminal.
+    /// Deposit an inbound reply's transport evidence under a one-use receipt.
+    ///
+    /// The trusted ingress calls this; it returns the challenge the reply
+    /// answers and an opaque receipt. The orchestrator then forwards
+    /// `challenge + code + receipt` to [`Self::reply`] — never the evidence
+    /// itself, which it cannot forge into a row it did not write (ADR-026).
+    async fn deposit_evidence(
+        &self,
+        inbound: &InboundEvidence,
+    ) -> Result<(String, String), ApprovalDenied>;
+
+    /// Answer it with a forwarded receipt. `approve` false is a rejection,
+    /// which is terminal. `actor` is the authenticated caller, used only to
+    /// return the SAME reference to a replayed `YES`, never to name the grant.
     async fn reply(
         &self,
         challenge: &str,
         code: &str,
-        from: &BindingRef,
-        assurance: AssuranceLevel,
+        receipt: &str,
+        actor: &ActorId,
         approve: bool,
     ) -> Result<Option<String>, ApprovalDenied>;
 
     /// Revoke a grant. `false` means it was already revoked or never existed —
     /// not an error, because REVOKE is a safety exit (spec §2).
     async fn revoke(&self, delegation: &str) -> Result<bool, String>;
+}
+
+/// One inbound reply's transport evidence, as the trusted ingress presents it.
+///
+/// The identity triple is transport-set: the ingress fills it from the carrier,
+/// and it is what stops a caller naming a row into being by choosing a sender.
+#[derive(Deserialize)]
+pub struct InboundEvidence {
+    pub provider: String,
+    pub account: String,
+    pub message_id: String,
+    /// The number the reply came from, normalized. Both the routing key and the
+    /// evidence's `claimed_sender`.
+    pub address: String,
+    pub verified: bool,
+    pub signature: Option<String>,
 }
 
 /// Everything the approval router can reach.
@@ -75,10 +107,11 @@ pub struct ApprovalState {
     pub authority: Arc<dyn crate::AuthorityResolver>,
 }
 
-/// The three routes.
+/// The routes.
 pub fn approval_router(state: ApprovalState) -> Router {
     Router::new()
         .route("/approvals", post(begin_approval))
+        .route("/inbound-evidence", post(deposit_evidence))
         .route("/approvals/{id}/reply", post(reply_to_approval))
         .route("/delegations/{id}/revoke", post(revoke_delegation))
         .with_state(state)
@@ -112,8 +145,10 @@ struct ReplyBody {
     /// `"YES"` or `"NO"`, spelled as the person spelled it.
     answer: String,
     code: String,
-    binding_principal: String,
-    binding_version: u64,
+    /// The opaque receipt for the deposited evidence — the ONLY thing the caller
+    /// says about the reply. No binding fields: the verifier reads the sender
+    /// from the receipt's row, not from anything the caller claims.
+    receipt: String,
 }
 
 async fn begin_approval(
@@ -177,11 +212,42 @@ async fn begin_approval(
     };
 
     match state.issuer.begin(&request).await {
-        Ok((id, preview)) => mapping::json_response(
-            StatusCode::CREATED,
+        // Created is 201; a redelivered BOOK that reused an existing challenge is
+        // 200 — the same id and code, not a fresh prompt.
+        Ok((created, id, preview)) => mapping::json_response(
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
             &serde_json::json!({ "challenge": id, "preview": preview }),
         ),
         Err(problem) => mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, &problem),
+    }
+}
+
+/// The trusted ingress deposits an inbound reply's evidence and gets a receipt.
+///
+/// This is the seam that makes the receipt honest: the evidence row is written
+/// HERE, in the server that owns the store, and the untrusted orchestrator only
+/// ever forwards the receipt this returns. It authenticates exactly as the other
+/// endpoints do — a compromised process holding a workload token can reach it,
+/// which is the SMS-demo assurance level ADR-026 concedes; the MODEL seat, which
+/// holds no token and no client, cannot.
+async fn deposit_evidence(
+    State(state): State<ApprovalState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<InboundEvidence>,
+) -> Response {
+    if let Err(refused) = crate::authenticated(state.authority.as_ref(), &headers) {
+        return refused;
+    }
+    match state.issuer.deposit_evidence(&body).await {
+        Ok((challenge, receipt)) => mapping::json_response(
+            StatusCode::CREATED,
+            &serde_json::json!({ "challenge": challenge, "receipt": receipt }),
+        ),
+        Err(denied) => denial_response(&denied),
     }
 }
 
@@ -191,9 +257,12 @@ async fn reply_to_approval(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<ReplyBody>,
 ) -> Response {
-    if let Err(refused) = crate::authenticated(state.authority.as_ref(), &headers) {
-        return refused;
-    }
+    // The authenticated caller is KEPT (M7B fixed the discard): it is the actor a
+    // replayed `YES` must match to recover its reference, never the grant's actor.
+    let actor = match crate::authenticated(state.authority.as_ref(), &headers) {
+        Ok(actor) => actor,
+        Err(refused) => return refused,
+    };
 
     let approve = match body.answer.trim().to_ascii_uppercase().as_str() {
         "YES" => true,
@@ -208,14 +277,10 @@ async fn reply_to_approval(
             );
         }
     };
-    let from = BindingRef {
-        principal: PrincipalId::new(body.binding_principal),
-        version: body.binding_version,
-    };
 
     match state
         .issuer
-        .reply(&id, &body.code, &from, AssuranceLevel::SmsReply, approve)
+        .reply(&id, &body.code, &body.receipt, &actor, approve)
         .await
     {
         // Approved: the caller gets a REFERENCE and nothing else.
@@ -274,16 +339,19 @@ async fn revoke_delegation(
 /// Each denial keeps its own status, because they are different facts.
 fn denial_response(denied: &ApprovalDenied) -> Response {
     let status = match denied {
-        // 404 rather than 400: a caller who guesses challenge ids learns
-        // nothing about which exist (ADR-022's reasoning, one layer up).
-        ApprovalDenied::UnknownChallenge => StatusCode::NOT_FOUND,
+        // 404 rather than 400: a caller who guesses challenge ids — or receipt
+        // ids — learns nothing about which exist (ADR-022's reasoning, one
+        // layer up).
+        ApprovalDenied::UnknownChallenge | ApprovalDenied::UnknownReceipt => StatusCode::NOT_FOUND,
         // 410 Gone: it existed, its moment has passed, and retrying the same
         // thing cannot help — which is exactly what Gone means.
         ApprovalDenied::ChallengeExpired | ApprovalDenied::Replay(_) => StatusCode::GONE,
-        // 403: the answer was heard and refused.
+        // 403: the answer was heard and refused — including a receipt that
+        // answers a different challenge than the one named.
         ApprovalDenied::WrongCode { .. }
         | ApprovalDenied::AttemptsExceeded
-        | ApprovalDenied::WrongChannel => StatusCode::FORBIDDEN,
+        | ApprovalDenied::WrongChannel
+        | ApprovalDenied::ReceiptChallengeMismatch => StatusCode::FORBIDDEN,
         // 500: the row contradicts itself. Not the caller's fault and not
         // something a retry fixes.
         ApprovalDenied::Unreadable => StatusCode::INTERNAL_SERVER_ERROR,

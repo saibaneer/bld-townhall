@@ -42,6 +42,10 @@ id_type!(CouncilBookingRef);
 id_type!(ApprovalChallengeId);
 id_type!(DelegationId);
 id_type!(ServiceId);
+// M7C-1's receipt for a deposited inbound-evidence row (ADR-026). An id names a
+// row; it grants nothing. The untrusted proposer forwards this opaque handle in
+// place of the transport evidence itself, and the verifier reads the row back.
+id_type!(EvidenceReceiptId);
 
 /// One thing an authority may permit, named independently of the domain.
 ///

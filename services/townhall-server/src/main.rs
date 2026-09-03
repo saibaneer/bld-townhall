@@ -306,7 +306,20 @@ impl DevAuthority {
                         from: "00:00".to_owned(),
                         to: "23:59".to_owned(),
                     },
-                    attendees: 1,
+                    // No headcount ceiling.
+                    //
+                    // This was `1`, written as a placeholder when the field was
+                    // only decoration in this lane. The M7B review made the
+                    // approved headcount a real constraint, and the placeholder
+                    // silently became a ceiling of ONE — so any change above
+                    // one attendee was refused, in a lane whose whole nature is
+                    // that it approves whatever was asked.
+                    //
+                    // CI caught it; a local sweep I neglected to re-run would
+                    // have. Worth the comment because the failure mode is
+                    // general: a placeholder in a field nobody reads is fine
+                    // until somebody starts reading the field.
+                    attendees: u16::MAX,
                     wheelchair_accessible: false,
                     max_fee: bld_types::Money::from_pence(max_fee_pence),
                 },

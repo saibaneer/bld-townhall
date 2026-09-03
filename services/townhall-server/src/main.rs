@@ -399,6 +399,40 @@ impl AuthorityResolver for DevAuthority {
     }
 }
 
+/// Whether `--dev-authority` is usable in THIS build.
+///
+/// # Why this is separate from `authority`, and runs first
+///
+/// It used to live inside `authority`, which needs a connection pool — so a
+/// build without the feature opened a database, ran migrations, and only THEN
+/// refused to start. Two things wrong with that. A server should not touch
+/// storage to discover its arguments are wrong; and returning from `main` with
+/// a live `sqlx` pool means dropping a Tokio runtime that is still waiting on
+/// the pool's per-connection blocking threads. On a loaded Linux runner that
+/// wait is long enough to look like a hang, which is exactly how CI reported
+/// it — `the_dev_authority_flag_does_not_exist_in_this_build` sitting for over
+/// sixty seconds on a check that takes microseconds.
+///
+/// Argument validation is now pure and happens before any I/O.
+// With the feature ENABLED this can only return `Ok`, and clippy says so. The
+// signature is not redundant — it is the shape of the question in the build
+// where the answer can be no, and collapsing it to `()` under one feature set
+// would mean the two builds disagreed about whether the check exists.
+#[allow(clippy::unnecessary_wraps)]
+fn dev_authority_available(args: &Args) -> Result<(), String> {
+    if !args.dev_authority {
+        return Ok(());
+    }
+    #[cfg(feature = "dev-authority")]
+    {
+        Ok(())
+    }
+    #[cfg(not(feature = "dev-authority"))]
+    {
+        Err("--dev-authority requires building with the dev-authority feature".to_owned())
+    }
+}
+
 /// The issuer, and the resolver that reads what it wrote.
 ///
 /// # Why the issuer is built unconditionally
@@ -450,9 +484,9 @@ fn authority(
             return Ok((Arc::new(DevAuthority), issuer));
         }
     }
-    if args.dev_authority {
-        return Err("--dev-authority requires building with the dev-authority feature".to_owned());
-    }
+    // The flag/feature combination was settled before any I/O — see
+    // `dev_authority_available`. Reaching here with the flag set and the
+    // feature absent is impossible.
 
     // The real resolver. It can mint nothing: a grant exists because somebody
     // answered a challenge, and this looks it up.
@@ -479,6 +513,10 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(problem) = dev_authority_available(&args) {
+        eprintln!("townhall-server: {problem}");
+        return ExitCode::from(2);
+    }
     let Some(key_bytes) = parse_key(&args.key_hex) else {
         eprintln!("townhall-server: --key-hex must be exactly 64 hex characters");
         return ExitCode::from(2);

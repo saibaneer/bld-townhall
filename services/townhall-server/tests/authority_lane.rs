@@ -522,6 +522,31 @@ fn the_dev_authority_flag_does_not_exist_in_this_build() {
         complaint.contains("requires building with the dev-authority feature"),
         "the refusal must say why: {complaint}"
     );
+
+    // And it refused BEFORE touching storage.
+    //
+    // # Why this assertion exists
+    //
+    // Because the first version did not. The flag/feature check lived inside
+    // the resolver's construction, which needs a connection pool — so this
+    // process opened a database, ran migrations, and only then declined to
+    // start. Returning from `main` with a live `sqlx` pool leaves a Tokio
+    // runtime waiting on the pool's per-connection blocking threads, and on a
+    // loaded Linux runner that wait was long enough that CI reported this very
+    // test as hanging for over sixty seconds — a check that takes microseconds.
+    //
+    // An empty directory is the witness, and it is a better one than a timeout:
+    // it says what the rule is rather than how slow the violation was.
+    // Validating arguments must not require storage.
+    let created: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("the directory is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        created.is_empty(),
+        "refusing an argument must not create a database: found {created:?}"
+    );
 }
 
 fn create_body(id: &str) -> serde_json::Value {

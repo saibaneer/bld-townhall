@@ -274,6 +274,36 @@ pub trait ApprovalStore: Send + Sync {
     /// `Ok(false)`.
     async fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError>;
 
+    /// Spend a control receipt one-use AND revoke every live delegation the
+    /// receipt's principal granted — both in ONE transaction. Returns the count
+    /// revoked.
+    ///
+    /// # Why the spend and the sweep must commit together
+    ///
+    /// Split into two calls, a crash between them either strands the receipt
+    /// (spent, nothing revoked) or double-spends it (revoked twice on a retry).
+    /// Folding the spend in also makes idempotency fall out for free: a receipt
+    /// already `consumed_at_ms` spends nothing, the sweep is skipped, and the
+    /// call returns `Ok(0)` — a re-sent REVOKE is a safety exit (spec §2), never
+    /// an error.
+    ///
+    /// # Why key on `grantor` and not the challenge→binding join
+    ///
+    /// `grantor` is who AUTHORIZED the grants — definitionally "everything this
+    /// person set in motion". It is a first-class indexed column, so the sweep is
+    /// one statement. The verifier resolves the inbound sender to a binding and
+    /// passes that binding's principal as `grantor`; for M7C's own-behalf
+    /// bookings grantor, subject and channel-owner coincide (see the dispatcher).
+    ///
+    /// # Errors
+    /// The store is unreachable.
+    async fn revoke_all_by_grantor_with_receipt(
+        &self,
+        grantor: &PrincipalId,
+        receipt: &EvidenceReceiptId,
+        at_ms: u64,
+    ) -> Result<u64, StoreError>;
+
     /// Deposit one inbound message's transport evidence under `receipt`, BOUND to
     /// the challenge it answers, and return the receipt actually stored.
     ///
@@ -289,6 +319,26 @@ pub trait ApprovalStore: Send + Sync {
         receipt: &EvidenceReceiptId,
         evidence: &InboundEvidenceRecord,
         challenge: &ApprovalChallengeId,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<EvidenceReceipt, StoreError>;
+
+    /// Deposit a CONTROL inbound's transport evidence under `receipt`, bound to
+    /// NO challenge (`challenge_id` NULL) — a command that answers no approval,
+    /// such as a REVOKE.
+    ///
+    /// One-use and short-TTL, and idempotent on the inbound identity triple
+    /// exactly as [`Self::write_inbound_evidence`]. A separate method rather than
+    /// an `Option<challenge>` parameter so the correlated path keeps its
+    /// bind-at-deposit invariant type-enforced: only a control inbound may land a
+    /// NULL-challenge row, and it must come through here to do it.
+    ///
+    /// # Errors
+    /// The store is unreachable.
+    async fn write_control_evidence(
+        &self,
+        receipt: &EvidenceReceiptId,
+        evidence: &InboundEvidenceRecord,
         now_ms: u64,
         expires_at_ms: u64,
     ) -> Result<EvidenceReceipt, StoreError>;
@@ -646,6 +696,45 @@ impl ApprovalStore for MemoryApprovalStore {
         Ok(true)
     }
 
+    async fn revoke_all_by_grantor_with_receipt(
+        &self,
+        grantor: &PrincipalId,
+        receipt: &EvidenceReceiptId,
+        at_ms: u64,
+    ) -> Result<u64, StoreError> {
+        // One lock for spend-then-sweep, the single-lock stand-in for the SQL
+        // transaction. The spend is the idempotency guard: a receipt already
+        // consumed revokes nothing and returns Ok(0), so a replayed REVOKE is a
+        // no-op rather than a double-sweep.
+        let mut held = self.locked();
+        match held.evidence.get_mut(receipt.as_str()) {
+            // A fresh CONTROL receipt (challenge_id NULL): spend it, then sweep
+            // below. The `challenge_id.is_none()` predicate is the anti-lever
+            // guard made structural — mirroring the SQL spend's `challenge_id IS
+            // NULL` — so a challenge-bound `YES` receipt can never be consumed
+            // here to drive a sweep, whatever the caller checked first.
+            Some(row) if row.consumed_at_ms.is_none() && row.challenge_id.is_none() => {
+                row.consumed_at_ms = Some(at_ms);
+            }
+            // Spent already (a replay), challenge-bound, or naming no row: revoke
+            // nothing. Ok(0), never an error — a re-sent REVOKE is a safety exit
+            // (spec §2).
+            _ => return Ok(0),
+        }
+        // Sweep by grantor — a direct field on the record, no join. Every live
+        // grant this principal authorized, not just one: the count is the full
+        // number stopped, which is what the caller reports back.
+        let mut revoked = 0u64;
+        for delegation in held.delegations.values_mut() {
+            if delegation.grantor.as_str() == grantor.as_str() && delegation.revoked_at_ms.is_none()
+            {
+                delegation.revoked_at_ms = Some(at_ms);
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
     async fn write_inbound_evidence(
         &self,
         receipt: &EvidenceReceiptId,
@@ -674,6 +763,44 @@ impl ApprovalStore for MemoryApprovalStore {
             verified: evidence.verified,
             signature: evidence.signature.clone(),
             challenge_id: Some(challenge.as_str().to_owned()),
+            consumed_at_ms: None,
+        };
+        held.evidence.insert(receipt.as_str().to_owned(), row);
+        held.evidence_by_identity
+            .insert(identity, receipt.as_str().to_owned());
+        Ok(EvidenceReceipt {
+            receipt: receipt.clone(),
+            fresh: true,
+        })
+    }
+
+    async fn write_control_evidence(
+        &self,
+        receipt: &EvidenceReceiptId,
+        evidence: &InboundEvidenceRecord,
+        _now_ms: u64,
+        _expires_at_ms: u64,
+    ) -> Result<EvidenceReceipt, StoreError> {
+        // As `write_inbound_evidence`, but the row is bound to NO challenge —
+        // `challenge_id = None`, the shape a control command (REVOKE) leaves.
+        let mut held = self.locked();
+        let identity = (
+            evidence.provider.clone(),
+            evidence.provider_account.clone(),
+            evidence.provider_message_id.clone(),
+        );
+        if let Some(existing) = held.evidence_by_identity.get(&identity) {
+            return Ok(EvidenceReceipt {
+                receipt: EvidenceReceiptId::new(existing.clone()),
+                fresh: false,
+            });
+        }
+        let row = StoredEvidence {
+            receipt: receipt.as_str().to_owned(),
+            claimed_sender: evidence.claimed_sender.clone(),
+            verified: evidence.verified,
+            signature: evidence.signature.clone(),
+            challenge_id: None,
             consumed_at_ms: None,
         };
         held.evidence.insert(receipt.as_str().to_owned(), row);

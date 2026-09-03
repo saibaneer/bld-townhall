@@ -314,4 +314,35 @@ impl townhall_http::approvals::ApprovalIssuer for ServiceIssuer {
             .await
             .map_err(|error| error.to_string())
     }
+
+    async fn revoke_via_receipt(
+        &self,
+        inbound: &townhall_http::approvals::InboundEvidence,
+    ) -> Result<u64, townhall_authority::ApprovalDenied> {
+        // The fuse point (ADR-026): the control evidence is deposited HERE, in the
+        // server that owns the store, and the receipt it mints never leaves — the
+        // untrusted orchestrator forwarded only the transport triple. Deposit →
+        // receipt → sweep, two awaits over one process.
+        let record = townhall_authority::InboundEvidenceRecord {
+            provider: inbound.provider.clone(),
+            provider_account: inbound.account.clone(),
+            provider_message_id: inbound.message_id.clone(),
+            claimed_sender: inbound.address.clone(),
+            verified: inbound.verified,
+            signature: inbound.signature.clone(),
+        };
+        let receipt = self
+            .0
+            .deposit_control_evidence(&inbound.address, &record, now_ms(), EVIDENCE_TTL_MS)
+            .await?;
+        // On a carrier redelivery, `deposit_control_evidence` returns the row the
+        // first deposit wrote. If a REVOKE's identity triple ever COLLIDED with a
+        // prior challenge-bound `YES` row (distinct carrier messages carry distinct
+        // message-ids, so this needs the carrier to reuse one), the returned
+        // receipt is challenge-bound and `revoke_via_receipt` refuses it as
+        // `ReceiptChallengeMismatch` — a 403 the SMS surface reads as "nothing to
+        // stop". That fails the REVOKE CLOSED: it wrongly stops nothing rather than
+        // wrongly sweeping, which is the safe direction.
+        self.0.revoke_via_receipt(&receipt, now_ms()).await
+    }
 }

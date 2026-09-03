@@ -171,6 +171,75 @@ async fn deposit_reply(service: &Service, address: &str, nonce: &str) -> Evidenc
     receipt
 }
 
+/// Begin and fully approve one booking for Lucy, returning the grant's
+/// delegation id. Each call uses a distinct booking (so the idempotent-begin
+/// dedupe raises a fresh challenge) and a distinct deposit nonce.
+async fn approve_booking(service: &Service, booking: &str, nonce: &str) -> DelegationId {
+    let (_, raised) = service
+        .begin(
+            &request_for(booking, [Behaviour::Book, Behaviour::Cancel]),
+            NOW,
+        )
+        .await
+        .expect("challenge raised");
+    let receipt = deposit_reply(service, LUCY_ADDR, nonce).await;
+    let grant = service
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+        .await
+        .expect("a correct code from the bound channel");
+    grant.delegation().clone()
+}
+
+/// A booking Marco grants over his OWN bound channel — a second grantor, so a
+/// sweep of Lucy's grants must leave this one standing.
+fn marcos_request(booking: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        binding: BindingRef {
+            principal: PrincipalId::new("marco"),
+            version: 1,
+        },
+        grantor: PrincipalId::new("marco"),
+        subject: PrincipalId::new("marco"),
+        ..request_for(booking, [Behaviour::Book, Behaviour::Cancel])
+    }
+}
+
+/// Begin and fully approve one booking for Marco, returning its delegation id.
+async fn approve_marcos_booking(service: &Service, booking: &str, nonce: &str) -> DelegationId {
+    let (_, raised) = service
+        .begin(&marcos_request(booking), NOW)
+        .await
+        .expect("challenge raised");
+    let receipt = deposit_reply(service, MARCO_ADDR, nonce).await;
+    let grant = service
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+        .await
+        .expect("Marco's own channel approves");
+    grant.delegation().clone()
+}
+
+/// Deposit a CONTROL inbound (a REVOKE) from `address` and return its receipt.
+/// `challenge_id` is NULL — this answers no challenge. The `ctrl-` message-id
+/// prefix keeps its transport identity distinct from any `YES` deposit's.
+async fn deposit_control(service: &Service, address: &str, nonce: &str) -> EvidenceReceiptId {
+    service
+        .deposit_control_evidence(
+            address,
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: format!("ctrl-{address}-{nonce}"),
+                claimed_sender: address.to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await
+        .expect("a bound channel may deposit a control inbound")
+}
+
 /// The happy path, and the gate's "£45 scope permitted" half.
 ///
 /// The £50 ceiling is what Lucy approved; the council's slot costs £45. The
@@ -907,6 +976,121 @@ async fn a_redelivered_book_reuses_its_challenge() {
     assert_eq!(still.id, first.id);
 }
 
+/// T6 — a redelivered `BOOK` after a TERMINAL state still reuses its challenge.
+///
+/// The existing witness covers pending and approved. The gate's denial 7 also
+/// spans the terminal states, and only a test that reaches a genuinely terminal
+/// or expired challenge proves it: the dedupe mechanism (the partial-unique
+/// `booking_intent` index) already spans the whole lifecycle, so a suite that
+/// never drives a booking to rejected / exhausted / expired would pass a broken
+/// impl that filtered the lookup by status or minted a fresh code on redelivery.
+///
+/// For each of the three terminal states, the redelivery must return the SAME id
+/// AND the SAME code — a fresh answerable prompt would carry a new code the
+/// person never saw, and an expired challenge must come back still expired, not
+/// re-opened.
+#[tokio::test]
+async fn a_redelivered_book_after_a_terminal_state_still_reuses_its_challenge() {
+    // Assert a redelivered BOOK for `booking` reuses `first_id`/`first_code`.
+    async fn reuses_after(service: &Service, booking: &str, id: &str, code: &str, at: u64) {
+        let (outcome, reused) = service
+            .begin(&request_for(booking, [Behaviour::Book]), at)
+            .await
+            .expect("redelivery");
+        assert_eq!(
+            outcome,
+            BeginOutcome::Existing,
+            "{booking}: a terminal challenge is reused, not re-minted"
+        );
+        assert_eq!(reused.id.as_str(), id, "{booking}: same challenge id");
+        assert_eq!(
+            reused.code.revealed(),
+            code,
+            "{booking}: the same code, not a fresh one the person never saw"
+        );
+    }
+
+    let service = service();
+
+    // (a) REJECTED — a declined booking, redelivered, is the same refused prompt.
+    let (_, rejected) = service
+        .begin(&request_for("book-rejected", [Behaviour::Book]), NOW)
+        .await
+        .expect("begin");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "reject").await;
+    service
+        .reject(&rejected.id, "7312", &receipt, NOW + 1_000)
+        .await
+        .expect("a decline is an outcome, not an error");
+    reuses_after(
+        &service,
+        "book-rejected",
+        rejected.id.as_str(),
+        rejected.code.revealed(),
+        NOW + 2_000,
+    )
+    .await;
+
+    // (b) EXHAUSTED — every attempt spent, redelivered, is the same dead prompt.
+    let (_, exhausted) = service
+        .begin(&request_for("book-exhausted", [Behaviour::Book]), NOW)
+        .await
+        .expect("begin");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "exhaust").await;
+    for _ in 0..MAX_ATTEMPTS {
+        let _ = service
+            .submit(
+                &exhausted.id,
+                "0000",
+                &townhall_actor(),
+                &receipt,
+                NOW + 1_000,
+            )
+            .await;
+    }
+    reuses_after(
+        &service,
+        "book-exhausted",
+        exhausted.id.as_str(),
+        exhausted.code.revealed(),
+        NOW + 2_000,
+    )
+    .await;
+
+    // (c) EXPIRED — the reply window passed, redelivered, is the SAME expired
+    //     challenge, not a fresh answerable one.
+    let (_, expired) = service
+        .begin(&request_for("book-expired", [Behaviour::Book]), NOW)
+        .await
+        .expect("begin");
+    let past_expiry = NOW + REPLY_WINDOW_MS + 1;
+    reuses_after(
+        &service,
+        "book-expired",
+        expired.id.as_str(),
+        expired.code.revealed(),
+        past_expiry, // past the challenge's own expiry
+    )
+    .await;
+    // And it is STILL expired, not silently re-opened: the correct code, offered
+    // to the redelivered challenge after expiry, is refused as expired. A mutant
+    // that reset the reply window on redelivery would let this approve.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "expired-check").await;
+    assert_eq!(
+        service
+            .submit(
+                &expired.id,
+                "7312",
+                &townhall_actor(),
+                &receipt,
+                past_expiry
+            )
+            .await,
+        Err(ApprovalDenied::ChallengeExpired),
+        "the redelivered challenge is the same expired one, not a fresh prompt"
+    );
+}
+
 /// Two DIFFERENT bookings are independent challenges.
 #[tokio::test]
 async fn two_different_bookings_are_their_own_challenges() {
@@ -1104,6 +1288,279 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
     );
 }
 
+/// T1 — a texted REVOKE stops EVERY live grant the sender authorized, not one.
+///
+/// Two distinct bookings, both approved, two delegations under one grantor. One
+/// control inbound revokes BOTH. Asserting on the full set is load-bearing: a
+/// single-grant test passes an impl that reuses `revoke_delegation` or an
+/// `== 1`, revoking only the first row (ADR-026 withdrew "one binding = one
+/// delegation", so a real account holds several).
+#[tokio::test]
+async fn a_revoke_stops_every_live_grant_the_sender_authorized() {
+    let service = service();
+    let first = approve_booking(&service, "sms-lucy-0001", "1").await;
+    let second = approve_booking(&service, "sms-lucy-0002", "2").await;
+    // A DIFFERENT grantor's live grant, over his own channel. Lucy's REVOKE must
+    // NOT touch it — the sweep is "the sender's grants, and only those". Without
+    // this witness a sweep that dropped `WHERE grantor = ?` (revoking everyone's
+    // grants) would pass every single-grantor assertion.
+    let marcos = approve_marcos_booking(&service, "sms-marco-0001", "m").await;
+
+    // All three live before the REVOKE.
+    service.resolve(&first, NOW + 2_000).await.expect("live");
+    service.resolve(&second, NOW + 2_000).await.expect("live");
+    service.resolve(&marcos, NOW + 2_000).await.expect("live");
+
+    let receipt = deposit_control(&service, LUCY_ADDR, "revoke-1").await;
+    let stopped = service
+        .revoke_via_receipt(&receipt, NOW + 3_000)
+        .await
+        .expect("a bound sender's REVOKE is answered");
+
+    assert_eq!(
+        stopped, 2,
+        "a REVOKE stops every grant the sender authorized — both, and ONLY those \
+         two (not Marco's)"
+    );
+    assert_eq!(
+        service.resolve(&first, NOW + 4_000).await,
+        Err(ResolveError::Revoked),
+        "the first grant is revoked"
+    );
+    assert_eq!(
+        service.resolve(&second, NOW + 4_000).await,
+        Err(ResolveError::Revoked),
+        "and so is the second — the sweep is by grantor, not one row"
+    );
+    service
+        .resolve(&marcos, NOW + 4_000)
+        .await
+        .expect("a different grantor's grant is untouched — the sweep is scoped");
+}
+
+/// T5 — a challenge-bound (`YES`) receipt cannot be turned into a revoke-all
+/// lever.
+///
+/// The whole anti-lever guard: a person's answer to their own £45 must never
+/// become "stop everything Lucy authorized". Only a NULL-challenge control row
+/// may drive a sweep; a receipt that names a challenge is refused BEFORE the
+/// sweep, and the live grant it names stays live.
+#[tokio::test]
+async fn a_challenge_bound_receipt_cannot_drive_a_revoke() {
+    let service = service();
+    // A live grant that must survive the refused revoke.
+    let live = approve_booking(&service, "sms-lucy-0001", "1").await;
+
+    // A fresh, unconsumed, challenge-BOUND receipt (a pending YES, not submitted).
+    service
+        .begin(&request_for("sms-lucy-0002", [Behaviour::Book]), NOW)
+        .await
+        .expect("a second challenge");
+    let challenge_bound = deposit_reply(&service, LUCY_ADDR, "2").await;
+
+    assert_eq!(
+        service
+            .revoke_via_receipt(&challenge_bound, NOW + 2_000)
+            .await,
+        Err(ApprovalDenied::ReceiptChallengeMismatch),
+        "a receipt bound to a challenge is not a control receipt"
+    );
+    service
+        .resolve(&live, NOW + 3_000)
+        .await
+        .expect("the refused revoke left the live grant untouched");
+}
+
+/// The anti-lever guard is STRUCTURAL, not a single-caller promise: even reaching
+/// PAST the service straight into the store, a challenge-bound receipt drives no
+/// sweep and is not spent.
+///
+/// `revoke_via_receipt` checks `challenge_id.is_some()` before it ever calls the
+/// store — but that is one layer above the mutation. This test bypasses it and
+/// calls `revoke_all_by_grantor_with_receipt` directly with a real `YES` receipt.
+/// The store's own `challenge_id IS NULL` spend-guard must refuse it: nothing
+/// revoked, and — crucially — the receipt is NOT consumed, so the real `YES` it
+/// belongs to can still approve afterwards.
+#[tokio::test]
+async fn the_store_itself_refuses_to_sweep_on_a_challenge_bound_receipt() {
+    let (service, store) = service_and_store();
+    let live = approve_booking(&service, "sms-lucy-0001", "1").await;
+
+    // A fresh, unconsumed, challenge-bound YES receipt.
+    let (_, raised) = service
+        .begin(&request_for("sms-lucy-0002", [Behaviour::Book]), NOW)
+        .await
+        .expect("a second challenge");
+    let challenge_bound = deposit_reply(&service, LUCY_ADDR, "2").await;
+
+    // Straight into the store, past the service guard entirely.
+    let swept = store
+        .revoke_all_by_grantor_with_receipt(
+            &PrincipalId::new("lucy"),
+            &challenge_bound,
+            NOW + 1_500,
+        )
+        .await
+        .expect("the store answers");
+    assert_eq!(
+        swept, 0,
+        "a challenge-bound receipt spends nothing and sweeps nothing"
+    );
+    service
+        .resolve(&live, NOW + 2_000)
+        .await
+        .expect("no grant was revoked");
+
+    // The receipt was not consumed, so the YES it belongs to still approves.
+    service
+        .submit(
+            &raised.id,
+            "7312",
+            &townhall_actor(),
+            &challenge_bound,
+            NOW + 2_500,
+        )
+        .await
+        .expect("the challenge-bound receipt is still spendable for its real YES");
+}
+
+/// A REVOKE whose receipt names no row at all is refused, distinctly — the
+/// receipt is the only tie to a real inbound, and an invented one is denied
+/// before anything is resolved or swept.
+#[tokio::test]
+async fn a_revoke_with_an_unknown_receipt_is_refused() {
+    let service = service();
+    let live = approve_booking(&service, "sms-lucy-0001", "1").await;
+
+    assert_eq!(
+        service
+            .revoke_via_receipt(&EvidenceReceiptId::new("no-such-receipt"), NOW + 1_000)
+            .await,
+        Err(ApprovalDenied::UnknownReceipt),
+        "an invented receipt names no inbound — it is not a silent Ok(0)"
+    );
+    service
+        .resolve(&live, NOW + 2_000)
+        .await
+        .expect("nothing was swept");
+}
+
+/// T3a — an unbound sender cannot even deposit a control row.
+///
+/// The forgeable field is `claimed_sender`; the deposit resolves it to a live
+/// binding first, so a number that is bound to nobody is refused at the door and
+/// never gets a receipt. This is the failure the first ADR-026 draft died on: a
+/// sweep keyed on the claimed sender without resolving it.
+#[tokio::test]
+async fn an_unbound_sender_cannot_deposit_a_control_row() {
+    let (service, _store) = service_and_store();
+    let victim = approve_booking(&service, "sms-lucy-0001", "1").await;
+
+    let refused = service
+        .deposit_control_evidence(
+            "+ghost", // bound to no one
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: "ctrl-ghost-1".to_owned(),
+                claimed_sender: "+ghost".to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await;
+
+    assert_eq!(
+        refused,
+        Err(ApprovalDenied::WrongChannel),
+        "an unbound number authorized nothing and may deposit nothing"
+    );
+    service
+        .resolve(&victim, NOW + 2_000)
+        .await
+        .expect("the victim's grant is untouched — no row, no sweep");
+}
+
+/// T3b — a control receipt whose binding is later withdrawn sweeps nothing.
+///
+/// The sweep re-resolves the sender to a LIVE binding at revoke time, not just at
+/// deposit. Once the binding is gone there is no grantor to resolve, so even a
+/// valid receipt revokes nothing — the sweep can never fall back to the stored
+/// (forgeable) `claimed_sender`.
+#[tokio::test]
+async fn a_control_receipt_whose_binding_is_withdrawn_sweeps_nothing() {
+    let (service, store) = service_and_store();
+    let grant = approve_booking(&service, "sms-lucy-0001", "1").await;
+    let receipt = deposit_control(&service, LUCY_ADDR, "revoke-1").await;
+
+    // The binding is withdrawn AFTER the control row was deposited.
+    store.unbind(&PrincipalId::new("lucy"));
+
+    assert_eq!(
+        service.revoke_via_receipt(&receipt, NOW + 2_000).await,
+        Err(ApprovalDenied::WrongChannel),
+        "no live binding to resolve the sender against — nothing to sweep by"
+    );
+    service
+        .resolve(&grant, NOW + 3_000)
+        .await
+        .expect("the grant is still live — the sweep never ran");
+}
+
+/// T4a — a replayed REVOKE returns `Ok(0)`, and touches nothing new.
+///
+/// REVOKE is a safety exit (spec §2): a re-sent one must never error. The same
+/// receipt, spent once, revokes nothing more — and a grant made AFTER the first
+/// sweep is not caught by the replay.
+#[tokio::test]
+async fn a_replayed_revoke_returns_zero_and_touches_nothing_new() {
+    let service = service();
+    let _first = approve_booking(&service, "sms-lucy-0001", "1").await;
+    let receipt = deposit_control(&service, LUCY_ADDR, "revoke-1").await;
+
+    assert_eq!(
+        service.revoke_via_receipt(&receipt, NOW + 2_000).await,
+        Ok(1),
+        "the first sweep stops the one live grant"
+    );
+
+    // A grant issued after the sweep — the replay must not reach it.
+    let later = approve_booking(&service, "sms-lucy-0002", "2").await;
+
+    assert_eq!(
+        service.revoke_via_receipt(&receipt, NOW + 4_000).await,
+        Ok(0),
+        "a replayed receipt is spent — it revokes nothing more, and does not error"
+    );
+    service
+        .resolve(&later, NOW + 5_000)
+        .await
+        .expect("the post-sweep grant is untouched by the replay");
+}
+
+/// T4b — a fresh REVOKE after everything is already revoked returns `Ok(0)`.
+///
+/// A DISTINCT control inbound (new transport identity), not a replay of the
+/// first. With nothing live to stop, the sweep is a no-op that still succeeds —
+/// idempotent by outcome, not just by receipt.
+#[tokio::test]
+async fn a_fresh_revoke_after_all_revoked_returns_zero() {
+    let service = service();
+    let _grant = approve_booking(&service, "sms-lucy-0001", "1").await;
+
+    let first = deposit_control(&service, LUCY_ADDR, "revoke-1").await;
+    assert_eq!(service.revoke_via_receipt(&first, NOW + 2_000).await, Ok(1));
+
+    let second = deposit_control(&service, LUCY_ADDR, "revoke-2").await;
+    assert_eq!(
+        service.revoke_via_receipt(&second, NOW + 3_000).await,
+        Ok(0),
+        "nothing left live — a second REVOKE stops nothing, and is not an error"
+    );
+}
+
 /// The gate's "tampered grant" half: a delegation that does not decode is
 /// refused rather than half-believed.
 ///
@@ -1189,11 +1646,28 @@ async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed(
         ) -> Result<bool, townhall_authority::StoreError> {
             Ok(false)
         }
+        async fn revoke_all_by_grantor_with_receipt(
+            &self,
+            _grantor: &PrincipalId,
+            _receipt: &EvidenceReceiptId,
+            _at_ms: u64,
+        ) -> Result<u64, townhall_authority::StoreError> {
+            unreachable!("this store never revokes")
+        }
         async fn write_inbound_evidence(
             &self,
             _receipt: &EvidenceReceiptId,
             _evidence: &InboundEvidenceRecord,
             _challenge: &ApprovalChallengeId,
+            _now_ms: u64,
+            _expires_at_ms: u64,
+        ) -> Result<EvidenceReceipt, townhall_authority::StoreError> {
+            unreachable!("this store never deposits evidence")
+        }
+        async fn write_control_evidence(
+            &self,
+            _receipt: &EvidenceReceiptId,
+            _evidence: &InboundEvidenceRecord,
             _now_ms: u64,
             _expires_at_ms: u64,
         ) -> Result<EvidenceReceipt, townhall_authority::StoreError> {

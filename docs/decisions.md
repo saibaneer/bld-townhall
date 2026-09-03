@@ -2353,3 +2353,59 @@ one line M12 replaces. Three ADRs and two ordered slices for a milestone the
 roadmap gives a week — the price of keeping the probabilistic component
 structurally away from the commit path, paid at the one seam where a person's yes
 becomes a grant, and claimed only for the seat where the code makes it true.
+
+### M7C-2 as built — four corrections the implementation forced (2026-09-03)
+
+Building the slice, and two adversarial review passes over the diff, changed four
+things this ADR had written down. Recorded here because the spec is never edited
+and this file is the amendment trail.
+
+- **Scope keys on `grantor`, NOT the challenge→binding join this ADR named.** The
+  planning text above (and the slice list) said revoke "joins back through
+  `delegations.challenge_id → approval_challenges → channel_bindings`". The build
+  did not: it keys the sweep on `delegations.grantor`, a first-class `NOT NULL`
+  column with its own index (`idx_delegations_grantor`), in one statement —
+  `UPDATE delegations SET revoked_at_ms=? WHERE grantor=? AND revoked_at_ms IS
+  NULL`. The join answers a DIFFERENT question: `approval_challenges.binding_
+  principal` is the channel owner who texted, and `grantor` is who AUTHORIZED the
+  grant. "Revoke everything this person set in motion" is definitionally the
+  grantor. The join would have returned the same rows today only by coincidence,
+  and cost a multi-table subquery to do it. The join phrasing above is withdrawn.
+
+- **The grantor == binding-principal equality is a STATED invariant, not a schema
+  fact.** The verifier resolves the texted sender to a live binding and sweeps by
+  that binding's principal — which is the grantor only because, for M7C's
+  own-behalf bookings, the dispatcher sets grantor = subject = binding-principal.
+  Nothing in the schema enforces it. The moment a true DELEGATED booking exists
+  (Lucy grants, Marco is the subject, one of their phones is bound), "revoke by
+  grantor" (everything the account holder authorized) versus "by subject"
+  (everything attributed to the phone owner) becomes a real choice again. Grantor
+  stays the right concept — ADR-026 anchors approval to the funded account holder
+  — but under-revoke is the dangerous direction on a safety exit, so the equality
+  is written down at the sweep site rather than assumed.
+
+- **The anti-lever guard is structural at the MUTATION, not a single-caller
+  promise.** A challenge-bound `YES` receipt must never drive a revoke-all sweep
+  (a person's answer to their £45 becoming "stop everything Lucy has"). The
+  service refuses it (`challenge_id.is_some()`), but that is one layer above the
+  write. So the store's own spend carries `AND challenge_id IS NULL`: the
+  statement is physically incapable of consuming a challenge-bound row for a
+  sweep, even if the service check were removed or reordered. Witnessed by feeding
+  a real `YES` receipt straight to the store op and asserting it sweeps nothing
+  and leaves the receipt spendable for its actual `YES`.
+
+- **The authorization asymmetry is deliberate, and it amplifies the conceded
+  threat.** `/revocations` has NO per-grant `resolve_delegation(actor)` gate — the
+  one `/delegations/{id}/revoke` has. A REVOKE names no delegation; its authority
+  is the transport-set control inbound, writable only by the trusted ingress and
+  only for a sender that resolves to a live binding, with the workload bearer as
+  the sole HTTP-layer barrier (the same compromised-process assurance the deposit
+  endpoint concedes). This is sharper than the reply path: forging a `YES` also
+  needs the code and a live challenge; a REVOKE needs only a bound victim address
+  and stops ALL their grants in one call. It is accepted because REVOKE only
+  STOPS authority (never widens it) and the victim can re-book — a bounded DoS,
+  not an escalation — and because M12's signed webhook makes the transport
+  identity unforgeable at exactly this seam. Named so the amplification is a
+  conscious acceptance, not an oversight. (A REVOKE whose triple happens to
+  collide with a prior `YES` row fails CLOSED — refused, nothing swept — the safe
+  direction.)

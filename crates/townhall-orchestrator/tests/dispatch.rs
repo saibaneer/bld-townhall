@@ -318,7 +318,10 @@ async fn b11_control_commands_reach_nothing() {
         ("HELP", "BOOK date="),
         ("STOP", "Stopped."),
         ("START", "Resumed."),
-        ("REVOKE", "M7"),
+        // REVOKE now reaches the approval PORT (a stub with no grants seeded for
+        // this number), still BEFORE identity — so the PanickingDirectory below
+        // never fires. With nothing to stop it answers plainly.
+        ("REVOKE", "no active approvals to stop"),
     ] {
         let n = counter.fetch_add(1, Ordering::SeqCst);
         dispatcher
@@ -351,6 +354,62 @@ async fn b11_control_commands_reach_nothing() {
         .expect("handled");
     assert!(bench.last_reply().contains(BALANCE_SENTINEL));
     assert_eq!(bench.wire.count(), 0, "BALANCE touched the wire");
+}
+
+/// T7 — a texted REVOKE names the real count and builds no identity.
+///
+/// The stub returns a count DERIVED from grants it holds (not a hardcoded 0), so
+/// the reply naming `Stopped 3` fails a dispatcher that never calls the port or
+/// mis-reads the count. And it runs on a PanickingDirectory/Proposer/Factory: if
+/// REVOKE resolved identity, built a token, or touched a wire before answering,
+/// the test would panic instead of pass — the "no grant, no principal" property
+/// STOP and REVOKE share.
+#[tokio::test]
+async fn a_revoke_names_the_count_and_builds_no_identity() {
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let approvals = Arc::new(StubApprovals::default());
+    // Three live grants for this number — the count the sweep must report.
+    approvals.seed_grants("+447700900123", 3);
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(PanickingDirectory),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        suppression,
+        Arc::new(PanickingFactory),
+        Arc::clone(&approvals) as Arc<dyn townhall_orchestrator::ApprovalPort>,
+        Arc::new(StubEvidence::default()),
+        Arc::new(MemoryContinuation::new()),
+    );
+
+    dispatcher
+        .handle(RawInbound {
+            identity: InboundIdentity::new("sim", "acct", "revoke-1"),
+            channel: ChannelKind::SmsSimulator,
+            from: "07700 900123".to_owned(),
+            body: "REVOKE".to_owned(),
+            received_at_ms: 0,
+            evidence: TransportEvidence::new("sim", "07700 900123", true),
+        })
+        .await
+        .expect("handled");
+
+    let outbox = channel.outbox();
+    let reply = &outbox.last().expect("a reply").text;
+    assert!(
+        reply.contains("Stopped 3 approval(s)"),
+        "the reply must name the real count the port returned: {reply:?}"
+    );
+    assert_eq!(
+        approvals.revocations.load(Ordering::SeqCst),
+        1,
+        "REVOKE reached the approval port exactly once"
+    );
 }
 
 // ------------------------------------------------------------------ B12

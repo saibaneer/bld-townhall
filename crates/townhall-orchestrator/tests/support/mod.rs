@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use bld_types::{BookingId, PrincipalId};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use townhall_orchestrator::{
@@ -86,10 +87,28 @@ impl ContinuationStore for MemoryContinuation {
 /// A stub approval port: `begin` returns a fixed challenge and a preview carrying
 /// a known code; `reply` returns a fixed reference. Enough for the tests that
 /// never actually approve (control/grammar ordering).
+///
+/// `revoke_via_receipt` is deliberately NOT a hardcoded `Ok(0)`: it returns a
+/// count derived from grants a test seeds per sender address, and zeroes them —
+/// so a REVOKE witness fails a dispatcher that never calls the port, mis-parses
+/// the count, or is not idempotent (the never-fake-tests rule).
 #[derive(Default)]
 pub struct StubApprovals {
     pub begins: AtomicUsize,
     pub replies: AtomicUsize,
+    pub revocations: AtomicUsize,
+    /// Sender address -> live grants the next REVOKE from it will stop.
+    grants: Mutex<HashMap<String, u32>>,
+}
+
+impl StubApprovals {
+    /// Seed `n` live grants for `address`, the count its next REVOKE returns.
+    pub fn seed_grants(&self, address: &str, n: u32) {
+        self.grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_owned(), n);
+    }
 }
 
 #[async_trait]
@@ -111,6 +130,17 @@ impl ApprovalPort for StubApprovals {
     ) -> Result<Option<String>, ApprovalError> {
         self.replies.fetch_add(1, Ordering::SeqCst);
         Ok(Some(format!("ref-{challenge}")))
+    }
+
+    async fn revoke_via_receipt(&self, evidence: &InboundEvidence) -> Result<u32, ApprovalError> {
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        // Return the seeded count for this sender, then zero it — a replayed
+        // REVOKE stops nothing more (idempotent), exactly as the real sweep.
+        let mut grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(grants.insert(evidence.address.clone(), 0).unwrap_or(0))
     }
 }
 
@@ -220,6 +250,31 @@ impl ApprovalPort for HttpApprovals {
             other => Err(ApprovalError::Transport(format!("reply: {other}"))),
         }
     }
+
+    async fn revoke_via_receipt(&self, evidence: &InboundEvidence) -> Result<u32, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/revocations", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "provider": evidence.provider,
+                "account": evidence.account,
+                "message_id": evidence.message_id,
+                "address": evidence.address,
+                "verified": evidence.verified,
+                "signature": evidence.signature,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            200 => Ok(count(&read_json(response).await?, "revoked")),
+            // Unbound/forged sender: the server swept nothing and recorded the
+            // 403; the surface collapses it to "0 stopped" (anti-enumeration).
+            403 => Ok(0),
+            other => Err(ApprovalError::Transport(format!("revoke: {other}"))),
+        }
+    }
 }
 
 /// The REAL deposit port over HTTP.
@@ -283,6 +338,11 @@ async fn read_json(response: reqwest::Response) -> Result<serde_json::Value, App
 
 fn field(body: &serde_json::Value, key: &str) -> String {
     body[key].as_str().unwrap_or_default().to_owned()
+}
+
+/// A non-negative integer field as a `u32` — the revoke count.
+fn count(body: &serde_json::Value, key: &str) -> u32 {
+    u32::try_from(body[key].as_u64().unwrap_or(0)).unwrap_or(u32::MAX)
 }
 
 fn first_number(text: &str) -> u8 {

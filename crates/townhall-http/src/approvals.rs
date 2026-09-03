@@ -80,6 +80,12 @@ pub trait ApprovalIssuer: Send + Sync {
     /// Revoke a grant. `false` means it was already revoked or never existed —
     /// not an error, because REVOKE is a safety exit (spec §2).
     async fn revoke(&self, delegation: &str) -> Result<bool, String>;
+
+    /// Revoke EVERY live grant for the principal whose bound channel sent this
+    /// control inbound. Deposits the transport evidence and sweeps in one server
+    /// operation, so the receipt never leaves the server. Returns the count
+    /// revoked; idempotent (a re-sent REVOKE returns the count still stopped).
+    async fn revoke_via_receipt(&self, inbound: &InboundEvidence) -> Result<u64, ApprovalDenied>;
 }
 
 /// One inbound reply's transport evidence, as the trusted ingress presents it.
@@ -114,6 +120,7 @@ pub fn approval_router(state: ApprovalState) -> Router {
         .route("/inbound-evidence", post(deposit_evidence))
         .route("/approvals/{id}/reply", post(reply_to_approval))
         .route("/delegations/{id}/revoke", post(revoke_delegation))
+        .route("/revocations", post(revoke_via_receipt))
         .with_state(state)
 }
 
@@ -333,6 +340,38 @@ async fn revoke_delegation(
             &serde_json::json!({ "revoked": revoked, "delegation": DelegationId::new(id).as_str() }),
         ),
         Err(problem) => mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, &problem),
+    }
+}
+
+/// A texted REVOKE: stop EVERY live grant the sender authorized.
+///
+/// # Why this has no per-grant actor gate, unlike `revoke_delegation`
+///
+/// The single-revoke route above gates on `resolve_delegation(actor)` — only the
+/// workload a delegation names may revoke it. This route deliberately does NOT.
+/// A REVOKE names no delegation; its authority is the transport-set control
+/// inbound itself, which only the trusted ingress can write and only for a sender
+/// that resolves to a live binding. That resolution — sender → binding →
+/// principal → sweep by grantor — IS the authorization, checked in the service.
+/// The bearer authentication here is the same compromised-workload assurance the
+/// deposit endpoint concedes (ADR-026); the anti-forgery property is that the
+/// identity triple is transport-set, never caller-chosen.
+async fn revoke_via_receipt(
+    State(state): State<ApprovalState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<InboundEvidence>,
+) -> Response {
+    if let Err(refused) = crate::authenticated(state.authority.as_ref(), &headers) {
+        return refused;
+    }
+    match state.issuer.revoke_via_receipt(&body).await {
+        // Idempotent by contract: a re-sent REVOKE returns the count still
+        // stopped (0 once everything is), never a 410. `revoked` is the count,
+        // not the single-route's bool — a distinct route, a distinct shape.
+        Ok(count) => {
+            mapping::json_response(StatusCode::OK, &serde_json::json!({ "revoked": count }))
+        }
+        Err(denied) => denial_response(&denied),
     }
 }
 

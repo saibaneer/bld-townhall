@@ -129,3 +129,165 @@ impl EvidenceDeposit for StubEvidence {
         })
     }
 }
+
+const WORKLOAD: &str = "agent-townhall";
+
+/// The REAL approval port over HTTP — the same shape the sms-simulator wires,
+/// for integration tests that drive the dispatcher against a live server. Owns
+/// its request bodies (this crate cannot name `townhall-http`).
+pub struct HttpApprovals {
+    pub base: String,
+    pub http: reqwest::Client,
+}
+
+impl HttpApprovals {
+    #[must_use]
+    pub fn new(base: &str) -> Self {
+        Self {
+            base: base.to_owned(),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalPort for HttpApprovals {
+    async fn begin(&self, request: &BeginApproval) -> Result<Raised, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/approvals", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "booking": request.booking,
+                "grantor": request.grantor,
+                "subject": request.subject,
+                "binding_principal": request.binding_principal,
+                "binding_version": request.binding_version,
+                "behaviours": request.behaviours,
+                "purpose": request.purpose,
+                "requested_date": request.requested_date,
+                "from": request.from,
+                "to": request.to,
+                "attendees": request.attendees,
+                "wheelchair_accessible": request.wheelchair_accessible,
+                "max_fee_pence": request.max_fee_pence,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status().is_success() {
+            let body = read_json(response).await?;
+            Ok(Raised {
+                challenge: field(&body, "challenge"),
+                preview: field(&body, "preview"),
+            })
+        } else {
+            Err(ApprovalError::Transport(format!(
+                "approvals begin: {}",
+                response.status()
+            )))
+        }
+    }
+
+    async fn reply(
+        &self,
+        challenge: &str,
+        answer: &str,
+        code: &str,
+        receipt: &str,
+    ) -> Result<Option<String>, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/approvals/{challenge}/reply", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({ "answer": answer, "code": code, "receipt": receipt }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            201 => Ok(Some(field(&read_json(response).await?, "delegation"))),
+            200 => Ok(None),
+            403 => {
+                let text = response.text().await.unwrap_or_default();
+                Err(ApprovalError::WrongCode {
+                    tries_left: first_number(&text),
+                })
+            }
+            404 | 410 => Err(ApprovalError::Gone(
+                response.text().await.unwrap_or_default(),
+            )),
+            other => Err(ApprovalError::Transport(format!("reply: {other}"))),
+        }
+    }
+}
+
+/// The REAL deposit port over HTTP.
+pub struct HttpEvidence {
+    pub base: String,
+    pub http: reqwest::Client,
+}
+
+impl HttpEvidence {
+    #[must_use]
+    pub fn new(base: &str) -> Self {
+        Self {
+            base: base.to_owned(),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl EvidenceDeposit for HttpEvidence {
+    async fn deposit(&self, evidence: &InboundEvidence) -> Result<Deposited, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/inbound-evidence", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "provider": evidence.provider,
+                "account": evidence.account,
+                "message_id": evidence.message_id,
+                "address": evidence.address,
+                "verified": evidence.verified,
+                "signature": evidence.signature,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            code if (200..300).contains(&code) => {
+                let body = read_json(response).await?;
+                Ok(Deposited {
+                    challenge: field(&body, "challenge"),
+                    receipt: field(&body, "receipt"),
+                })
+            }
+            404 | 410 => Err(ApprovalError::Gone(
+                response.text().await.unwrap_or_default(),
+            )),
+            other => Err(ApprovalError::Transport(format!("deposit: {other}"))),
+        }
+    }
+}
+
+fn transport(error: reqwest::Error) -> ApprovalError {
+    ApprovalError::Transport(error.to_string())
+}
+
+async fn read_json(response: reqwest::Response) -> Result<serde_json::Value, ApprovalError> {
+    response.json().await.map_err(transport)
+}
+
+fn field(body: &serde_json::Value, key: &str) -> String {
+    body[key].as_str().unwrap_or_default().to_owned()
+}
+
+fn first_number(text: &str) -> u8 {
+    text.chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}

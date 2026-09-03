@@ -2132,6 +2132,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bld-types",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

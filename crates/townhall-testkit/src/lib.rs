@@ -26,6 +26,15 @@ use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 
 pub const KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+
+/// The delegation envelope's authentication key, for every spawned world.
+///
+/// A DIFFERENT value from `KEY_HEX` on purpose: that one is the council's
+/// signing key, and a test that accidentally passed one where the other
+/// belonged would still work if they matched — and would keep working until the
+/// day the two keys legitimately differed.
+pub const AUTHORITY_KEY_HEX: &str =
+    "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
 pub const LUCY: &str = "dev-lucy";
 pub const MARCO: &str = "dev-marco-restricted";
 pub const PRIYA: &str = "dev-priya-nobook";
@@ -60,23 +69,72 @@ impl Drop for World {
     }
 }
 
+/// Wait for `READY <port>`, or fail loudly with everything the child said.
+///
+/// # Why a deadline exists at all
+///
+/// It did not, and codex named the consequence before it happened: "any live
+/// startup stall will hang indefinitely". It then happened — twice — as CI runs
+/// that sat silent for twenty and ninety minutes on a check that takes
+/// microseconds locally. A harness that can hang converts an unknown bug into
+/// an unknowable one: the step times out with no output and the cause dies with
+/// the runner.
+///
+/// Thirty seconds is generous for a process whose job is to print one line
+/// after binding a port, and the panic carries the child's stderr, so the next
+/// stall names itself in the CI log instead of being reconstructed from
+/// timestamps.
 fn spawn_ready(mut command: Command) -> (Child, u16) {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+
     let mut child = command
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("the binary spawns");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut lines = std::io::BufReader::new(stdout).lines();
-    let ready = lines.next().expect("a line").expect("readable");
-    let port: u16 = ready
-        .strip_prefix("READY ")
-        .unwrap_or_else(|| panic!("expected READY, got {ready:?}"))
-        .parse()
-        .expect("a port");
-    // Keep draining, or the child blocks on a full pipe.
-    std::thread::spawn(move || for _ in lines {});
-    (child, port)
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // The read happens on its own thread so the deadline is real: a blocked
+    // read on the main thread IS the hang this function exists to prevent.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines.next().map(|line| line.expect("readable stdout"));
+        let _ = sender.send(first);
+        // Keep draining so the child never blocks on a full stdout pipe.
+        for _ in lines {}
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Some(line)) => {
+            let port = line
+                .strip_prefix("READY ")
+                .unwrap_or_else(|| panic!("expected READY, got {line:?}"))
+                .parse()
+                .expect("a port");
+            (child, port)
+        }
+        Ok(None) => {
+            // The child exited without a READY line: stdout hit EOF. Its
+            // stderr says why, and that is the error worth reading.
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("the child exited before READY. stderr:\n{said}");
+        }
+        Err(_) => {
+            // Still alive, still silent. Kill it, then report everything it
+            // wrote — the difference between this panic and a hung CI step is
+            // the entire reason this arm exists.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("no READY within 30s from a live child. stderr so far:\n{said}");
+        }
+    }
 }
 
 fn build_binaries() {
@@ -128,6 +186,13 @@ pub fn world_with(extra: &[&str]) -> World {
             KEY_HEX,
             "--port",
             "0",
+            // The envelope key. Fixed, because these worlds are restarted
+            // mid-test (the chase-survives-a-restart cases) and a grant issued
+            // before the restart has to still verify after it — which is the
+            // whole reason the key is configuration and not a per-process
+            // accident.
+            "--authority-key",
+            AUTHORITY_KEY_HEX,
             "--dev-authority",
             "--retry-cadence-ms",
             "200",
@@ -413,11 +478,13 @@ pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
 /// test that depends on authority rather than silently keeping them green.
 pub mod issuer {
     use bld_types::{
-        Behaviour, BookingId, BookingRequirements, Money, PrincipalId, ServiceId, TimeWindow,
+        ActorId, Behaviour, BookingId, BookingRequirements, Money, PrincipalId, ServiceId,
+        TimeWindow,
     };
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope, VerifiedAuthority,
+        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
+        VerifiedAuthority,
     };
 
     /// The instant every issued test grant is stamped with.
@@ -442,18 +509,61 @@ pub mod issuer {
         pub booking: BookingId,
         pub behaviours: Vec<Behaviour>,
         pub max_fee: Money,
+        /// The headcount ceiling the grant approves.
+        ///
+        /// Defaults to the fixture requirements' own 20, which is what a real
+        /// approval would carry. A test whose subject is CHANGING the headcount
+        /// raises it deliberately — see [`GrantSpec::seating`].
+        pub max_attendees: u16,
     }
 
+    /// Everything a booking walk needs, end to end.
+    ///
+    /// # Why this is the default and not `[Book, Cancel]`
+    ///
+    /// Getting a booking to `Book` takes `SelectVenue`, `VerifySlot` and
+    /// sometimes `RevalidateVenue` first. Until M7B those were ungated, so a
+    /// grant naming only `Book` walked the whole way regardless — a fixture
+    /// that looked narrow and was not. Now the grant is consulted for every
+    /// proposal, so a fixture has to name what it actually does.
+    ///
+    /// `UpdateRequirements` and `ChangeVenue` are deliberately ABSENT: they
+    /// change what a person approved, so a test that wants them says so.
+    pub const WALK: &[Behaviour] = &[
+        Behaviour::SelectVenue,
+        Behaviour::VerifySlot,
+        Behaviour::RevalidateVenue,
+        Behaviour::Book,
+        Behaviour::Cancel,
+    ];
+
+    /// Every behaviour there is.
+    ///
+    /// For fixtures whose subject is something OTHER than authority — the
+    /// topology matrix, the characterization suite — where a narrow grant would
+    /// make a test fail for a reason it is not about. A test that IS about
+    /// authority names its behaviours explicitly instead.
+    pub const ALL: &[Behaviour] = &[
+        Behaviour::SelectVenue,
+        Behaviour::VerifySlot,
+        Behaviour::ChangeVenue,
+        Behaviour::UpdateRequirements,
+        Behaviour::RevalidateVenue,
+        Behaviour::Book,
+        Behaviour::Cancel,
+    ];
+
     impl GrantSpec {
-        /// The ordinary case: one person, their own booking, book and cancel.
+        /// The ordinary case: one person, their own booking, the whole walk.
         #[must_use]
         pub fn own(principal: &str, booking: &str, max_fee_pence: u64) -> Self {
             Self {
                 grantor: PrincipalId::new(principal),
                 subject: PrincipalId::new(principal),
                 booking: BookingId::new(booking),
-                behaviours: vec![Behaviour::Book, Behaviour::Cancel],
+                behaviours: WALK.to_vec(),
                 max_fee: Money::from_pence(max_fee_pence),
+                max_attendees: 20,
             }
         }
 
@@ -466,6 +576,7 @@ pub mod issuer {
                 booking: BookingId::new(booking),
                 behaviours: vec![Behaviour::Cancel],
                 max_fee: Money::from_pence(max_fee_pence),
+                max_attendees: 20,
             }
         }
 
@@ -473,6 +584,18 @@ pub mod issuer {
         #[must_use]
         pub fn permitting(mut self, behaviours: &[Behaviour]) -> Self {
             self.behaviours = behaviours.to_vec();
+            self
+        }
+
+        /// Approve a different headcount ceiling.
+        ///
+        /// For fixtures whose subject IS changing the headcount — the domain's
+        /// characterization suite raises attendees to prove revalidation
+        /// happens, and would otherwise be refused by the approval ceiling for a
+        /// reason it is not about.
+        #[must_use]
+        pub fn seating(mut self, attendees: u16) -> Self {
+            self.max_attendees = attendees;
             self
         }
     }
@@ -498,14 +621,26 @@ pub mod issuer {
     /// and every test resting on it should say so loudly rather than proceed.
     #[must_use]
     pub async fn issue(spec: &GrantSpec) -> VerifiedAuthority {
+        let store = std::sync::Arc::new(MemoryApprovalStore::new());
+        // The grantor's channel is BOUND before the challenge is answered.
+        //
+        // Not scaffolding. Review found the verifier comparing the caller's
+        // claimed binding against the caller's own earlier claim, so it checks
+        // against a row now — which means a test grant needs a binding to
+        // exist, exactly as a real approval does. Every grant in the workspace
+        // therefore travels the path a person's approval travels.
+        store.bind(&spec.grantor, 1);
         let service = AuthorityService::new(
-            std::sync::Arc::new(MemoryApprovalStore::new()),
+            std::sync::Arc::clone(&store),
             OneCode,
             AuthorityPolicy {
                 reply_window_ms: 600_000,
                 grant_ttl_ms: GRANT_TTL_MS,
                 assurance: AssuranceLevel::SmsReply,
             },
+            // A fixed key: every grant a test holds was signed by the same
+            // issuer, which is the only property tests need from it.
+            EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes"),
         );
         let binding = BindingRef {
             principal: spec.grantor.clone(),
@@ -526,7 +661,7 @@ pub mod issuer {
                                 from: "13:00".to_owned(),
                                 to: "17:00".to_owned(),
                             },
-                            attendees: 20,
+                            attendees: spec.max_attendees,
                             wheelchair_accessible: true,
                             max_fee: spec.max_fee,
                         },
@@ -534,6 +669,9 @@ pub mod issuer {
                     binding: binding.clone(),
                     grantor: spec.grantor.clone(),
                     subject: spec.subject.clone(),
+                    // Every test grant names one workload, so a test that cares
+                    // about the actor check has a value to disagree with.
+                    actor: ActorId::new("agent:townhall"),
                 },
                 ISSUED_AT_MS,
             )

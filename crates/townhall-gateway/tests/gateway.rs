@@ -22,8 +22,29 @@ fn requirements() -> BookingRequirements {
     }
 }
 
+/// A client for `bearer`, reading that principal's bookings and holding a
+/// grant reference over `booking`.
+///
+/// The dev lane's reference IS the booking id (see `DevAuthority`), so a test
+/// that wants to change something says which booking it is changing — which is
+/// M7B's header split, from the client's side.
+fn gateway_for(world: &World, bearer: &str, booking: &str) -> Gateway {
+    Gateway::new(world.server_url.clone(), bearer, principal_of(bearer)).with_delegation(booking)
+}
+
+/// A read-only client: no grant, so every change it attempts is refused.
 fn gateway(world: &World, bearer: &str) -> Gateway {
-    Gateway::new(world.server_url.clone(), bearer)
+    Gateway::new(world.server_url.clone(), bearer, principal_of(bearer))
+}
+
+/// Which principal a dev token acts for.
+fn principal_of(bearer: &str) -> &'static str {
+    match bearer {
+        LUCY => "lucy",
+        MARCO => "marco",
+        PRIYA => "priya",
+        _ => "nobody",
+    }
 }
 
 /// One fixed inbound message identity — the value a redelivery repeats.
@@ -64,7 +85,7 @@ async fn awaiting(gw: &Gateway, id: &BookingId) -> u64 {
 #[tokio::test]
 async fn a10_create_round_trips_every_field() {
     let world = world();
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-A10");
     let id = BookingId::new("BKG-A10");
 
     let created = gw.create(&id, &requirements()).await.expect("create");
@@ -97,8 +118,9 @@ async fn a10_create_round_trips_every_field() {
 #[tokio::test]
 async fn a11_a12_duplicate_create_distinguishes_owner_from_stranger() {
     let world = world();
-    let lucy = gateway(&world, LUCY);
-    let priya = gateway(&world, PRIYA);
+    let message = townhall_channel_identity();
+    let lucy = gateway_for(&world, LUCY, message.booking_id().as_str());
+    let priya = gateway_for(&world, PRIYA, message.booking_id().as_str());
 
     // The DERIVED id — the redelivery protection this test is actually about.
     // A hand-picked "BKG-A12" tested nothing about the seam M6B will stand on:
@@ -128,7 +150,7 @@ async fn a11_a12_duplicate_create_distinguishes_owner_from_stranger() {
 #[tokio::test]
 async fn a13_propose_sends_the_version_it_was_given() {
     let world = world();
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-A13");
     let id = BookingId::new("BKG-A13");
     let version = awaiting(&gw, &id).await;
 
@@ -154,8 +176,8 @@ async fn a13_propose_sends_the_version_it_was_given() {
 #[allow(clippy::too_many_lines)] // one sweep, deliberately: the table IS the test
 async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     let world = world();
-    let lucy = gateway(&world, LUCY);
-    let priya = gateway(&world, PRIYA);
+    let lucy = gateway_for(&world, LUCY, "BKG-A14");
+    let priya = gateway_for(&world, PRIYA, "BKG-A14");
 
     // 404 for absent AND for invisible — deliberately indistinguishable.
     let hers = BookingId::new("BKG-A14");
@@ -181,9 +203,13 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     assert_eq!(menu, vec!["SelectVenue", "Cancel"]);
 
     // 403: a capability refusal, as a Denied turn with the domain's own name.
+    // Priya's own booking, so her own grant over it — the earlier `priya`
+    // client holds a grant for LUCY's booking and is used only for the reads
+    // above, which need no grant at all.
     let priyas = BookingId::new("BKG-A14-PRIYA");
-    let version = awaiting(&priya, &priyas).await;
-    let turn = priya
+    let priya_own = gateway_for(&world, PRIYA, "BKG-A14-PRIYA");
+    let version = awaiting(&priya_own, &priyas).await;
+    let turn = priya_own
         .propose_at(&priyas, version, "book", None)
         .await
         .expect("a turn");
@@ -198,7 +224,7 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     // 403 again, a DIFFERENT guard: Marco's fee ceiling. Same status, same
     // shape — only the domain's error name separates them, which is why the
     // gateway carries the name rather than the number.
-    let marco = gateway(&world, MARCO);
+    let marco = gateway_for(&world, MARCO, "BKG-A14-MARCO");
     let his = BookingId::new("BKG-A14-MARCO");
     let created = marco.create(&his, &requirements()).await.expect("create");
     let selected = marco
@@ -242,13 +268,17 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     // first version of this test never exercised at all: a data guard (the
     // capacity check) refusing with the domain's own name, ETag attached.
     let crowded = BookingId::new("BKG-A14-CROWDED");
+    // Its own client, because a grant names one booking. This sweep walks four
+    // of them, so it holds four grants — which is the contract, not the
+    // harness: Lucy approves each booking separately.
+    let lucy_crowded = gateway_for(&world, LUCY, "BKG-A14-CROWDED");
     let mut wants_too_many = requirements();
     wants_too_many.attendees = 999;
-    let created = lucy
+    let created = lucy_crowded
         .create(&crowded, &wants_too_many)
         .await
         .expect("create");
-    let selected = lucy
+    let selected = lucy_crowded
         .propose_at(
             &crowded,
             created.version,
@@ -261,7 +291,8 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
         panic!("select-venue: {selected:?}");
     };
     assert_eq!(
-        lucy.propose_at(&crowded, version, "verify-slot", None)
+        lucy_crowded
+            .propose_at(&crowded, version, "verify-slot", None)
             .await
             .expect("turn"),
         Turn::Denied {
@@ -276,7 +307,7 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
     // classification is unit-tested against constructed responses instead.
 
     // 401: no usable credential.
-    let anonymous = Gateway::new(world.server_url.clone(), "not-a-token");
+    let anonymous = Gateway::new(world.server_url.clone(), "not-a-token", "nobody");
     assert!(matches!(
         anonymous.read(&hers).await,
         Err(GatewayError::Unauthenticated)
@@ -293,7 +324,7 @@ async fn a14_the_status_contract_is_keyed_on_more_than_the_number() {
 #[tokio::test]
 async fn a15_a16_acceptance_returns_before_convergence() {
     let world = world();
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-A15");
     let id = BookingId::new("BKG-A15");
     let version = awaiting(&gw, &id).await;
 
@@ -352,7 +383,7 @@ async fn a15_a16_acceptance_returns_before_convergence() {
 #[tokio::test]
 async fn a17_convergence_is_bounded() {
     let mut world = world();
-    let gw = gateway(&world, LUCY).with_policy(RetryPolicy {
+    let gw = gateway_for(&world, LUCY, "BKG-A17").with_policy(RetryPolicy {
         max_convergence_polls: 2,
         convergence_deadline: Duration::from_millis(400),
     });
@@ -385,7 +416,7 @@ async fn a17_convergence_is_bounded() {
 #[tokio::test]
 async fn a17_the_deadline_caps_the_sleep_itself() {
     let mut world = world();
-    let gw = gateway(&world, LUCY).with_policy(RetryPolicy {
+    let gw = gateway_for(&world, LUCY, "BKG-A17B").with_policy(RetryPolicy {
         max_convergence_polls: 8,
         convergence_deadline: Duration::from_millis(300),
     });
@@ -424,8 +455,8 @@ async fn a17_the_deadline_caps_the_sleep_itself() {
 #[tokio::test]
 async fn a18_ownership_reaches_the_client() {
     let world = world();
-    let lucy = gateway(&world, LUCY);
-    let priya = gateway(&world, PRIYA);
+    let lucy = gateway_for(&world, LUCY, "BKG-A18");
+    let priya = gateway_for(&world, PRIYA, "BKG-A18");
     let id = BookingId::new("BKG-A18");
     lucy.create(&id, &requirements()).await.expect("create");
 
@@ -457,7 +488,7 @@ async fn a14b_request_ids_survive_the_round_trip() {
     let world = world();
     let id = BookingId::new("BKG-REQID");
 
-    let chosen = gateway(&world, LUCY).with_request_id("req-of-my-own");
+    let chosen = gateway_for(&world, LUCY, "BKG-REQID").with_request_id("req-of-my-own");
     chosen.create(&id, &requirements()).await.expect("create");
     assert_eq!(
         chosen.last_request_id().as_deref(),
@@ -465,7 +496,7 @@ async fn a14b_request_ids_survive_the_round_trip() {
         "the middleware echoes a supplied id verbatim, and the gateway keeps it"
     );
 
-    let minted = gateway(&world, LUCY);
+    let minted = gateway_for(&world, LUCY, "BKG-REQID");
     minted.read(&id).await.expect("read");
     let value = minted
         .last_request_id()
@@ -487,7 +518,7 @@ async fn a14b_request_ids_survive_the_round_trip() {
 #[tokio::test]
 async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     let world = world();
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-GATE-CLEAN");
 
     // --- clean: the council answers, so every turn settles synchronously.
     let clean = BookingId::new("BKG-GATE-CLEAN");
@@ -538,13 +569,21 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     // so an erroneous second POST leaves exactly one row and the wrong
     // implementation walks free. The requests themselves are the witness.
     let proxy = townhall_testkit::RecordingProxy::in_front_of(&world.server_url);
-    let gw = Gateway::new(proxy.url.clone(), LUCY);
+    // A SECOND client, because a grant names one booking.
+    //
+    // Not an inconvenience of the test harness — it is the contract. Lucy
+    // approves each booking separately, so a journey that touches two of them
+    // holds two grants, and one approval can never quietly cover the other.
     let faulted = BookingId::new("BKG-GATE-FAULT");
-    let version = awaiting(&gw, &faulted).await;
+    // Through the PROXY, so the POST count below is a real witness — and with
+    // its own grant reference, per the note above.
+    let faulted_gw =
+        Gateway::new(proxy.url.clone(), LUCY, "lucy").with_delegation("BKG-GATE-FAULT");
+    let version = awaiting(&faulted_gw, &faulted).await;
     let effect = format!("EFF-{}-BOOK-{version}", faulted.as_str());
     let fault = arm_fault(&world, &effect, "create", "drop_response").await;
 
-    let turn = gw
+    let turn = faulted_gw
         .propose_at(&faulted, version, "book", None)
         .await
         .expect("book");
@@ -556,7 +595,10 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
         1,
         "the drop genuinely fired"
     );
-    let settled = gw.converge(&faulted, retry_after).await.expect("converge");
+    let settled = faulted_gw
+        .converge(&faulted, retry_after)
+        .await
+        .expect("converge");
     assert_eq!(settled.state, "Booked");
     assert_eq!(
         proxy.count("POST", "/behaviours/book"),
@@ -567,7 +609,7 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
         proxy.requests()
     );
 
-    let cancelled = gw
+    let cancelled = faulted_gw
         .propose_at(
             &faulted,
             settled.version,
@@ -579,7 +621,8 @@ async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     let final_state = match cancelled {
         Turn::Committed { state, .. } => state,
         Turn::Accepted { retry_after } => {
-            gw.converge(&faulted, retry_after)
+            faulted_gw
+                .converge(&faulted, retry_after)
                 .await
                 .expect("converge")
                 .state
@@ -634,7 +677,7 @@ async fn the_catalogue_round_trips() {
 #[tokio::test]
 async fn a14_the_two_503_shapes_are_distinguished() {
     let mut world = world();
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-503");
 
     // A booking parked where its next step needs the provider.
     let id = BookingId::new("BKG-503");
@@ -697,7 +740,7 @@ async fn a17_contention_surfaces_typed_and_a_reread_tells_the_truth() {
     // The deterministic-429 seam: zero reclassification attempts (ADR-021's
     // sanctioned zero).
     let world = townhall_testkit::world_with(&["--reclassify-attempts", "0"]);
-    let gw = gateway(&world, LUCY);
+    let gw = gateway_for(&world, LUCY, "BKG-429");
 
     let id = BookingId::new("BKG-429");
     let version = awaiting(&gw, &id).await;

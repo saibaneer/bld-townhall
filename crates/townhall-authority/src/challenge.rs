@@ -161,6 +161,8 @@ pub struct ChallengeRecord {
     /// level the challenge was raised at so the cap is checkable after the fact
     /// rather than only at issuance.
     pub assurance: AssuranceLevel,
+    /// The authenticated workload that may present this challenge's grant.
+    pub actor: bld_types::ActorId,
 }
 
 impl ChallengeRecord {

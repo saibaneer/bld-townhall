@@ -129,6 +129,12 @@ impl SqlApprovalStore {
             return Ok(None);
         };
 
+        Self::decode_binding(&row).map(Some)
+    }
+
+    /// One binding row, shared by both lookups so neither can decode it
+    /// differently from the other.
+    fn decode_binding(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelBinding, StoreError> {
         let id: String = row.try_get("id")?;
         let assurance_text: String = row.try_get("assurance")?;
         // An unreadable level is a refusal, never a default. Defaulting weak
@@ -139,14 +145,47 @@ impl SqlApprovalStore {
             ))
         })?;
 
-        Ok(Some(ChannelBinding {
+        Ok(ChannelBinding {
             id,
             address: row.try_get("address")?,
             principal: PrincipalId::new(row.try_get::<String, _>("principal")?),
             version: from_i64(row.try_get::<i64, _>("version")?),
             assurance,
             withdrawn: false,
-        }))
+        })
+    }
+
+    /// The live binding for a PRINCIPAL, if any.
+    ///
+    /// # Why this exists beside `live_binding`
+    ///
+    /// That one answers "who is this number?", which is what an inbound message
+    /// needs. This one answers "is this person's channel bound?", which is what
+    /// a read gate needs before it will scope a query to them — so that a
+    /// principal named in a header is checked against a row rather than
+    /// believed.
+    ///
+    /// # Errors
+    /// The query failed, or a row carries an assurance level that does not read.
+    pub async fn live_binding_for(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<ChannelBinding>, StoreError> {
+        let Some(row) = sqlx::query(
+            r"
+            SELECT id, address, principal, version, assurance
+            FROM channel_bindings
+            WHERE principal = ? AND status = 'active'
+            ORDER BY version DESC
+            ",
+        )
+        .bind(principal.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Self::decode_binding(&row).map(Some)
     }
 
     /// Raise a binding's revision — a re-verification, or a status change.
@@ -229,6 +268,7 @@ impl SqlApprovalStore {
                 .unwrap_or(MAX_ATTEMPTS),
             status,
             assurance,
+            actor: bld_types::ActorId::new(row.try_get::<String, _>("actor")?),
         })
     }
 
@@ -258,9 +298,9 @@ impl ApprovalStore for SqlApprovalStore {
             r"
             INSERT INTO approval_challenges
                 (id, code, scope, scope_hash, binding_principal, binding_version,
-                 grantor, subject, assurance, status, attempts_used,
+                 grantor, subject, actor, assurance, status, attempts_used,
                  created_at_ms, expires_at_ms, settled_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ",
         )
         .bind(challenge.id.as_str())
@@ -271,6 +311,7 @@ impl ApprovalStore for SqlApprovalStore {
         .bind(as_i64(challenge.binding.version))
         .bind(challenge.grantor.as_str())
         .bind(challenge.subject.as_str())
+        .bind(challenge.actor.as_str())
         .bind(challenge.assurance.name())
         .bind(challenge.status.name())
         .bind(i64::from(challenge.attempts_used))
@@ -295,7 +336,8 @@ impl ApprovalStore for SqlApprovalStore {
         let row = sqlx::query(
             r"
             SELECT id, code, scope, scope_hash, binding_principal, binding_version,
-                   grantor, subject, assurance, status, attempts_used, created_at_ms
+                   grantor, subject, actor, assurance, status, attempts_used,
+                   created_at_ms
             FROM approval_challenges
             WHERE id = ?
             ",
@@ -503,6 +545,19 @@ impl ApprovalStore for SqlApprovalStore {
                 .try_get::<Vec<u8>, _>("envelope")
                 .map_err(|error| row_error(&error))?,
         }))
+    }
+
+    async fn live_binding(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<BindingRef>, AuthorityStoreError> {
+        // The inherent `live_binding_for` already answers this against a row;
+        // the port simply exposes it to the verifier, which needs it to check a
+        // claimed binding against something other than the claim itself.
+        Self::live_binding_for(self, principal)
+            .await
+            .map(|found| found.map(|binding| binding.reference()))
+            .map_err(|error| AuthorityStoreError::Unavailable(error.to_string()))
     }
 
     async fn revoke_delegation(

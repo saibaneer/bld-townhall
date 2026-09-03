@@ -23,12 +23,26 @@ use std::sync::Arc;
 
 use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::CouncilKey;
+mod authority;
+
+use authority::{OsEntropy, RealAuthority};
+use townhall_authority::AuthorityService;
 use townhall_http::{AuthorityResolver, ServerState};
 use townhall_service::{BookingApi, Coordinator, PursuitConfig, Reconciliation};
 use townhall_store::{SqliteBookingRepository, StoreClock, SystemStoreClock};
 
 struct Args {
     db: String,
+    /// The key the delegation envelope's authentication tag is made with.
+    ///
+    /// 64 hex characters. Required whenever grants are READ BACK — which is
+    /// every real deployment — because a tag verified with a different key than
+    /// it was written with is no tag at all, and a per-process key would make
+    /// every grant expire at restart.
+    ///
+    /// Optional only with `--dev-authority`, whose resolver mints a grant per
+    /// request and never reads one back (see `DevAuthority::issue`).
+    authority_key: Option<String>,
     denials_db: String,
     council_url: String,
     key_hex: String,
@@ -45,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let (mut db, mut denials, mut council, mut key, mut port) = (None, None, None, None, None);
     let mut dev_authority = false;
+    let mut authority_key = None;
     let mut retry_cadence_ms = 5_000;
     let mut reconcile_interval_ms = 1_000;
     let mut reclassify_attempts = None;
@@ -63,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--dev-authority" => dev_authority = true,
+            "--authority-key" => authority_key = Some(value()?),
             "--retry-cadence-ms" => {
                 retry_cadence_ms = value()?
                     .parse::<i64>()
@@ -88,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         db: db.ok_or("--db is required")?,
+        authority_key,
         denials_db: denials.ok_or("--denials-db is required")?,
         council_url: council.ok_or("--council-url is required")?,
         key_hex: key.ok_or("--key-hex is required")?,
@@ -127,8 +144,23 @@ impl DevAuthority {
     /// real 401.
     fn allowed(bearer: &str) -> Option<(&'static str, u64, &'static [bld_types::Behaviour])> {
         use bld_types::Behaviour;
-        const BOTH: &[Behaviour] = &[Behaviour::Book, Behaviour::Cancel];
-        const NEITHER: &[Behaviour] = &[];
+        // EVERY behaviour, because M7B consults the grant for every proposal
+        // and these tokens exist to isolate ONE guard each.
+        //
+        // An earlier version withheld `UpdateRequirements` and `ChangeVenue`
+        // from all three on the grounds that "no dev token pretends to that".
+        // That made Lucy restricted too, so she stopped being the control, and
+        // a version-bumping test broke on a guard it was not about.
+        const ALL: &[Behaviour] = &[
+            Behaviour::SelectVenue,
+            Behaviour::VerifySlot,
+            Behaviour::ChangeVenue,
+            Behaviour::UpdateRequirements,
+            Behaviour::RevalidateVenue,
+            Behaviour::Book,
+            Behaviour::Cancel,
+        ];
+
         // Restricted in EXACTLY ONE way, and that is the point.
         //
         // Marco is restricted twice over — a £10 ceiling and no behaviours — so
@@ -136,11 +168,48 @@ impl DevAuthority {
         // Lucy's ceiling and lacks only `Book`, so a refusal on her own booking
         // can only be `BookingAuthorityRequired`. Without her, the behaviour
         // guard has no test that isolates it.
-        const CANCEL_ONLY: &[Behaviour] = &[Behaviour::Cancel];
+        // Priya lacks exactly ONE behaviour — `Book` — so a refusal on her own
+        // booking can only be the booking-authority guard. She can still walk
+        // a booking to `AwaitingBooking`, which is what makes the isolation
+        // real rather than incidental.
+        const ALL_WITHOUT_BOOK: &[Behaviour] = &[
+            Behaviour::SelectVenue,
+            Behaviour::VerifySlot,
+            Behaviour::ChangeVenue,
+            Behaviour::UpdateRequirements,
+            Behaviour::RevalidateVenue,
+            Behaviour::Cancel,
+        ];
+        // Each token restricted in EXACTLY ONE way, which is what makes a
+        // refusal name its guard:
+        //
+        // - Lucy: unrestricted, the £50 ceiling every seeded slot fits under.
+        // - Marco: the same walk, a £10 ceiling. A refusal on his booking can
+        //   only be the FEE guard.
+        // - Priya: Lucy's ceiling, missing only `Book`. A refusal on hers can
+        //   only be the BEHAVIOUR guard.
+        //
+        // An earlier version of this table gave Marco no behaviours AND a £10
+        // ceiling — restricted twice, so "Marco is refused" said nothing about
+        // which guard refused him, and the fee-ceiling test broke at
+        // `select-venue` for a reason it was not about.
         match bearer {
-            "dev-lucy" => Some(("lucy", 5_000, BOTH)),
-            "dev-marco-restricted" => Some(("marco", 1_000, NEITHER)),
-            "dev-priya-nobook" => Some(("priya", 5_000, CANCEL_ONLY)),
+            "dev-lucy" => Some(("lucy", 5_000, ALL)),
+            "dev-marco-restricted" => Some(("marco", 1_000, ALL)),
+            "dev-priya-nobook" => Some(("priya", 5_000, ALL_WITHOUT_BOOK)),
+            _ => None,
+        }
+    }
+
+    /// Which token belongs to a principal — `allowed` read backwards.
+    ///
+    /// A closed match in both directions rather than a format string, so the
+    /// allowlist stays the only place a dev identity is named.
+    fn bearer_for(principal: &str) -> Option<&'static str> {
+        match principal {
+            "lucy" => Some("dev-lucy"),
+            "marco" => Some("dev-marco-restricted"),
+            "priya" => Some("dev-priya-nobook"),
             _ => None,
         }
     }
@@ -178,7 +247,7 @@ impl DevAuthority {
         use bld_types::{PrincipalId, ServiceId};
         use townhall_authority::{
             ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-            BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+            BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
         };
 
         struct DevCode;
@@ -192,8 +261,14 @@ impl DevAuthority {
         }
 
         let (principal, max_fee_pence, behaviours) = Self::allowed(bearer)?;
+        let store = std::sync::Arc::new(MemoryApprovalStore::new());
+        // Bound, because the verifier checks a claimed binding against a row.
+        // Even a lane where nobody is asked cannot skip the check — it just
+        // supplies the row itself, which is exactly what makes it a stand-in
+        // rather than a bypass.
+        store.bind(&PrincipalId::new(principal), 1);
         let service = AuthorityService::new(
-            std::sync::Arc::new(MemoryApprovalStore::new()),
+            std::sync::Arc::clone(&store),
             DevCode,
             AuthorityPolicy {
                 reply_window_ms: 60_000,
@@ -201,6 +276,12 @@ impl DevAuthority {
                 grant_ttl_ms: 5 * 60 * 1_000,
                 assurance: AssuranceLevel::Dev,
             },
+            // Per-process, and it genuinely does not matter here: this service
+            // issues a grant and hands it straight back, and its store is
+            // dropped on the next line. Nothing ever reads the envelope it
+            // wrote. A deployment binds a configured key at the composition
+            // root, where the grant IS read back — see M7B's resolver.
+            EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8)).expect("32 bytes"),
         );
         let binding = BindingRef {
             principal: PrincipalId::new(principal),
@@ -225,7 +306,20 @@ impl DevAuthority {
                         from: "00:00".to_owned(),
                         to: "23:59".to_owned(),
                     },
-                    attendees: 1,
+                    // No headcount ceiling.
+                    //
+                    // This was `1`, written as a placeholder when the field was
+                    // only decoration in this lane. The M7B review made the
+                    // approved headcount a real constraint, and the placeholder
+                    // silently became a ceiling of ONE — so any change above
+                    // one attendee was refused, in a lane whose whole nature is
+                    // that it approves whatever was asked.
+                    //
+                    // CI caught it; a local sweep I neglected to re-run would
+                    // have. Worth the comment because the failure mode is
+                    // general: a placeholder in a field nobody reads is fine
+                    // until somebody starts reading the field.
+                    attendees: u16::MAX,
                     wheelchair_accessible: false,
                     max_fee: bld_types::Money::from_pence(max_fee_pence),
                 },
@@ -233,6 +327,9 @@ impl DevAuthority {
             binding: binding.clone(),
             grantor: PrincipalId::new(principal),
             subject: PrincipalId::new(principal),
+            // The same actor `authenticate` hands out for this token, so the
+            // grant this mints is presentable by the caller that asked for it.
+            actor: bld_types::ActorId::new(format!("dev:{principal}")),
         };
 
         // Blocking on a fresh runtime in a thread: this resolver is called from
@@ -259,43 +356,148 @@ impl DevAuthority {
 
 #[cfg(feature = "dev-authority")]
 impl AuthorityResolver for DevAuthority {
-    fn resolve(
-        &self,
-        bearer: &str,
-        booking: &bld_types::BookingId,
-    ) -> Option<townhall_domain::VerifiedAuthority> {
-        Self::issue(bearer, booking)
+    /// A dev token names its own actor.
+    ///
+    /// The actor carries the principal, which is what lets the two questions
+    /// below be answered without a second lookup. A real deployment
+    /// authenticates a workload credential that has nothing to do with any
+    /// person, and finds the principal through the presented grant or the
+    /// channel binding instead.
+    fn authenticate(&self, bearer: &str) -> Option<bld_types::ActorId> {
+        Self::allowed(bearer)
+            .map(|(principal, _, _)| bld_types::ActorId::new(format!("dev:{principal}")))
     }
 
-    /// A reader gets a name, not a grant — nothing here to mint.
-    fn resolve_reader(&self, bearer: &str) -> Option<bld_types::PrincipalId> {
-        Self::allowed(bearer).map(|(principal, _, _)| bld_types::PrincipalId::new(principal))
+    /// In this lane the reference IS the booking id.
+    ///
+    /// # Why that is not cheating, and what it costs
+    ///
+    /// A real reference names a delegation that an approval produced, and the
+    /// resolver looks it up. Here nobody was asked, so there is nothing to look
+    /// up — the lane's whole nature is that it skips the person. Rather than
+    /// pretend, it says so: hand it a booking id and it issues a grant over
+    /// that booking, for the principal the actor names.
+    ///
+    /// What it costs is stated in `issue`: this lane cannot witness the
+    /// resource guard, because the grant always names whatever was asked for.
+    /// It still witnesses the behaviour guard and the ownership guard, and it
+    /// now also witnesses that a change without ANY delegation header is
+    /// refused — which is new in M7B and is a real property.
+    fn resolve_delegation(
+        &self,
+        reference: &str,
+        actor: &bld_types::ActorId,
+    ) -> Option<townhall_domain::VerifiedAuthority> {
+        let principal = actor.as_str().strip_prefix("dev:")?;
+        let bearer = Self::bearer_for(principal)?;
+        Self::issue(bearer, &bld_types::BookingId::new(reference))
+    }
+
+    /// A dev actor reads for its own principal and no other.
+    fn may_read_for(&self, actor: &bld_types::ActorId, principal: &bld_types::PrincipalId) -> bool {
+        actor.as_str().strip_prefix("dev:") == Some(principal.as_str())
     }
 }
 
-fn resolver(args: &Args) -> Result<Arc<dyn AuthorityResolver>, String> {
+/// Whether `--dev-authority` is usable in THIS build.
+///
+/// # Why this is separate from `authority`, and runs first
+///
+/// It used to live inside `authority`, which needs a connection pool — so a
+/// build without the feature opened a database, ran migrations, and only THEN
+/// refused to start. Two things wrong with that. A server should not touch
+/// storage to discover its arguments are wrong; and returning from `main` with
+/// a live `sqlx` pool means dropping a Tokio runtime that is still waiting on
+/// the pool's per-connection blocking threads. On a loaded Linux runner that
+/// wait is long enough to look like a hang, which is exactly how CI reported
+/// it — `the_dev_authority_flag_does_not_exist_in_this_build` sitting for over
+/// sixty seconds on a check that takes microseconds.
+///
+/// Argument validation is now pure and happens before any I/O.
+// With the feature ENABLED this can only return `Ok`, and clippy says so. The
+// signature is not redundant — it is the shape of the question in the build
+// where the answer can be no, and collapsing it to `()` under one feature set
+// would mean the two builds disagreed about whether the check exists.
+#[allow(clippy::unnecessary_wraps)]
+fn dev_authority_available(args: &Args) -> Result<(), String> {
+    if !args.dev_authority {
+        return Ok(());
+    }
+    #[cfg(feature = "dev-authority")]
+    {
+        Ok(())
+    }
+    #[cfg(not(feature = "dev-authority"))]
+    {
+        Err("--dev-authority requires building with the dev-authority feature".to_owned())
+    }
+}
+
+/// The issuer, and the resolver that reads what it wrote.
+///
+/// # Why the issuer is built unconditionally
+///
+/// The approval endpoints exist in every build: a person can be asked for
+/// approval whether or not the dev lane is armed, and a challenge answered
+/// through them produces a real delegation row either way. Only the RESOLVER
+/// differs — which is precisely ADR-025's amendment to ADR-021: the real one is
+/// the default and `--dev-authority` selects the stand-in explicitly, so there
+/// is no silent fallback in either direction.
+type Issuer = AuthorityService<townhall_store::authority::SqlApprovalStore, OsEntropy>;
+
+fn authority(
+    args: &Args,
+    pool: &sqlx::SqlitePool,
+) -> Result<(Arc<dyn AuthorityResolver>, Arc<Issuer>), String> {
+    use townhall_authority::{AuthorityPolicy, EnvelopeKey};
+
+    let key_hex = args
+        .authority_key
+        .as_deref()
+        .ok_or("--authority-key is required: 64 hex characters")?;
+    let key_bytes = parse_key(key_hex)
+        .ok_or("--authority-key must be 64 hex characters (32 bytes)".to_owned())?;
+    let key = EnvelopeKey::new(key_bytes.to_vec()).map_err(|error| error.to_string())?;
+
+    let store = Arc::new(townhall_store::authority::SqlApprovalStore::new(
+        pool.clone(),
+    ));
+    let issuer = Arc::new(AuthorityService::new(
+        Arc::clone(&store),
+        OsEntropy,
+        AuthorityPolicy::default(),
+        key,
+    ));
+
     #[cfg(feature = "dev-authority")]
     {
         if args.dev_authority {
             eprintln!(
                 "==============================================================\n\
-                 townhall-server: DEV AUTHORITY IS ACTIVE (ADR-021).\n\
-                 Three fixed tokens exist: dev-lucy, dev-marco-restricted,\n\
-                 dev-priya-nobook.\n\
-                 This resolver is a stand-in until M7 and must never ship.\n\
+                 townhall-server: DEV AUTHORITY IS ACTIVE (ADR-021, amended by\n\
+                 ADR-025). Three fixed tokens exist: dev-lucy,\n\
+                 dev-marco-restricted, dev-priya-nobook. Each mints a grant per\n\
+                 request over whatever booking was named — nobody is asked.\n\
+                 This resolver is a stand-in and must never ship.\n\
                  =============================================================="
             );
-            return Ok(Arc::new(DevAuthority));
+            return Ok((Arc::new(DevAuthority), issuer));
         }
     }
-    if args.dev_authority {
-        return Err("--dev-authority requires building with the dev-authority feature".to_owned());
-    }
-    Err(
-        "no authority resolver: until M7, start with the dev-authority feature AND \
-         --dev-authority"
-            .to_owned(),
-    )
+    // The flag/feature combination was settled before any I/O — see
+    // `dev_authority_available`. Reaching here with the flag set and the
+    // feature absent is impossible.
+
+    // The real resolver. It can mint nothing: a grant exists because somebody
+    // answered a challenge, and this looks it up.
+    let actors = vec![(
+        "agent-townhall".to_owned(),
+        bld_types::ActorId::new("agent:townhall"),
+    )];
+    Ok((
+        Arc::new(RealAuthority::new(Arc::clone(&issuer), store, actors)),
+        issuer,
+    ))
 }
 
 // One long function, deliberately: the composition root's whole job is this
@@ -311,16 +513,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(problem) = dev_authority_available(&args) {
+        eprintln!("townhall-server: {problem}");
+        return ExitCode::from(2);
+    }
     let Some(key_bytes) = parse_key(&args.key_hex) else {
         eprintln!("townhall-server: --key-hex must be exactly 64 hex characters");
         return ExitCode::from(2);
-    };
-    let authority = match resolver(&args) {
-        Ok(authority) => authority,
-        Err(problem) => {
-            eprintln!("townhall-server: {problem}");
-            return ExitCode::from(2);
-        }
     };
     let mut config = PursuitConfig {
         retry_cadence_ms: args.retry_cadence_ms,
@@ -350,6 +549,17 @@ async fn main() -> ExitCode {
         Err(error) => {
             eprintln!("townhall-server: cannot open {}: {error}", args.db);
             return ExitCode::FAILURE;
+        }
+    };
+    // The issuer and resolver, built here because they need the pool the
+    // repository owns — one database, so a delegation written by the endpoints
+    // is the same row the resolver reads back (ADR-025's shared authority
+    // plane, which is why these endpoints live in the server at all).
+    let (authority, issuer) = match authority(&args, repository.pool()) {
+        Ok(pair) => pair,
+        Err(problem) => {
+            eprintln!("townhall-server: {problem}");
+            return ExitCode::from(2);
         }
     };
     let denials = match townhall_store::denials::DenialLog::open(&args.denials_db, clock).await {
@@ -391,7 +601,20 @@ async fn main() -> ExitCode {
         stopped,
     ));
 
-    let router = townhall_http::router(ServerState { api, authority });
+    // Two routers, one listener.
+    //
+    // The booking API and the trusted approval endpoints are separate surfaces
+    // that happen to share a port. What keeps the untrusted proposer away from
+    // the second is not the network — it is that `Gateway` has no method naming
+    // any of these paths and `townhall-orchestrator` cannot name
+    // `townhall-authority` at all (ADR-025, asserted by that crate's
+    // resolved-dependency test).
+    let approvals =
+        townhall_http::approvals::approval_router(townhall_http::approvals::ApprovalState {
+            issuer: Arc::new(authority::ServiceIssuer(issuer)),
+            authority: Arc::clone(&authority),
+        });
+    let router = townhall_http::router(ServerState { api, authority }).merge(approvals);
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -419,4 +642,64 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// ADR-025's amendment, second property: the flag is unavailable without the
+/// feature.
+///
+/// # Why this is a unit test and not a spawned binary
+///
+/// It was a spawned binary, and that cost an afternoon. The test ran
+/// `CARGO_BIN_EXE_townhall-server --dev-authority` and asserted a refusal — but
+/// that path is `target/debug/townhall-server`, a single file every
+/// feature-build overwrites and CI's cache leaves pointing at the FEATURE lane's
+/// binary. So the test spawned a feature-enabled server, which accepted the flag
+/// and served, and the whole run hung. Every fix that kept the spawn — asking
+/// cargo for the path (still the shared path), an isolated rebuild (a nested
+/// `cargo build` that starved for CPU under the parallel workspace run) — traded
+/// one flavour of the same fragility for another.
+///
+/// The property is a COMPILE-TIME fact: in a build without the feature,
+/// `dev_authority_available` returns `Err`. So it is tested where it is decided,
+/// with no process, no path, no cache, and no chance of checking the wrong
+/// binary. `main` acts on that `Err` by refusing to start (one visible line
+/// above), which is the part a subprocess was never really needed to prove.
+///
+/// Compiled only WITHOUT the feature — under `--dev-authority` the function can
+/// only return `Ok`, and asserting a refusal there would assert the build's own
+/// configuration back at itself.
+#[cfg(all(test, not(feature = "dev-authority")))]
+mod feature_gate {
+    use super::{Args, dev_authority_available};
+
+    fn args(dev_authority: bool) -> Args {
+        Args {
+            db: "/tmp/unused".to_owned(),
+            authority_key: None,
+            denials_db: "/tmp/unused".to_owned(),
+            council_url: "http://127.0.0.1:1".to_owned(),
+            key_hex: "0".repeat(64),
+            port: 0,
+            dev_authority,
+            retry_cadence_ms: 0,
+            reconcile_interval_ms: 1,
+            reclassify_attempts: None,
+        }
+    }
+
+    #[test]
+    fn dev_authority_is_refused_without_the_feature() {
+        assert!(
+            dev_authority_available(&args(true)).is_err(),
+            "a build without the dev-authority feature must refuse --dev-authority"
+        );
+    }
+
+    #[test]
+    fn no_flag_is_fine_without_the_feature() {
+        assert!(
+            dev_authority_available(&args(false)).is_ok(),
+            "not asking for the dev lane is always allowed"
+        );
+    }
 }

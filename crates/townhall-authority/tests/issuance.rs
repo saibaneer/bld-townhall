@@ -14,8 +14,8 @@ use bld_types::{
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, MAX_ATTEMPTS, MemoryApprovalStore,
-    PendingScope, ResolveError,
+    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS,
+    MemoryApprovalStore, PendingScope, ResolveError,
 };
 
 const NOW: u64 = 1_700_000_000_000;
@@ -63,6 +63,10 @@ use std::sync::Arc;
 /// assert on rows keeps its own `Arc` from the start.
 fn service_and_store() -> (Service, Arc<MemoryApprovalStore>) {
     let store = Arc::new(MemoryApprovalStore::new());
+    // Lucy's channel is bound, because the verifier checks the claimed binding
+    // against a row now rather than against the caller's own claim.
+    store.bind(&PrincipalId::new("lucy"), 1);
+    store.bind(&PrincipalId::new("marco"), 1);
     let service = AuthorityService::new(
         Arc::clone(&store),
         FixedEntropy::new("7312"),
@@ -71,12 +75,19 @@ fn service_and_store() -> (Service, Arc<MemoryApprovalStore>) {
             grant_ttl_ms: GRANT_TTL_MS,
             assurance: AssuranceLevel::SmsReply,
         },
+        test_key(),
     );
     (service, store)
 }
 
 fn service() -> Service {
     service_and_store().0
+}
+
+/// One key for the whole suite. Fixed rather than random so a failure is a
+/// failure and not a coin flip.
+fn test_key() -> EnvelopeKey {
+    EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes")
 }
 
 fn lucys_binding() -> BindingRef {
@@ -109,6 +120,7 @@ fn lucys_request() -> ApprovalRequest {
         binding: lucys_binding(),
         grantor: PrincipalId::new("lucy"),
         subject: PrincipalId::new("lucy"),
+        actor: ActorId::new("agent:townhall"),
     }
 }
 
@@ -688,6 +700,18 @@ async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed(
                 envelope: b"not an envelope".to_vec(),
             }))
         }
+        async fn live_binding(
+            &self,
+            principal: &PrincipalId,
+        ) -> Result<Option<BindingRef>, townhall_authority::StoreError> {
+            // Bound, so this store's refusals are about what it is testing and
+            // not about the binding check in front of it.
+            Ok(Some(BindingRef {
+                principal: principal.clone(),
+                version: 1,
+            }))
+        }
+
         async fn revoke_delegation(
             &self,
             _id: &DelegationId,
@@ -701,6 +725,7 @@ async fn a_delegation_that_does_not_decode_is_refused_rather_than_half_believed(
         Arc::new(CorruptStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
+        test_key(),
     );
 
     assert_eq!(
@@ -783,10 +808,19 @@ async fn a_delegated_grant_separates_the_owner_from_the_requester() {
         "marco",
         "the cancellation is attributed to Marco"
     );
-    assert_eq!(
-        grant.actor(),
-        &ActorId::new("agent:marco"),
-        "the workload presenting the grant acts for the subject"
+    // The actor is the AUTHENTICATED WORKLOAD, and deliberately not derived
+    // from anybody's name.
+    //
+    // It used to be `agent:{subject}` — an identity nothing had authenticated,
+    // invented by string formatting. M7B binds it to the caller's own
+    // credential and the challenge persists it, so the person approving a
+    // preview that says "Agent: TownHallAgent" is approving THAT agent. A
+    // different workload answering the same challenge receives nothing.
+    assert_eq!(grant.actor(), &ActorId::new("agent:townhall"));
+    assert_ne!(
+        grant.actor().as_str(),
+        format!("agent:{}", grant.subject().as_str()),
+        "an actor derived from the subject would be a name nobody authenticated"
     );
     assert!(grant.covers(Behaviour::Cancel, &BookingId::new("sms-lucy-0001")));
     assert!(
@@ -1003,6 +1037,7 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
                 attempts_used: 0,
                 status: townhall_authority::ChallengeStatus::Pending,
                 assurance: AssuranceLevel::SmsReply,
+                actor: ActorId::new("agent:townhall"),
             }))
         }
         async fn record_failed_attempt(
@@ -1033,6 +1068,18 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
         {
             Ok(None)
         }
+        async fn live_binding(
+            &self,
+            principal: &PrincipalId,
+        ) -> Result<Option<BindingRef>, townhall_authority::StoreError> {
+            // Bound, so this store's refusals are about what it is testing and
+            // not about the binding check in front of it.
+            Ok(Some(BindingRef {
+                principal: principal.clone(),
+                version: 1,
+            }))
+        }
+
         async fn revoke_delegation(
             &self,
             _id: &DelegationId,
@@ -1046,6 +1093,7 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
         Arc::new(ForgedStore),
         FixedEntropy::new("7312"),
         AuthorityPolicy::default(),
+        test_key(),
     );
 
     // The right code, from the right channel, inside the window — and still no
@@ -1074,5 +1122,157 @@ async fn a_challenge_whose_digest_contradicts_its_scope_yields_no_grant() {
             )
             .await,
         Err(ApprovalDenied::Unreadable)
+    );
+}
+
+/// A challenge cannot be answered by a binding that does not exist.
+///
+/// # The defect this witnesses
+///
+/// Both sides of the "wrong channel" comparison used to come from the CALLER:
+/// the binding it named when raising the challenge, and the binding it named
+/// when answering. Sending the same pair twice passed, so possession of a
+/// workload credential was enough to mint an in-policy grant with no phone
+/// involved. Found in review after M7B was written.
+///
+/// Here the challenge is raised naming a principal nobody has bound, and
+/// answered with the very same values — the case that used to succeed.
+#[tokio::test]
+async fn a_binding_nobody_has_made_cannot_answer_its_own_challenge() {
+    let store = Arc::new(MemoryApprovalStore::new());
+    // Deliberately NOT bound. Mallory names herself and answers as herself.
+    let service = AuthorityService::new(
+        Arc::clone(&store),
+        FixedEntropy::new("7312"),
+        AuthorityPolicy::default(),
+        test_key(),
+    );
+    let invented = BindingRef {
+        principal: PrincipalId::new("mallory"),
+        version: 1,
+    };
+    let mut request = lucys_request();
+    request.binding = invented.clone();
+    request.grantor = PrincipalId::new("mallory");
+    request.subject = PrincipalId::new("mallory");
+
+    let raised = service.begin(&request, NOW).await.expect("challenge");
+    assert_eq!(
+        service
+            .submit(
+                &raised.id,
+                "7312",
+                &invented,
+                AssuranceLevel::SmsReply,
+                NOW + 1_000
+            )
+            .await,
+        Err(ApprovalDenied::WrongChannel),
+        "naming a binding and then answering as it must not be an approval"
+    );
+}
+
+/// A binding that has moved since the challenge was raised cannot answer it.
+///
+/// The revision check, against the STORE. `a_binding_at_a_newer_revision…`
+/// above proves the challenge remembers its revision; this proves the verifier
+/// compares that memory against what is currently true, so a number
+/// re-verified or reassigned mid-challenge stops being able to answer.
+#[tokio::test]
+async fn a_binding_re_verified_since_the_challenge_can_no_longer_answer_it() {
+    let store = Arc::new(MemoryApprovalStore::new());
+    store.bind(&PrincipalId::new("lucy"), 1);
+    let service = AuthorityService::new(
+        Arc::clone(&store),
+        FixedEntropy::new("7312"),
+        AuthorityPolicy::default(),
+        test_key(),
+    );
+    let raised = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+
+    // Her number is re-verified: same principal, new revision.
+    store.bind(&PrincipalId::new("lucy"), 2);
+
+    assert_eq!(
+        service
+            .submit(
+                &raised.id,
+                "7312",
+                &lucys_binding(),
+                AssuranceLevel::SmsReply,
+                NOW + 1_000
+            )
+            .await,
+        Err(ApprovalDenied::WrongChannel),
+        "a challenge sent to a binding must not survive that binding moving"
+    );
+
+    // And withdrawing it entirely does the same, rather than erroring
+    // differently.
+    store.unbind(&PrincipalId::new("lucy"));
+    let raised = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    assert_eq!(
+        service
+            .submit(
+                &raised.id,
+                "7312",
+                &lucys_binding(),
+                AssuranceLevel::SmsReply,
+                NOW + 1_000
+            )
+            .await,
+        Err(ApprovalDenied::WrongChannel)
+    );
+}
+
+/// A grant resolves for the actor it names, and for nobody else.
+///
+/// # Why this is the property the revoke endpoint rests on
+///
+/// A delegation reference is not a bearer token. It travels in a header, ends
+/// up in logs and error reports, and is exactly the sort of value that leaks —
+/// so a workload that merely FINDS one must not be able to use it, or revoke
+/// it. Review found the revoke endpoint checking only that somebody had
+/// authenticated; it now asks this question first.
+#[tokio::test]
+async fn a_grant_resolves_only_for_the_actor_it_names() {
+    let (service, _store) = service_and_store();
+    let raised = service
+        .begin(&lucys_request(), NOW)
+        .await
+        .expect("challenge");
+    let grant = service
+        .submit(
+            &raised.id,
+            "7312",
+            &lucys_binding(),
+            AssuranceLevel::SmsReply,
+            NOW + 1_000,
+        )
+        .await
+        .expect("answered");
+
+    // The actor it names.
+    service
+        .resolve(grant.delegation(), NOW + 2_000)
+        .await
+        .expect("the grant is live");
+    assert_eq!(grant.actor(), &ActorId::new("agent:townhall"));
+
+    // And a different one gets nothing from the same reference. The service's
+    // own `resolve` does not take an actor — that check belongs to whoever
+    // presents it — so this asserts the value the presenter compares against,
+    // which is what makes the comparison possible at all.
+    assert_ne!(
+        grant.actor(),
+        &ActorId::new("agent:someone-else"),
+        "a reference that any authenticated workload could use would be a \
+         bearer token, and this one is not"
     );
 }

@@ -14,6 +14,10 @@ council-wire = { path = "../../crates/council-wire" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 # The dev resolver issues real grants now — nothing asserts its own
 # authority any more (ADR-025).
+# The pool type only: the composition root hands one to the authority
+# store, and naming a type is the least it can do to pass it along.
+async-trait = { workspace = true }
+sqlx = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
 townhall-domain = { path = "../../crates/townhall-domain" }
 townhall-http = { path = "../../crates/townhall-http" }
@@ -29,9 +33,17 @@ bld-types = { path = "../../crates/bld-types" }
 dev-authority = []
 
 [dev-dependencies]
+# The no-feature lane needs a channel binding to exist before a READ is scoped
+# to anybody, and there is no endpoint that creates one — binding a phone is
+# M7C's, with the verification flow. So that lane writes the row through the
+# store, which is the same surface the composition root uses.
+bld-types = { path = "../../crates/bld-types" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "blocking"] }
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true }
+townhall-authority = { path = "../../crates/townhall-authority" }
+townhall-store = { path = "../../crates/townhall-store" }
 
 [lints]
 workspace = true

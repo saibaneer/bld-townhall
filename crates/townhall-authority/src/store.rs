@@ -133,6 +133,29 @@ pub trait ApprovalStore: Send + Sync {
         id: &DelegationId,
     ) -> Result<Option<DelegationRecord>, StoreError>;
 
+    /// The live binding for a principal, if their channel is bound.
+    ///
+    /// # Why the VERIFIER needs this and not just the read gate
+    ///
+    /// Because without it, "the reply came from the channel the challenge was
+    /// sent to" was checked by comparing two values the CALLER supplied: the
+    /// binding it named when raising the challenge, and the binding it named
+    /// when answering. A caller that sent the same pair twice passed. Review
+    /// found this after M7B was written, and it is the difference between a
+    /// check and a formality.
+    ///
+    /// Now the verifier compares against a row. That still does not prove a
+    /// person answered — proving that needs evidence from the channel itself,
+    /// which arrives with M7C — but it does mean the binding named must exist,
+    /// be active, and be at the revision it claims.
+    ///
+    /// # Errors
+    /// The store is unreachable. An unbound principal is `Ok(None)`.
+    async fn live_binding(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<crate::grant::BindingRef>, StoreError>;
+
     /// Revoke, returning whether this call was the one that did it.
     ///
     /// Idempotent by contract: REVOKE is a safety exit (spec §2) and a second
@@ -158,12 +181,30 @@ pub struct MemoryApprovalStore {
 struct Held {
     challenges: HashMap<String, ChallengeRecord>,
     delegations: HashMap<String, DelegationRecord>,
+    /// Principal -> live binding revision.
+    bindings: HashMap<String, u64>,
 }
 
 impl MemoryApprovalStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind a principal's channel at `version`.
+    ///
+    /// The in-memory equivalent of a `channel_bindings` row. Tests that answer
+    /// a challenge need one, because the verifier now checks against it rather
+    /// than against the caller's own claim.
+    pub fn bind(&self, principal: &PrincipalId, version: u64) {
+        self.locked()
+            .bindings
+            .insert(principal.as_str().to_owned(), version);
+    }
+
+    /// Withdraw it, so a test can watch a challenge become unanswerable.
+    pub fn unbind(&self, principal: &PrincipalId) {
+        self.locked().bindings.remove(principal.as_str());
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Held> {
@@ -259,6 +300,20 @@ impl ApprovalStore for MemoryApprovalStore {
         id: &DelegationId,
     ) -> Result<Option<DelegationRecord>, StoreError> {
         Ok(self.locked().delegations.get(id.as_str()).cloned())
+    }
+
+    async fn live_binding(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<crate::grant::BindingRef>, StoreError> {
+        Ok(self
+            .locked()
+            .bindings
+            .get(principal.as_str())
+            .map(|version| crate::grant::BindingRef {
+                principal: principal.clone(),
+                version: *version,
+            }))
     }
 
     async fn revoke_delegation(&self, id: &DelegationId, at_ms: u64) -> Result<bool, StoreError> {

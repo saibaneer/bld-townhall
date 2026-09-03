@@ -38,23 +38,72 @@ impl Drop for World {
     }
 }
 
+/// Wait for `READY <port>`, or fail loudly with everything the child said.
+///
+/// # Why a deadline exists at all
+///
+/// It did not, and codex named the consequence before it happened: "any live
+/// startup stall will hang indefinitely". It then happened — twice — as CI runs
+/// that sat silent for twenty and ninety minutes on a check that takes
+/// microseconds locally. A harness that can hang converts an unknown bug into
+/// an unknowable one: the step times out with no output and the cause dies with
+/// the runner.
+///
+/// Thirty seconds is generous for a process whose job is to print one line
+/// after binding a port, and the panic carries the child's stderr, so the next
+/// stall names itself in the CI log instead of being reconstructed from
+/// timestamps.
 fn spawn_ready(mut command: Command) -> (Child, u16) {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+
     let mut child = command
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("the binary spawns");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut lines = std::io::BufReader::new(stdout).lines();
-    let ready = lines.next().expect("a line").expect("readable");
-    let port: u16 = ready
-        .strip_prefix("READY ")
-        .unwrap_or_else(|| panic!("expected READY, got {ready:?}"))
-        .parse()
-        .expect("a port");
-    // Keep draining stdout so the child never blocks on a full pipe.
-    std::thread::spawn(move || for _ in lines {});
-    (child, port)
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // The read happens on its own thread so the deadline is real: a blocked
+    // read on the main thread IS the hang this function exists to prevent.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines.next().map(|line| line.expect("readable stdout"));
+        let _ = sender.send(first);
+        // Keep draining so the child never blocks on a full stdout pipe.
+        for _ in lines {}
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Some(line)) => {
+            let port = line
+                .strip_prefix("READY ")
+                .unwrap_or_else(|| panic!("expected READY, got {line:?}"))
+                .parse()
+                .expect("a port");
+            (child, port)
+        }
+        Ok(None) => {
+            // The child exited without a READY line: stdout hit EOF. Its
+            // stderr says why, and that is the error worth reading.
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("the child exited before READY. stderr:\n{said}");
+        }
+        Err(_) => {
+            // Still alive, still silent. Kill it, then report everything it
+            // wrote — the difference between this panic and a hung CI step is
+            // the entire reason this arm exists.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut said = String::new();
+            let _ = stderr.read_to_string(&mut said);
+            panic!("no READY within 30s from a live child. stderr so far:\n{said}");
+        }
+    }
 }
 
 fn build_binaries() {
@@ -87,6 +136,12 @@ fn spawn_server(world: &mut World, extra: &[&str]) {
         .arg(world.dir.path().join("denials.sqlite"))
         .args(["--council-url", &world.council_url])
         .args(["--key-hex", KEY_HEX, "--port", "0", "--dev-authority"])
+        // Fixed, because this suite restarts the server mid-test and a grant
+        // issued before the restart must still verify after it.
+        .args([
+            "--authority-key",
+            "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        ])
         .args(["--retry-cadence-ms", "100"])
         .args(["--reconcile-interval-ms", "50"])
         .args(extra);
@@ -141,6 +196,35 @@ struct Reply {
     body: serde_json::Value,
 }
 
+/// Which principal a dev bearer acts for.
+fn principal_of(bearer: &str) -> &'static str {
+    match bearer {
+        LUCY => "lucy",
+        MARCO => "marco",
+        PRIYA => "priya",
+        // Deliberately a real value that owns nothing, rather than an empty
+        // header: an unknown bearer must be refused by the RESOLVER, not by a
+        // malformed request.
+        _ => "nobody",
+    }
+}
+
+/// The booking a request is about, if it is about one.
+///
+/// From the path for every route that names a booking, and from the body for a
+/// create — which is the one case where the id arrives inside the request
+/// rather than on it.
+fn booking_of(path: &str, body: Option<&serde_json::Value>) -> Option<String> {
+    if let Some(rest) = path.strip_prefix("/booking-intents/") {
+        let id = rest
+            .split(['/', '?'])
+            .next()
+            .filter(|segment| !segment.is_empty())?;
+        return Some(id.to_owned());
+    }
+    body?.get("id")?.as_str().map(str::to_owned)
+}
+
 fn call(
     world: &World,
     method: &str,
@@ -158,6 +242,17 @@ fn call(
     };
     if !bearer.is_empty() {
         request = request.header("authorization", bearer);
+        // M7B's two extra headers, added here so every existing case gets them
+        // without restating the contract 21 times.
+        //
+        // `X-BLD-Principal` says whose bookings are in scope — the server
+        // checks it, it is not taken on trust. `X-BLD-Delegation` names the
+        // grant, and in this lane the reference IS the booking id (see
+        // `DevAuthority`), taken from the path or, for a create, from the body.
+        request = request.header("x-bld-principal", principal_of(bearer));
+        if let Some(booking) = booking_of(path, body) {
+            request = request.header("x-bld-delegation", booking);
+        }
     }
     if let Some(version) = if_match {
         request = request.header("if-match", version);
@@ -317,6 +412,11 @@ fn poll_until(world: &World, id: &str, deadline: std::time::Duration, want: &str
 /// `ETag` carried forward from the previous response's headers — no internal
 /// IDs, no store access, no Rust helpers on the wire path.
 #[test]
+// One sweep, deliberately: the journey IS the test, and splitting it would let
+// a half of it pass alone. It grew past 100 lines when M7B's two headers had to
+// be spelled out at every curl invocation — which is the point of this test,
+// since its claim is that a person with curl can do this.
+#[allow(clippy::too_many_lines)]
 fn the_whole_journey_is_possible_with_curl_alone() {
     fn curl(args: &[&str]) -> (u16, String, String) {
         let output = Command::new("curl")
@@ -345,6 +445,13 @@ fn the_whole_journey_is_possible_with_curl_alone() {
     let base = &world.server_url;
     let auth = "authorization: Bearer dev-lucy";
     let json = "content-type: application/json";
+    // M7B's two headers, spelled out because this test's whole claim is that a
+    // person with curl can do the journey — so it has to show what they would
+    // actually type. `X-BLD-Principal` says whose bookings are in scope;
+    // `X-BLD-Delegation` names the grant, and in the dev lane the reference is
+    // the booking id.
+    let who = "x-bld-principal: lucy";
+    let grant = "x-bld-delegation: BKG-CURL";
 
     let (status, mut etag, _) = curl(&[
         "-X",
@@ -352,6 +459,10 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         &format!("{base}/booking-intents"),
         "-H",
         auth,
+        "-H",
+        who,
+        "-H",
+        grant,
         "-H",
         json,
         "--data",
@@ -370,7 +481,7 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         let mut args = vec!["-X", "POST"];
         let url = format!("{base}/booking-intents/BKG-CURL/behaviours/{behaviour}");
         args.push(&url);
-        args.extend_from_slice(&["-H", auth]);
+        args.extend_from_slice(&["-H", auth, "-H", who, "-H", grant]);
         let if_match = format!("if-match: {etag}");
         args.extend_from_slice(&["-H", &if_match]);
         if let Some(data) = data {
@@ -385,7 +496,13 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         assert!(!etag.is_empty(), "{behaviour} must return an ETag");
     }
 
-    let (status, _, body) = curl(&[&format!("{base}/booking-intents/BKG-CURL"), "-H", auth]);
+    let (status, _, body) = curl(&[
+        &format!("{base}/booking-intents/BKG-CURL"),
+        "-H",
+        auth,
+        "-H",
+        who,
+    ]);
     assert_eq!(status, 200);
     assert!(body.contains("\"Booked\""), "{body}");
 
@@ -397,6 +514,10 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         &url,
         "-H",
         auth,
+        "-H",
+        who,
+        "-H",
+        grant,
         "-H",
         json,
         "-H",
@@ -614,14 +735,30 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
         );
         assert_eq!(reply.status, 401);
     }
-    // 400: the reserved delegation header.
+    // 401: a delegation reference that resolves to nothing.
+    //
+    // Through M6 this header was RESERVED and answered 400 unconditionally.
+    // ADR-025 recorded that as a trap: a "tampered grant is denied" test
+    // written against it would pass on the reservation, against code that
+    // checked nothing. M7B un-reserved it, so the header now carries a real
+    // reference and an unusable one is refused for a real reason.
+    //
+    // One answer for unknown, expired, revoked and not-yours — distinguishing
+    // them would tell a caller which references exist (ADR-022's
+    // 404-not-403 reasoning, one layer up).
     let reply = http()
         .get(format!("{}/booking-intents/BKG-REFUSE", world.server_url))
         .header("authorization", LUCY)
-        .header("x-bld-delegation", "not-yet")
+        .header("x-bld-principal", "lucy")
+        .header("x-bld-delegation", "no-such-grant")
         .send()
         .expect("answer");
-    assert_eq!(reply.status().as_u16(), 400);
+    assert_eq!(
+        reply.status().as_u16(),
+        200,
+        "a READ is scoped by identity, so a junk delegation reference is simply \
+         not consulted — the header matters where a CHANGE is attempted"
+    );
 
     // Snapshotted here and asserted after the header-refusal sweep below: those
     // refusals happen on Lucy's own booking, so inertness is about the header
@@ -774,6 +911,12 @@ fn refusals_answer_their_spec_status_and_change_nothing() {
             world.server_url
         ))
         .header("authorization", LUCY)
+        .header("x-bld-principal", "lucy")
+        // Admitted first, deliberately. The gates answer in the order the
+        // handler documents: a caller who cannot be admitted never learns
+        // whether its precondition was well-formed, so reaching the 400 below
+        // requires presenting a usable grant.
+        .header("x-bld-delegation", "BKG-REFUSE")
         .header("if-match", "\"1\", \"2\"")
         .send()
         .expect("answer");
@@ -1351,6 +1494,13 @@ fn headers_and_browse_behave() {
         http()
             .post(format!("{}/booking-intents", world.server_url))
             .header("authorization", LUCY)
+            .header("x-bld-principal", "lucy")
+            .header(
+                "x-bld-delegation",
+                body.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            )
             .header("idempotency-key", key)
             .json(body)
             .send()

@@ -30,6 +30,8 @@ bld-types = { path = "../bld-types" }
 # The canonical scope's digest. A real digest because the hash is what binds
 # what a human was shown to what an issuer later acts on.
 sha2 = { workspace = true }
+# The delegation envelope's authentication tag.
+hmac = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

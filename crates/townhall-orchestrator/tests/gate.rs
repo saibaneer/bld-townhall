@@ -150,7 +150,7 @@ async fn m6_gate_the_scripted_journey_with_the_answer_lost() {
         .expect("the opening completes");
 
     // Arm the drop against the booking the walk created.
-    let gateway = Gateway::new(world.server_url.clone(), LUCY);
+    let gateway = Gateway::new(world.server_url.clone(), LUCY, "lucy");
     let parked = gateway.cancellable().await.expect("lookup").remove(0);
     let effect = format!("EFF-{}-BOOK-{}", parked.id, parked.version);
     let fault = arm_fault(&world, &effect, "create", "drop_response").await;
@@ -247,9 +247,16 @@ async fn m6_gate_the_journey_with_the_world_moving_under_it() {
     // The out-of-band bump: attendees 20 → 24, Lucy's own credential,
     // AwaitingBooking → NeedsRevalidation (the domain insists the changed
     // count re-checks capacity).
-    let gateway = Gateway::new(world.server_url.clone(), LUCY);
-    let parked = gateway.cancellable().await.expect("lookup").remove(0);
+    // Reading first, then changing — and the change presents a grant naming
+    // this booking. That is not harness noise: the "world moving under it"
+    // actor is exactly somebody who would have had to be authorized separately,
+    // and since M7B every proposal is checked against the grant rather than
+    // only `Book` and `Cancel`.
+    let reader = Gateway::new(world.server_url.clone(), LUCY, "lucy");
+    let parked = reader.cancellable().await.expect("lookup").remove(0);
     let id = bld_types::BookingId::new(parked.id.clone());
+    let gateway =
+        Gateway::new(world.server_url.clone(), LUCY, "lucy").with_delegation(parked.id.clone());
     let bumped = gateway
         .propose_at(
             &id,

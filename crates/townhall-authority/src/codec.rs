@@ -48,6 +48,15 @@ impl<'bytes> Reader<'bytes> {
         self.field()?.try_into().ok()
     }
 
+    /// How many bytes have been read so far.
+    ///
+    /// Used to find where a body ends and its trailing tag begins, rather than
+    /// assuming a fixed offset — an assumption that breaks silently the first
+    /// time a field is added.
+    pub(crate) fn consumed(&self) -> usize {
+        self.at
+    }
+
     /// Whether every byte has been consumed.
     ///
     /// Checked at the end of a decode: trailing bytes mean the envelope is not

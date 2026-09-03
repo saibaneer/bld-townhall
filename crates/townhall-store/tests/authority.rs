@@ -11,13 +11,14 @@
 //! Migration 0006 is exercised by every test here simply by opening the store.
 
 use bld_types::{
-    Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId, ServiceId,
-    TimeWindow,
+    ActorId, Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId,
+    ServiceId, TimeWindow,
 };
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, MAX_ATTEMPTS, PendingScope, ResolveError,
+    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS, PendingScope,
+    ResolveError,
 };
 use townhall_store::SqliteBookingRepository;
 use townhall_store::authority::{ChannelBinding, SqlApprovalStore};
@@ -52,6 +53,30 @@ impl Entropy for FixedEntropy {
     }
 }
 
+/// Bind Lucy's channel, so a challenge she raises can be answered.
+///
+/// The verifier checks a claimed binding against a ROW now (the M7B review fix),
+/// so every test that answers a challenge needs this — the SQL analogue of the
+/// in-memory store's `bind`. Idempotent per database: written once, it survives
+/// a reopen, which is exactly what the reopen tests rely on.
+async fn bind_lucy(store: &SqlApprovalStore) {
+    store
+        .bind_channel(
+            &ChannelBinding {
+                id: "binding-lucy".to_owned(),
+                address: "+447700900123".to_owned(),
+                principal: PrincipalId::new("lucy"),
+                version: 1,
+                assurance: AssuranceLevel::SmsReply,
+                withdrawn: false,
+            },
+            None,
+            NOW,
+        )
+        .await
+        .expect("the binding is written");
+}
+
 /// A store over a fresh temporary database, migrations applied.
 async fn store() -> (SqlApprovalStore, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -71,6 +96,7 @@ fn service(store: SqlApprovalStore) -> AuthorityService<SqlApprovalStore, FixedE
             grant_ttl_ms: GRANT_TTL_MS,
             assurance: AssuranceLevel::SmsReply,
         },
+        EnvelopeKey::new(vec![0xA7; 32]).expect("32 bytes"),
     )
 }
 
@@ -103,6 +129,7 @@ fn request() -> ApprovalRequest {
         binding: lucys_binding(),
         grantor: PrincipalId::new("lucy"),
         subject: PrincipalId::new("marco"),
+        actor: ActorId::new("agent:townhall"),
     }
 }
 
@@ -110,6 +137,7 @@ fn request() -> ApprovalRequest {
 #[tokio::test]
 async fn a_grant_round_trips_through_sqlite_unchanged() {
     let (store, _directory) = store().await;
+    bind_lucy(&store).await;
     let service = service(store);
 
     let raised = service.begin(&request(), NOW).await.expect("challenge");
@@ -148,7 +176,9 @@ async fn a_challenges_scope_survives_a_reopened_database() {
         let bookings = SqliteBookingRepository::open(&path)
             .await
             .expect("migrations");
-        let service = service(SqlApprovalStore::new(bookings.pool().clone()));
+        let store = SqlApprovalStore::new(bookings.pool().clone());
+        bind_lucy(&store).await;
+        let service = service(store);
         service.begin(&request(), NOW).await.expect("challenge").id
     };
 
@@ -191,6 +221,7 @@ async fn two_simultaneous_replies_over_sqlite_yield_exactly_one_grant() {
 
     for round in 0..8 {
         let (store, _directory) = store().await;
+        bind_lucy(&store).await;
         let service = Arc::new(service(store));
         let raised = service.begin(&request(), NOW).await.expect("challenge");
 
@@ -248,7 +279,9 @@ async fn the_attempt_count_survives_a_reopened_database() {
         let bookings = SqliteBookingRepository::open(&path)
             .await
             .expect("migrations");
-        let service = service(SqlApprovalStore::new(bookings.pool().clone()));
+        let store = SqlApprovalStore::new(bookings.pool().clone());
+        bind_lucy(&store).await;
+        let service = service(store);
         let raised = service.begin(&request(), NOW).await.expect("challenge");
         assert_eq!(
             service
@@ -300,7 +333,9 @@ async fn revocation_survives_a_reopened_database() {
         let bookings = SqliteBookingRepository::open(&path)
             .await
             .expect("migrations");
-        let service = service(SqlApprovalStore::new(bookings.pool().clone()));
+        let store = SqlApprovalStore::new(bookings.pool().clone());
+        bind_lucy(&store).await;
+        let service = service(store);
         let raised = service.begin(&request(), NOW).await.expect("challenge");
         let grant = service
             .submit(

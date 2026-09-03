@@ -1429,9 +1429,9 @@ where
     pub async fn read(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Projection, ApiError> {
-        let aggregate = self.load_visible(id, access).await?;
+        let aggregate = self.load_visible(id, reader).await?;
         Ok(Self::project(&aggregate))
     }
 
@@ -1454,9 +1454,9 @@ where
     pub async fn ensure_visible(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<(), ApiError> {
-        self.load_visible(id, access).await.map(|_| ())
+        self.load_visible(id, reader).await.map(|_| ())
     }
 
     /// The caller's bookings matching one closed query.
@@ -1496,7 +1496,7 @@ where
         // its current version — the resource's state, leaked by the guard meant
         // to protect it. A foreign caller must not be able to tell a stale
         // precondition from a fictional booking.
-        self.ensure_visible(id, authority).await?;
+        self.ensure_visible(id, authority.grantor()).await?;
 
         let outcome = self
             .coordinator
@@ -1516,7 +1516,7 @@ where
         let (current_version, retry_after_ms) = match &outcome {
             BoundaryOutcome::Committed(aggregate) => (aggregate.version, None),
             BoundaryOutcome::Unresolved => {
-                let aggregate = self.load_visible(id, authority).await?;
+                let aggregate = self.load_visible(id, authority.grantor()).await?;
                 let hint = match &aggregate.active_effect {
                     Some(effect) => self
                         .coordinator
@@ -1528,7 +1528,10 @@ where
                 };
                 (aggregate.version, hint)
             }
-            _ => (self.load_visible(id, authority).await?.version, None),
+            _ => (
+                self.load_visible(id, authority.grantor()).await?.version,
+                None,
+            ),
         };
         Ok(Mutated {
             outcome,
@@ -1544,13 +1547,13 @@ where
     pub async fn audit(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<AuditEntry>, ApiError> {
         // Reads on an unknown OR invisible booking answer 404, not an empty
         // trail. Admission is settled here; `audit_events` may then read by id
         // alone, because ownership is immutable — a row cannot change hands
         // between these two lines.
-        self.load_visible(id, access).await?;
+        self.load_visible(id, reader).await?;
         let events = self
             .coordinator
             .repository()
@@ -1593,11 +1596,11 @@ where
     pub async fn attend_booking(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Attended>, ApiError> {
         let mut outcomes = Vec::new();
         for _ in 0..4 {
-            let Some(effect) = self.load_visible(id, access).await?.active_effect else {
+            let Some(effect) = self.load_visible(id, reader).await?.active_effect else {
                 break;
             };
             let attended = self
@@ -1625,14 +1628,9 @@ where
     async fn load_visible(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<BookingAggregate, ApiError> {
-        match self
-            .coordinator
-            .repository()
-            .load_visible(access.grantor(), id)
-            .await
-        {
+        match self.coordinator.repository().load_visible(reader, id).await {
             Ok(aggregate) => Ok(aggregate),
             Err(StoreError::NotFound(_)) => Err(ApiError::UnknownBooking),
             Err(error) => Err(ApiError::Unavailable(error.to_string())),
@@ -1665,7 +1663,7 @@ pub trait BookingFacade: Send + Sync {
     async fn read(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Projection, ApiError>;
     async fn propose_at(
         &self,
@@ -1677,19 +1675,19 @@ pub trait BookingFacade: Send + Sync {
     async fn audit(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<AuditEntry>, ApiError>;
     async fn attend_booking(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Attended>, ApiError>;
     /// Side-effect-free admission check, for handlers that must decide
     /// visibility before they parse preconditions.
     async fn ensure_visible(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<(), ApiError>;
     /// Listing takes an IDENTITY, not a grant.
     ///
@@ -1730,16 +1728,16 @@ where
     async fn read(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Projection, ApiError> {
-        Self::read(self, id, access).await
+        Self::read(self, id, reader).await
     }
     async fn ensure_visible(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<(), ApiError> {
-        Self::ensure_visible(self, id, access).await
+        Self::ensure_visible(self, id, reader).await
     }
     async fn lookup(
         &self,
@@ -1760,16 +1758,16 @@ where
     async fn audit(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<AuditEntry>, ApiError> {
-        Self::audit(self, id, access).await
+        Self::audit(self, id, reader).await
     }
     async fn attend_booking(
         &self,
         id: &BookingId,
-        access: &VerifiedAuthority,
+        reader: &bld_types::PrincipalId,
     ) -> Result<Vec<Attended>, ApiError> {
-        Self::attend_booking(self, id, access).await
+        Self::attend_booking(self, id, reader).await
     }
     async fn venues(&self, filters: VenueFilters) -> Result<Vec<VenueSummary>, ApiError> {
         Self::venues(self, filters).await

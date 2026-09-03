@@ -98,10 +98,10 @@ impl Capability<BookingEffect> for DiesOnCue {
 /// booking; a deployment binds `SqlApprovalStore` here instead, which is M7B's
 /// work.
 async fn authority(id: &BookingId) -> VerifiedAuthority {
-    use bld_types::Behaviour;
+    use bld_types::{ActorId, Behaviour};
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, MemoryApprovalStore, PendingScope,
+        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
     };
 
     /// The demo's fixed code. A real one comes from the OS (M7B).
@@ -120,10 +120,21 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
+    let store = std::sync::Arc::new(MemoryApprovalStore::new());
+    // The driver's own channel, bound before it answers its own challenge.
+    //
+    // The verifier checks a claimed binding against a row rather than against
+    // the caller's earlier claim, so even a demo that asks nobody has to have
+    // the row — which is the point: the check is not skippable by being a demo.
+    store.bind(&PrincipalId::new("lucy"), 1);
     let service = AuthorityService::new(
-        std::sync::Arc::new(MemoryApprovalStore::new()),
+        std::sync::Arc::clone(&store),
         DemoCode,
         AuthorityPolicy::default(),
+        // This driver issues and resolves within one process and one run, so
+        // the key need only be unguessable from outside it. A deployment binds
+        // a configured key here instead.
+        EnvelopeKey::new(std::process::id().to_le_bytes().repeat(8)).expect("32 bytes"),
     );
     let binding = BindingRef {
         principal: PrincipalId::new("lucy"),
@@ -136,12 +147,22 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
                     service: bld_types::ServiceId::new("demo-council-town-hall"),
                     agent: "bld-driver".to_owned(),
                     booking: id.clone(),
-                    behaviours: BehaviourSet::new([Behaviour::Book, Behaviour::Cancel]),
+                    // The whole walk: M7B consults the grant for every
+                    // proposal, so a grant naming only `Book` stops at
+                    // `select-venue`.
+                    behaviours: BehaviourSet::new([
+                        Behaviour::SelectVenue,
+                        Behaviour::VerifySlot,
+                        Behaviour::RevalidateVenue,
+                        Behaviour::Book,
+                        Behaviour::Cancel,
+                    ]),
                     requirements: requirements(),
                 },
                 binding: binding.clone(),
                 grantor: PrincipalId::new("lucy"),
                 subject: PrincipalId::new("lucy"),
+                actor: ActorId::new("agent:bld-driver"),
             },
             now,
         )

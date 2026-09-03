@@ -75,6 +75,25 @@ fn authority_for(id: &BookingId) -> VerifiedAuthority {
     issue_blocking(&GrantSpec::own("lucy", id.as_str(), 5_000))
 }
 
+/// A grant that also permits the requirement-changing behaviours.
+///
+/// # Why this is a separate fixture
+///
+/// `authority_for` grants the booking WALK and deliberately withholds
+/// `UpdateRequirements` and `ChangeVenue`: they change what a person approved,
+/// so since M7B a test that uses one has to say so.
+///
+/// The two tests below use `UpdateRequirements` only because it is a
+/// convenient LOCAL transition — it commits without calling the council, which
+/// is what makes it a clean subject for a CAS race. They are not about
+/// authority at all, so they opt in explicitly rather than quietly widening
+/// the default for everyone.
+fn authority_amending(id: &BookingId) -> VerifiedAuthority {
+    issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(townhall_testkit::issuer::ALL),
+    )
+}
+
 fn select() -> BookingProposal {
     BookingProposal::SelectVenue {
         venue_id: VenueId::new("TH-A"),
@@ -2640,7 +2659,7 @@ async fn a_stale_expectation_is_refused_before_classification() {
             &id,
             seen,
             BookingProposal::UpdateRequirements { attendees: None },
-            &authority_for(&id),
+            &authority_amending(&id),
         )
         .await
         .expect("the winner's turn runs");
@@ -2711,10 +2730,15 @@ async fn a_cas_loss_mid_turn_is_refused_as_stale() {
         .propose_at(
             &id,
             loaded.version,
+            // Fewer than the fixture's approved 20, deliberately. This test is
+            // about a CAS race and nothing else; asking for MORE than was
+            // approved would now be refused by the headcount guard before the
+            // race could happen, and the test would pass while witnessing the
+            // wrong refusal.
             BookingProposal::UpdateRequirements {
-                attendees: Some(25),
+                attendees: Some(12),
             },
-            &authority_for(&id),
+            &authority_amending(&id),
         )
         .await;
     let Err(ServiceError::PreconditionFailed { current }) = refused else {
@@ -2847,7 +2871,10 @@ async fn the_facade_carries_the_whole_surface() {
             .expect("committed");
         version = mutated.current_version;
     }
-    let projection = api.read(&id, &authority_for(&id)).await.expect("read");
+    let projection = api
+        .read(&id, &PrincipalId::new("lucy"))
+        .await
+        .expect("read");
     assert_eq!(projection.state, "AwaitingBooking");
     assert_eq!(
         projection.available_behaviours,
@@ -2872,34 +2899,34 @@ async fn the_facade_carries_the_whole_surface() {
     // The reconcile trigger drives the chase to done — attend, never propose.
     h.clock.advance(10_000);
     let outcomes = api
-        .attend_booking(&id, &authority_for(&id))
+        .attend_booking(&id, &PrincipalId::new("lucy"))
         .await
         .expect("attend");
     assert_eq!(outcomes, vec![Attended::Settled]);
     assert_eq!(
-        api.read(&id, &authority_for(&id))
+        api.read(&id, &PrincipalId::new("lucy"))
             .await
             .expect("read")
             .state,
         "Booked"
     );
     assert!(
-        api.attend_booking(&id, &authority_for(&id))
+        api.attend_booking(&id, &PrincipalId::new("lucy"))
             .await
             .expect("attend")
             .is_empty(),
         "nothing in flight, nothing to attend"
     );
 
-    let audit = api.audit(&id, &authority_for(&id)).await.expect("audit");
+    let audit = api
+        .audit(&id, &PrincipalId::new("lucy"))
+        .await
+        .expect("audit");
     let last = audit.last().expect("rows");
     assert_eq!(last.driver_kind, "Fact");
     assert_eq!(last.driver_detail, "BookingExists");
     let missing = api
-        .audit(
-            &BookingId::new("BKG-NOBODY"),
-            &authority_for(&BookingId::new("BKG-NOBODY")),
-        )
+        .audit(&BookingId::new("BKG-NOBODY"), &PrincipalId::new("lucy"))
         .await;
     assert!(matches!(
         missing,
@@ -3263,7 +3290,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // Read.
     assert!(
         matches!(
-            api.read(&id, &priya).await,
+            api.read(&id, &PrincipalId::new("priya")).await,
             Err(townhall_service::ApiError::UnknownBooking)
         ),
         "a foreign read reached the projection"
@@ -3271,7 +3298,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // Audit.
     assert!(
         matches!(
-            api.audit(&id, &priya).await,
+            api.audit(&id, &PrincipalId::new("priya")).await,
             Err(townhall_service::ApiError::UnknownBooking)
         ),
         "a foreign audit reached the trail"
@@ -3279,7 +3306,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // Visibility preflight, asked directly.
     assert!(
         matches!(
-            api.ensure_visible(&id, &priya).await,
+            api.ensure_visible(&id, &PrincipalId::new("priya")).await,
             Err(townhall_service::ApiError::UnknownBooking)
         ),
         "ensure_visible admitted a stranger"
@@ -3297,7 +3324,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // did. That witness was incapable of failing.)
     assert!(
         matches!(
-            api.attend_booking(&id, &priya).await,
+            api.attend_booking(&id, &PrincipalId::new("priya")).await,
             Err(townhall_service::ApiError::UnknownBooking)
         ),
         "a foreign reconcile reached the chase"
@@ -3333,7 +3360,7 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // Nothing moved: same version, same trail length as before the probes.
     let trail_before_owner = h.repo.audit_events(&id).await.expect("audit").len();
     let mine = api
-        .read(&id, &authority_for(&id))
+        .read(&id, &PrincipalId::new("lucy"))
         .await
         .expect("the owner reads it");
     assert_eq!(
@@ -3345,10 +3372,14 @@ async fn the_facade_conceals_a_foreign_booking_without_help_from_a_handler() {
     // passed by refusing everyone. The owner's attend DOES reach the council,
     // which is what makes the foreign call-count assertion meaningful: the
     // chase was reachable from here, and only ownership stopped it.
-    assert!(api.ensure_visible(&id, &authority_for(&id)).await.is_ok());
-    assert!(api.audit(&id, &authority_for(&id)).await.is_ok());
+    assert!(
+        api.ensure_visible(&id, &PrincipalId::new("lucy"))
+            .await
+            .is_ok()
+    );
+    assert!(api.audit(&id, &PrincipalId::new("lucy")).await.is_ok());
     let outcomes = api
-        .attend_booking(&id, &authority_for(&id))
+        .attend_booking(&id, &PrincipalId::new("lucy"))
         .await
         .expect("the owner may attend");
     assert_eq!(
@@ -3504,19 +3535,93 @@ async fn a_booking_created_under_delegation_belongs_to_the_grantor() {
     );
 
     // 2. And through the facade, which is what an adapter sees.
-    api.read(&id, &authority_for(&id))
+    api.read(&id, &PrincipalId::new("lucy"))
         .await
         .expect("the owner can read her own booking");
 
-    // 3. Marco cannot, even holding the delegation that created it. His
-    //    visibility is his own bookings; his authority here is the grant.
-    let marcos_own = issue_blocking(&GrantSpec::own("marco", id.as_str(), 5_000));
+    // 3. Marco cannot see it, even though he holds the delegation that created
+    //    it — which is the grant/identity split made visible. His grant
+    //    authorizes a CHANGE to this booking; it is not a licence to LOOK at
+    //    it, and looking is scoped by ownership.
     assert!(
         matches!(
-            api.read(&id, &marcos_own).await,
+            api.read(&id, &PrincipalId::new("marco")).await,
             Err(townhall_service::ApiError::UnknownBooking)
         ),
         "a delegate's own visibility must not include the booking he acted on \
          — 404, not 403, because 403 confirms it exists (ADR-022)"
+    );
+}
+
+/// A grant approved for twenty people cannot seat five hundred.
+///
+/// # The defect this witnesses
+///
+/// The preview a person reads says `Attendees: <= 20`. Until review found it,
+/// the grant carried only the fee ceiling and the booking id — so a holder of
+/// that grant could send `UpdateRequirements` with 500 attendees and carry on
+/// under the same approval. The money stayed bounded by the fee ceiling and the
+/// booking did not stay bounded by anything: Lucy approves a room for twenty
+/// and ends up with a booking for five hundred.
+///
+/// The behaviour check could never catch it. `UpdateRequirements` is a
+/// behaviour a grant may legitimately name; what it must not do is exceed the
+/// number the person was shown. So this is a CONSTRAINT test, and the fixture
+/// deliberately grants the behaviour — otherwise it would pass for the wrong
+/// reason, refused as an unapproved behaviour rather than an unapproved number.
+#[tokio::test]
+async fn a_grant_cannot_seat_more_people_than_were_approved() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-HEADCOUNT");
+    awaiting(&h, &id, requirements()).await;
+
+    // Approved for 20, and permitted to change requirements.
+    let approved = issue_blocking(
+        &GrantSpec::own("lucy", id.as_str(), 5_000).permitting(townhall_testkit::issuer::ALL),
+    );
+    assert_eq!(
+        approved.max_attendees(),
+        20,
+        "the fixture's requirements say 20, so the grant's ceiling must too"
+    );
+
+    let refused = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::UpdateRequirements {
+                attendees: Some(500),
+            },
+            &approved,
+        )
+        .await
+        .expect("no service error");
+
+    let BoundaryOutcome::Denied(error) = refused else {
+        panic!("500 attendees under a grant for 20 must be refused, got {refused:?}");
+    };
+    assert_eq!(
+        error.name(),
+        "AttendeesExceedApproval",
+        "the refusal must name the number, not the behaviour — a grant that \
+         permits UpdateRequirements is being refused for what it asked, not \
+         for asking"
+    );
+
+    // Fewer than approved is not a widening, so it commits.
+    let allowed = h
+        .coordinator
+        .propose(
+            &id,
+            BookingProposal::UpdateRequirements {
+                attendees: Some(12),
+            },
+            &approved,
+        )
+        .await
+        .expect("no service error");
+    assert!(
+        matches!(allowed, BoundaryOutcome::Committed(_)),
+        "asking for fewer people than were approved must be allowed: {allowed:?}"
     );
 }

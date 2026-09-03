@@ -68,6 +68,61 @@ pub struct Dispatcher<C: HumanChannel<Address = ChannelAddress>> {
     followups: Mutex<Vec<Followup>>,
 }
 
+/// One turn's access to the wire, in its two kinds.
+///
+/// # Why a holder rather than a wire
+///
+/// Through M6 the dispatcher built ONE wire at the top of a turn and passed it
+/// everywhere, which was right while a credential authorized everything its
+/// holder could name. M7B split reading from changing: a read is scoped to a
+/// principal, a change presents a grant naming ONE booking — and the dispatcher
+/// does not know which booking a turn is about until it has read something.
+///
+/// "Cancel it" is the case that forces the shape. It needs Lucy's bookings read
+/// before any grant can name the one she means, so the reader comes first and
+/// the changer is built afterwards, per booking (spec §23.1).
+struct Wires<'turn> {
+    factory: &'turn dyn crate::ports::WireFactory,
+    token: String,
+    principal: PrincipalId,
+    /// Built once and shared: reading is not per-booking.
+    reader: std::sync::Arc<dyn crate::ports::BookingWire>,
+}
+
+impl<'turn> Wires<'turn> {
+    fn new(
+        factory: &'turn dyn crate::ports::WireFactory,
+        token: String,
+        principal: PrincipalId,
+    ) -> Self {
+        let reader = factory.reader_for(&token, &principal);
+        Self {
+            factory,
+            token,
+            principal,
+            reader,
+        }
+    }
+
+    /// The read wire. Cannot change anything, by construction.
+    fn reader(&self) -> &dyn crate::ports::BookingWire {
+        self.reader.as_ref()
+    }
+
+    /// A wire that may change `booking`, and only that booking.
+    ///
+    /// # The reference this presents, and what replaces it
+    ///
+    /// M7B's dev lane treats the reference as the booking id, because nobody
+    /// has been asked yet and there is no approval to name. M7C changes exactly
+    /// this line: the reference becomes the one an approval produced, and a
+    /// turn nobody approved cannot build a changer at all.
+    fn changer(&self, booking: &BookingId) -> std::sync::Arc<dyn crate::ports::BookingWire> {
+        self.factory
+            .changer_for(&self.token, &self.principal, booking.as_str())
+    }
+}
+
 impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // the composition root names every port once
@@ -138,24 +193,23 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             .await;
             return Ok(());
         };
-        let wire = self.wires.wire_for(&token);
+        let wires = Wires::new(self.wires.as_ref(), token, principal.clone());
 
         let text = match classify(message.body.revealed()) {
             Command::Control(_) => unreachable!("handled above"),
             Command::Resource(resource) => {
-                self.answer_resource(resource, &principal, wire.as_ref(), &message)
+                self.answer_resource(resource, &principal, &wires, &message)
                     .await
             }
             Command::Freeform => {
                 // 3. The proposer — LAST, with a projection and nothing else.
-                let context = self.project(&principal, wire.as_ref()).await;
+                let context = self.project(&principal, wires.reader()).await;
                 match self.proposer.propose(&context, &message).await {
                     Proposed::Unclear => {
                         "I didn't understand. Reply HELP for what I can do.".to_owned()
                     }
                     Proposed::Typed(request) => {
-                        self.execute(request, &principal, wire.as_ref(), &message)
-                            .await
+                        self.execute(request, &principal, &wires, &message).await
                     }
                 }
             }
@@ -201,7 +255,14 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             let Some(token) = self.credentials.token_for(&followup.principal) else {
                 continue;
             };
-            let wire = self.wires.wire_for(&token);
+            // The RE-RESOLVED principal, not one captured when the follow-up
+            // was queued. The drift check above compares them; using the
+            // captured value here would reintroduce the same defect one line
+            // later, on the header that decides whose bookings are in scope.
+            // A READER: convergence only reads. The chase owns the effect
+            // (ADR-019), so a follow-up that could change something would be a
+            // second way to cause what recovery is already causing.
+            let wire = self.wires.reader_for(&token, &followup.principal);
             let text = match wire.converge(&followup.booking, followup.first_wait).await {
                 Ok(projection) => outcome_text(followup.verb, &projection),
                 Err(error) => format!("Still working on it ({error})."),
@@ -248,14 +309,15 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         &self,
         resource: ResourceCommand,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
         match resource {
             ResourceCommand::Status { reference } => {
                 let projection = match reference {
                     Some(reference) => {
-                        match wire
+                        match wires
+                            .reader()
                             .by_reference(&CouncilBookingRef::new(reference.clone()))
                             .await
                         {
@@ -267,7 +329,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                         }
                     }
                     None => match self.most_recent(principal) {
-                        Some(id) => wire.read(&id).await,
+                        Some(id) => wires.reader().read(&id).await,
                         None => return "You have no bookings.".to_owned(),
                     },
                 };
@@ -278,7 +340,8 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 }
             }
             ResourceCommand::Cancel { reference } => {
-                match wire
+                match wires
+                    .reader()
                     .by_reference(&CouncilBookingRef::new(reference.clone()))
                     .await
                 {
@@ -287,7 +350,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                     }
                     Ok(mut rows) => {
                         let projection = rows.remove(0);
-                        self.cancel(projection, principal, wire, message).await
+                        self.cancel(projection, principal, wires, message).await
                     }
                     Err(error) => cannot_answer(&error),
                 }
@@ -299,13 +362,13 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         &self,
         request: Request,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
         match request {
-            Request::Book(booking) => self.book(booking, principal, wire, message).await,
-            Request::Confirm => self.confirm(principal, wire, message).await,
-            Request::CancelIntent => self.cancel_intent(principal, wire, message).await,
+            Request::Book(booking) => self.book(booking, principal, wires, message).await,
+            Request::Confirm => self.confirm(principal, wires, message).await,
+            Request::CancelIntent => self.cancel_intent(principal, wires, message).await,
         }
     }
 
@@ -318,19 +381,23 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         &self,
         request: BookingRequest,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
         // The message IS the intent, so it names the intent: a carrier
         // redelivery derives the same id and lands on AlreadyExists instead of
         // booking twice — even across a restart that emptied the replay window.
         let id = message.identity.booking_id();
+        // The changer is built HERE, once the booking has a name — which is the
+        // earliest a grant can exist for it. Everything above this line ran on
+        // a wire that could not change anything.
+        let wire = wires.changer(&id);
         let created = match wire.create(&id, &request.requirements()).await {
             Ok(projection) => projection,
             Err(GatewayError::Existing { .. }) => {
                 // The redelivery path: this exact message already created it.
                 self.remember(principal, &id);
-                return match wire.read(&id).await {
+                return match wires.reader().read(&id).await {
                     Ok(projection) => {
                         format!("Already working on that one. {}", status_text(&projection))
                     }
@@ -344,7 +411,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         // Pick the first venue whose facts fit the request. The COUNCIL's
         // guards re-check all of this at verify — the pick is a suggestion,
         // the boundary is the boundary.
-        let venues = match wire.venues().await {
+        let venues = match wires.reader().venues().await {
             Ok(rows) => rows,
             Err(error) => return cannot_answer(&error),
         };
@@ -389,16 +456,21 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
     async fn confirm(
         &self,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
         let Some(id) = self.most_recent(principal) else {
             return "Nothing to confirm — start with BOOK. Reply HELP for the format.".to_owned();
         };
+        // The booking is known, so a grant over it can be presented. The reads
+        // inside the walk still go through the reader: reloading is not
+        // changing, and keeping them separate means a wire that could change
+        // something is only ever held where something is being changed.
+        let wire = wires.changer(&id);
 
         // Bounded: the longest legal walk is revalidate → verify → book.
         for _ in 0..4 {
-            let projection = match wire.read(&id).await {
+            let projection = match wires.reader().read(&id).await {
                 Ok(projection) => projection,
                 Err(error) => return cannot_answer(&error),
             };
@@ -416,7 +488,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 .await
             {
                 Ok(Turn::Committed { state, .. }) if state == "Booked" => {
-                    return match wire.read(&id).await {
+                    return match wires.reader().read(&id).await {
                         Ok(done) => outcome_text("Booked", &done),
                         Err(error) => cannot_answer(&error),
                     };
@@ -441,10 +513,10 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
     async fn cancel_intent(
         &self,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
-        let mut candidates = match wire.cancellable().await {
+        let mut candidates = match wires.reader().cancellable().await {
             Ok(rows) => rows,
             Err(error) => return cannot_answer(&error),
         };
@@ -452,7 +524,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             0 => "You have no bookings to cancel.".to_owned(),
             1 => {
                 let projection = candidates.remove(0);
-                self.cancel(projection, principal, wire, message).await
+                self.cancel(projection, principal, wires, message).await
             }
             _ => {
                 // Order by the session's recency so the question reads
@@ -478,11 +550,14 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         &self,
         projection: Projection,
         principal: &PrincipalId,
-        wire: &dyn crate::ports::BookingWire,
+        wires: &Wires<'_>,
         message: &InboundMessage,
     ) -> String {
         let id = BookingId::new(projection.id.clone());
         self.remember(principal, &id);
+        // The booking arrived already identified — a reader found it — so the
+        // grant naming it can be presented now and not before.
+        let wire = wires.changer(&id);
         let turn = wire
             .propose_at(
                 &id,

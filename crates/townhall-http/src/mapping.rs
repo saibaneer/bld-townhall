@@ -24,7 +24,8 @@ pub fn denial_status(error: &BookingError) -> StatusCode {
         | BookingError::CancellationAuthorityRequired
         | BookingError::FeeExceeded {
             ceiling: FeeCeiling::Authority,
-        } => StatusCode::FORBIDDEN,
+        }
+        | BookingError::AttendeesExceedApproval { .. } => StatusCode::FORBIDDEN,
         BookingError::FactsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         BookingError::VenueFactsMissing
         | BookingError::SlotUnavailable
@@ -196,6 +197,15 @@ pub fn projection_body(projection: &Projection) -> serde_json::Value {
 #[must_use]
 pub fn plain_error(status: StatusCode, detail: &str) -> Response {
     (status, axum::Json(serde_json::json!({ "error": detail }))).into_response()
+}
+
+/// A JSON body with a status and nothing else.
+///
+/// The approval endpoints carry no resource version, so none of the `ETag`
+/// machinery above applies to them: a challenge is not a resource a caller
+/// mutates with `If-Match`, it is a question somebody answers once.
+pub fn json_response(status: StatusCode, body: &serde_json::Value) -> Response {
+    (status, axum::Json(body.clone())).into_response()
 }
 
 fn etag_header(version: u64) -> (header::HeaderName, String) {

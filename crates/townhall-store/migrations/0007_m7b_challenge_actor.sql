@@ -1,0 +1,24 @@
+-- Which workload may present the grant a challenge produces.
+--
+-- # Why the challenge records this, and not the issuer
+--
+-- Until now the actor was DERIVED from the subject: a grant for Lucy named
+-- `agent:lucy`, an identity nothing had authenticated. ADR-025 assigned the fix
+-- to M7B — "binding the actor to an authenticated workload rather than deriving
+-- it from the subject" — and the binding has to happen when the challenge is
+-- RAISED, not when it is answered.
+--
+-- The reason is what the person is being asked. The preview says "Agent:
+-- TownHallAgent may book one meeting room"; if the actor were settled at reply
+-- time, a different workload could answer and receive a grant naming itself,
+-- and Lucy's approval of one agent would have authorized another. So the
+-- challenge carries the actor the caller authenticated as, and the grant
+-- inherits it.
+--
+-- # The default, and why it fails closed
+--
+-- An empty string. No live deployment has rows here (0006 is unreleased), but a
+-- row that somehow predated this column would produce a grant whose actor
+-- matches no authenticated caller — so it would resolve to nothing rather than
+-- to something permissive. An unusable grant is the right shape of wrong.
+ALTER TABLE approval_challenges ADD COLUMN actor TEXT NOT NULL DEFAULT '';

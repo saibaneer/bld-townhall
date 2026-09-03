@@ -12,9 +12,10 @@
 //!
 //! Not the network — these share a listener with the booking API. The
 //! guarantee is the crate graph and the client surface: `Gateway` has no method
-//! that names any of these paths, `townhall-orchestrator` has no dependency on
-//! `townhall-authority`, and its resolved-dependency test forbids one. A crate
-//! that cannot name an issuer cannot call one, whatever it can reach over TCP.
+//! that names any of these paths, and `townhall-orchestrator` may not depend on
+//! `townhall-authority` — forbidden by its resolved-dependency test
+//! (`crates/townhall-orchestrator/tests/boundary.rs`). A crate that cannot name
+//! an issuer cannot call one, whatever it can reach over TCP.
 //!
 //! # What is deliberately NOT here
 //!

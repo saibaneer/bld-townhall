@@ -23,8 +23,8 @@ use std::sync::Arc;
 use townhall_channel::{ChannelAddress, ChannelConfig, Region, SmsSimulator, SuppressionStore};
 use townhall_orchestrator::{
     ApprovalError, ApprovalPort, BeginApproval, ContinuationStore, CredentialSource, Deposited,
-    Dispatcher, EvidenceDeposit, FileContinuation, FileSuppression, GatewayFactory, InboundEvidence,
-    NoLedgerYet, PrincipalDirectory, Raised, ScriptedProposer, journey,
+    Dispatcher, EvidenceDeposit, FileContinuation, FileSuppression, GatewayFactory,
+    InboundEvidence, NoLedgerYet, PrincipalDirectory, Raised, ScriptedProposer, journey,
 };
 
 /// The one workload credential the real resolver knows — a WORKLOAD, not a
@@ -181,6 +181,7 @@ impl EvidenceDeposit for HttpEvidence {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn transport(error: reqwest::Error) -> ApprovalError {
     ApprovalError::Transport(error.to_string())
 }
@@ -288,10 +289,7 @@ async fn main() -> ExitCode {
             base: server.clone(),
             http: http.clone(),
         }),
-        Arc::new(HttpEvidence {
-            base: server,
-            http,
-        }),
+        Arc::new(HttpEvidence { base: server, http }),
         continuations,
     );
 

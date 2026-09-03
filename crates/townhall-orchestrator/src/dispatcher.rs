@@ -421,6 +421,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
     /// the demo binds every channel at revision 1, and `BookingRequest` carries
     /// no purpose. Production needs the directory to return a `BindingRef` (with
     /// the revision) and a purpose to ride the request — noted, not built here.
+    #[allow(clippy::unused_self)] // a method for cohesion with the booking paths
     fn begin_request(
         &self,
         id: &BookingId,
@@ -464,7 +465,10 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         // no second booking, even across a restart that emptied the replay
         // window.
         let id = message.identity.booking_id();
-        let raised = match self.approvals.begin(&self.begin_request(&id, principal, &request)).await
+        let raised = match self
+            .approvals
+            .begin(&self.begin_request(&id, principal, &request))
+            .await
         {
             Ok(raised) => raised,
             Err(error) => return approval_error_text(&error),
@@ -633,7 +637,10 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                     ));
                 }
             };
-            match wire.propose_at(id, projection.version, behaviour, body).await {
+            match wire
+                .propose_at(id, projection.version, behaviour, body)
+                .await
+            {
                 Ok(Turn::Committed { state, .. }) if state == "Booked" => {
                     return match reader.read(id).await {
                         Ok(done) => Walk::Booked(outcome_text("Booked", &done)),
@@ -734,7 +741,9 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             let Some(token) = self.credentials.token_for(&continuation.principal) else {
                 continue;
             };
-            let wire = self.wires.changer_for(&token, &continuation.principal, &reference);
+            let wire = self
+                .wires
+                .changer_for(&token, &continuation.principal, &reference);
             let reader = self.wires.reader_for(&token, &continuation.principal);
             let walk = self
                 .complete_booking(
@@ -826,7 +835,8 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             return "I can only cancel a booking you approved through me. Reply STATUS to see yours.".to_owned();
         };
         let Some(reference) = continuation.reference.clone() else {
-            return "That request isn't approved yet — there's nothing booked to cancel.".to_owned();
+            return "That request isn't approved yet — there's nothing booked to cancel."
+                .to_owned();
         };
         let wire = wires.changer_with_reference(&reference);
         let turn = wire
@@ -1003,7 +1013,9 @@ fn cannot_answer(error: &GatewayError) -> String {
 fn answer_code(body: &str, word: &str) -> String {
     let trimmed = body.trim();
     match trimmed.get(..word.len()) {
-        Some(prefix) if prefix.eq_ignore_ascii_case(word) => trimmed[word.len()..].trim().to_owned(),
+        Some(prefix) if prefix.eq_ignore_ascii_case(word) => {
+            trimmed[word.len()..].trim().to_owned()
+        }
         _ => String::new(),
     }
 }

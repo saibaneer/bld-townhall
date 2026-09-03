@@ -69,7 +69,8 @@ impl ContinuationStore for MemoryContinuation {
     }
 
     fn clear(&self, challenge_id: &str) -> Result<(), String> {
-        self.locked().retain(|held| held.challenge_id != challenge_id);
+        self.locked()
+            .retain(|held| held.challenge_id != challenge_id);
         Ok(())
     }
 
@@ -271,6 +272,7 @@ impl EvidenceDeposit for HttpEvidence {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn transport(error: reqwest::Error) -> ApprovalError {
     ApprovalError::Transport(error.to_string())
 }

@@ -88,11 +88,25 @@ fn spawn_ready(mut command: Command) -> (Child, u16) {
     use std::io::Read as _;
     use std::sync::mpsc;
 
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the binary spawns");
+    // Retry a TRANSIENT spawn failure. A full-workspace run spawns many servers
+    // at once, and the OS can refuse a fork with EAGAIN ("resource temporarily
+    // unavailable") when it does — a load symptom, not a broken binary, so a
+    // short backoff clears it. A genuinely missing binary fails every attempt.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                    let _ = error;
+                }
+                Err(error) => panic!("the binary spawns: {error}"),
+            }
+        }
+    };
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
@@ -227,7 +241,7 @@ fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
     let (server, server_port) = spawn_ready(command);
 
     if !dev_authority {
-        bind_lucy_channel(&townhall_db);
+        bind_channels(&townhall_db);
     }
 
     World {
@@ -240,23 +254,36 @@ fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
     }
 }
 
-/// Bind Lucy's channel in a real-authority world's store, so a challenge she
-/// raises can be answered from her number. `sms-reply` is
+/// Bind Lucy's and Priya's channels in a real-authority world's store, so a
+/// challenge raised against either number can be answered. `sms-reply` is
 /// `AssuranceLevel::SmsReply.name()`, and the row shape is migration 0006's.
-fn bind_lucy_channel(townhall_db: &std::path::Path) {
-    let sql = "INSERT INTO channel_bindings \
-        (id, address, principal, version, status, assurance, evidence, \
-         verified_at_ms, created_at_ms, updated_at_ms) \
-        VALUES ('binding-lucy', '+447700900123', 'lucy', 1, 'active', 'sms-reply', \
-         NULL, 1700000000000, 1700000000000, 1700000000000);";
+///
+/// Both rows go in ONE `sqlite3` invocation — the CLI this crate already shells
+/// out to — after the server has run its migrations (so the table exists) and in
+/// a single process, because a full-workspace run already spawns many.
+fn bind_channels(townhall_db: &std::path::Path) {
+    let row = |id: &str, address: &str, principal: &str| {
+        format!(
+            "INSERT INTO channel_bindings \
+             (id, address, principal, version, status, assurance, evidence, \
+              verified_at_ms, created_at_ms, updated_at_ms) \
+             VALUES ('{id}', '{address}', '{principal}', 1, 'active', 'sms-reply', \
+              NULL, 1700000000000, 1700000000000, 1700000000000);"
+        )
+    };
+    let sql = format!(
+        "{}{}",
+        row("binding-lucy", "+447700900123", "lucy"),
+        row("binding-priya", "+447700900456", "priya"),
+    );
     let output = Command::new("sqlite3")
         .arg(townhall_db)
-        .arg(sql)
+        .arg(&sql)
         .output()
         .expect("sqlite3 runs");
     assert!(
         output.status.success(),
-        "binding lucy's channel failed: {}",
+        "binding channels failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

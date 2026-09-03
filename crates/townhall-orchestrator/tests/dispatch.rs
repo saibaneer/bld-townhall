@@ -792,3 +792,203 @@ async fn a_drifted_binding_drops_the_followup_before_any_wire() {
         channel.outbox().last()
     );
 }
+
+// ------------------------------------------------------------------ W7
+
+/// A stateful mock council: `create` makes a Draft→Created booking (idempotent
+/// on re-create), and `propose_at` walks it Created→VenueSelected→
+/// AwaitingBooking→Booked. `creates` counts only NEW creates, so a resumed walk
+/// that re-creates
+/// an existing booking is caught as a double-book.
+#[derive(Default)]
+struct MockCouncil {
+    bookings: std::sync::Mutex<std::collections::HashMap<String, (u64, String)>>,
+    creates: AtomicUsize,
+}
+
+fn mock_requirements() -> townhall_gateway::dto::Requirements {
+    townhall_gateway::dto::Requirements {
+        purpose: "p".to_owned(),
+        requested_date: "2026-09-10".to_owned(),
+        from: "14:00".to_owned(),
+        to: "17:00".to_owned(),
+        attendees: 20,
+        wheelchair_accessible: true,
+        max_fee_pence: 5_000,
+    }
+}
+
+fn mock_projection(id: &str, version: u64, state: &str) -> Projection {
+    Projection {
+        id: id.to_owned(),
+        version,
+        state: state.to_owned(),
+        requirements: mock_requirements(),
+        selected_venue: None,
+        booking_ref: (state == "Booked").then(|| "TH-W7".to_owned()),
+        available_behaviours: Vec::new(),
+    }
+}
+
+#[async_trait]
+impl BookingWire for MockCouncil {
+    async fn create(
+        &self,
+        id: &BookingId,
+        _: &BookingRequirements,
+    ) -> Result<Projection, GatewayError> {
+        let mut bookings = self.bookings.lock().unwrap();
+        if let Some((version, _)) = bookings.get(id.as_str()) {
+            // Idempotent: the message-derived id already exists.
+            return Err(GatewayError::Existing { current: *version });
+        }
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        bookings.insert(id.as_str().to_owned(), (1, "Created".to_owned()));
+        Ok(mock_projection(id.as_str(), 1, "Created"))
+    }
+    async fn read(&self, id: &BookingId) -> Result<Projection, GatewayError> {
+        let bookings = self.bookings.lock().unwrap();
+        let (version, state) = bookings
+            .get(id.as_str())
+            .ok_or(GatewayError::UnknownBooking)?;
+        Ok(mock_projection(id.as_str(), *version, state))
+    }
+    async fn cancellable(&self) -> Result<Vec<Projection>, GatewayError> {
+        Ok(Vec::new())
+    }
+    async fn by_reference(&self, _: &CouncilBookingRef) -> Result<Vec<Projection>, GatewayError> {
+        Ok(Vec::new())
+    }
+    async fn venues(&self) -> Result<Vec<VenueRow>, GatewayError> {
+        Ok(vec![VenueRow {
+            venue_id: "TH-A".to_owned(),
+            slot_id: "SLOT-A".to_owned(),
+            capacity: 30,
+            accessible: true,
+            fee_pence: 4_500,
+            available: true,
+        }])
+    }
+    async fn propose_at(
+        &self,
+        id: &BookingId,
+        expected_version: u64,
+        behaviour: &str,
+        _: Option<serde_json::Value>,
+    ) -> Result<Turn, GatewayError> {
+        let mut bookings = self.bookings.lock().unwrap();
+        let (version, state) = bookings
+            .get_mut(id.as_str())
+            .ok_or(GatewayError::UnknownBooking)?;
+        if *version != expected_version {
+            return Err(GatewayError::Contended);
+        }
+        let next = match behaviour {
+            "select-venue" => "VenueSelected",
+            "verify-slot" => "AwaitingBooking",
+            "book" => "Booked",
+            other => panic!("unexpected behaviour {other}"),
+        };
+        *version += 1;
+        next.clone_into(state);
+        Ok(Turn::Committed {
+            state: next.to_owned(),
+            version: *version,
+        })
+    }
+    async fn converge(
+        &self,
+        _: &BookingId,
+        _: std::time::Duration,
+    ) -> Result<Projection, GatewayError> {
+        Err(GatewayError::NotConverged { attempts: 0 })
+    }
+}
+
+struct MockFactory(Arc<MockCouncil>);
+
+impl WireFactory for MockFactory {
+    fn reader_for(&self, _: &str, _: &PrincipalId) -> Arc<dyn BookingWire> {
+        Arc::clone(&self.0) as Arc<dyn BookingWire>
+    }
+    fn changer_for(&self, _: &str, _: &PrincipalId, _: &str) -> Arc<dyn BookingWire> {
+        Arc::clone(&self.0) as Arc<dyn BookingWire>
+    }
+}
+
+/// W7 — a crash between YES and Booked resumes and books exactly once.
+///
+/// A booking Lucy approved was created at the council, then the process died
+/// before the walk reached Booked: the durable continuation holds it
+/// `reference: Some`, `booked: false`. A reborn dispatcher's `resume()` finishes
+/// it — and creates NO second booking, because the message-derived id is
+/// idempotent (`create` lands on `Existing`). A second `resume()` is a no-op.
+#[tokio::test]
+async fn w7_a_crash_between_yes_and_booked_resumes_and_books_once() {
+    let council = Arc::new(MockCouncil::default());
+    // The crashed process had created the booking (Created) before dying — count
+    // that create as the process's, not resume's.
+    council
+        .bookings
+        .lock()
+        .unwrap()
+        .insert("sms-w7".to_owned(), (1, "Created".to_owned()));
+
+    let continuations = Arc::new(MemoryContinuation::new());
+    continuations.seed(Continuation {
+        principal: PrincipalId::new("lucy"),
+        challenge_id: "ch-w7".to_owned(),
+        booking_id: BookingId::new("sms-w7"),
+        request: Request::Book(BookingRequest {
+            date: "2026-09-10".to_owned(),
+            from: "14:00".to_owned(),
+            to: "17:00".to_owned(),
+            people: 20,
+            accessible: true,
+            max_pence: 5_000,
+        }),
+        address_revealed: "+447700900123".to_owned(),
+        region: "Gb".to_owned(),
+        reference: Some("ref-w7".to_owned()),
+        booked: false,
+    });
+
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    let dispatcher = Dispatcher::new(
+        channel,
+        Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
+        Arc::new(FixedCredentials),
+        Arc::new(NoLedgerYet),
+        Arc::new(PanickingProposer),
+        suppression,
+        Arc::new(MockFactory(Arc::clone(&council))),
+        Arc::new(StubApprovals::default()),
+        Arc::new(StubEvidence::default()),
+        Arc::clone(&continuations) as Arc<dyn townhall_orchestrator::ContinuationStore>,
+    );
+
+    dispatcher.resume().await;
+
+    assert_eq!(
+        council.bookings.lock().unwrap().get("sms-w7").unwrap().1,
+        "Booked",
+        "resume walks the owed booking to Booked"
+    );
+    assert_eq!(
+        council.creates.load(Ordering::SeqCst),
+        0,
+        "resume must not create a SECOND booking — the id is idempotent"
+    );
+
+    // A second resume is a no-op: the continuation is now booked.
+    dispatcher.resume().await;
+    assert_eq!(council.creates.load(Ordering::SeqCst), 0);
+    assert!(
+        continuations.all().iter().all(|c| c.booked),
+        "the completed booking is marked booked, off the resume list"
+    );
+}

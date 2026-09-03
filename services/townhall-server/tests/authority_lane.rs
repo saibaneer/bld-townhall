@@ -210,6 +210,36 @@ fn bind_lucy(lane: &Lane) {
     .expect("the binding thread did not panic");
 }
 
+/// The address Lucy's channel is bound to — where a reply comes FROM.
+const LUCY_ADDR: &str = "+447700900123";
+
+/// Deposit an inbound reply's evidence at the ingress endpoint and return the
+/// one-use receipt to forward with the answer (ADR-026). `msg` keeps the inbound
+/// identity unique so a test can deposit more than one reply.
+fn deposit_receipt(client: &reqwest::blocking::Client, url: &str, msg: &str) -> String {
+    let resp = client
+        .post(format!("{url}/inbound-evidence"))
+        .header("authorization", AGENT)
+        .json(&serde_json::json!({
+            "provider": "sim",
+            "account": "townhall",
+            "message_id": msg,
+            "address": LUCY_ADDR,
+            "verified": true
+        }))
+        .send()
+        .expect("the ingress answers");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "the ingress deposits the reply's evidence and returns a receipt"
+    );
+    resp.json::<serde_json::Value>().expect("json")["receipt"]
+        .as_str()
+        .expect("a receipt")
+        .to_owned()
+}
+
 /// A change requires a challenge, answered against a live binding.
 ///
 /// # What this proves, and what it does NOT
@@ -296,13 +326,17 @@ fn a_change_requires_a_challenge_answered_against_a_live_binding() {
     );
     let code = code_from(preview);
 
+    // The reply's evidence is deposited at the ingress; the workload forwards the
+    // receipt, never the binding it claims. A wrong code does not consume it, so
+    // the same receipt carries the retry.
+    let receipt = deposit_receipt(&client, &lane.url, "reply-1");
+
     // 3. A wrong code is refused, and says how many tries are left.
     let wrong = client
         .post(format!("{}/approvals/{challenge}/reply", lane.url))
         .header("authorization", AGENT)
         .json(&serde_json::json!({
-            "answer": "YES", "code": "0000",
-            "binding_principal": "lucy", "binding_version": 1
+            "answer": "YES", "code": "0000", "receipt": receipt
         }))
         .send()
         .expect("answer");
@@ -317,8 +351,7 @@ fn a_change_requires_a_challenge_answered_against_a_live_binding() {
         .post(format!("{}/approvals/{challenge}/reply", lane.url))
         .header("authorization", AGENT)
         .json(&serde_json::json!({
-            "answer": "YES", "code": code,
-            "binding_principal": "lucy", "binding_version": 1
+            "answer": "YES", "code": code, "receipt": receipt
         }))
         .send()
         .expect("answer");
@@ -456,12 +489,17 @@ fn a_declined_request_cannot_be_approved_afterwards() {
     let challenge = raised["challenge"].as_str().expect("id").to_owned();
     let code = code_from(raised["preview"].as_str().expect("preview"));
 
+    // Two receipts deposited while the number still awaits the challenge: the
+    // decline consumes one and clears the correlation, and the later YES rides
+    // its own already-bound receipt.
+    let no_receipt = deposit_receipt(&client, &lane.url, "no");
+    let yes_receipt = deposit_receipt(&client, &lane.url, "yes");
+
     let declined = client
         .post(format!("{}/approvals/{challenge}/reply", lane.url))
         .header("authorization", AGENT)
         .json(&serde_json::json!({
-            "answer": "NO", "code": code,
-            "binding_principal": "lucy", "binding_version": 1
+            "answer": "NO", "code": code, "receipt": no_receipt
         }))
         .send()
         .expect("answer");
@@ -475,8 +513,7 @@ fn a_declined_request_cannot_be_approved_afterwards() {
         .post(format!("{}/approvals/{challenge}/reply", lane.url))
         .header("authorization", AGENT)
         .json(&serde_json::json!({
-            "answer": "YES", "code": code,
-            "binding_principal": "lucy", "binding_version": 1
+            "answer": "YES", "code": code, "receipt": yes_receipt
         }))
         .send()
         .expect("answer");

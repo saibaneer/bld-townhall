@@ -22,8 +22,11 @@ use crate::envelope;
 use crate::grant::{BindingRef, VerifiedApproval, VerifiedAuthority};
 use crate::key::EnvelopeKey;
 use crate::scope::CanonicalScope;
-use crate::store::{ApprovalStore, DelegationRecord, Settled, StoreError};
-use bld_types::{ActorId, ApprovalChallengeId, DelegationId, PrincipalId};
+use crate::store::{
+    ApprovalStore, BoundChannel, DelegationRecord, InboundEvidenceRecord, InsertOutcome,
+    LoadedEvidence, Settled, StoreError,
+};
+use bld_types::{ActorId, ApprovalChallengeId, DelegationId, EvidenceReceiptId, PrincipalId};
 use std::sync::Arc;
 
 /// Where codes and opaque identifiers come from.
@@ -129,6 +132,21 @@ pub struct RaisedChallenge {
     pub code: ApprovalCode,
 }
 
+/// Whether [`AuthorityService::begin`] raised a new challenge or reused one.
+///
+/// Approve-first removed ADR-024's incidental dedupe (a redelivered `BOOK` used
+/// to hit `create` and return `Existing`), so `begin` carries its own: a
+/// redelivered `BOOK` for a booking that already has a challenge — at any
+/// lifecycle stage — gets `Existing` with the SAME id and code, never a second
+/// challenge the person would see as a fresh, contradictory prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeginOutcome {
+    /// A new challenge was raised.
+    Created,
+    /// A challenge for this inbound intent already existed and was returned.
+    Existing,
+}
+
 /// Why an approval was refused.
 ///
 /// Spec §20 names `ChallengeExpired`, `WrongCode`, `Replay` and
@@ -148,6 +166,16 @@ pub enum ApprovalDenied {
     AttemptsExceeded,
     #[error("that reply did not come from the channel the challenge was sent to")]
     WrongChannel,
+    /// The forwarded receipt names no deposited evidence row. The receipt is the
+    /// only thing the untrusted caller supplies about the reply; one that names
+    /// nothing is refused before any challenge is touched.
+    #[error("no such receipt")]
+    UnknownReceipt,
+    /// The receipt's evidence was deposited for a DIFFERENT challenge than the
+    /// one being answered. This is the anti-cross-submit check: a person's answer
+    /// to their £45 cannot be presented against a £5000.
+    #[error("that receipt does not answer this challenge")]
+    ReceiptChallengeMismatch,
     /// A replayed approval, or a concurrent one that lost.
     #[error("that challenge was already {0}")]
     Replay(&'static str),
@@ -162,6 +190,11 @@ impl From<StoreError> for ApprovalDenied {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::UnknownChallenge => Self::UnknownChallenge,
+            StoreError::UnknownReceipt => Self::UnknownReceipt,
+            // A receipt spent under the store's one-use guard while `submit` held
+            // it unconsumed is a contradiction, not a user error — the same class
+            // as a self-contradicting row.
+            StoreError::EvidenceSpent => Self::Unreadable,
             other => Self::Unavailable(other.to_string()),
         }
     }
@@ -244,7 +277,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         &self,
         request: &ApprovalRequest,
         now_ms: u64,
-    ) -> Result<RaisedChallenge, StoreError> {
+    ) -> Result<(BeginOutcome, RaisedChallenge), StoreError> {
         let scope = CanonicalScope {
             service: request.scope.service.clone(),
             agent: request.scope.agent.clone(),
@@ -257,6 +290,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         let code = self.entropy.code();
         let id = ApprovalChallengeId::new(self.entropy.identifier());
         let preview = scope.preview(code.revealed(), now_ms);
+        let expires_at_ms = scope.expires_at_ms;
 
         let record = ChallengeRecord {
             id: id.clone(),
@@ -272,8 +306,80 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             assurance: self.policy.assurance,
             actor: request.actor.clone(),
         };
-        self.store.insert_challenge(&record).await?;
-        Ok(RaisedChallenge { id, preview, code })
+
+        // Idempotent begin: a redelivered `BOOK` for a booking that already has a
+        // challenge gets that one back rather than a second prompt with a fresh
+        // code. Approve-first removed the incidental dedupe `create` used to give.
+        match self.store.insert_or_get_challenge(&record).await? {
+            InsertOutcome::Existing(existing) => {
+                let preview = existing
+                    .scope
+                    .preview(existing.code.revealed(), existing.created_at_ms);
+                Ok((
+                    BeginOutcome::Existing,
+                    RaisedChallenge {
+                        id: existing.id.clone(),
+                        preview,
+                        code: existing.code.clone(),
+                    },
+                ))
+            }
+            InsertOutcome::Inserted => {
+                // Correlate the bound number to this challenge, so a bare `YES
+                // 7312` from that number routes to it — the reply carries no
+                // challenge id, and its code is not unique enough to route.
+                if let Some(address) = self.store.address_for(&request.binding.principal).await? {
+                    self.store
+                        .await_reply(&address, &id, now_ms, expires_at_ms)
+                        .await?;
+                }
+                Ok((BeginOutcome::Created, RaisedChallenge { id, preview, code }))
+            }
+        }
+    }
+
+    /// Deposit an inbound reply's transport evidence under a one-use receipt,
+    /// BOUND to the challenge the reply answers.
+    ///
+    /// Called by the trusted ingress, never by the proposer. It resolves which
+    /// challenge the reply answers from the number it came from (the durable
+    /// correlation `begin` wrote), and returns the challenge and an opaque
+    /// receipt. The orchestrator then forwards `challenge + code + receipt` — and
+    /// never the evidence — to [`Self::submit`]. This is the store-mediated seam
+    /// ADR-026 turns on: the proof becomes which row the verifier reads.
+    ///
+    /// # Errors
+    /// The number is awaiting no challenge, or is not bound, or the store is
+    /// unreachable.
+    pub async fn deposit_evidence(
+        &self,
+        address: &str,
+        evidence: &InboundEvidenceRecord,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<(ApprovalChallengeId, EvidenceReceiptId), ApprovalDenied> {
+        let challenge = self
+            .store
+            .awaiting_reply(address)
+            .await?
+            .ok_or(ApprovalDenied::UnknownChallenge)?;
+        // A reply from a number that is not bound correlates to nothing a grant
+        // could name — refuse the deposit rather than store an unanchored row.
+        if self.store.live_binding_by_address(address).await?.is_none() {
+            return Err(ApprovalDenied::WrongChannel);
+        }
+        let receipt = EvidenceReceiptId::new(self.entropy.identifier());
+        let deposited = self
+            .store
+            .write_inbound_evidence(
+                &receipt,
+                evidence,
+                &challenge,
+                now_ms,
+                now_ms.saturating_add(ttl_ms),
+            )
+            .await?;
+        Ok((challenge, deposited.receipt))
     }
 
     /// Answer `YES`: steps 4 to 6 of §13.1, and the only route to a grant.
@@ -300,11 +406,40 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         &self,
         id: &ApprovalChallengeId,
         offered_code: &str,
-        from: &BindingRef,
-        binding_assurance: AssuranceLevel,
+        actor: &ActorId,
+        receipt: &EvidenceReceiptId,
         now_ms: u64,
     ) -> Result<VerifiedAuthority, ApprovalDenied> {
-        let challenge = self.pending(id, from, now_ms).await?;
+        let evidence = self.bound_evidence(id, receipt).await?;
+        let challenge = self
+            .store
+            .load_challenge(id)
+            .await?
+            .ok_or(ApprovalDenied::UnknownChallenge)?;
+        if challenge.scope_hash != challenge.scope.digest() {
+            return Err(ApprovalDenied::Unreadable);
+        }
+
+        // Idempotent replay, checked BEFORE anything that could fail on state
+        // that moved since the approval. The delegation reference is returned
+        // exactly once (§13.1 step 7), so a person whose booking was lost after
+        // they approved — a retried `YES` — must recover that reference rather
+        // than be told `Replay` and stranded. Only to the SAME actor: a
+        // different workload replaying gets `Replay`, never someone else's grant.
+        if challenge.status == ChallengeStatus::Approved {
+            return self.recover_reference(id, actor).await;
+        }
+        if challenge.status.is_settled() {
+            return Err(ApprovalDenied::Replay(challenge.status.name()));
+        }
+        if challenge.has_expired(now_ms) {
+            return Err(ApprovalDenied::ChallengeExpired);
+        }
+
+        // The reply's binding comes from the EVIDENCE row's sender resolved to a
+        // live binding — not from anything the caller claims. Wrong channel does
+        // not cost an attempt.
+        let bound = self.resolve_sender(&evidence, &challenge).await?;
 
         if !challenge.code.matches(offered_code) {
             let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms).await?;
@@ -326,8 +461,9 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
 
         // Step 6, with the cap. A binding cannot lift a grant above the
         // assurance it established, and the challenge cannot lift it above the
-        // policy it was raised under: the weakest of the three wins.
-        let assurance = challenge.assurance.min(binding_assurance);
+        // policy it was raised under: the weakest of the three wins. The
+        // binding's assurance is read from its row, resolved above.
+        let assurance = challenge.assurance.min(bound.assurance);
         let delegation = DelegationId::new(self.entropy.identifier());
         let authority = VerifiedAuthority::issue(
             delegation,
@@ -344,6 +480,7 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
 
         let record = DelegationRecord {
             id: authority.delegation().clone(),
+            challenge_id: challenge.id.clone(),
             grantor: authority.grantor().clone(),
             subject: authority.subject().clone(),
             service: authority.service().clone(),
@@ -353,9 +490,83 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
             envelope: envelope::encode(&authority, &self.key),
         };
 
-        match self.store.settle_with_grant(id, &record).await? {
+        match self
+            .store
+            .settle_with_grant(id, &record, receipt, &evidence.claimed_sender, now_ms)
+            .await?
+        {
             Settled::Now => Ok(authority),
+            // The race loser recovers the SAME reference the winner minted,
+            // exactly as the replay above does — never a second grant, never a
+            // stranded approver.
+            Settled::Already(ChallengeStatus::Approved) => self.recover_reference(id, actor).await,
             Settled::Already(status) => Err(ApprovalDenied::Replay(status.name())),
+        }
+    }
+
+    /// Load the evidence a receipt names, and confirm it answers THIS challenge.
+    ///
+    /// The two refusals here are the receipt's whole contract: a receipt that
+    /// names no row (the untrusted caller invented it), and a receipt whose
+    /// evidence was deposited for a different challenge (a valid answer to one
+    /// challenge presented against another). Both are checked before the
+    /// challenge is even read.
+    async fn bound_evidence(
+        &self,
+        id: &ApprovalChallengeId,
+        receipt: &EvidenceReceiptId,
+    ) -> Result<LoadedEvidence, ApprovalDenied> {
+        let evidence = self
+            .store
+            .load_evidence_by_receipt(receipt)
+            .await?
+            .ok_or(ApprovalDenied::UnknownReceipt)?;
+        if evidence.challenge_id.as_ref() != Some(id) {
+            return Err(ApprovalDenied::ReceiptChallengeMismatch);
+        }
+        Ok(evidence)
+    }
+
+    /// Resolve the evidence's sender to a live binding, and require it to be the
+    /// challenge's binding at the challenge's revision.
+    ///
+    /// This is the store-mediated version of "the reply came from the channel we
+    /// texted": the number is resolved against a row, and a binding withdrawn or
+    /// re-verified since the challenge was raised no longer answers it.
+    async fn resolve_sender(
+        &self,
+        evidence: &LoadedEvidence,
+        challenge: &ChallengeRecord,
+    ) -> Result<BoundChannel, ApprovalDenied> {
+        let bound = self
+            .store
+            .live_binding_by_address(&evidence.claimed_sender)
+            .await?
+            .ok_or(ApprovalDenied::WrongChannel)?;
+        if bound.reference != challenge.binding {
+            return Err(ApprovalDenied::WrongChannel);
+        }
+        Ok(bound)
+    }
+
+    /// Return the reference an already-approved challenge issued, to the actor it
+    /// was issued for — the idempotent-`YES` recovery path.
+    async fn recover_reference(
+        &self,
+        id: &ApprovalChallengeId,
+        actor: &ActorId,
+    ) -> Result<VerifiedAuthority, ApprovalDenied> {
+        let record = self
+            .store
+            .load_delegation_by_challenge(id)
+            .await?
+            .ok_or(ApprovalDenied::Replay("approved"))?;
+        let authority =
+            envelope::decode(&record.envelope, &self.key).ok_or(ApprovalDenied::Unreadable)?;
+        if authority.actor() == actor {
+            Ok(authority)
+        } else {
+            Err(ApprovalDenied::Replay("approved"))
         }
     }
 
@@ -371,10 +582,25 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         &self,
         id: &ApprovalChallengeId,
         offered_code: &str,
-        from: &BindingRef,
+        receipt: &EvidenceReceiptId,
         now_ms: u64,
     ) -> Result<(), ApprovalDenied> {
-        let challenge = self.pending(id, from, now_ms).await?;
+        let evidence = self.bound_evidence(id, receipt).await?;
+        let challenge = self
+            .store
+            .load_challenge(id)
+            .await?
+            .ok_or(ApprovalDenied::UnknownChallenge)?;
+        if challenge.scope_hash != challenge.scope.digest() {
+            return Err(ApprovalDenied::Unreadable);
+        }
+        if challenge.status.is_settled() {
+            return Err(ApprovalDenied::Replay(challenge.status.name()));
+        }
+        if challenge.has_expired(now_ms) {
+            return Err(ApprovalDenied::ChallengeExpired);
+        }
+        self.resolve_sender(&evidence, &challenge).await?;
         if !challenge.code.matches(offered_code) {
             let (attempts_left, status) = self.store.record_failed_attempt(id, now_ms).await?;
             return Err(if status == ChallengeStatus::Exhausted {
@@ -383,7 +609,11 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
                 ApprovalDenied::WrongCode { attempts_left }
             });
         }
-        match self.store.settle_rejected(id).await? {
+        match self
+            .store
+            .settle_rejected(id, receipt, &evidence.claimed_sender, now_ms)
+            .await?
+        {
             Settled::Now => Ok(()),
             Settled::Already(status) => Err(ApprovalDenied::Replay(status.name())),
         }
@@ -426,79 +656,5 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// The store could not be reached.
     pub async fn revoke(&self, id: &DelegationId, now_ms: u64) -> Result<bool, StoreError> {
         self.store.revoke_delegation(id, now_ms).await
-    }
-
-    /// The four checks every answer passes before its code is even looked at.
-    async fn pending(
-        &self,
-        id: &ApprovalChallengeId,
-        from: &BindingRef,
-        now_ms: u64,
-    ) -> Result<ChallengeRecord, ApprovalDenied> {
-        let challenge = self
-            .store
-            .load_challenge(id)
-            .await?
-            .ok_or(ApprovalDenied::UnknownChallenge)?;
-
-        // Two layers guard replay, and the mutation battery proved each
-        // sufficient on its own SEQUENTIALLY: this one, and the store's atomic
-        // check inside `settle_with_grant`. Neither is redundant.
-        //
-        // This one gives the answer without spending an attempt or building
-        // evidence, and it is the only one `reject` reaches at all. The store's
-        // is the only one that holds when two correct replies arrive at once —
-        // see the concurrency test, which is the sole witness for it.
-        // The stored digest must describe the stored scope.
-        //
-        // The SQL store checks this too, on the way out of the row. It is
-        // checked HERE as well because that made it a property of one
-        // implementation rather than of the component: an in-memory store, a
-        // future store, or a fabricated row all reach this line. If the two
-        // disagree, one was edited, and choosing which to believe would be
-        // choosing whose version of the approval stands.
-        if challenge.scope_hash != challenge.scope.digest() {
-            return Err(ApprovalDenied::Unreadable);
-        }
-        if challenge.status.is_settled() {
-            return Err(ApprovalDenied::Replay(challenge.status.name()));
-        }
-        if challenge.has_expired(now_ms) {
-            return Err(ApprovalDenied::ChallengeExpired);
-        }
-        // The claimed binding is checked against a ROW, not against itself.
-        //
-        // # The defect this closes, and the one it does not
-        //
-        // Before this, both sides of the comparison came from the caller: the
-        // binding it named when raising the challenge, and the binding it named
-        // when answering. A caller sending the same pair twice passed — so the
-        // "wrong channel" refusal was a formality, and possession of a workload
-        // credential was enough to mint an in-policy grant with no phone
-        // involved at all. Review found it after M7B was written.
-        //
-        // Three comparisons now, and all three must hold: the reply names the
-        // challenge's binding, that principal is CURRENTLY bound, and the
-        // revision matches. A binding that has been withdrawn or re-verified
-        // since the challenge was raised no longer answers it.
-        //
-        // What this still does not prove is that a PERSON answered. That needs
-        // evidence from the channel — an inbound message the adapter
-        // received — and the channel arrives with M7C. Until then this is a
-        // well-formedness check against durable state, which is more than it
-        // was and less than it needs to be. Named in the M7B acceptance record
-        // rather than papered over.
-        if &challenge.binding != from {
-            return Err(ApprovalDenied::WrongChannel);
-        }
-        let live = self
-            .store
-            .live_binding(&from.principal)
-            .await
-            .map_err(|error| ApprovalDenied::Unavailable(error.to_string()))?;
-        if live.as_ref() != Some(from) {
-            return Err(ApprovalDenied::WrongChannel);
-        }
-        Ok(challenge)
     }
 }

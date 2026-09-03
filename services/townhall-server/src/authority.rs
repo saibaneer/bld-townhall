@@ -245,13 +245,18 @@ fn now_ms() -> u64 {
 /// arrived rather than by when the process started.
 pub struct ServiceIssuer(pub Arc<AuthorityService<SqlApprovalStore, OsEntropy>>);
 
+/// How long a deposited evidence row stays usable before the expiry sweep may
+/// reclaim it. Matches the reply window a person has to answer: a receipt is only
+/// ever spent inside that window, so nothing needs it longer.
+const EVIDENCE_TTL_MS: u64 = 10 * 60 * 1_000;
+
 #[async_trait::async_trait]
 impl townhall_http::approvals::ApprovalIssuer for ServiceIssuer {
     async fn begin(
         &self,
         request: &townhall_authority::ApprovalRequest,
-    ) -> Result<(String, String), String> {
-        let raised = self
+    ) -> Result<(bool, String, String), String> {
+        let (outcome, raised) = self
             .0
             .begin(request, now_ms())
             .await
@@ -259,25 +264,46 @@ impl townhall_http::approvals::ApprovalIssuer for ServiceIssuer {
         // The PREVIEW, not the code. The code is inside the preview because the
         // person has to be told it, and returning it separately would invite a
         // caller to use it without ever sending the message.
-        Ok((raised.id.as_str().to_owned(), raised.preview))
+        let created = outcome == townhall_authority::BeginOutcome::Created;
+        Ok((created, raised.id.as_str().to_owned(), raised.preview))
+    }
+
+    async fn deposit_evidence(
+        &self,
+        inbound: &townhall_http::approvals::InboundEvidence,
+    ) -> Result<(String, String), townhall_authority::ApprovalDenied> {
+        let record = townhall_authority::InboundEvidenceRecord {
+            provider: inbound.provider.clone(),
+            provider_account: inbound.account.clone(),
+            provider_message_id: inbound.message_id.clone(),
+            claimed_sender: inbound.address.clone(),
+            verified: inbound.verified,
+            signature: inbound.signature.clone(),
+        };
+        let (challenge, receipt) = self
+            .0
+            .deposit_evidence(&inbound.address, &record, now_ms(), EVIDENCE_TTL_MS)
+            .await?;
+        Ok((challenge.as_str().to_owned(), receipt.as_str().to_owned()))
     }
 
     async fn reply(
         &self,
         challenge: &str,
         code: &str,
-        from: &townhall_authority::BindingRef,
-        assurance: townhall_authority::AssuranceLevel,
+        receipt: &str,
+        actor: &ActorId,
         approve: bool,
     ) -> Result<Option<String>, townhall_authority::ApprovalDenied> {
         let id = bld_types::ApprovalChallengeId::new(challenge);
+        let receipt = bld_types::EvidenceReceiptId::new(receipt);
         let now = now_ms();
         if approve {
-            let grant = self.0.submit(&id, code, from, assurance, now).await?;
+            let grant = self.0.submit(&id, code, actor, &receipt, now).await?;
             // Only the reference crosses back (spec §13.1 step 7).
             Ok(Some(grant.delegation().as_str().to_owned()))
         } else {
-            self.0.reject(&id, code, from, now).await?;
+            self.0.reject(&id, code, &receipt, now).await?;
             Ok(None)
         }
     }

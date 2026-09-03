@@ -11,14 +11,14 @@
 //! Migration 0006 is exercised by every test here simply by opening the store.
 
 use bld_types::{
-    ActorId, Behaviour, BookingId, BookingRequirements, DelegationId, Money, PrincipalId,
-    ServiceId, TimeWindow,
+    ActorId, Behaviour, BookingId, BookingRequirements, DelegationId, EvidenceReceiptId, Money,
+    PrincipalId, ServiceId, TimeWindow,
 };
 use std::sync::Mutex;
 use townhall_authority::{
     ApprovalCode, ApprovalDenied, ApprovalRequest, ApprovalStore, AssuranceLevel, AuthorityPolicy,
-    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, MAX_ATTEMPTS, PendingScope,
-    ResolveError,
+    AuthorityService, BehaviourSet, BindingRef, Entropy, EnvelopeKey, InboundEvidenceRecord,
+    MAX_ATTEMPTS, PendingScope, ResolveError,
 };
 use townhall_store::SqliteBookingRepository;
 use townhall_store::authority::{ChannelBinding, SqlApprovalStore};
@@ -26,6 +26,37 @@ use townhall_store::authority::{ChannelBinding, SqlApprovalStore};
 const NOW: u64 = 1_700_000_000_000;
 const REPLY_WINDOW_MS: u64 = 600_000;
 const GRANT_TTL_MS: u64 = 3_600_000;
+const LUCY_ADDR: &str = "+447700900123";
+
+type Svc = AuthorityService<SqlApprovalStore, FixedEntropy>;
+
+fn townhall_actor() -> ActorId {
+    ActorId::new("agent:townhall")
+}
+
+/// Deposit one reply's evidence for whatever challenge `address` awaits, over the
+/// real store, and return the receipt to forward. `nonce` keeps the inbound
+/// identity unique. The reopen tests rely on the awaiting-reply row surviving in
+/// the database, exactly as a person's reply after a restart does.
+async fn deposit_reply(service: &Svc, address: &str, nonce: &str) -> EvidenceReceiptId {
+    let (_challenge, receipt) = service
+        .deposit_evidence(
+            address,
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: format!("msg-{address}-{nonce}"),
+                claimed_sender: address.to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await
+        .expect("the bound channel is awaiting a challenge");
+    receipt
+}
 
 struct FixedEntropy {
     code: String,
@@ -140,15 +171,10 @@ async fn a_grant_round_trips_through_sqlite_unchanged() {
     bind_lucy(&store).await;
     let service = service(store);
 
-    let raised = service.begin(&request(), NOW).await.expect("challenge");
+    let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let issued = service
-        .submit(
-            &raised.id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("answered");
 
@@ -179,7 +205,12 @@ async fn a_challenges_scope_survives_a_reopened_database() {
         let store = SqlApprovalStore::new(bookings.pool().clone());
         bind_lucy(&store).await;
         let service = service(store);
-        service.begin(&request(), NOW).await.expect("challenge").id
+        service
+            .begin(&request(), NOW)
+            .await
+            .expect("challenge")
+            .1
+            .id
     };
 
     // A different process, as far as the data is concerned.
@@ -188,14 +219,11 @@ async fn a_challenges_scope_survives_a_reopened_database() {
         .expect("migrations");
     let service = service(SqlApprovalStore::new(bookings.pool().clone()));
 
+    // The reply arrives after the restart. Its correlation and evidence are
+    // durable rows, so the challenge is still answerable — W6, over real SQLite.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     let grant = service
-        .submit(
-            &raised_id,
-            "7312",
-            &lucys_binding(),
-            AssuranceLevel::SmsReply,
-            NOW + 1_000,
-        )
+        .submit(&raised_id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
         .await
         .expect("a challenge raised before the restart is still answerable");
 
@@ -223,48 +251,50 @@ async fn two_simultaneous_replies_over_sqlite_yield_exactly_one_grant() {
         let (store, _directory) = store().await;
         bind_lucy(&store).await;
         let service = Arc::new(service(store));
-        let raised = service.begin(&request(), NOW).await.expect("challenge");
+        let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
+        let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
 
         let granted = Arc::new(AtomicUsize::new(0));
-        let refused = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let service = Arc::clone(&service);
                 let id = raised.id.clone();
+                let receipt = receipt.clone();
                 let granted = Arc::clone(&granted);
-                let refused = Arc::clone(&refused);
                 let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
                     barrier.wait();
                     match service
-                        .submit(
-                            &id,
-                            "7312",
-                            &lucys_binding(),
-                            AssuranceLevel::SmsReply,
-                            NOW + 1_000,
-                        )
+                        .submit(&id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
                         .await
                     {
-                        Ok(_) => granted.fetch_add(1, Ordering::SeqCst),
-                        Err(ApprovalDenied::Replay(_)) => refused.fetch_add(1, Ordering::SeqCst),
-                        Err(other) => panic!("neither granted nor refused as a replay: {other}"),
-                    };
+                        // One settles the challenge, the other recovers the same
+                        // reference — both hold the grant, but only one row exists.
+                        Ok(grant) => {
+                            granted.fetch_add(1, Ordering::SeqCst);
+                            grant.delegation().clone()
+                        }
+                        Err(other) => panic!("a correct concurrent reply was refused: {other}"),
+                    }
                 })
             })
             .collect();
+        let mut references = Vec::new();
         for handle in handles {
-            handle.await.expect("no task panicked");
+            references.push(handle.await.expect("no task panicked"));
         }
 
         assert_eq!(
             granted.load(Ordering::SeqCst),
-            1,
-            "round {round}: one challenge, one grant"
+            2,
+            "round {round}: both correct replies must be answered"
         );
-        assert_eq!(refused.load(Ordering::SeqCst), 1, "round {round}");
+        assert_eq!(
+            references[0], references[1],
+            "round {round}: both callers receive the SAME reference — one grant"
+        );
     }
 }
 
@@ -275,29 +305,26 @@ async fn the_attempt_count_survives_a_reopened_database() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("authority.db");
 
-    let raised_id = {
+    let (raised_id, receipt) = {
         let bookings = SqliteBookingRepository::open(&path)
             .await
             .expect("migrations");
         let store = SqlApprovalStore::new(bookings.pool().clone());
         bind_lucy(&store).await;
         let service = service(store);
-        let raised = service.begin(&request(), NOW).await.expect("challenge");
+        let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
+        // A wrong code does not consume the receipt, so the same one carries the
+        // retry after the restart.
+        let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
         assert_eq!(
             service
-                .submit(
-                    &raised.id,
-                    "0000",
-                    &lucys_binding(),
-                    AssuranceLevel::SmsReply,
-                    NOW + 1_000
-                )
+                .submit(&raised.id, "0000", &townhall_actor(), &receipt, NOW + 1_000)
                 .await,
             Err(ApprovalDenied::WrongCode {
                 attempts_left: MAX_ATTEMPTS - 1
             })
         );
-        raised.id
+        (raised.id, receipt)
     };
 
     let bookings = SqliteBookingRepository::open(&path)
@@ -307,13 +334,7 @@ async fn the_attempt_count_survives_a_reopened_database() {
 
     assert_eq!(
         service
-            .submit(
-                &raised_id,
-                "0000",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 2_000
-            )
+            .submit(&raised_id, "0000", &townhall_actor(), &receipt, NOW + 2_000)
             .await,
         Err(ApprovalDenied::WrongCode {
             attempts_left: MAX_ATTEMPTS - 2
@@ -336,15 +357,10 @@ async fn revocation_survives_a_reopened_database() {
         let store = SqlApprovalStore::new(bookings.pool().clone());
         bind_lucy(&store).await;
         let service = service(store);
-        let raised = service.begin(&request(), NOW).await.expect("challenge");
+        let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
+        let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
         let grant = service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000,
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
             .await
             .expect("answered");
         assert!(
@@ -472,7 +488,7 @@ async fn re_verifying_a_number_strands_the_challenge_bound_to_its_old_revision()
         .expect("bound");
 
     let service = service(store.clone());
-    let raised = service.begin(&request(), NOW).await.expect("challenge");
+    let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
 
     let bumped = store
         .bump_binding("binding-lucy", NOW + 500)
@@ -481,22 +497,13 @@ async fn re_verifying_a_number_strands_the_challenge_bound_to_its_old_revision()
         .expect("the binding exists");
     assert_eq!(bumped, 2);
 
-    let now_current = store
-        .live_binding("+447700900123")
-        .await
-        .expect("queryable")
-        .expect("still bound")
-        .reference();
-
+    // The reply arrives from Lucy's real number, now at revision 2; the challenge
+    // names revision 1. The evidence resolves to the current binding, which no
+    // longer matches what the challenge was sent to.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     assert_eq!(
         service
-            .submit(
-                &raised.id,
-                "7312",
-                &now_current,
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
             .await,
         Err(ApprovalDenied::WrongChannel),
         "a challenge sent to a number must not be answerable after that number \
@@ -533,9 +540,14 @@ async fn a_challenge_whose_digest_contradicts_its_scope_is_refused() {
         .await
         .expect("migrations");
     let store = SqlApprovalStore::new(bookings.pool().clone());
+    bind_lucy(&store).await;
     let service = service(store.clone());
 
-    let raised = service.begin(&request(), NOW).await.expect("challenge");
+    let (_, raised) = service.begin(&request(), NOW).await.expect("challenge");
+    // Deposit a real receipt BEFORE the tamper, so the eventual refusal is the
+    // digest check the verifier reaches — not a missing receipt short-circuiting
+    // in front of it.
+    let receipt = deposit_reply(&service, LUCY_ADDR, "1").await;
     assert!(
         store
             .load_challenge(&raised.id)
@@ -567,13 +579,7 @@ async fn a_challenge_whose_digest_contradicts_its_scope_is_refused() {
     // And the refusal reaches the verifier as a denial, not as an approval.
     assert!(
         service
-            .submit(
-                &raised.id,
-                "7312",
-                &lucys_binding(),
-                AssuranceLevel::SmsReply,
-                NOW + 1_000
-            )
+            .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
             .await
             .is_err(),
         "an unreadable challenge must never yield a grant"

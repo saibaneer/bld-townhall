@@ -483,8 +483,8 @@ pub mod issuer {
     };
     use townhall_authority::{
         ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
-        VerifiedAuthority,
+        BehaviourSet, BindingRef, Entropy, EnvelopeKey, InboundEvidenceRecord, MemoryApprovalStore,
+        PendingScope, VerifiedAuthority,
     };
 
     /// The instant every issued test grant is stamped with.
@@ -646,7 +646,8 @@ pub mod issuer {
             principal: spec.grantor.clone(),
             version: 1,
         };
-        let raised = service
+        let actor = ActorId::new("agent:townhall");
+        let (_, raised) = service
             .begin(
                 &ApprovalRequest {
                     scope: PendingScope {
@@ -671,20 +672,34 @@ pub mod issuer {
                     subject: spec.subject.clone(),
                     // Every test grant names one workload, so a test that cares
                     // about the actor check has a value to disagree with.
-                    actor: ActorId::new("agent:townhall"),
+                    actor: actor.clone(),
                 },
                 ISSUED_AT_MS,
             )
             .await
             .expect("a challenge can always be raised against an empty store");
-        service
-            .submit(
-                &raised.id,
-                "7312",
-                &binding,
-                AssuranceLevel::SmsReply,
-                ISSUED_AT_MS + 1_000,
+        // The grant travels the receipt seam a person's approval travels: the
+        // trusted ingress deposits the reply's evidence under a one-use receipt,
+        // and the issuer forwards the receipt — never fabricated evidence.
+        let address = format!("+{}", spec.grantor.as_str());
+        let (_challenge, receipt) = service
+            .deposit_evidence(
+                &address,
+                &InboundEvidenceRecord {
+                    provider: "sim".to_owned(),
+                    provider_account: "townhall".to_owned(),
+                    provider_message_id: format!("msg-{}", raised.id.as_str()),
+                    claimed_sender: address.clone(),
+                    verified: true,
+                    signature: None,
+                },
+                ISSUED_AT_MS + 500,
+                600_000,
             )
+            .await
+            .expect("the bound channel is awaiting this challenge");
+        service
+            .submit(&raised.id, "7312", &actor, &receipt, ISSUED_AT_MS + 1_000)
             .await
             .expect("the right code, from the bound channel, inside the window")
     }

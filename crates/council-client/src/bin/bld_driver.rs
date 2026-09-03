@@ -100,8 +100,8 @@ impl Capability<BookingEffect> for DiesOnCue {
 async fn authority(id: &BookingId) -> VerifiedAuthority {
     use bld_types::{ActorId, Behaviour};
     use townhall_authority::{
-        ApprovalCode, ApprovalRequest, AssuranceLevel, AuthorityPolicy, AuthorityService,
-        BehaviourSet, BindingRef, Entropy, EnvelopeKey, MemoryApprovalStore, PendingScope,
+        ApprovalCode, ApprovalRequest, AuthorityPolicy, AuthorityService, BehaviourSet, BindingRef,
+        Entropy, EnvelopeKey, InboundEvidenceRecord, MemoryApprovalStore, PendingScope,
     };
 
     /// The demo's fixed code. A real one comes from the OS (M7B).
@@ -168,13 +168,33 @@ async fn authority(id: &BookingId) -> VerifiedAuthority {
         )
         .await
         .expect("a challenge over an empty store");
+    let (_, raised) = raised;
     println!("APPROVAL PREVIEW\n{}", raised.preview);
+    // The driver travels the receipt seam: it deposits its own reply's evidence
+    // and forwards the receipt, exactly as the SMS ingress does.
+    let address = "+lucy".to_owned();
+    let (_challenge, receipt) = service
+        .deposit_evidence(
+            &address,
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "driver".to_owned(),
+                provider_message_id: raised.id.as_str().to_owned(),
+                claimed_sender: address.clone(),
+                verified: true,
+                signature: None,
+            },
+            now,
+            600_000,
+        )
+        .await
+        .expect("the driver's channel is awaiting this challenge");
     service
         .submit(
             &raised.id,
             raised.code.revealed(),
-            &binding,
-            AssuranceLevel::SmsReply,
+            &ActorId::new("agent:bld-driver"),
+            &receipt,
             now + 1,
         )
         .await

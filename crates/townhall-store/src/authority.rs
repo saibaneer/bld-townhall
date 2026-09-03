@@ -22,11 +22,12 @@
 //! rather than two that can disagree by however long a query took.
 
 use crate::StoreError;
-use bld_types::{ApprovalChallengeId, DelegationId, PrincipalId, ServiceId};
+use bld_types::{ApprovalChallengeId, DelegationId, EvidenceReceiptId, PrincipalId, ServiceId};
 use sqlx::{Row, SqlitePool};
 use townhall_authority::{
-    ApprovalCode, ApprovalStore, AssuranceLevel, BindingRef, CanonicalScope, ChallengeRecord,
-    ChallengeStatus, DelegationRecord, MAX_ATTEMPTS, ScopeHash, Settled,
+    ApprovalCode, ApprovalStore, AssuranceLevel, BindingRef, BoundChannel, CanonicalScope,
+    ChallengeRecord, ChallengeStatus, DelegationRecord, EvidenceReceipt, InboundEvidenceRecord,
+    InsertOutcome, LoadedEvidence, MAX_ATTEMPTS, ScopeHash, Settled,
     store::StoreError as AuthorityStoreError,
 };
 
@@ -401,6 +402,9 @@ impl ApprovalStore for SqlApprovalStore {
         &self,
         id: &ApprovalChallengeId,
         grant: &DelegationRecord,
+        receipt: &EvidenceReceiptId,
+        address: &str,
+        now_ms: u64,
     ) -> Result<Settled, AuthorityStoreError> {
         let mut transaction = self
             .pool
@@ -458,6 +462,41 @@ impl ApprovalStore for SqlApprovalStore {
             }
         })?;
 
+        // Spend the receipt under a one-use guard, in the same transaction that
+        // claimed the challenge. Reaching here means we won the `status =
+        // 'pending'` race, so the receipt bound to this challenge is unconsumed;
+        // 0 rows is a contradiction (a spent receipt for a just-claimed
+        // challenge), so the whole settlement rolls back rather than mint a grant
+        // over evidence that was already spent.
+        let spent = sqlx::query(
+            r"
+            UPDATE inbound_evidence
+            SET consumed_at_ms = ?
+            WHERE receipt = ? AND consumed_at_ms IS NULL
+            ",
+        )
+        .bind(as_i64(now_ms))
+        .bind(receipt.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if spent == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| unavailable(&error))?;
+            return Err(AuthorityStoreError::EvidenceSpent);
+        }
+
+        // The number is no longer awaiting a reply.
+        sqlx::query("DELETE FROM awaiting_reply WHERE address = ?")
+            .bind(address)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| unavailable(&error))?;
+
         transaction
             .commit()
             .await
@@ -468,7 +507,16 @@ impl ApprovalStore for SqlApprovalStore {
     async fn settle_rejected(
         &self,
         id: &ApprovalChallengeId,
+        receipt: &EvidenceReceiptId,
+        address: &str,
+        now_ms: u64,
     ) -> Result<Settled, AuthorityStoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| unavailable(&error))?;
+
         let claimed = sqlx::query(
             r"
             UPDATE approval_challenges
@@ -477,14 +525,51 @@ impl ApprovalStore for SqlApprovalStore {
             ",
         )
         .bind(id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| unavailable(&error))?
         .rows_affected();
 
         if claimed == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| unavailable(&error))?;
             return self.settled_state(id).await;
         }
+
+        let spent = sqlx::query(
+            r"
+            UPDATE inbound_evidence
+            SET consumed_at_ms = ?
+            WHERE receipt = ? AND consumed_at_ms IS NULL
+            ",
+        )
+        .bind(as_i64(now_ms))
+        .bind(receipt.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if spent == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| unavailable(&error))?;
+            return Err(AuthorityStoreError::EvidenceSpent);
+        }
+
+        sqlx::query("DELETE FROM awaiting_reply WHERE address = ?")
+            .bind(address)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| unavailable(&error))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| unavailable(&error))?;
         Ok(Settled::Now)
     }
 
@@ -494,8 +579,8 @@ impl ApprovalStore for SqlApprovalStore {
     ) -> Result<Option<DelegationRecord>, AuthorityStoreError> {
         let row = sqlx::query(
             r"
-            SELECT id, grantor, subject, service, expires_at_ms, revoked_at_ms,
-                   envelope, created_at_ms
+            SELECT id, challenge_id, grantor, subject, service, expires_at_ms,
+                   revoked_at_ms, envelope, created_at_ms
             FROM delegations
             WHERE id = ?
             ",
@@ -508,43 +593,7 @@ impl ApprovalStore for SqlApprovalStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        // Every column here is read with `try_get?` rather than a defaulting
-        // `unwrap_or`: the M5.1 review found a shim whose `.unwrap_or(0)` made
-        // an assertion on a nonexistent column vacuous, and a delegation that
-        // silently reads as never-revoked is that defect with teeth.
-        Ok(Some(DelegationRecord {
-            id: DelegationId::new(
-                row.try_get::<String, _>("id")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            grantor: PrincipalId::new(
-                row.try_get::<String, _>("grantor")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            subject: PrincipalId::new(
-                row.try_get::<String, _>("subject")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            service: ServiceId::new(
-                row.try_get::<String, _>("service")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            issued_at_ms: from_i64(
-                row.try_get::<i64, _>("created_at_ms")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            expires_at_ms: from_i64(
-                row.try_get::<i64, _>("expires_at_ms")
-                    .map_err(|error| row_error(&error))?,
-            ),
-            revoked_at_ms: row
-                .try_get::<Option<i64>, _>("revoked_at_ms")
-                .map_err(|error| row_error(&error))?
-                .map(from_i64),
-            envelope: row
-                .try_get::<Vec<u8>, _>("envelope")
-                .map_err(|error| row_error(&error))?,
-        }))
+        decode_delegation(&row).map(Some)
     }
 
     async fn live_binding(
@@ -583,6 +632,332 @@ impl ApprovalStore for SqlApprovalStore {
         .rows_affected();
         Ok(affected == 1)
     }
+
+    async fn write_inbound_evidence(
+        &self,
+        receipt: &EvidenceReceiptId,
+        evidence: &InboundEvidenceRecord,
+        challenge: &ApprovalChallengeId,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<EvidenceReceipt, AuthorityStoreError> {
+        // `DO NOTHING` on the inbound-identity index makes a carrier redelivery a
+        // no-op rather than a second row — the evidence analogue of idempotent
+        // begin. The receipt is bound to its challenge here, at deposit.
+        let inserted = sqlx::query(
+            r"
+            INSERT INTO inbound_evidence
+                (receipt, provider, provider_account, provider_message_id,
+                 claimed_sender, verified, signature, challenge_id,
+                 consumed_at_ms, created_at_ms, expires_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(provider, provider_account, provider_message_id) DO NOTHING
+            ",
+        )
+        .bind(receipt.as_str())
+        .bind(&evidence.provider)
+        .bind(&evidence.provider_account)
+        .bind(&evidence.provider_message_id)
+        .bind(&evidence.claimed_sender)
+        .bind(i64::from(evidence.verified))
+        .bind(evidence.signature.as_deref())
+        .bind(challenge.as_str())
+        .bind(as_i64(now_ms))
+        .bind(as_i64(expires_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if inserted == 1 {
+            return Ok(EvidenceReceipt {
+                receipt: receipt.clone(),
+                fresh: true,
+            });
+        }
+
+        // Redelivery: return the receipt the first deposit minted, not the one
+        // offered now.
+        let row = sqlx::query(
+            r"
+            SELECT receipt FROM inbound_evidence
+            WHERE provider = ? AND provider_account = ? AND provider_message_id = ?
+            ",
+        )
+        .bind(&evidence.provider)
+        .bind(&evidence.provider_account)
+        .bind(&evidence.provider_message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+        Ok(EvidenceReceipt {
+            receipt: EvidenceReceiptId::new(
+                row.try_get::<String, _>("receipt")
+                    .map_err(|error| row_error(&error))?,
+            ),
+            fresh: false,
+        })
+    }
+
+    async fn load_evidence_by_receipt(
+        &self,
+        receipt: &EvidenceReceiptId,
+    ) -> Result<Option<LoadedEvidence>, AuthorityStoreError> {
+        let row = sqlx::query(
+            r"
+            SELECT receipt, claimed_sender, verified, signature, challenge_id,
+                   consumed_at_ms
+            FROM inbound_evidence
+            WHERE receipt = ?
+            ",
+        )
+        .bind(receipt.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(LoadedEvidence {
+            receipt: EvidenceReceiptId::new(
+                row.try_get::<String, _>("receipt")
+                    .map_err(|error| row_error(&error))?,
+            ),
+            claimed_sender: row
+                .try_get::<String, _>("claimed_sender")
+                .map_err(|error| row_error(&error))?,
+            verified: row
+                .try_get::<i64, _>("verified")
+                .map_err(|error| row_error(&error))?
+                != 0,
+            signature: row
+                .try_get::<Option<String>, _>("signature")
+                .map_err(|error| row_error(&error))?,
+            challenge_id: row
+                .try_get::<Option<String>, _>("challenge_id")
+                .map_err(|error| row_error(&error))?
+                .map(ApprovalChallengeId::new),
+            consumed_at_ms: row
+                .try_get::<Option<i64>, _>("consumed_at_ms")
+                .map_err(|error| row_error(&error))?
+                .map(from_i64),
+        }))
+    }
+
+    async fn load_delegation_by_challenge(
+        &self,
+        challenge: &ApprovalChallengeId,
+    ) -> Result<Option<DelegationRecord>, AuthorityStoreError> {
+        let row = sqlx::query(
+            r"
+            SELECT id, challenge_id, grantor, subject, service, expires_at_ms,
+                   revoked_at_ms, envelope, created_at_ms
+            FROM delegations
+            WHERE challenge_id = ?
+            ",
+        )
+        .bind(challenge.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        decode_delegation(&row).map(Some)
+    }
+
+    async fn live_binding_by_address(
+        &self,
+        address: &str,
+    ) -> Result<Option<BoundChannel>, AuthorityStoreError> {
+        // The inherent `live_binding` answers "who is this number?" against a
+        // row, carrying the assurance the grant is capped at.
+        self.live_binding(address)
+            .await
+            .map(|found| {
+                found.map(|binding| BoundChannel {
+                    reference: binding.reference(),
+                    assurance: binding.assurance,
+                })
+            })
+            .map_err(|error| AuthorityStoreError::Unavailable(error.to_string()))
+    }
+
+    async fn address_for(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Option<String>, AuthorityStoreError> {
+        self.live_binding_for(principal)
+            .await
+            .map(|found| found.map(|binding| binding.address))
+            .map_err(|error| AuthorityStoreError::Unavailable(error.to_string()))
+    }
+
+    async fn await_reply(
+        &self,
+        address: &str,
+        challenge: &ApprovalChallengeId,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<(), AuthorityStoreError> {
+        // Address is the key: a second challenge raised to the same number
+        // supersedes the first, so one number awaits at most one reply.
+        sqlx::query(
+            r"
+            INSERT INTO awaiting_reply (address, challenge_id, created_at_ms, expires_at_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(address) DO UPDATE SET
+                challenge_id = excluded.challenge_id,
+                created_at_ms = excluded.created_at_ms,
+                expires_at_ms = excluded.expires_at_ms
+            ",
+        )
+        .bind(address)
+        .bind(challenge.as_str())
+        .bind(as_i64(now_ms))
+        .bind(as_i64(expires_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+        Ok(())
+    }
+
+    async fn awaiting_reply(
+        &self,
+        address: &str,
+    ) -> Result<Option<ApprovalChallengeId>, AuthorityStoreError> {
+        let row = sqlx::query("SELECT challenge_id FROM awaiting_reply WHERE address = ?")
+            .bind(address)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ApprovalChallengeId::new(
+            row.try_get::<String, _>("challenge_id")
+                .map_err(|error| row_error(&error))?,
+        )))
+    }
+
+    async fn insert_or_get_challenge(
+        &self,
+        challenge: &ChallengeRecord,
+    ) -> Result<InsertOutcome, AuthorityStoreError> {
+        // A fresh id, so the only conflict this can hit is the partial UNIQUE on
+        // `booking_intent`: a challenge already exists for this inbound booking.
+        let inserted = sqlx::query(
+            r"
+            INSERT INTO approval_challenges
+                (id, code, scope, scope_hash, binding_principal, binding_version,
+                 grantor, subject, actor, assurance, status, attempts_used,
+                 created_at_ms, expires_at_ms, settled_at_ms, booking_intent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT DO NOTHING
+            ",
+        )
+        .bind(challenge.id.as_str())
+        .bind(challenge.code.revealed())
+        .bind(challenge.scope.encode())
+        .bind(challenge.scope_hash.to_string())
+        .bind(challenge.binding.principal.as_str())
+        .bind(as_i64(challenge.binding.version))
+        .bind(challenge.grantor.as_str())
+        .bind(challenge.subject.as_str())
+        .bind(challenge.actor.as_str())
+        .bind(challenge.assurance.name())
+        .bind(challenge.status.name())
+        .bind(i64::from(challenge.attempts_used))
+        .bind(as_i64(challenge.created_at_ms))
+        .bind(as_i64(challenge.scope.expires_at_ms))
+        .bind(challenge.scope.booking.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if inserted == 1 {
+            return Ok(InsertOutcome::Inserted);
+        }
+
+        // The conflict was the booking's existing challenge — return it, so the
+        // redelivered BOOK reuses that id and code rather than raising a second.
+        let row = sqlx::query(
+            r"
+            SELECT id, code, scope, scope_hash, binding_principal, binding_version,
+                   grantor, subject, actor, assurance, status, attempts_used,
+                   created_at_ms
+            FROM approval_challenges
+            WHERE booking_intent = ?
+            ",
+        )
+        .bind(challenge.scope.booking.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+
+        match row {
+            Some(row) => Ok(InsertOutcome::Existing(Box::new(
+                Self::decode_challenge(&row)
+                    .map_err(|error| AuthorityStoreError::Unavailable(error.to_string()))?,
+            ))),
+            // No row for this booking, yet the insert conflicted: an id
+            // collision, not a redelivery. Refuse rather than silently reuse an
+            // unrelated challenge.
+            None => Err(AuthorityStoreError::ChallengeExists),
+        }
+    }
+}
+
+/// Decode one delegation row into the record.
+///
+/// Every column is read with `try_get?` rather than a defaulting `unwrap_or`:
+/// the M5.1 review found a shim whose `.unwrap_or(0)` made an assertion on a
+/// nonexistent column vacuous, and a delegation that silently reads as
+/// never-revoked is that defect with teeth. Shared by the by-id and by-challenge
+/// lookups so neither can decode a row differently from the other.
+fn decode_delegation(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<DelegationRecord, AuthorityStoreError> {
+    Ok(DelegationRecord {
+        id: DelegationId::new(
+            row.try_get::<String, _>("id")
+                .map_err(|error| row_error(&error))?,
+        ),
+        challenge_id: ApprovalChallengeId::new(
+            row.try_get::<String, _>("challenge_id")
+                .map_err(|error| row_error(&error))?,
+        ),
+        grantor: PrincipalId::new(
+            row.try_get::<String, _>("grantor")
+                .map_err(|error| row_error(&error))?,
+        ),
+        subject: PrincipalId::new(
+            row.try_get::<String, _>("subject")
+                .map_err(|error| row_error(&error))?,
+        ),
+        service: ServiceId::new(
+            row.try_get::<String, _>("service")
+                .map_err(|error| row_error(&error))?,
+        ),
+        issued_at_ms: from_i64(
+            row.try_get::<i64, _>("created_at_ms")
+                .map_err(|error| row_error(&error))?,
+        ),
+        expires_at_ms: from_i64(
+            row.try_get::<i64, _>("expires_at_ms")
+                .map_err(|error| row_error(&error))?,
+        ),
+        revoked_at_ms: row
+            .try_get::<Option<i64>, _>("revoked_at_ms")
+            .map_err(|error| row_error(&error))?
+            .map(from_i64),
+        envelope: row
+            .try_get::<Vec<u8>, _>("envelope")
+            .map_err(|error| row_error(&error))?,
+    })
 }
 
 fn as_i64(value: u64) -> i64 {

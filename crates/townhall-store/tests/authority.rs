@@ -585,3 +585,221 @@ async fn a_challenge_whose_digest_contradicts_its_scope_is_refused() {
         "an unreadable challenge must never yield a grant"
     );
 }
+
+/// The same request, for a distinct booking — so a second challenge is raised
+/// rather than the first reused. Grantor stays Lucy (subject Marco), which is
+/// what the bulk sweep keys on.
+fn request_for(booking: &str) -> ApprovalRequest {
+    let mut request = request();
+    request.scope.booking = BookingId::new(booking);
+    request
+}
+
+/// Begin and fully approve one booking over SQLite, returning its delegation id.
+async fn approve_booking(service: &Svc, booking: &str, nonce: &str) -> DelegationId {
+    let (_, raised) = service
+        .begin(&request_for(booking), NOW)
+        .await
+        .expect("challenge raised");
+    let receipt = deposit_reply(service, LUCY_ADDR, nonce).await;
+    let grant = service
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+        .await
+        .expect("a correct code from the bound channel");
+    grant.delegation().clone()
+}
+
+/// A second grantor over his OWN bound channel — a sweep of Lucy's grants must
+/// leave his standing.
+const MARCO_ADDR: &str = "+447700900456";
+
+async fn bind_marco(store: &SqlApprovalStore) {
+    store
+        .bind_channel(
+            &ChannelBinding {
+                id: "binding-marco".to_owned(),
+                address: MARCO_ADDR.to_owned(),
+                principal: PrincipalId::new("marco"),
+                version: 1,
+                assurance: AssuranceLevel::SmsReply,
+                withdrawn: false,
+            },
+            None,
+            NOW,
+        )
+        .await
+        .expect("the binding is written");
+}
+
+/// Begin and approve one booking Marco grants over his own channel.
+async fn approve_marcos_booking(service: &Svc, booking: &str, nonce: &str) -> DelegationId {
+    let request = ApprovalRequest {
+        binding: BindingRef {
+            principal: PrincipalId::new("marco"),
+            version: 1,
+        },
+        grantor: PrincipalId::new("marco"),
+        subject: PrincipalId::new("marco"),
+        ..request_for(booking)
+    };
+    let (_, raised) = service
+        .begin(&request, NOW)
+        .await
+        .expect("challenge raised");
+    let receipt = deposit_reply(service, MARCO_ADDR, nonce).await;
+    let grant = service
+        .submit(&raised.id, "7312", &townhall_actor(), &receipt, NOW + 1_000)
+        .await
+        .expect("Marco's own channel approves");
+    grant.delegation().clone()
+}
+
+/// Deposit a CONTROL inbound (a REVOKE) over SQLite, returning its receipt.
+async fn deposit_control(service: &Svc, address: &str, nonce: &str) -> EvidenceReceiptId {
+    service
+        .deposit_control_evidence(
+            address,
+            &InboundEvidenceRecord {
+                provider: "sim".to_owned(),
+                provider_account: "townhall".to_owned(),
+                provider_message_id: format!("ctrl-{address}-{nonce}"),
+                claimed_sender: address.to_owned(),
+                verified: true,
+                signature: None,
+            },
+            NOW,
+            REPLY_WINDOW_MS,
+        )
+        .await
+        .expect("a bound channel may deposit a control inbound")
+}
+
+/// T1 over SQLite: the bulk sweep and the receipt-spend commit as ONE
+/// transaction, and revoke EVERY grant the grantor authorized.
+///
+/// The memory store proves the logic under a `Mutex`; this proves the actual SQL
+/// — the `grantor = ?` UPDATE returning the full `rows_affected()`, folded into
+/// the same transaction that spends the receipt. Two grants, one REVOKE, both
+/// dead — and a THIRD grantor's grant left standing, so the `WHERE grantor = ?`
+/// clause has a witness (dropping it would revoke everyone's).
+#[tokio::test]
+async fn a_revoke_over_sqlite_stops_every_grant_in_one_transaction() {
+    let (store, _dir) = store().await;
+    bind_lucy(&store).await;
+    bind_marco(&store).await;
+    let service = service(store);
+
+    let first = approve_booking(&service, "sms-lucy-0001", "1").await;
+    let second = approve_booking(&service, "sms-lucy-0002", "2").await;
+    let marcos = approve_marcos_booking(&service, "sms-marco-0001", "m").await;
+
+    let receipt = deposit_control(&service, LUCY_ADDR, "revoke-1").await;
+    let stopped = service
+        .revoke_via_receipt(&receipt, NOW + 3_000)
+        .await
+        .expect("a bound sender's REVOKE is answered");
+    assert_eq!(
+        stopped, 2,
+        "the SQL sweep returns the full count of the SENDER's grants — not one, \
+         and not everyone's"
+    );
+
+    assert_eq!(
+        service.resolve(&first, NOW + 4_000).await,
+        Err(ResolveError::Revoked)
+    );
+    assert_eq!(
+        service.resolve(&second, NOW + 4_000).await,
+        Err(ResolveError::Revoked)
+    );
+    service
+        .resolve(&marcos, NOW + 4_000)
+        .await
+        .expect("a different grantor's grant is untouched over SQLite too");
+
+    // A replay of the spent receipt sweeps nothing and does not error — the
+    // one-use guard and idempotency, over real SQLite.
+    assert_eq!(
+        service.revoke_via_receipt(&receipt, NOW + 5_000).await,
+        Ok(0),
+        "a spent control receipt revokes nothing more"
+    );
+}
+
+/// T6 over SQLite: a redelivered BOOK after a TERMINAL (rejected) state reuses
+/// its challenge — the partial-unique `booking_intent` index spans the lifecycle
+/// in the real schema, not just in the `HashMap`.
+#[tokio::test]
+async fn a_terminal_challenge_is_reused_over_sqlite() {
+    let (store, _dir) = store().await;
+    bind_lucy(&store).await;
+    let service = service(store);
+
+    let (_, first) = service.begin(&request(), NOW).await.expect("challenge");
+    let receipt = deposit_reply(&service, LUCY_ADDR, "reject").await;
+    service
+        .reject(&first.id, "7312", &receipt, NOW + 1_000)
+        .await
+        .expect("a decline is terminal");
+
+    let (outcome, reused) = service
+        .begin(&request(), NOW + 2_000)
+        .await
+        .expect("redelivery after rejection");
+    assert_eq!(
+        outcome,
+        townhall_authority::BeginOutcome::Existing,
+        "a rejected challenge is still reused, not re-minted"
+    );
+    assert_eq!(reused.id, first.id, "the same challenge id");
+    assert_eq!(
+        reused.code.revealed(),
+        first.code.revealed(),
+        "the same code, not a fresh one"
+    );
+}
+
+/// The anti-lever guard is structural in the ACTUAL SQL, not just the service:
+/// the spend's `WHERE … AND challenge_id IS NULL` refuses a challenge-bound `YES`
+/// receipt fed straight to the store, so it can never be turned into a
+/// revoke-all lever — and the receipt stays spendable for its real `YES`.
+#[tokio::test]
+async fn the_sql_store_refuses_to_sweep_on_a_challenge_bound_receipt() {
+    let (store, _dir) = store().await;
+    bind_lucy(&store).await;
+    let service = service(store.clone());
+
+    let live = approve_booking(&service, "sms-lucy-0001", "1").await;
+    // A fresh, unconsumed, challenge-bound YES receipt.
+    let (_, raised) = service
+        .begin(&request_for("sms-lucy-0002"), NOW)
+        .await
+        .expect("a second challenge");
+    let challenge_bound = deposit_reply(&service, LUCY_ADDR, "2").await;
+
+    // Straight into the store, past the service's `challenge_id.is_some()` check.
+    let swept = store
+        .revoke_all_by_grantor_with_receipt(
+            &PrincipalId::new("lucy"),
+            &challenge_bound,
+            NOW + 1_500,
+        )
+        .await
+        .expect("the store answers");
+    assert_eq!(swept, 0, "the SQL guard refuses a challenge-bound receipt");
+    service
+        .resolve(&live, NOW + 2_000)
+        .await
+        .expect("no grant was revoked");
+    // Not consumed — the real YES still approves.
+    service
+        .submit(
+            &raised.id,
+            "7312",
+            &townhall_actor(),
+            &challenge_bound,
+            NOW + 2_500,
+        )
+        .await
+        .expect("the challenge-bound receipt is still spendable for its real YES");
+}

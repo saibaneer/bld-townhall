@@ -571,6 +571,162 @@ fn the_real_resolver_refuses_a_dev_token() {
     );
 }
 
+/// Raise and approve one booking for Lucy over HTTP, returning the delegation
+/// reference. `booking` is distinct per call so idempotent-begin raises a fresh
+/// challenge; `msg` keeps each reply deposit's transport identity unique.
+fn approve(client: &reqwest::blocking::Client, url: &str, booking: &str, msg: &str) -> String {
+    let raised: serde_json::Value = client
+        .post(format!("{url}/approvals"))
+        .header("authorization", AGENT)
+        .json(&serde_json::json!({
+            "booking": booking,
+            "grantor": "lucy", "subject": "lucy",
+            "binding_principal": "lucy", "binding_version": 1,
+            "behaviours": ["SelectVenue", "VerifySlot", "Book", "Cancel"],
+            "purpose": "community meeting",
+            "requested_date": "2026-09-10", "from": "14:00", "to": "17:00",
+            "attendees": 20, "wheelchair_accessible": true, "max_fee_pence": 5_000
+        }))
+        .send()
+        .expect("the server answers")
+        .json()
+        .expect("json");
+    let challenge = raised["challenge"].as_str().expect("a challenge id");
+    let code = code_from(raised["preview"].as_str().expect("a preview"));
+    let receipt = deposit_receipt(client, url, msg);
+    let approved: serde_json::Value = client
+        .post(format!("{url}/approvals/{challenge}/reply"))
+        .header("authorization", AGENT)
+        .json(&serde_json::json!({ "answer": "YES", "code": code, "receipt": receipt }))
+        .send()
+        .expect("the server answers")
+        .json()
+        .expect("json");
+    approved["delegation"]
+        .as_str()
+        .expect("a delegation reference")
+        .to_owned()
+}
+
+/// Post a control inbound (a REVOKE) to `/revocations` from `address`, returning
+/// the raw response for the caller to assert status and body on.
+fn post_revocation(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    address: &str,
+    msg: &str,
+) -> reqwest::blocking::Response {
+    client
+        .post(format!("{url}/revocations"))
+        .header("authorization", AGENT)
+        .json(&serde_json::json!({
+            "provider": "sim",
+            "account": "townhall",
+            "message_id": msg,
+            "address": address,
+            "verified": true
+        }))
+        .send()
+        .expect("the server answers")
+}
+
+/// T2 — a texted REVOKE stops EVERY grant over HTTP, and each stops authorizing.
+///
+/// Two grants for one number, one `POST /revocations`, `{"revoked": 2}` — the
+/// bulk sweep through the real lane. Then a change under EACH reference is
+/// refused: the count is not cosmetic, the rows are marked. This is the HTTP
+/// mirror of the unit sweep, and it fails a "count only" revoke that marks
+/// nothing or marks the wrong rows.
+#[test]
+fn a_texted_revoke_stops_every_grant_and_each_stops_authorizing() {
+    let lane = lane();
+    bind_lucy(&lane);
+    let client = http();
+
+    let r1 = approve(&client, &lane.url, "BKG-REVOKE-1", "reply-1");
+    let r2 = approve(&client, &lane.url, "BKG-REVOKE-2", "reply-2");
+
+    // r1 authorizes a change BEFORE the revoke — the grant is real and live.
+    let before = client
+        .post(format!("{}/booking-intents", lane.url))
+        .header("authorization", AGENT)
+        .header("x-bld-principal", "lucy")
+        .header("x-bld-delegation", &r1)
+        .json(&create_body("BKG-REVOKE-1"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        before.status().as_u16(),
+        201,
+        "the grant authorizes before revoke"
+    );
+
+    let revoked = post_revocation(&client, &lane.url, LUCY_ADDR, "revoke-1");
+    assert_eq!(revoked.status().as_u16(), 200);
+    let body: serde_json::Value = revoked.json().expect("json");
+    assert_eq!(
+        body["revoked"].as_u64(),
+        Some(2),
+        "one REVOKE stops both grants the number authorized"
+    );
+
+    // Both references are dead now — a change under either is refused.
+    for (reference, booking) in [(&r1, "BKG-AFTER-1"), (&r2, "BKG-AFTER-2")] {
+        let after = client
+            .post(format!("{}/booking-intents", lane.url))
+            .header("authorization", AGENT)
+            .header("x-bld-principal", "lucy")
+            .header("x-bld-delegation", reference)
+            .json(&create_body(booking))
+            .send()
+            .expect("answer");
+        assert_eq!(
+            after.status().as_u16(),
+            401,
+            "a revoked reference authorizes nothing"
+        );
+    }
+}
+
+/// T3 (HTTP) — a REVOKE from an unbound number stops nothing and cannot touch a
+/// victim's grants.
+///
+/// The anti-DoS core over the wire: the sweep resolves the sender to a live
+/// binding, so a number bound to no one is a `403` that sweeps nothing. Lucy's
+/// grant, from her own bound number, still authorizes after. This fails an impl
+/// that swept on the forgeable `claimed_sender` without resolving it — the exact
+/// hole the first ADR-026 draft had.
+#[test]
+fn a_revoke_from_an_unbound_number_stops_nothing() {
+    let lane = lane();
+    bind_lucy(&lane);
+    let client = http();
+
+    let reference = approve(&client, &lane.url, "BKG-VICTIM", "reply-1");
+
+    let refused = post_revocation(&client, &lane.url, "+447700900999", "forged-1");
+    assert_eq!(
+        refused.status().as_u16(),
+        403,
+        "an unbound number resolves to no binding — it may sweep nothing"
+    );
+
+    // The victim's grant, from her OWN bound number, still authorizes a change.
+    let still = client
+        .post(format!("{}/booking-intents", lane.url))
+        .header("authorization", AGENT)
+        .header("x-bld-principal", "lucy")
+        .header("x-bld-delegation", &reference)
+        .json(&create_body("BKG-VICTIM"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        still.status().as_u16(),
+        201,
+        "the forged REVOKE left the victim's grant untouched"
+    );
+}
+
 fn create_body(id: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,

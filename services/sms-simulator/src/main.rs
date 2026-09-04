@@ -137,6 +137,34 @@ impl ApprovalPort for HttpApprovals {
             other => Err(ApprovalError::Transport(format!("reply: {other}"))),
         }
     }
+
+    async fn revoke_via_receipt(&self, evidence: &InboundEvidence) -> Result<u32, ApprovalError> {
+        let response = self
+            .http
+            .post(format!("{}/revocations", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&serde_json::json!({
+                "provider": evidence.provider,
+                "account": evidence.account,
+                "message_id": evidence.message_id,
+                "address": evidence.address,
+                "verified": evidence.verified,
+                "signature": evidence.signature,
+            }))
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status().as_u16() {
+            200 => Ok(count(&json(response).await?, "revoked")),
+            // Unbound or forged sender (WrongChannel): the server recorded the
+            // distinct 403 denial and swept nothing, so the victim's grants are
+            // untouched. The SMS surface collapses it to "0 stopped" — a texter
+            // must not be able to learn which numbers are bound by watching the
+            // reply's wording (ADR-022's anti-enumeration reasoning).
+            403 => Ok(0),
+            other => Err(ApprovalError::Transport(format!("revoke: {other}"))),
+        }
+    }
 }
 
 /// Deposits an inbound reply's evidence at the ingress endpoint, holding the
@@ -192,6 +220,12 @@ async fn json(response: reqwest::Response) -> Result<serde_json::Value, Approval
 
 fn field(body: &serde_json::Value, key: &str) -> String {
     body[key].as_str().unwrap_or_default().to_owned()
+}
+
+/// A non-negative integer field, read as a `u32` — the revoke count. `0` when
+/// the key is absent or not a number, which reads as "nothing stopped".
+fn count(body: &serde_json::Value, key: &str) -> u32 {
+    u32::try_from(body[key].as_u64().unwrap_or(0)).unwrap_or(u32::MAX)
 }
 
 /// The first run of ASCII digits in `text`, as a `u8` — how many tries remain,

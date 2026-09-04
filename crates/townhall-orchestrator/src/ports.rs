@@ -276,6 +276,18 @@ pub trait ApprovalPort: Send + Sync {
         code: &str,
         receipt: &str,
     ) -> Result<Option<String>, ApprovalError>;
+
+    /// Revoke EVERY live grant the channel this inbound proves may authorize —
+    /// the bulk safety exit behind a texted REVOKE. Returns the count stopped.
+    ///
+    /// No challenge and no grant reference: the authority resolves the sender to
+    /// a binding and sweeps by grantor, all inside the server (ADR-026). The
+    /// receipt never reaches this crate. Idempotent — a re-sent REVOKE returns
+    /// the count still stopped, never an error.
+    ///
+    /// # Errors
+    /// The sender resolves to no live binding, or the transport failed.
+    async fn revoke_via_receipt(&self, evidence: &InboundEvidence) -> Result<u32, ApprovalError>;
 }
 
 /// Where parked and approved bookings wait durably — the approve-first analogue

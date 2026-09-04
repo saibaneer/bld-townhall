@@ -712,6 +712,46 @@ async fn b15_conversations_do_not_bleed_across_principals() {
     assert!(priya_cancel.contains("Cancelled"), "{priya_cancel}");
 }
 
+// ------------------------------------------------------------------ B16
+
+/// A texted REVOKE, end to end, is anti-enumerating — and names its true count.
+///
+/// This drives the WHOLE path: dispatcher → real `HttpApprovals` → real server →
+/// real sweep. It is the only witness that exercises the adapter's `403 → Ok(0)`
+/// collapse against a LIVE 403 (a stub cannot produce one). The property under
+/// test is the dispatcher's own claim: an UNBOUND sender and a BOUND sender with
+/// nothing live must get the identical reply, so a texter cannot learn which
+/// numbers the system knows by watching the wording.
+#[tokio::test]
+async fn b16_revoke_is_anti_enumerating_end_to_end() {
+    let world = world_real();
+    let talk = talk(&world, &world.server_url);
+
+    // Lucy books and approves — one live grant — then REVOKEs. The real count,
+    // through the real sweep.
+    talk.book_and_approve(LUCY_PHONE).await;
+    let stopped = talk.say(LUCY_PHONE, "REVOKE").await;
+    assert!(
+        stopped.contains("Stopped 1 approval"),
+        "a real REVOKE names the true count the server swept: {stopped}"
+    );
+
+    // Priya is BOUND but holds no grant; +447700900999 is bound to no one. The
+    // server answers the first with Ok(0) and the second with a 403 that the
+    // adapter collapses to Ok(0) — and the two replies must be identical.
+    let bound_but_empty = talk.say(PRIYA_PHONE, "REVOKE").await;
+    let unbound = talk.say("+447700900999", "REVOKE").await;
+    assert_eq!(
+        bound_but_empty, unbound,
+        "bound-with-nothing and unbound must read identically — the reply leaks \
+         no binding status (unbound {unbound:?} vs bound-empty {bound_but_empty:?})"
+    );
+    assert!(
+        unbound.contains("no active approvals to stop"),
+        "and both say there is nothing to stop: {unbound}"
+    );
+}
+
 // ------------------------------------------------------------------ helpers
 
 /// The council reference out of a "Booked. Council ref X." outcome.

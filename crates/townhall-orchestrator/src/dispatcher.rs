@@ -205,8 +205,17 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
 
         // 1. Channel controls — answered from ports, before ANYTHING else.
         //    (§15.1: "handled deterministically before invoking the LLM".)
+        //
+        //    REVOKE is the one control that reaches the authority, so it alone is
+        //    async; it still runs HERE, before identity resolution, so it builds
+        //    no principal, no token and no Wires — the "no grant" property it
+        //    shares with STOP. Its authority is the transport evidence, not a
+        //    resolved identity. The other four stay on the zero-await path.
         if let Command::Control(control) = classify(message.body.revealed()) {
-            let text = self.answer_control(control, &message);
+            let text = match control {
+                ControlCommand::Revoke => self.revoke_all(&message).await,
+                other => self.answer_control(other, &message),
+            };
             self.reply(&message.address, text).await;
             return Ok(());
         }
@@ -341,9 +350,37 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 Ok(()) => "Resumed. I'll pick up anything that was owed.".to_owned(),
                 Err(_) => "I couldn't make that stick — reply START to try again.".to_owned(),
             },
+            // REVOKE crosses into the authority, so it is answered by the async
+            // `revoke_all` in the control lane above, never here.
             ControlCommand::Revoke => {
-                "Delegations arrive with M7; there is nothing to revoke yet.".to_owned()
+                unreachable!("REVOKE is handled by revoke_all in the async control lane")
             }
+        }
+    }
+
+    /// Answer a texted REVOKE: stop EVERY live grant the sender authorized.
+    ///
+    /// Runs in the control lane, before identity resolution — it builds no
+    /// principal, no token and no Wires. The authority is the transport evidence
+    /// (the identity triple the carrier set), forwarded to the server, which
+    /// resolves the sender to a binding and sweeps by grantor. The receipt never
+    /// reaches this crate.
+    ///
+    /// An unbound or forged sender comes back as `Ok(0)` (the port collapses the
+    /// server's `WrongChannel` denial), so the reply is the SAME as "bound,
+    /// nothing live" — a texter cannot learn which numbers are known by the
+    /// wording.
+    async fn revoke_all(&self, message: &InboundMessage) -> String {
+        match self
+            .approvals
+            .revoke_via_receipt(&inbound_evidence(message))
+            .await
+        {
+            Ok(0) => "You have no active approvals to stop.".to_owned(),
+            Ok(n) => {
+                format!("Stopped {n} approval(s). I won't make a new booking on your behalf.")
+            }
+            Err(error) => approval_error_text(&error),
         }
     }
 

@@ -633,6 +633,78 @@ impl ApprovalStore for SqlApprovalStore {
         Ok(affected == 1)
     }
 
+    async fn revoke_all_by_grantor_with_receipt(
+        &self,
+        grantor: &PrincipalId,
+        receipt: &EvidenceReceiptId,
+        at_ms: u64,
+    ) -> Result<u64, AuthorityStoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| unavailable(&error))?;
+
+        // (i) Spend the receipt under the same one-use guard `settle_with_grant`
+        // uses, PLUS `challenge_id IS NULL`. A receipt already consumed matches no
+        // row: the sweep is skipped and the call returns Ok(0). That is the
+        // idempotency of a re-sent REVOKE — a safety exit (spec §2) that must
+        // never error on a replay — and the replay defence, in one guard.
+        //
+        // The `challenge_id IS NULL` clause is the anti-lever guard made
+        // STRUCTURAL: a challenge-bound `YES` receipt matches no row here, so this
+        // statement is physically incapable of consuming one to drive a sweep —
+        // even if the service-layer check (`revoke_via_receipt`) were removed or
+        // reordered. The dangerous direction (a £45-YES becoming "stop everything")
+        // is defended at the mutation, not only one layer above it.
+        let spent = sqlx::query(
+            r"
+            UPDATE inbound_evidence
+            SET consumed_at_ms = ?
+            WHERE receipt = ? AND consumed_at_ms IS NULL AND challenge_id IS NULL
+            ",
+        )
+        .bind(as_i64(at_ms))
+        .bind(receipt.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if spent == 0 {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| unavailable(&error))?;
+            return Ok(0);
+        }
+
+        // (ii) Sweep by grantor — `revoke_delegation`'s idempotency guard with
+        // `id = ?` widened to `grantor = ?`, so it revokes EVERY live grant this
+        // principal authorized in one statement. Unlike the single revoke, the
+        // full `rows_affected()` is the answer, not an `== 1` — the count is how
+        // many grants were stopped.
+        let revoked = sqlx::query(
+            r"
+            UPDATE delegations
+            SET revoked_at_ms = ?
+            WHERE grantor = ? AND revoked_at_ms IS NULL
+            ",
+        )
+        .bind(as_i64(at_ms))
+        .bind(grantor.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| unavailable(&error))?;
+        Ok(revoked)
+    }
+
     async fn write_inbound_evidence(
         &self,
         receipt: &EvidenceReceiptId,
@@ -678,6 +750,69 @@ impl ApprovalStore for SqlApprovalStore {
 
         // Redelivery: return the receipt the first deposit minted, not the one
         // offered now.
+        let row = sqlx::query(
+            r"
+            SELECT receipt FROM inbound_evidence
+            WHERE provider = ? AND provider_account = ? AND provider_message_id = ?
+            ",
+        )
+        .bind(&evidence.provider)
+        .bind(&evidence.provider_account)
+        .bind(&evidence.provider_message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?;
+        Ok(EvidenceReceipt {
+            receipt: EvidenceReceiptId::new(
+                row.try_get::<String, _>("receipt")
+                    .map_err(|error| row_error(&error))?,
+            ),
+            fresh: false,
+        })
+    }
+
+    async fn write_control_evidence(
+        &self,
+        receipt: &EvidenceReceiptId,
+        evidence: &InboundEvidenceRecord,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<EvidenceReceipt, AuthorityStoreError> {
+        // `write_inbound_evidence` verbatim, except the `challenge_id` bind is a
+        // literal NULL: a control inbound answers no challenge. The DDL column is
+        // nullable; this is the only write that leaves it so. Same identity-triple
+        // `DO NOTHING`, same redelivery SELECT-back.
+        let inserted = sqlx::query(
+            r"
+            INSERT INTO inbound_evidence
+                (receipt, provider, provider_account, provider_message_id,
+                 claimed_sender, verified, signature, challenge_id,
+                 consumed_at_ms, created_at_ms, expires_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(provider, provider_account, provider_message_id) DO NOTHING
+            ",
+        )
+        .bind(receipt.as_str())
+        .bind(&evidence.provider)
+        .bind(&evidence.provider_account)
+        .bind(&evidence.provider_message_id)
+        .bind(&evidence.claimed_sender)
+        .bind(i64::from(evidence.verified))
+        .bind(evidence.signature.as_deref())
+        .bind(as_i64(now_ms))
+        .bind(as_i64(expires_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| unavailable(&error))?
+        .rows_affected();
+
+        if inserted == 1 {
+            return Ok(EvidenceReceipt {
+                receipt: receipt.clone(),
+                fresh: true,
+            });
+        }
+
         let row = sqlx::query(
             r"
             SELECT receipt FROM inbound_evidence

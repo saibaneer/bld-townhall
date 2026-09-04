@@ -382,6 +382,38 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
         Ok((challenge, deposited.receipt))
     }
 
+    /// Deposit a CONTROL inbound's transport evidence under a one-use receipt,
+    /// answering NO challenge — the deposit half of a REVOKE.
+    ///
+    /// Unlike [`Self::deposit_evidence`], there is no awaiting challenge to
+    /// correlate to; the authority is the live BINDING itself. So the guard is
+    /// only that the sender resolves to a bound channel — an unbound number
+    /// cannot land an unanchored control row and cannot revoke anything. The
+    /// row's `challenge_id` is NULL, which is exactly what [`Self::revoke_via_receipt`]
+    /// requires: a challenge-bound `YES` receipt must not double as a revoke-all
+    /// lever.
+    ///
+    /// # Errors
+    /// The sender is not bound ([`ApprovalDenied::WrongChannel`]), or the store is
+    /// unreachable.
+    pub async fn deposit_control_evidence(
+        &self,
+        address: &str,
+        evidence: &InboundEvidenceRecord,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<EvidenceReceiptId, ApprovalDenied> {
+        if self.store.live_binding_by_address(address).await?.is_none() {
+            return Err(ApprovalDenied::WrongChannel);
+        }
+        let receipt = EvidenceReceiptId::new(self.entropy.identifier());
+        let deposited = self
+            .store
+            .write_control_evidence(&receipt, evidence, now_ms, now_ms.saturating_add(ttl_ms))
+            .await?;
+        Ok(deposited.receipt)
+    }
+
     /// Answer `YES`: steps 4 to 6 of §13.1, and the only route to a grant.
     ///
     /// # The order of the checks, and why
@@ -656,5 +688,61 @@ impl<S: ApprovalStore, E: Entropy> AuthorityService<S, E> {
     /// The store could not be reached.
     pub async fn revoke(&self, id: &DelegationId, now_ms: u64) -> Result<bool, StoreError> {
         self.store.revoke_delegation(id, now_ms).await
+    }
+
+    /// Revoke EVERY live grant the sender authorized, proven by a deposited
+    /// control receipt. The bulk safety exit behind a texted REVOKE.
+    ///
+    /// # The order of the checks, and why each is its own denial
+    ///
+    /// 1. **Unknown receipt** — the receipt names no row. The receipt is the only
+    ///    thing tying this call to a real inbound; one that names nothing is
+    ///    refused before anything is read.
+    /// 2. **Receipt challenge mismatch** — the receipt IS real, but it is bound to
+    ///    a challenge (a `YES`). A challenge-bound receipt must never become a
+    ///    lever to revoke everything: a person's answer to their £45 cannot be
+    ///    turned into "stop all of Lucy's grants". Only a NULL-challenge control
+    ///    row may drive a sweep.
+    /// 3. **Wrong channel** — the sender resolves to no live binding. An unbound
+    ///    number authorized nothing and revokes nothing; refused distinctly so
+    ///    the denial is attributable, not folded into a silent `Ok(0)`.
+    /// 4. **Sweep** — revoke everything the resolved principal (the grantor)
+    ///    authorized, spending the receipt in the same transaction. A bound
+    ///    sender with nothing live returns `Ok(0)`, as does a replayed receipt.
+    ///
+    /// # Errors
+    /// One [`ApprovalDenied`] per check above, or the store is unreachable.
+    pub async fn revoke_via_receipt(
+        &self,
+        receipt: &EvidenceReceiptId,
+        now_ms: u64,
+    ) -> Result<u64, ApprovalDenied> {
+        let evidence = self
+            .store
+            .load_evidence_by_receipt(receipt)
+            .await?
+            .ok_or(ApprovalDenied::UnknownReceipt)?;
+        if evidence.challenge_id.is_some() {
+            return Err(ApprovalDenied::ReceiptChallengeMismatch);
+        }
+        let bound = self
+            .store
+            .live_binding_by_address(&evidence.claimed_sender)
+            .await?
+            .ok_or(ApprovalDenied::WrongChannel)?;
+        // The sweep key is the resolved BINDING's principal, and it sweeps by
+        // `grantor`. This rests on a stated invariant: a grant's `grantor` is the
+        // channel owner who authorized it. For M7C's own-behalf bookings the
+        // dispatcher sets grantor = subject = binding-principal, so the two
+        // resolvers (the orchestrator's directory at BOOK time, the authority's
+        // channel_bindings here) name the same principal. The moment a true
+        // DELEGATED booking exists (grantor ≠ phone owner), "revoke by grantor"
+        // must be a deliberate choice again — see ADR-026's REVOKE record. Under-
+        // revoke is the dangerous direction, so this equality is load-bearing.
+        let revoked = self
+            .store
+            .revoke_all_by_grantor_with_receipt(&bound.reference.principal, receipt, now_ms)
+            .await?;
+        Ok(revoked)
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use townhall_channel::{ChannelAddress, ChannelConfig, Region, SmsSimulator, SuppressionStore};
 use townhall_orchestrator::{
     ContinuationStore, CredentialSource, Dispatcher, FileContinuation, FileSuppression,
-    GatewayFactory, NoLedgerYet, PrincipalDirectory, ScriptedProposer, journey,
+    GatewayFactory, PrincipalDirectory, ScriptedProposer, UnmeteredLedger, journey,
 };
 use townhall_testkit::{RecordingProxy, WORKLOAD, council_count, world_real};
 
@@ -71,7 +71,7 @@ fn dispatcher_at(
         Arc::clone(&channel),
         Arc::new(DevDirectory),
         Arc::new(WorkloadCredential),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(GatewayFactory {

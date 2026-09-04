@@ -24,6 +24,7 @@ use std::sync::Arc;
 use council_client::{CouncilClient, CouncilVerifier};
 use council_wire::CouncilKey;
 mod authority;
+mod usage;
 
 use authority::{OsEntropy, RealAuthority};
 use townhall_authority::AuthorityService;
@@ -643,7 +644,27 @@ async fn main() -> ExitCode {
             issuer: Arc::new(authority::ServiceIssuer(issuer)),
             authority: Arc::clone(&authority),
         });
-    let router = townhall_http::router(ServerState { api, authority }).merge(approvals);
+    // The usage meter (M8, ADR-027), over the SAME pool as bookings and the
+    // authority rows. Its binding resolver is a second handle to the approval
+    // store, so a metered turn resolves to the same principal the approval plane
+    // would — one identity, both planes.
+    let usage_routes = townhall_http::usage::usage_router(townhall_http::usage::UsageState {
+        meter: Arc::new(usage::ServiceMeter {
+            usage: Arc::new(townhall_usage::UsageService::new(
+                Arc::new(townhall_store::usage::SqlUsageStore::new(
+                    repository.pool().clone(),
+                )),
+                townhall_usage::UsagePolicy::default(),
+            )),
+            bindings: Arc::new(townhall_store::authority::SqlApprovalStore::new(
+                repository.pool().clone(),
+            )),
+        }),
+        authority: Arc::clone(&authority),
+    });
+    let router = townhall_http::router(ServerState { api, authority })
+        .merge(approvals)
+        .merge(usage_routes);
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(error) => {

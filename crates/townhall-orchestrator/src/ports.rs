@@ -33,22 +33,58 @@ pub trait CredentialSource: Send + Sync {
     fn token_for(&self, principal: &PrincipalId) -> Option<String>;
 }
 
-/// What BALANCE answers.
+/// The zero-price usage meter, as the dispatcher reaches it (M8, ADR-027).
 ///
-/// Deliberately no debit method: zero-cost safety commands are structural here,
-/// not remembered. M8's ledger implements this with real numbers; M6's honest
-/// answer is that there are none yet.
-pub trait UsageBalance: Send + Sync {
-    fn describe(&self, principal: &PrincipalId) -> String;
+/// Every method takes the inbound's transport EVIDENCE — never a principal or a
+/// unit count. The server derives the principal (resolving the sender to a live
+/// binding), the intent (from the transport triple) and the unit cost (from its
+/// own `PricingSchedule`), so a compromised dispatcher can meter only turns it
+/// can present transport evidence for. This is the `/revocations` anti-forgery
+/// property, applied to the meter: the caller names nothing load-bearing. A unit
+/// is £0 and grants no authority.
+///
+/// `reserve` is the quota gate and runs BEFORE the proposer; `debit` settles a
+/// turn that produced a chargeable request; `release` rescinds — on an unclear
+/// turn, a failure before consumption, or a turn the proposer resolved to a
+/// zero-unit action (a cancellation, §16.2). `debit`/`release` are best-effort
+/// and idempotent, so they return nothing.
+#[async_trait]
+pub trait UsageLedger: Send + Sync {
+    /// # Errors
+    /// [`UsageDenied::QuotaExhausted`] (a typed denial, surfaced before the model
+    /// turn) or a transport failure.
+    async fn reserve(&self, evidence: &InboundEvidence) -> Result<(), UsageDenied>;
+    async fn debit(&self, evidence: &InboundEvidence);
+    async fn release(&self, evidence: &InboundEvidence);
+    /// The account's balance as a person-facing line — a zero-unit read (BALANCE).
+    async fn describe_balance(&self, evidence: &InboundEvidence) -> String;
 }
 
-/// M6's balance: no ledger exists, and inventing a number a person could act on
-/// would be worse than saying so.
-#[derive(Debug, Default)]
-pub struct NoLedgerYet;
+/// Why a metered turn was refused before it ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsageDenied {
+    /// The account is out of quota. The person is told, and the turn does not run.
+    QuotaExhausted,
+    /// The meter could not be reached — not a denial, a call that got no answer,
+    /// which must not read as "quota spent".
+    Transport(String),
+}
 
-impl UsageBalance for NoLedgerYet {
-    fn describe(&self, _principal: &PrincipalId) -> String {
+/// The no-metering fallback: reserves always succeed, nothing is charged, and
+/// BALANCE says accounting is not enabled here. It keeps the M6 scripts and the
+/// tests that do not exercise quota unchanged, while the composition root wires
+/// the real `HttpUsage` for the demo.
+#[derive(Debug, Default)]
+pub struct UnmeteredLedger;
+
+#[async_trait]
+impl UsageLedger for UnmeteredLedger {
+    async fn reserve(&self, _evidence: &InboundEvidence) -> Result<(), UsageDenied> {
+        Ok(())
+    }
+    async fn debit(&self, _evidence: &InboundEvidence) {}
+    async fn release(&self, _evidence: &InboundEvidence) {}
+    async fn describe_balance(&self, _evidence: &InboundEvidence) -> String {
         "Balance unavailable until usage accounting is enabled. This command costs zero.".to_owned()
     }
 }

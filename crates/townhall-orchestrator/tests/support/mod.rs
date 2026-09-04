@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use townhall_orchestrator::{
     ApprovalError, ApprovalPort, BeginApproval, Continuation, ContinuationStore, Deposited,
-    EvidenceDeposit, InboundEvidence, Raised,
+    EvidenceDeposit, InboundEvidence, Raised, UsageDenied, UsageLedger,
 };
 
 /// The in-memory analogue of `FileContinuation` — same load/record/clear/resume
@@ -323,6 +323,82 @@ impl EvidenceDeposit for HttpEvidence {
                 response.text().await.unwrap_or_default(),
             )),
             other => Err(ApprovalError::Transport(format!("deposit: {other}"))),
+        }
+    }
+}
+
+/// The REAL usage meter over HTTP — the same shape the sms-simulator wires, so
+/// the conversation tests exercise real metering against a live server.
+pub struct HttpUsage {
+    pub base: String,
+    pub http: reqwest::Client,
+}
+
+impl HttpUsage {
+    #[must_use]
+    pub fn new(base: &str) -> Self {
+        Self {
+            base: base.to_owned(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn body(evidence: &InboundEvidence) -> serde_json::Value {
+        serde_json::json!({
+            "provider": evidence.provider,
+            "account": evidence.account,
+            "message_id": evidence.message_id,
+            "address": evidence.address,
+            "verified": evidence.verified,
+            "signature": evidence.signature,
+        })
+    }
+
+    async fn post(
+        &self,
+        path: &str,
+        evidence: &InboundEvidence,
+    ) -> Result<reqwest::Response, String> {
+        self.http
+            .post(format!("{}{path}", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&Self::body(evidence))
+            .send()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl UsageLedger for HttpUsage {
+    async fn reserve(&self, evidence: &InboundEvidence) -> Result<(), UsageDenied> {
+        let response = self
+            .post("/usage/reserve", evidence)
+            .await
+            .map_err(UsageDenied::Transport)?;
+        match response.status().as_u16() {
+            200 => Ok(()),
+            429 => Err(UsageDenied::QuotaExhausted),
+            other => Err(UsageDenied::Transport(format!("reserve: {other}"))),
+        }
+    }
+    async fn debit(&self, evidence: &InboundEvidence) {
+        let _ = self.post("/usage/debit", evidence).await;
+    }
+    async fn release(&self, evidence: &InboundEvidence) {
+        let _ = self.post("/usage/release", evidence).await;
+    }
+    async fn describe_balance(&self, evidence: &InboundEvidence) -> String {
+        match self.post("/usage/balance", evidence).await {
+            Ok(response) if response.status().is_success() => {
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                let remaining = body["remaining"].as_i64().unwrap_or(0);
+                let limit = body["limit"].as_i64().unwrap_or(0);
+                format!(
+                    "You have {remaining} of {limit} usage units left. This command costs nothing."
+                )
+            }
+            _ => "Balance unavailable right now. This command costs nothing.".to_owned(),
         }
     }
 }

@@ -37,6 +37,7 @@ use townhall_service::{
 
 pub mod approvals;
 pub mod mapping;
+pub mod usage;
 
 /// The two decisions every request needs, and they are not the same decision.
 ///

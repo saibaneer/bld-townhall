@@ -19,6 +19,7 @@ use thiserror::Error;
 
 pub mod authority;
 pub mod denials;
+pub mod usage;
 use townhall_domain::{
     Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
     IncoherentBooking, IncoherentIntent, OperationKind,

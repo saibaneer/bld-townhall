@@ -30,8 +30,8 @@ pub use dispatcher::Dispatcher;
 pub use ports::{
     ApprovalError, ApprovalPort, BeginApproval, BookingRequest, BookingWire, CandidateSummary,
     Continuation, ContinuationStore, CredentialSource, Deposited, EvidenceDeposit, GatewayFactory,
-    InboundEvidence, NoLedgerYet, PendingSummary, PrincipalDirectory, ProjectedContext, Proposed,
-    Proposer, Raised, Request, UsageBalance, WireFactory,
+    InboundEvidence, PendingSummary, PrincipalDirectory, ProjectedContext, Proposed, Proposer,
+    Raised, Request, UnmeteredLedger, UsageDenied, UsageLedger, WireFactory,
 };
 pub use scripted::ScriptedProposer;
 pub use suppression::FileSuppression;

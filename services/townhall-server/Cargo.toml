@@ -19,10 +19,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
+townhall-channel = { path = "../../crates/townhall-channel" }
 townhall-domain = { path = "../../crates/townhall-domain" }
 townhall-http = { path = "../../crates/townhall-http" }
 townhall-service = { path = "../../crates/townhall-service" }
 townhall-store = { path = "../../crates/townhall-store" }
+townhall-usage = { path = "../../crates/townhall-usage" }
 bld-types = { path = "../../crates/bld-types" }
 
 [features]

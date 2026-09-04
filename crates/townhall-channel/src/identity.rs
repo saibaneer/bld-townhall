@@ -1,6 +1,6 @@
 //! One definition of "the same message", used everywhere it matters.
 
-use bld_types::BookingId;
+use bld_types::{BookingId, UsageIntentId};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -65,6 +65,42 @@ impl InboundIdentity {
     /// concealment as a backstop, even though it would hold.
     #[must_use]
     pub fn booking_id(&self) -> BookingId {
+        BookingId::new(format!("sms-{}", self.digest16_hex()))
+    }
+
+    /// The usage intent id this message deterministically names (ADR-027).
+    ///
+    /// The SAME discipline as [`Self::booking_id`], one meter out: the message is
+    /// the intent, so it names the metered turn. A carrier redelivery — even
+    /// after a restart has emptied the replay window — derives the same id, and
+    /// the ledger's unique index on the settling `Debit` per intent collapses the
+    /// retry to one charge (§16.2: "the same `UsageIntentId` cannot be metered
+    /// twice"). It is the cross-restart backstop the in-memory replay window
+    /// cannot be, exactly as `booking_id` backstops `create`.
+    ///
+    /// A distinct `usage-` prefix over the same digest so a message's booking id
+    /// and its usage intent id are never confusable, even though both are derived
+    /// from one identity.
+    #[must_use]
+    pub fn usage_intent_id(&self) -> UsageIntentId {
+        UsageIntentId::new(format!("usage-{}", self.digest16_hex()))
+    }
+
+    /// 16 bytes of a length-prefixed SHA-256 over the identity triple, as hex —
+    /// the shared core of every id this message derives.
+    ///
+    /// # Why length-prefixed, and why a real digest
+    ///
+    /// The components are provider-controlled text, so two rules hold. First,
+    /// fields are length-prefixed into the hash — naive joining with a delimiter
+    /// is not injective when a field may contain the delimiter, and
+    /// `("a\u{1f}b", "c")` colliding with `("a", "b\u{1f}c")` would let one
+    /// message shadow another. Second, SHA-256 rather than something fast and
+    /// forgeable: collision resistance here should not lean on M5.1's ownership
+    /// concealment as a backstop, even though it would hold. 16 bytes of a
+    /// 256-bit digest is collision-safe at any plausible scale and short enough
+    /// to live in a URL path without dominating it.
+    fn digest16_hex(&self) -> String {
         let mut hasher = Sha256::new();
         for part in [
             &self.provider,
@@ -75,15 +111,12 @@ impl InboundIdentity {
             hasher.update(part.as_bytes());
         }
         let digest = hasher.finalize();
-        // 16 bytes of a 256-bit digest: collision-safe at any plausible scale,
-        // and short enough to live in a URL path without dominating it.
-        let hex = digest[..16]
+        digest[..16]
             .iter()
             .fold(String::with_capacity(32), |mut hex, byte| {
                 let _ = write!(hex, "{byte:02x}");
                 hex
-            });
-        BookingId::new(format!("sms-{hex}"))
+            })
     }
 }
 

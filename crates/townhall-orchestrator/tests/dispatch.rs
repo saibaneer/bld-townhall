@@ -15,9 +15,9 @@ use townhall_channel::{
 };
 use townhall_gateway::{GatewayError, Projection, Turn, VenueRow};
 use townhall_orchestrator::{
-    BookingRequest, BookingWire, Continuation, CredentialSource, Dispatcher, NoLedgerYet,
+    BookingRequest, BookingWire, Continuation, CredentialSource, Dispatcher, InboundEvidence,
     PrincipalDirectory, ProjectedContext, Proposed, Proposer, Request, ScriptedProposer,
-    UsageBalance, WireFactory,
+    UnmeteredLedger, UsageDenied, UsageLedger, WireFactory,
 };
 
 #[path = "support/mod.rs"]
@@ -193,16 +193,28 @@ impl WireFactory for PanickingFactory {
     }
 }
 
-/// A balance port that counts and answers a nonsense sentinel a hardcoded
-/// string could not reproduce.
+/// A usage ledger that counts both the balance reads and the reserves, and
+/// answers BALANCE with a nonsense sentinel a hardcoded string could not
+/// reproduce. The reserve counter is the witness that a control command spends
+/// no unit.
 #[derive(Default)]
-struct SentinelBalance(AtomicUsize);
+struct SentinelLedger {
+    describes: AtomicUsize,
+    reserves: AtomicUsize,
+}
 
 const BALANCE_SENTINEL: &str = "UNMETERED-SENTINEL-7f3a";
 
-impl UsageBalance for SentinelBalance {
-    fn describe(&self, _: &PrincipalId) -> String {
-        self.0.fetch_add(1, Ordering::SeqCst);
+#[async_trait]
+impl UsageLedger for SentinelLedger {
+    async fn reserve(&self, _evidence: &InboundEvidence) -> Result<(), UsageDenied> {
+        self.reserves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn debit(&self, _evidence: &InboundEvidence) {}
+    async fn release(&self, _evidence: &InboundEvidence) {}
+    async fn describe_balance(&self, _evidence: &InboundEvidence) -> String {
+        self.describes.fetch_add(1, Ordering::SeqCst);
         BALANCE_SENTINEL.to_owned()
     }
 }
@@ -213,7 +225,7 @@ struct Bench {
     dispatcher: Dispatcher<SmsSimulator>,
     channel: Arc<SmsSimulator>,
     wire: Arc<CountingWire>,
-    balance: Arc<SentinelBalance>,
+    ledger: Arc<SentinelLedger>,
     proposer_calls: Option<Arc<UnclearProposer>>,
     counter: AtomicUsize,
 }
@@ -225,7 +237,7 @@ fn bench(proposer: &ProposerChoice) -> Bench {
         Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
     ));
     let wire = Arc::new(CountingWire::default());
-    let balance = Arc::new(SentinelBalance::default());
+    let ledger = Arc::new(SentinelLedger::default());
     let (proposer_arc, proposer_calls): (Arc<dyn Proposer>, Option<Arc<UnclearProposer>>) =
         match proposer {
             ProposerChoice::Panicking => (Arc::new(PanickingProposer), None),
@@ -239,7 +251,7 @@ fn bench(proposer: &ProposerChoice) -> Bench {
         Arc::clone(&channel),
         Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
         Arc::new(FixedCredentials),
-        Arc::clone(&balance) as Arc<dyn UsageBalance>,
+        Arc::clone(&ledger) as Arc<dyn UsageLedger>,
         proposer_arc,
         suppression,
         Arc::new(FixedWireFactory(Arc::clone(&wire))),
@@ -251,7 +263,7 @@ fn bench(proposer: &ProposerChoice) -> Bench {
         dispatcher,
         channel,
         wire,
-        balance,
+        ledger,
         proposer_calls,
         counter: AtomicUsize::new(0),
     }
@@ -305,7 +317,7 @@ async fn b11_control_commands_reach_nothing() {
         Arc::clone(&channel),
         Arc::new(PanickingDirectory),
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(PanickingProposer),
         suppression,
         Arc::new(PanickingFactory),
@@ -378,7 +390,7 @@ async fn a_revoke_names_the_count_and_builds_no_identity() {
         Arc::clone(&channel),
         Arc::new(PanickingDirectory),
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(PanickingProposer),
         suppression,
         Arc::new(PanickingFactory),
@@ -425,7 +437,7 @@ async fn b12_balance_consults_the_port_and_answers_honestly() {
         .await
         .expect("handled");
     assert!(bench.last_reply().contains(BALANCE_SENTINEL));
-    assert_eq!(bench.balance.0.load(Ordering::SeqCst), 1);
+    assert_eq!(bench.ledger.describes.load(Ordering::SeqCst), 1);
 
     // HELP and STOP must not spend a balance question.
     for text in ["HELP", "STOP", "START"] {
@@ -436,9 +448,16 @@ async fn b12_balance_consults_the_port_and_answers_honestly() {
             .expect("handled");
     }
     assert_eq!(
-        bench.balance.0.load(Ordering::SeqCst),
+        bench.ledger.describes.load(Ordering::SeqCst),
         1,
-        "only BALANCE may consult the balance port"
+        "only BALANCE may consult the balance read"
+    );
+    // And the zero-unit property, witnessed directly: not one of these control
+    // commands reserved a usage unit.
+    assert_eq!(
+        bench.ledger.reserves.load(Ordering::SeqCst),
+        0,
+        "a safety exit must never reserve a unit — it cannot be paywalled"
     );
     // And no digit-only invention: the sentinel is not a number.
     assert!(!bench.last_reply().chars().all(|c| c.is_ascii_digit()));
@@ -462,7 +481,7 @@ async fn b9_an_unbound_address_is_refused_before_any_wire_call() {
         Arc::clone(&bench.channel),
         Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(PanickingProposer),
         Arc::new(InMemorySuppression::default()),
         Arc::new(FixedWireFactory(panicking)),
@@ -611,7 +630,7 @@ async fn a_failed_stop_is_reported_as_not_stopped() {
         Arc::clone(&channel),
         Arc::new(PanickingDirectory),
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(PanickingProposer),
         Arc::new(BrokenSuppression),
         Arc::new(PanickingFactory),
@@ -812,7 +831,7 @@ async fn a_drifted_binding_drops_the_followup_before_any_wire() {
         Arc::clone(&channel),
         Arc::clone(&directory) as Arc<dyn PrincipalDirectory>,
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(AcceptingFactory),
@@ -1021,7 +1040,7 @@ async fn w7_a_crash_between_yes_and_booked_resumes_and_books_once() {
         channel,
         Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
         Arc::new(FixedCredentials),
-        Arc::new(NoLedgerYet),
+        Arc::new(UnmeteredLedger),
         Arc::new(PanickingProposer),
         suppression,
         Arc::new(MockFactory(Arc::clone(&council))),

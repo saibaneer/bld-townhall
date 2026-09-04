@@ -2158,10 +2158,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "townhall-authority",
+ "townhall-channel",
  "townhall-domain",
  "townhall-http",
  "townhall-service",
  "townhall-store",
+ "townhall-usage",
 ]
 
 [[package]]
@@ -2194,6 +2196,7 @@ dependencies = [
  "tokio",
  "townhall-authority",
  "townhall-domain",
+ "townhall-usage",
 ]
 
 [[package]]
@@ -2206,6 +2209,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "townhall-authority",
+]
+
+[[package]]
+name = "townhall-usage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bld-types",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

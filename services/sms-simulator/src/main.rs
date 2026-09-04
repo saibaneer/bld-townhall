@@ -24,7 +24,8 @@ use townhall_channel::{ChannelAddress, ChannelConfig, Region, SmsSimulator, Supp
 use townhall_orchestrator::{
     ApprovalError, ApprovalPort, BeginApproval, ContinuationStore, CredentialSource, Deposited,
     Dispatcher, EvidenceDeposit, FileContinuation, FileSuppression, GatewayFactory,
-    InboundEvidence, NoLedgerYet, PrincipalDirectory, Raised, ScriptedProposer, journey,
+    InboundEvidence, PrincipalDirectory, Raised, ScriptedProposer, UsageDenied, UsageLedger,
+    journey,
 };
 
 /// The one workload credential the real resolver knows — a WORKLOAD, not a
@@ -209,6 +210,82 @@ impl EvidenceDeposit for HttpEvidence {
     }
 }
 
+/// The usage meter over HTTP (M8, ADR-027). Sends only the transport-evidence
+/// body; the server derives the principal, the intent and the unit cost.
+struct HttpUsage {
+    base: String,
+    http: reqwest::Client,
+}
+
+impl HttpUsage {
+    /// The transport-evidence body every `/usage/*` call carries — the same
+    /// triple `/inbound-evidence` and `/revocations` take.
+    fn body(evidence: &InboundEvidence) -> serde_json::Value {
+        serde_json::json!({
+            "provider": evidence.provider,
+            "account": evidence.account,
+            "message_id": evidence.message_id,
+            "address": evidence.address,
+            "verified": evidence.verified,
+            "signature": evidence.signature,
+        })
+    }
+
+    async fn post(
+        &self,
+        path: &str,
+        evidence: &InboundEvidence,
+    ) -> Result<reqwest::Response, String> {
+        self.http
+            .post(format!("{}{path}", self.base))
+            .header("authorization", format!("Bearer {WORKLOAD}"))
+            .json(&Self::body(evidence))
+            .send()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl UsageLedger for HttpUsage {
+    async fn reserve(&self, evidence: &InboundEvidence) -> Result<(), UsageDenied> {
+        let response = self
+            .post("/usage/reserve", evidence)
+            .await
+            .map_err(UsageDenied::Transport)?;
+        match response.status().as_u16() {
+            200 => Ok(()),
+            // 429: the quota is spent. A retry does not help until units free up.
+            429 => Err(UsageDenied::QuotaExhausted),
+            other => Err(UsageDenied::Transport(format!("reserve: {other}"))),
+        }
+    }
+
+    async fn debit(&self, evidence: &InboundEvidence) {
+        // Best-effort: a lost debit is recovered by the ledger's idempotency on a
+        // redelivery; there is nothing to do on a transport failure here.
+        let _ = self.post("/usage/debit", evidence).await;
+    }
+
+    async fn release(&self, evidence: &InboundEvidence) {
+        let _ = self.post("/usage/release", evidence).await;
+    }
+
+    async fn describe_balance(&self, evidence: &InboundEvidence) -> String {
+        match self.post("/usage/balance", evidence).await {
+            Ok(response) if response.status().is_success() => {
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                let remaining = body["remaining"].as_i64().unwrap_or(0);
+                let limit = body["limit"].as_i64().unwrap_or(0);
+                format!(
+                    "You have {remaining} of {limit} usage units left. This command costs nothing."
+                )
+            }
+            _ => "Balance unavailable right now. This command costs nothing.".to_owned(),
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn transport(error: reqwest::Error) -> ApprovalError {
     ApprovalError::Transport(error.to_string())
@@ -313,7 +390,10 @@ async fn main() -> ExitCode {
         Arc::clone(&channel),
         Arc::new(DevDirectory),
         Arc::new(WorkloadCredential),
-        Arc::new(NoLedgerYet),
+        Arc::new(HttpUsage {
+            base: server.clone(),
+            http: http.clone(),
+        }),
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(GatewayFactory {

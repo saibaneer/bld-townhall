@@ -18,6 +18,7 @@
 
 use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
+use townhall_usage::store::UsageStore as _; // for `open_account` in `seed_usage`
 
 const COUNCIL_KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
 const AUTHORITY_KEY_HEX: &str = "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
@@ -724,6 +725,140 @@ fn a_revoke_from_an_unbound_number_stops_nothing() {
         still.status().as_u16(),
         201,
         "the forged REVOKE left the victim's grant untouched"
+    );
+}
+
+/// Seed Lucy's usage account with a LOW quota through the store, so exhaustion is
+/// reachable without driving the default ceiling. The id matches what
+/// `UsageService` derives (`usage-<principal>`), and open is idempotent, so the
+/// server keeps this limit. Written on its own runtime thread, exactly as
+/// `bind_lucy` writes a binding.
+fn seed_usage(lane: &Lane, principal: &str, limit_units: i64) {
+    let db = lane.db.clone();
+    let principal = principal.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async move {
+                let repository = townhall_store::SqliteBookingRepository::open(&db)
+                    .await
+                    .expect("the same database the server opened");
+                let store = townhall_store::usage::SqlUsageStore::new(repository.pool().clone());
+                store
+                    .open_account(
+                        &bld_types::UsageAccountId::new(format!("usage-{principal}")),
+                        &bld_types::PrincipalId::new(principal.clone()),
+                        limit_units,
+                        1_700_000_000_000,
+                    )
+                    .await
+                    .expect("the account is opened");
+            });
+    })
+    .join()
+    .expect("the seed thread did not panic");
+}
+
+/// The transport-evidence body a `/usage/*` call carries. `msg` sets the intent,
+/// so distinct messages meter as distinct turns.
+fn usage_body(msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "provider": "sim",
+        "account": "townhall",
+        "message_id": msg,
+        "address": LUCY_ADDR,
+        "verified": true
+    })
+}
+
+/// A metered turn spends a unit; once the quota is spent, the next turn is a 429
+/// BEFORE any metered step — the gate's "exhausted quota blocks metered work",
+/// over the wire and server-derived (the caller names no principal, no units).
+#[test]
+fn a_usage_turn_meters_then_the_quota_is_exhausted() {
+    let lane = lane();
+    bind_lucy(&lane);
+    seed_usage(&lane, "lucy", 1);
+    let client = http();
+
+    let reserve = client
+        .post(format!("{}/usage/reserve", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-1"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        reserve.status().as_u16(),
+        200,
+        "the first turn fits the quota"
+    );
+    let debit = client
+        .post(format!("{}/usage/debit", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-1"))
+        .send()
+        .expect("answer");
+    assert_eq!(debit.status().as_u16(), 200);
+
+    // A distinct turn is refused — the one unit is spent.
+    let refused = client
+        .post(format!("{}/usage/reserve", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-2"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        refused.status().as_u16(),
+        429,
+        "an exhausted quota is a 429, before the metered step"
+    );
+
+    let balance: serde_json::Value = client
+        .post(format!("{}/usage/balance", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-2"))
+        .send()
+        .expect("answer")
+        .json()
+        .expect("json");
+    assert_eq!(balance["remaining"].as_i64(), Some(0), "nothing left");
+    assert_eq!(balance["limit"].as_i64(), Some(1));
+}
+
+/// Metering grants NO authority (§16): a fully metered turn does not let a change
+/// through — a booking mutation still needs a delegation a `YES` issued. A debit
+/// is a resource fact, never a permission.
+#[test]
+fn a_metered_turn_grants_no_authority() {
+    let lane = lane();
+    bind_lucy(&lane);
+    let client = http();
+
+    // A fully metered turn (auto-opens the account at the default quota).
+    for path in ["/usage/reserve", "/usage/debit"] {
+        let response = client
+            .post(format!("{}{path}", lane.url))
+            .header("authorization", AGENT)
+            .json(&usage_body("turn-1"))
+            .send()
+            .expect("answer");
+        assert_eq!(response.status().as_u16(), 200, "{path}");
+    }
+
+    // The change is still refused — the meter issued no grant.
+    let refused = client
+        .post(format!("{}/booking-intents", lane.url))
+        .header("authorization", AGENT)
+        .header("x-bld-principal", "lucy")
+        .json(&create_body("BKG-METERED"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        refused.status().as_u16(),
+        401,
+        "metering grants no authority — a change still needs a delegation"
     );
 }
 

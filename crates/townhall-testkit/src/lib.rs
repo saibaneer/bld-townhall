@@ -45,6 +45,11 @@ pub struct World {
     council: Child,
     pub council_url: String,
     pub council_db: std::path::PathBuf,
+    /// The server's SQLite file — the shared pool bookings, authority rows and
+    /// the usage ledger all live in. Exposed so a test can seed a row the way the
+    /// composition root would (a channel binding, a low usage quota) before the
+    /// server is asked. Empty for a `world()` that ran no townhall server.
+    pub townhall_db: std::path::PathBuf,
     server: Option<Child>,
     pub server_url: String,
 }
@@ -249,6 +254,7 @@ fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
         council,
         council_url,
         council_db,
+        townhall_db,
         server: Some(server),
         server_url: format!("http://127.0.0.1:{server_port}"),
     }
@@ -286,6 +292,53 @@ fn bind_channels(townhall_db: &std::path::Path) {
         "binding channels failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Seed a usage account with a LOW quota, so an exhausted-quota state is reachable
+/// in a test without driving the default (generous) ceiling. The id matches what
+/// `UsageService` derives from the principal (`usage-<principal>`), and the
+/// service's `open_account` is idempotent, so this pre-seeded low limit stands.
+/// Run after `world_real()` (the migrations have applied), before the first turn.
+pub fn seed_usage_quota(townhall_db: &std::path::Path, principal: &str, limit_units: i64) {
+    let sql = format!(
+        "INSERT INTO usage_accounts \
+         (id, principal, status, limit_units, reserved_units, debited_units, \
+          created_at_ms, updated_at_ms) \
+         VALUES ('usage-{principal}', '{principal}', 'active', {limit_units}, 0, 0, \
+          1700000000000, 1700000000000);"
+    );
+    let output = Command::new("sqlite3")
+        .arg(townhall_db)
+        .arg(&sql)
+        .output()
+        .expect("sqlite3 runs");
+    assert!(
+        output.status.success(),
+        "seeding usage quota failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The units debited to a principal's usage account — the authoritative witness
+/// that a turn metered (or that a cancellation did NOT). `0` if no account row
+/// exists yet.
+#[must_use]
+pub fn usage_debited(townhall_db: &std::path::Path, principal: &str) -> i64 {
+    let sql = format!("SELECT debited_units FROM usage_accounts WHERE principal = '{principal}';");
+    let output = Command::new("sqlite3")
+        .arg(townhall_db)
+        .arg(&sql)
+        .output()
+        .expect("sqlite3 runs");
+    assert!(
+        output.status.success(),
+        "reading usage_debited failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
 }
 
 /// A count from the council's own database.

@@ -1,0 +1,27 @@
+[package]
+name = "townhall-usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The dependency list IS the trust posture (spec §5/§16: the usage ledger is a
+# trusted resource-accounting component that "may reserve/meter/release units; no
+# booking mutation" — and grants no authority).
+#
+# Absent, deliberately: townhall-domain, townhall-service, townhall-store,
+# townhall-http, townhall-orchestrator, sqlx, axum, reqwest. Like
+# townhall-authority (ADR-025), this component sits BELOW the domain and names no
+# booking mutation, no socket and no connection pool — so "meters, does not
+# mutate" is discharged by the crate graph, not by discipline. It also names no
+# envelope or key: a usage unit grants nothing, so there is nothing to sign.
+[dependencies]
+async-trait = { workspace = true }
+bld-types = { path = "../bld-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

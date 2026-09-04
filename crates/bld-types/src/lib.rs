@@ -46,6 +46,13 @@ id_type!(ServiceId);
 // row; it grants nothing. The untrusted proposer forwards this opaque handle in
 // place of the transport evidence itself, and the verifier reads the row back.
 id_type!(EvidenceReceiptId);
+// M8's usage-metering ids (spec §16.1, ADR-027). Usage units are £0 and bound
+// resource consumption only — they grant NO authority — so, like every id here,
+// minting one permits nothing. `UsageIntentId` is the retry-stable meter key:
+// derived from the inbound message's transport identity (as `BookingId` is), so
+// a redelivery — even across a restart — names the same intent and meters once.
+id_type!(UsageAccountId);
+id_type!(UsageIntentId);
 
 /// One thing an authority may permit, named independently of the domain.
 ///

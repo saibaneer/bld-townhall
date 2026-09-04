@@ -10,7 +10,8 @@
 use crate::ports::{
     ApprovalError, ApprovalPort, BeginApproval, BookingRequest, CandidateSummary, Continuation,
     ContinuationStore, CredentialSource, EvidenceDeposit, InboundEvidence, PendingSummary,
-    PrincipalDirectory, ProjectedContext, Proposed, Proposer, Request, UsageBalance, WireFactory,
+    PrincipalDirectory, ProjectedContext, Proposed, Proposer, Request, UsageDenied, UsageLedger,
+    WireFactory,
 };
 use bld_types::{BookingId, CouncilBookingRef, PrincipalId};
 use std::collections::HashMap;
@@ -77,7 +78,10 @@ pub struct Dispatcher<C: HumanChannel<Address = ChannelAddress>> {
     channel: Arc<C>,
     directory: Arc<dyn PrincipalDirectory>,
     credentials: Arc<dyn CredentialSource>,
-    balance: Arc<dyn UsageBalance>,
+    /// The zero-price usage meter (M8). Reserves a turn before the proposer,
+    /// settles or releases it after, and answers BALANCE — all keyed by the
+    /// inbound's transport evidence, resolved server-side.
+    ledger: Arc<dyn UsageLedger>,
     proposer: Arc<dyn Proposer>,
     suppression: Arc<dyn SuppressionStore>,
     wires: Arc<dyn WireFactory>,
@@ -159,7 +163,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         channel: Arc<C>,
         directory: Arc<dyn PrincipalDirectory>,
         credentials: Arc<dyn CredentialSource>,
-        balance: Arc<dyn UsageBalance>,
+        ledger: Arc<dyn UsageLedger>,
         proposer: Arc<dyn Proposer>,
         suppression: Arc<dyn SuppressionStore>,
         wires: Arc<dyn WireFactory>,
@@ -171,7 +175,7 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
             channel,
             directory,
             credentials,
-            balance,
+            ledger,
             proposer,
             suppression,
             wires,
@@ -206,14 +210,21 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
         // 1. Channel controls — answered from ports, before ANYTHING else.
         //    (§15.1: "handled deterministically before invoking the LLM".)
         //
-        //    REVOKE is the one control that reaches the authority, so it alone is
-        //    async; it still runs HERE, before identity resolution, so it builds
-        //    no principal, no token and no Wires — the "no grant" property it
-        //    shares with STOP. Its authority is the transport evidence, not a
-        //    resolved identity. The other four stay on the zero-await path.
+        //    REVOKE and BALANCE reach the server, so they are async; both still
+        //    run HERE, before identity resolution and before the meter, so they
+        //    build no principal, no token and no Wires — the "no grant, no unit"
+        //    property they share with STOP. Their authority/identity is the
+        //    transport evidence, resolved server-side. The other three stay on the
+        //    zero-await path. NONE of them reserves a unit, so a spent quota can
+        //    never trap a person behind a safety exit (§16.2).
         if let Command::Control(control) = classify(message.body.revealed()) {
             let text = match control {
                 ControlCommand::Revoke => self.revoke_all(&message).await,
+                ControlCommand::Balance => {
+                    self.ledger
+                        .describe_balance(&inbound_evidence(&message))
+                        .await
+                }
                 other => self.answer_control(other, &message),
             };
             self.reply(&message.address, text).await;
@@ -246,17 +257,49 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                     .await
             }
             Command::Freeform => {
-                // 3. The proposer — LAST, with a projection and the REDUCED view
-                //    (no transport evidence), and nothing else. The full message
-                //    is kept here for the deposit path an approval reply takes.
-                let context = self.project(&principal, wires.reader()).await;
-                let utterance = message.utterance();
-                match self.proposer.propose(&context, &utterance).await {
-                    Proposed::Unclear => {
-                        "I didn't understand. Reply HELP for what I can do.".to_owned()
+                // 3. The meter, THEN the proposer. `reserve` is the quota gate:
+                //    it runs before the projection read and the model turn, so an
+                //    exhausted quota skips both and returns the typed denial. Every
+                //    safety exit was answered above, before this arm, so none of
+                //    them is ever gated (§16.2). The evidence is the same triple
+                //    REVOKE forwards — the server derives principal, intent and
+                //    cost from it.
+                let evidence = inbound_evidence(&message);
+                match self.ledger.reserve(&evidence).await {
+                    Err(UsageDenied::QuotaExhausted) => {
+                        "You've used up your usage allowance. STOP, HELP, BALANCE and \
+                         CANCEL <ref> still work — reply BALANCE to check."
+                            .to_owned()
                     }
-                    Proposed::Typed(request) => {
-                        self.execute(request, &principal, &wires, &message).await
+                    Err(UsageDenied::Transport(why)) => {
+                        format!(
+                            "I couldn't check your usage allowance ({why}). Nothing was changed."
+                        )
+                    }
+                    Ok(()) => {
+                        // The proposer — LAST, with a projection and the REDUCED
+                        // view (no transport evidence). The full message is kept
+                        // for the deposit path an approval reply takes.
+                        let context = self.project(&principal, wires.reader()).await;
+                        let utterance = message.utterance();
+                        match self.proposer.propose(&context, &utterance).await {
+                            Proposed::Unclear => {
+                                // No chargeable request — rescind the hold.
+                                self.ledger.release(&evidence).await;
+                                "I didn't understand. Reply HELP for what I can do.".to_owned()
+                            }
+                            Proposed::Typed(request) => {
+                                // A cancellation resolved from natural language is
+                                // zero-unit (§16.2): release, don't debit. Every
+                                // other turn settles.
+                                if matches!(request, Request::CancelIntent) {
+                                    self.ledger.release(&evidence).await;
+                                } else {
+                                    self.ledger.debit(&evidence).await;
+                                }
+                                self.execute(request, &principal, &wires, &message).await
+                            }
+                        }
                     }
                 }
             }
@@ -327,10 +370,11 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                  from=HH:MM to=HH:MM people=N accessible=yes max=PENCE, then reply YES <code> \
                  to approve (or NO to decline). Also: STATUS, CANCEL <ref>, BALANCE, STOP, START."
                 .to_owned(),
-            ControlCommand::Balance => match self.directory.resolve(&message.address) {
-                Some(principal) => self.balance.describe(&principal),
-                None => "I don't recognize this number.".to_owned(),
-            },
+            // BALANCE reads the real ledger over HTTP, so it is answered by the
+            // async control arm above (beside REVOKE), never here.
+            ControlCommand::Balance => {
+                unreachable!("BALANCE is answered async in the control lane")
+            }
             // STOP TERMINATES the agent's action — it does not merely mute it.
             // While stopped, no automated message is sent AND no owed booking is
             // completed on your behalf (§14.1: automated messaging AND scheduled

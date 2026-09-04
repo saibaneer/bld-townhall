@@ -17,14 +17,17 @@ use townhall_channel::{
 use townhall_gateway::Gateway;
 use townhall_orchestrator::{
     BookingWire, ContinuationStore, CredentialSource, Dispatcher, FileContinuation,
-    FileSuppression, GatewayFactory, NoLedgerYet, PrincipalDirectory, ProjectedContext, Proposed,
-    Proposer, Request, ScriptedProposer, WireFactory,
+    FileSuppression, GatewayFactory, PrincipalDirectory, ProjectedContext, Proposed, Proposer,
+    Request, ScriptedProposer, WireFactory,
 };
-use townhall_testkit::{RecordingProxy, WORKLOAD, World, arm_fault, council_count, world_real};
+use townhall_testkit::{
+    RecordingProxy, WORKLOAD, World, arm_fault, council_count, seed_usage_quota, usage_debited,
+    world_real,
+};
 
 #[path = "support/mod.rs"]
 mod support;
-use support::{HttpApprovals, HttpEvidence};
+use support::{HttpApprovals, HttpEvidence, HttpUsage};
 
 const LUCY_PHONE: &str = "+447700900123";
 const PRIYA_PHONE: &str = "+447700900456";
@@ -201,7 +204,7 @@ fn talk_at(
         Arc::clone(&channel),
         Arc::new(DevDirectory),
         Arc::new(WorkloadCredential),
-        Arc::new(NoLedgerYet),
+        Arc::new(HttpUsage::new(base)),
         Arc::new(ScriptedProposer),
         suppression,
         Arc::new(CountingFactory {
@@ -581,7 +584,7 @@ async fn b10_a_token_in_the_body_upgrades_nobody() {
         Arc::clone(&channel),
         Arc::new(DevDirectory),
         Arc::new(WorkloadCredential),
-        Arc::new(NoLedgerYet),
+        Arc::new(HttpUsage::new(&world.server_url)),
         Arc::new(HostileProposer),
         suppression,
         Arc::new(GatewayFactory {
@@ -749,6 +752,98 @@ async fn b16_revoke_is_anti_enumerating_end_to_end() {
     assert!(
         unbound.contains("no active approvals to stop"),
         "and both say there is nothing to stop: {unbound}"
+    );
+}
+
+// ------------------------------------------------------------------ B17 / B18 (M8)
+
+/// The M8 gate, end to end: an exhausted quota blocks a metered turn, but never a
+/// safety exit. STOP/HELP/BALANCE/STATUS/REVOKE and the keyword `CANCEL <ref>`
+/// all still answer at zero units when the allowance is spent (§16.2) — proven
+/// through the real dispatcher, the real `/usage/*` endpoints and a real sweep.
+#[tokio::test]
+async fn b17_exhausted_quota_blocks_a_turn_but_never_a_safety_exit() {
+    let world = world_real();
+    // Two units: enough for BOOK (1) and YES (1) to reach Booked, then spent.
+    seed_usage_quota(&world.townhall_db, "lucy", 2);
+    let talk = talk(&world, &world.server_url);
+
+    let booked = talk.book_and_approve(LUCY_PHONE).await;
+    assert!(booked.contains("Booked. Council ref"), "{booked}");
+    let reference = council_ref(&booked);
+
+    // A third freeform turn is refused BEFORE the proposer — the quota is spent.
+    let blocked = talk
+        .say(
+            LUCY_PHONE,
+            "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000",
+        )
+        .await;
+    assert!(
+        blocked.contains("used up your usage allowance"),
+        "a metered turn is blocked once quota is spent: {blocked}"
+    );
+
+    // Every safety exit still answers — none of them reserves a unit.
+    assert!(
+        talk.say(LUCY_PHONE, "HELP").await.contains("BOOK date="),
+        "HELP is reachable under exhausted quota"
+    );
+    assert!(
+        talk.say(LUCY_PHONE, "BALANCE")
+            .await
+            .contains("0 of 2 usage units"),
+        "BALANCE is reachable and reads zero remaining"
+    );
+    assert!(
+        talk.say(LUCY_PHONE, "STATUS").await.contains("Booked"),
+        "STATUS is reachable"
+    );
+    // The keyword cancel is a zero-unit resource command — the always-open route
+    // to cancel, even fully exhausted (ADR-027's amendment).
+    let cancelled = talk.say(LUCY_PHONE, &format!("CANCEL {reference}")).await;
+    assert!(
+        cancelled.contains("Cancelled"),
+        "CANCEL <ref> cancels under exhausted quota: {cancelled}"
+    );
+    assert!(
+        talk.say(LUCY_PHONE, "STOP").await.contains("Stopped"),
+        "STOP is reachable"
+    );
+
+    // And metering charged exactly what the two real turns cost — no safety exit
+    // added a unit.
+    assert_eq!(
+        usage_debited(&world.townhall_db, "lucy"),
+        2,
+        "only BOOK and YES metered; every safety exit stayed zero-unit"
+    );
+}
+
+/// A natural-language cancellation is zero-unit (§16.2): with headroom, the turn
+/// that resolves "cancel it" to a cancellation is RELEASED, not debited.
+#[tokio::test]
+async fn b18_a_natural_language_cancellation_is_zero_unit() {
+    let world = world_real();
+    seed_usage_quota(&world.townhall_db, "lucy", 100);
+    let talk = talk(&world, &world.server_url);
+
+    let booked = talk.book_and_approve(LUCY_PHONE).await;
+    assert!(booked.contains("Booked. Council ref"), "{booked}");
+    assert_eq!(
+        usage_debited(&world.townhall_db, "lucy"),
+        2,
+        "BOOK and YES cost one unit each"
+    );
+
+    // "cancel it" is a freeform turn — it runs the proposer (which needs a unit
+    // reserved), but resolves to a cancellation, so the unit is released.
+    let cancelled = talk.say(LUCY_PHONE, "cancel it").await;
+    assert!(cancelled.contains("Cancelled"), "{cancelled}");
+    assert_eq!(
+        usage_debited(&world.townhall_db, "lucy"),
+        2,
+        "the cancellation reserved but RELEASED its unit — still two, not three"
     );
 }
 

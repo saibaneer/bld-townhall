@@ -2409,3 +2409,198 @@ and this file is the amendment trail.
   conscious acceptance, not an oversight. (A REVOKE whose triple happens to
   collide with a prior `YES` row fails CLOSED — refused, nothing swept — the safe
   direction.)
+
+## ADR-027 — Usage: M8's decisions before M8's code
+
+Decided 2026-09-04 with the project owner. Plans M8 (Zero-price usage metering),
+depends on M6 only, and settles what §16 leaves as latitude before a line of the
+ledger is written — the same discipline ADR-021 and ADR-025 kept for M5 and M7,
+because M8's failure modes are all silent: a double-meter, a quota driven
+negative, a stranded reservation, a paywalled safety exit. An understand pass
+(five readers over the spec, the dispatcher, the M7 template, the gate, and the
+ADR trail) produced the blueprint this records; the decisions were then read
+adversarially before code, and that read changed three of them — the reservation
+gained a deterministic expiry, the `/usage/*` surface became server-authoritative
+over the transport evidence, and the freeform cancel gained a release path. Very
+nearly every choice below is within the spec's stated latitude; exactly one
+narrows a sentence, and it is in the amendment table at the end rather than left
+implied.
+
+### The ledger lives behind the boundary, not beside the model seat
+
+The one architecturally decisive fact: the metered step is the proposer's turn
+(`dispatcher.rs`'s `self.proposer.propose`), and the dispatcher is constructed
+in `sms-simulator`, which has no `sqlx` and reaches the server only over HTTP.
+So "where does the usage ledger live" is a real fork, and it is answered by what
+the ledger IS: §16/§9 name it a TRUSTED resource-accounting component in the
+persistence layer. Trusted accounting cannot sit in the same process as the
+untrusted-facing model seat — that is the whole thesis. So the ledger's tables
+live in `townhall-store` over the one shared pool (beside bookings and the
+authority rows), a `/usage/*` endpoint surface authenticates the workload bearer
+exactly as `/approvals` does, and the dispatcher consults it over an
+`HttpUsage` port — the M7 authority plane, cloned. The cost is one HTTP
+round-trip per proposer turn and a BALANCE read that becomes async; both are
+paid in the right place. The rejected alternative — a persist-first ledger local
+to `sms-simulator`, mirroring `FileContinuation` — is lighter and keeps BALANCE
+sync, but it puts the trusted quota in the reach of the seat the quota exists to
+bound. Declined on the thesis, not on the effort.
+
+But moving the tables server-side is only half the thesis, and the honest half
+is the harder one: an endpoint that took a caller-supplied `principal` and a
+caller-supplied `units` under a bearer that "authorizes nothing" would let a
+compromised dispatcher drain any victim's quota by naming them — the weaker
+pattern, chosen for the very component whose reason to be server-side is to keep
+it out of the seat's reach. So `/usage/*` takes the SAME transport-evidence
+triple `/revocations` does, and the server derives all three load-bearing values
+itself: the principal by resolving the sender to a live binding (the caller
+cannot name a victim), the `UsageIntentId` from the triple (the caller cannot
+forge an intent), and the unit cost from its own `PricingSchedule` (the caller
+cannot inflate a debit). A compromised dispatcher can then still spend its OWN
+bound principal's quota — which it could do by sending real turns anyway — but
+cannot touch a principal it holds no transport evidence for. That is the same
+conceded-process assurance the deposit and revoke endpoints carry, no weaker,
+closed at the same seam by M12's signed webhook.
+
+### A metered step is one LLM turn — the proposer's, and only there
+
+§16.2 offers "fixed units per LLM turn and/or per completed task" — latitude, and
+M8 takes per-LLM-turn: the single `proposer.propose` call, which is the only
+async model-turn site and the exact seam M11's real model inherits. Metering the
+booking commit or the convergence follow-up instead (or as well) would
+double-charge a turn that also books, and would meter reads that mutate nothing.
+The `Debit` ledger kind still supports per-task metering — it is left as a named,
+unused seam, not built.
+
+This makes one invariant load-bearing, and it is stated rather than assumed:
+**one inbound message drives at most one proposer turn.** It holds today —
+`handle` reaches `propose` exactly once, in the Freeform arm; `resume` and the
+follow-up drain never call the proposer — and the meter-once key (the unique
+`Debit` per `UsageIntentId`, itself derived per message) depends on it. The day a
+turn loops the model more than once per message, that key must gain a step
+ordinal, or two legitimate debits would collapse into one. Named here so the seam
+the ADR advertises for per-task metering is not silently blocked by the key.
+(A carrier redelivery outside the replay window re-runs the proposer a second
+time without a fresh charge — the debit dedupes, the reservation recovers — so
+the meter is not double-charged, but a real model would be invoked twice; the
+bound is on billing, not on invocations, across a cross-restart redelivery.)
+
+### Reserve, then settle, then release — two-phase even though the POC's turn is flat
+
+Before the turn, `reserve` the maximum units it may cost; on a typed proposal,
+`debit` the actual; on an unclear turn or any early return before the proposal,
+`release` the reservation (§16.2's "settle actual usage and release unused", and
+§2's rescind-on-failure-before-consumption). For the deterministic scripted
+proposer max == actual == 1, so `release` is only ever the failure path today —
+but keeping reserve and debit distinct is precisely what lets M11's variable-cost
+model settle less than it reserved without a rewrite. The reservation is the
+quota gate: an exhausted quota fails `reserve`, so the projection read and the
+proposer are both skipped, and the typed denial rides the dispatcher's existing
+reply path (no new plumbing). A meter that cannot be REACHED fails the turn
+closed, not open — a transport error is answered "nothing was changed", never run
+unmetered — because the bound the meter exists to keep (anti-loop, bounded
+liveness) would evaporate if an unreachable meter let turns through unbounded. It
+is the one place the meter's unavailability stops work, and deliberately so.
+
+A reservation must not be able to strand. The dispatcher is a separate process
+that can die between `reserve` and `debit`; graceful unwinding (`release` on an
+early return) does not cover a crash, and §16.2 wants "system failure before
+consumption rescinds according to deterministic policy" — a policy, not a hope
+that the carrier redelivers. So each reservation carries an `expires_at_ms`, and
+the release policy is lazy and deterministic: a `reserve` first reclaims that
+account's own `live` reservations whose expiry has passed — logging a `Release`
+to the ledger for each (naming its intent and units), flipping them to
+`released`, and drawing `reserved_units` back down — then applies the quota
+guard. A crashed turn's held units are therefore returned
+by the account's next reserve — including the account's own next attempt, so an
+account cannot lock itself out with units it never consumed. No background reaper,
+no timer; the reclaim rides the operation that would otherwise be starved. This
+clones the authority store's `expires_at_ms` + sweep, moved onto the write that
+needs it.
+
+### The meter is idempotent because the message names the intent
+
+`UsageIntentId` is derived from the inbound message's transport identity
+(provider, account, message-id), exactly as `booking_id()` already derives a
+`BookingId` — "the message IS the intent, so it names the intent." A carrier
+redelivery, even across a restart that emptied the replay window, derives the
+same id, and the ledger's unique index on the settling `Debit` per intent
+collapses the retry to one meter (§16.2: "the same UsageIntentId cannot be
+metered twice"). The in-window replay is already dropped as a `Duplicate`; the
+derived-id idempotency is the cross-restart backstop, the same relationship
+`booking_id()` has to `create`.
+
+### Quota may never SILENTLY go negative — so the write is the guard
+
+Quota is a per-account `limit_units` ceiling (one account per principal — the
+funded-account anchor ADR-026 named). "May not silently go negative" (§16.2) is
+enforced structurally, not by a read-then-check: the reservation is a
+conditional `UPDATE ... WHERE debited_units + reserved_units + ? <= limit_units`,
+and `rows_affected() == 0` IS the over-quota signal — rollback, typed denial.
+This clones the approval store's one-use guard: the check and the write are one
+statement, so two concurrent turns cannot both squeeze past a ceiling. Remaining
+units can be driven below zero only by an explicit, audited `Adjustment` row —
+which is why "silently" is the load-bearing word, and why `Adjustment` is the
+one sanctioned escape hatch. `Refund` (a post-settlement reversal of a `Debit`)
+and `Adjustment` are migrated but unexercised by M8's gate — named seams.
+
+### The safety exits are zero-unit by CONSTRUCTION
+
+STOP, HELP, BALANCE, REVOKE and an explicit `CANCEL <ref>` must stay reachable
+under an exhausted quota (§16.2, §2 — "users cannot be trapped behind an
+exhausted quota"). This is not a special case to remember: the control and
+resource commands are answered and returned BEFORE identity resolution and
+before the Freeform arm where the meter sits, so the reservation can only ever
+gate the LLM turn. M8's obligation is therefore the negative one — add no
+reserve or quota call in the control or resource arms — and the gate witnesses
+it directly: under a spent quota, each of those commands still answers, with a
+ledger `Debit` count of zero beside it.
+
+One seam still needs care. Cancellation is one of the actions §16.2 names
+zero-unit, but the meter sits upstream of the proposer that DISAMBIGUATES a
+freeform "cancel it" into a cancel — so a cancellation cannot be recognized as
+one without spending the turn that recognizes it. Two things close the gap. When
+there IS quota headroom, a freeform turn that the proposer resolves to a
+cancellation (or a decline) is `release`d, not `debit`ed — so an ordinary "cancel
+it" costs zero units, honoring the spec for the common case. When quota is fully
+exhausted, the freeform turn cannot run at all; the user is not trapped, because
+the explicit `CANCEL <ref>` and `STATUS` paths are keyword resource commands that
+run before the meter, so the zero-unit route to cancel is always open, and the
+quota-exhausted reply points at it. The residual — that the NATURAL-language
+cancel is unavailable to a fully-exhausted user, who must use the keyword — is
+the one place M8 narrows a spec sentence, and it is recorded in the amendment
+table below rather than left implied.
+
+### Units are not money, and BALANCE now counts units
+
+The ledger counts `units: i64`; the versioned, deterministic `PricingSchedule`
+maps every unit to £0. The two never merge — usage metering bounds resource
+consumption and grants no authority (§16 preamble), and £0 is a price, not a
+permission. BALANCE, already consulted at most once and only for BALANCE, now
+reports a real unit count read from the ledger (a zero-unit read with no debit
+reachable from it), moving to the async control arm beside REVOKE.
+
+### The slice — M8-1 is the gate; the rest of ADR-023 is M8-2
+
+ADR-023 named per-principal/channel rate limits and a global provider budget as
+"the ledger that can account for them" — M8's, but not M8's acceptance gate. So
+M8 is sliced the way M7C was: M8-1 delivers the gate — per-account quota,
+idempotent `UsageIntentId` metering, reserve/debit/release, and the zero-unit
+safety exits — independently runnable and provable. M8-2 adds the rate limits
+and the global budget on the ledger M8-1 builds. Each slice stands alone, so a
+dev default cannot make either decorative.
+
+### What the spec latitude does — and the one line M8 narrows
+
+Per-LLM-turn metering (§16.2's "per LLM turn and/or per completed task"),
+units-not-pence (§16.1's `units: i64`), server-side placement (§9/§16's
+persistence-layer trusted component) and derived idempotent ids are all WITHIN
+the spec's stated latitude — no line of `technical-spec-v0.4.2.md` is overridden
+by any of them. One choice does narrow a sentence, and honesty requires naming it
+rather than claiming an empty table:
+
+| Superseded | Where | By |
+|---|---|---|
+| "booking cancellation [is a] zero-unit operation … so users cannot be trapped behind an exhausted quota" | §16.2 | Realized as the keyword `CANCEL <ref>` (+ `STATUS`) path, which is zero-unit. A freeform "cancel it" is zero-unit only when quota headroom lets the proposer run and resolve it (released, not debited); a FULLY exhausted user cancels via the keyword, not natural language. The zero-unit route to cancel is always open, but not in every phrasing. |
+
+Nothing else in M8-1 supersedes the spec; the amendment trail carries exactly
+this one row.

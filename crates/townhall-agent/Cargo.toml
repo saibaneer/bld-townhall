@@ -16,6 +16,10 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 bld-client = { path = "../bld-client" }
+# The thin OpenAI-compatible client (ADR-031's deviation from Rig) talks to a
+# local Ollama endpoint; http-to-localhost needs no TLS, so the workspace
+# json-only reqwest is enough.
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

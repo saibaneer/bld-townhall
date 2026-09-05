@@ -26,6 +26,8 @@
 //! carries only a behaviour name plus its arguments.
 
 pub mod hostile;
+pub mod llm;
+pub mod openai;
 
 use async_trait::async_trait;
 
@@ -66,7 +68,7 @@ impl ProjectedContext {
 /// One venue candidate a proposer may choose among — an id pair and the facts a
 /// choice turns on. Read-only: surfaced by the browse projection, never authored
 /// by the proposer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct VenueOption {
     pub venue_id: String,
     pub slot_id: String,

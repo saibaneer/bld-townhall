@@ -271,6 +271,19 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                          CANCEL <ref> still work — reply BALANCE to check."
                             .to_owned()
                     }
+                    // A rate limit clears on its own — a bounded wait rolls the
+                    // window — so the reply says to try again shortly. The safety
+                    // exits still work now.
+                    Err(UsageDenied::PrincipalRateLimited | UsageDenied::ChannelRateLimited) => {
+                        "You're going a bit fast — try again shortly. STOP, HELP, BALANCE \
+                         and CANCEL <ref> still work now."
+                            .to_owned()
+                    }
+                    Err(UsageDenied::ProviderBudgetExhausted) => {
+                        "The service is at capacity right now — please try again later. \
+                         STOP, HELP, BALANCE and CANCEL <ref> still work."
+                            .to_owned()
+                    }
                     Err(UsageDenied::Transport(why)) => {
                         format!(
                             "I couldn't check your usage allowance ({why}). Nothing was changed."

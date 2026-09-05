@@ -54,6 +54,13 @@ struct Args {
     /// The deterministic-429 test seam (ADR-021): the one config zero
     /// `PursuitConfig` sanctions.
     reclassify_attempts: Option<u32>,
+    /// M8-2 rate/budget ceilings (ADR-028), each overriding a generous default so
+    /// an acceptance test can spawn a tiny ceiling and exhaust it in a few turns.
+    /// The windows stay at their default (long), so a per-window ceiling reads as
+    /// a de-facto cap for the run.
+    usage_principal_rate_max: Option<i64>,
+    usage_channel_rate_max: Option<i64>,
+    usage_global_budget_max: Option<i64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +71,9 @@ fn parse_args() -> Result<Args, String> {
     let mut retry_cadence_ms = 5_000;
     let mut reconcile_interval_ms = 1_000;
     let mut reclassify_attempts = None;
+    let mut usage_principal_rate_max = None;
+    let mut usage_channel_rate_max = None;
+    let mut usage_global_budget_max = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -100,6 +110,27 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| "--reclassify-attempts needs a count".to_owned())?,
                 );
             }
+            "--principal-rate-max" => {
+                usage_principal_rate_max = Some(
+                    value()?
+                        .parse::<i64>()
+                        .map_err(|_| "--principal-rate-max needs a unit count".to_owned())?,
+                );
+            }
+            "--channel-rate-max" => {
+                usage_channel_rate_max = Some(
+                    value()?
+                        .parse::<i64>()
+                        .map_err(|_| "--channel-rate-max needs a unit count".to_owned())?,
+                );
+            }
+            "--global-budget-max" => {
+                usage_global_budget_max = Some(
+                    value()?
+                        .parse::<i64>()
+                        .map_err(|_| "--global-budget-max needs a unit count".to_owned())?,
+                );
+            }
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -114,6 +145,9 @@ fn parse_args() -> Result<Args, String> {
         retry_cadence_ms,
         reconcile_interval_ms,
         reclassify_attempts,
+        usage_principal_rate_max,
+        usage_channel_rate_max,
+        usage_global_budget_max,
     })
 }
 
@@ -648,13 +682,33 @@ async fn main() -> ExitCode {
     // authority rows. Its binding resolver is a second handle to the approval
     // store, so a metered turn resolves to the same principal the approval plane
     // would — one identity, both planes.
+    // Start from the generous defaults; the three optional flags let a test (or a
+    // deployment) tighten a ceiling. `validated()` rejects a max below one turn
+    // (a permanent brick) before any traffic.
+    let mut usage_policy = townhall_usage::UsagePolicy::default();
+    if let Some(max) = args.usage_principal_rate_max {
+        usage_policy.principal_rate_max = max;
+    }
+    if let Some(max) = args.usage_channel_rate_max {
+        usage_policy.channel_rate_max = max;
+    }
+    if let Some(max) = args.usage_global_budget_max {
+        usage_policy.global_budget_max = max;
+    }
+    let usage_policy = match usage_policy.validated() {
+        Ok(policy) => policy,
+        Err(problem) => {
+            eprintln!("townhall-server: {problem}");
+            return ExitCode::from(2);
+        }
+    };
     let usage_routes = townhall_http::usage::usage_router(townhall_http::usage::UsageState {
         meter: Arc::new(usage::ServiceMeter {
             usage: Arc::new(townhall_usage::UsageService::new(
                 Arc::new(townhall_store::usage::SqlUsageStore::new(
                     repository.pool().clone(),
                 )),
-                townhall_usage::UsagePolicy::default(),
+                usage_policy,
             )),
             bindings: Arc::new(townhall_store::authority::SqlApprovalStore::new(
                 repository.pool().clone(),
@@ -734,6 +788,9 @@ mod feature_gate {
             retry_cadence_ms: 0,
             reconcile_interval_ms: 1,
             reclassify_attempts: None,
+            usage_principal_rate_max: None,
+            usage_channel_rate_max: None,
+            usage_global_budget_max: None,
         }
     }
 

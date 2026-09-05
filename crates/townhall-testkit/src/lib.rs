@@ -200,6 +200,13 @@ pub fn world_real() -> World {
     spawn_world(false, &[])
 }
 
+/// As [`world_real`], with extra server flags — e.g. a tight `--global-budget-max`
+/// so an M8-2 rate/budget ceiling is reachable in a few real turns.
+#[must_use]
+pub fn world_real_with(extra: &[&str]) -> World {
+    spawn_world(false, extra)
+}
+
 fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
     build_binaries();
     let dir = tempfile::tempdir().expect("tempdir");

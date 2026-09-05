@@ -28,18 +28,42 @@ impl Balance {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StoreError {
     /// A reserve for a principal that has no account. Not a normal path — the
     /// service opens the account first — so it signals an invariant break.
     #[error("no usage account for that principal")]
     UnknownAccount,
-    /// The reservation would take the account past its quota ceiling. The typed
-    /// resource denial the gate turns on, surfaced before any metered step.
+    /// The reservation would take the account past its quota ceiling — the M8-1
+    /// total-stock denial.
     #[error("usage quota exhausted")]
     QuotaExhausted,
+    /// This principal has consumed its per-window turn allowance (M8-2 rate).
+    #[error("principal rate limit exceeded")]
+    PrincipalRateLimited,
+    /// This channel has consumed its per-window turn allowance (M8-2 rate).
+    #[error("channel rate limit exceeded")]
+    ChannelRateLimited,
+    /// The global per-window provider ceiling is spent — every principal's
+    /// chargeable turn is refused until the window rolls (M8-2).
+    #[error("provider budget exhausted")]
+    ProviderBudgetExhausted,
     #[error("the usage store could not be reached: {0}")]
     Unavailable(String),
+}
+
+/// The three per-window ceilings a reserve is checked against (M8-2, ADR-028).
+/// Passed as primitives so the store stays policy-free, exactly as `units` and
+/// the TTL already are. A window is `now_ms - now_ms % window_ms`; a `max` at or
+/// above any reachable per-window count is "effectively off".
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimits {
+    pub principal_max: i64,
+    pub principal_window_ms: u64,
+    pub channel_max: i64,
+    pub channel_window_ms: u64,
+    pub global_max: i64,
+    pub global_window_ms: u64,
 }
 
 /// Everything the meter needs to persist.
@@ -74,21 +98,29 @@ pub trait UsageStore: Send + Sync {
     ///
     /// First reclaims that account's own `live` reservations whose `expires_at_ms`
     /// has passed (the deterministic release policy, §16.2), so a crashed turn's
-    /// units are returned by the next reserve rather than stranded. Then the guard
-    /// commits the hold ONLY if it fits under the ceiling. Idempotent on `intent`:
-    /// a retry recovers the existing reservation rather than holding twice.
+    /// units are returned by the next reserve rather than stranded. Then, in one
+    /// transaction: the three per-window rate ceilings (principal, `channel`,
+    /// global) — each a conditional counter upsert — and finally the quota guard.
+    /// The hold commits ONLY if every guard passes; any failure rolls the whole
+    /// transaction back, so a denied turn burns no rate token. Idempotent on
+    /// `intent`: a retry recovers the existing reservation, touching no counter.
     ///
     /// # Errors
-    /// [`StoreError::QuotaExhausted`] if the hold would exceed the ceiling,
-    /// [`StoreError::UnknownAccount`] if the principal has none, or the store is
-    /// unreachable.
+    /// [`StoreError::PrincipalRateLimited`] / [`StoreError::ChannelRateLimited`] /
+    /// [`StoreError::ProviderBudgetExhausted`] if a per-window ceiling is hit;
+    /// [`StoreError::QuotaExhausted`] if the total ceiling is; [`StoreError::UnknownAccount`]
+    /// if the principal has none; or the store is unreachable. Checked in that
+    /// order, so the FIRST ceiling hit names the denial.
+    #[allow(clippy::too_many_arguments)] // the service passes each derived primitive once
     async fn reserve(
         &self,
         principal: &PrincipalId,
         intent: &UsageIntentId,
+        channel: &str,
         units: i64,
         now_ms: u64,
         expires_at_ms: u64,
+        limits: RateLimits,
     ) -> Result<(), StoreError>;
 
     /// Settle `intent`'s reservation at `actual_units` — the meter-once op. Draws
@@ -150,6 +182,17 @@ struct Held {
     /// Intents that have a settled `Debit` — the in-memory analogue of the unique
     /// `Debit` index, so meter-once holds even against a direct double-debit.
     debited_intents: std::collections::HashSet<String>,
+    /// (`counter_key`, `window_start_ms`) -> `used_units` — the M8-2 windowed rate
+    /// counters, the analogue of the `usage_rate_counters` table.
+    rate_counters: HashMap<(String, u64), i64>,
+}
+
+/// The window a timestamp falls in: `now_ms - now_ms % window_ms`. `checked_rem`
+/// makes a `window_ms` of 0 total (it yields `now_ms`, one all-of-time window)
+/// rather than a panic — `UsagePolicy::validated` already refuses 0 for the
+/// service, and this keeps a direct store caller safe too.
+fn window_floor(now_ms: u64, window_ms: u64) -> u64 {
+    now_ms - now_ms.checked_rem(window_ms).unwrap_or(0)
 }
 
 /// The in-memory store: this crate's tests and the composition roots' doubles.
@@ -232,30 +275,73 @@ impl UsageStore for MemoryUsageStore {
         &self,
         principal: &PrincipalId,
         intent: &UsageIntentId,
+        channel: &str,
         units: i64,
         now_ms: u64,
         expires_at_ms: u64,
+        limits: RateLimits,
     ) -> Result<(), StoreError> {
         let mut held = self.locked();
         Self::reclaim_expired(&mut held, principal.as_str(), now_ms);
 
         // Idempotent: a reservation already exists for this intent (a retry). The
-        // hold is not taken twice; the eventual debit settles it once.
+        // hold is not taken twice, and no counter is touched.
         if held.reservations.contains_key(intent.as_str()) {
             return Ok(());
+        }
+
+        // The three per-window ceilings, in order (principal, channel, global) —
+        // the FIRST hit names the denial. Checked all-then-incremented, so a later
+        // guard (or the quota guard below) that fails leaves every counter
+        // untouched: all-or-nothing, the memory stand-in for the SQL rollback.
+        let checks = [
+            (
+                format!("principal:{}", principal.as_str()),
+                limits.principal_window_ms,
+                limits.principal_max,
+                StoreError::PrincipalRateLimited,
+            ),
+            (
+                format!("channel:{channel}"),
+                limits.channel_window_ms,
+                limits.channel_max,
+                StoreError::ChannelRateLimited,
+            ),
+            (
+                "global".to_owned(),
+                limits.global_window_ms,
+                limits.global_max,
+                StoreError::ProviderBudgetExhausted,
+            ),
+        ];
+        for (key, window_ms, max, denial) in &checks {
+            let window = window_floor(now_ms, *window_ms);
+            let used = held
+                .rate_counters
+                .get(&(key.clone(), window))
+                .copied()
+                .unwrap_or(0);
+            if used + units > *max {
+                return Err(denial.clone());
+            }
         }
 
         let account = held
             .accounts
             .get_mut(principal.as_str())
             .ok_or(StoreError::UnknownAccount)?;
-        // The guard: hold only if it fits under the ceiling. This is the memory
-        // stand-in for the conditional UPDATE — the check and the write are one
-        // critical section under the single lock.
+        // The quota guard: hold only if it fits under the TOTAL ceiling. This is
+        // the memory stand-in for the conditional UPDATE — the check and the write
+        // are one critical section under the single lock.
         if account.debited_units + account.reserved_units + units > account.limit_units {
             return Err(StoreError::QuotaExhausted);
         }
         account.reserved_units += units;
+        // Every guard passed — now spend the rate tokens (all-or-nothing).
+        for (key, window_ms, _max, _denial) in &checks {
+            let window = window_floor(now_ms, *window_ms);
+            *held.rate_counters.entry((key.clone(), window)).or_insert(0) += units;
+        }
         held.reservations.insert(
             intent.as_str().to_owned(),
             Reservation {

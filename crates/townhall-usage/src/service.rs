@@ -6,7 +6,7 @@
 //! socket. A successful reserve or debit returns nothing an authority check reads
 //! (§16: metering grants no authority).
 
-use crate::store::{Balance, StoreError, UsageStore};
+use crate::store::{Balance, RateLimits, StoreError, UsageStore};
 use bld_types::{PrincipalId, UsageAccountId, UsageIntentId};
 use std::sync::Arc;
 
@@ -45,36 +45,134 @@ pub struct UsagePolicy {
     /// real turn never expires mid-flight; it exists for the crashed turn.
     pub reservation_ttl_ms: u64,
     pub pricing: PricingSchedule,
+    // M8-2 (ADR-028) — the three per-window rate ceilings. A `*_max` at or above
+    // any reachable per-window count is "effectively off"; the generous defaults
+    // are exactly that, so metering behaves as M8-1 did until a deployment tightens
+    // them. Windows default long so a per-window ceiling reads as a de-facto cap
+    // for a demo run.
+    pub principal_rate_max: i64,
+    pub principal_rate_window_ms: u64,
+    pub channel_rate_max: i64,
+    pub channel_rate_window_ms: u64,
+    pub global_budget_max: i64,
+    pub global_budget_window_ms: u64,
 }
 
 impl Default for UsagePolicy {
     fn default() -> Self {
+        let hour = 60 * 60 * 1_000;
         Self {
-            // Generous for the demo — a real deployment would size this per plan.
+            // Generous for the demo — a real deployment would size these per plan.
             default_limit_units: 1_000,
             units_per_turn: 1,
             reservation_ttl_ms: 10 * 60 * 1_000,
             pricing: PricingSchedule::default(),
+            principal_rate_max: 10_000,
+            principal_rate_window_ms: hour,
+            channel_rate_max: 100_000,
+            channel_rate_window_ms: hour,
+            global_budget_max: 1_000_000,
+            global_budget_window_ms: hour,
         }
     }
 }
 
-/// Why a metering call was refused.
+impl UsagePolicy {
+    /// The rate ceilings, bundled for the store — the M8-2 guard inputs.
+    #[must_use]
+    pub const fn rate_limits(&self) -> RateLimits {
+        RateLimits {
+            principal_max: self.principal_rate_max,
+            principal_window_ms: self.principal_rate_window_ms,
+            channel_max: self.channel_rate_max,
+            channel_window_ms: self.channel_rate_window_ms,
+            global_max: self.global_budget_max,
+            global_window_ms: self.global_budget_window_ms,
+        }
+    }
+
+    /// Reject a policy that cannot meter. Each ceiling must admit at least one
+    /// turn per window (`max >= units_per_turn` — a lower max would deny every
+    /// turn forever, and it is also what keeps the counter's fresh-INSERT path
+    /// safe), and each window must be positive (the window floor divides by it).
+    ///
+    /// # Errors
+    /// A one-line description of the first violated invariant.
+    pub fn validated(self) -> Result<Self, String> {
+        let per_turn = self.units_per_turn;
+        for (name, max, window) in [
+            (
+                "principal rate",
+                self.principal_rate_max,
+                self.principal_rate_window_ms,
+            ),
+            (
+                "channel rate",
+                self.channel_rate_max,
+                self.channel_rate_window_ms,
+            ),
+            (
+                "global budget",
+                self.global_budget_max,
+                self.global_budget_window_ms,
+            ),
+        ] {
+            if max < per_turn {
+                return Err(format!(
+                    "{name} max ({max}) must be at least units_per_turn ({per_turn})"
+                ));
+            }
+            if window == 0 {
+                return Err(format!("{name} window must be positive"));
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// Why a metering call was refused. Each resource denial is distinct so the gate
+/// can prove it in isolation, even though all map to HTTP 429 (ADR-028).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UsageDenied {
-    /// The account is out of quota. The typed resource denial the gate surfaces
-    /// before a metered step — an HTTP 429.
+    /// The account is out of total quota (M8-1's stock ceiling).
     #[error("usage quota exhausted")]
     QuotaExhausted,
+    /// This principal hit its per-window turn allowance (M8-2 rate).
+    #[error("principal rate limit exceeded")]
+    PrincipalRateLimited,
+    /// This channel hit its per-window turn allowance (M8-2 rate).
+    #[error("channel rate limit exceeded")]
+    ChannelRateLimited,
+    /// The global per-window provider ceiling is spent (M8-2).
+    #[error("provider budget exhausted")]
+    ProviderBudgetExhausted,
     /// The store could not be reached — a 503, never read as "quota spent".
     #[error("the usage store could not be reached: {0}")]
     Unavailable(String),
+}
+
+impl UsageDenied {
+    /// The stable audit/wire code (ADR-028): all resource denials are 429, so this
+    /// is how a client tells them apart. Aligned with `AuditEvent.denial_code`.
+    #[must_use]
+    pub const fn denial_code(&self) -> &'static str {
+        match self {
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::PrincipalRateLimited => "rate_limited_principal",
+            Self::ChannelRateLimited => "rate_limited_channel",
+            Self::ProviderBudgetExhausted => "provider_budget_exhausted",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
 }
 
 impl From<StoreError> for UsageDenied {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::QuotaExhausted => Self::QuotaExhausted,
+            StoreError::PrincipalRateLimited => Self::PrincipalRateLimited,
+            StoreError::ChannelRateLimited => Self::ChannelRateLimited,
+            StoreError::ProviderBudgetExhausted => Self::ProviderBudgetExhausted,
             // The service opens the account before every reserve, so a missing
             // account here is an invariant break, not a user error.
             StoreError::UnknownAccount => Self::Unavailable("no usage account".to_owned()),
@@ -126,6 +224,7 @@ impl<S: UsageStore> UsageService<S> {
         &self,
         principal: &PrincipalId,
         intent: &UsageIntentId,
+        channel: &str,
         now_ms: u64,
     ) -> Result<(), UsageDenied> {
         self.ensure_account(principal, now_ms).await?;
@@ -133,9 +232,11 @@ impl<S: UsageStore> UsageService<S> {
             .reserve(
                 principal,
                 intent,
+                channel,
                 self.policy.units_per_turn,
                 now_ms,
                 now_ms.saturating_add(self.policy.reservation_ttl_ms),
+                self.policy.rate_limits(),
             )
             .await?;
         Ok(())

@@ -2604,3 +2604,196 @@ rather than claiming an empty table:
 
 Nothing else in M8-1 supersedes the spec; the amendment trail carries exactly
 this one row.
+
+## ADR-028 — Rate limits and the provider budget: M8-2's decisions before M8-2's code
+
+Decided 2026-09-05 with the project owner. Plans M8-2, the second usage slice,
+and discharges ADR-023's named deferral ("Rate limits per principal/channel and
+the global provider budget: M8, with the ledger that can account for them") and
+the slice ADR-027 carved ("M8-2 adds the rate limits and the global budget on the
+ledger M8-1 builds"). It realizes one spec sentence — §15.1's "Rate limits per
+principal/channel plus global provider budget." An understand pass (four readers
+over the requirement, the M8-1 ledger, the clock/test seams, and the ADR
+conventions) produced the blueprint this records; the decisions were read
+adversarially before code.
+
+M8-2 inherits, unbroken, the five invariants ADR-027 fixed: safety exits are
+zero-unit by construction, units are not money, the server derives every
+load-bearing value, the metered turn (only) fails closed when the meter is
+unreachable, and the write IS the guard. Everything below sits inside those.
+
+### The difference from M8-1: a rate is not a quota
+
+M8-1's quota is a TOTAL — how many units an account may ever hold at once. M8-2
+adds three RATE ceilings — how many units may be consumed per time WINDOW — that
+bound throughput, not stock: one per principal, one per channel, and one global
+across every principal (the shared provider budget). They answer the abuse the
+quota cannot: a single principal burning the provider fast, or the whole system
+outrunning the LLM spend the demo can afford.
+
+### One windowed-counter table serves all three
+
+`usage_rate_counters(counter_key, window_start_ms, used_units)` (migration 0010),
+where the row `(counter_key, window_start_ms)` IS the fixed window — a new window
+is a new row, so a window reset needs no sweep (the fixed-window pattern
+`denials.rs` already uses). `counter_key` is `principal:<id>`, `channel:<provider>|<account>`,
+or the literal `global`; the three ceilings differ only by key, limit and window,
+all passed as primitives, so the store stays policy-free. The window floor is
+`now_ms - now_ms.checked_rem(window_ms).unwrap_or(0)` — total on a zero window
+(it collapses to one all-of-time window) rather than a panic, so a direct store
+caller is safe even though `validated()` already refuses a zero window.
+
+**Why a counter table, not a scan of the ledger.** A rate could be `COUNT`ed from
+`usage_ledger` events in the window — but the ledger carries no channel column
+(0009), so per-channel is impossible there without a schema change anyway, and a
+scan gives no single-statement atomic check-and-write. The counter's conditional
+upsert does, exactly like the quota guard:
+
+```sql
+INSERT INTO usage_rate_counters (counter_key, window_start_ms, used_units)
+VALUES (?, ?, ?)
+ON CONFLICT (counter_key, window_start_ms)
+DO UPDATE SET used_units = used_units + ? WHERE used_units + ? <= ?
+```
+
+`rows_affected() == 0` on the conflict path IS the over-limit signal — rollback,
+typed denial. The three upserts sit inside the existing `reserve()` transaction,
+after the idempotency early-return and before the quota guard, so they inherit
+M8-1's lead-with-a-write deadlock safety (the expiry-Release INSERT already holds
+SQLite's write lock) and its all-or-nothing rollback: a turn that later fails the
+quota guard burns no rate token. A token is spent by a turn that takes the hold —
+which, barring a crash between the reserve and the proposer call (that burns a
+token conservatively, for a turn that never ran — fail-safe), is a turn that
+reaches the proposer and consumes provider resource.
+
+### The "global provider budget" is a global RATE, honestly named
+
+Spec §15.1 says "global provider budget", and it is tempting to read that as a
+lifetime pool that depletes. It is not built that way, and the honest name is a
+global RATE: the `global`-keyed counter in the same table, incremented at reserve,
+resets each window — so it caps provider turns *per window across all principals*,
+not total spend over all time. A cumulative lifetime pool was rejected because,
+once hit, it bricks the whole system for every principal until an out-of-band
+`Adjustment`, and the POC has no operator lever to un-brick it. A
+`SUM(debited + reserved)` across `usage_accounts` was rejected twice over — a
+full-table aggregate on every reserve, and it would DRIFT, because reservations
+expire lazily inside each principal's own sweep, which never decrements a global
+reserved total. The windowed counter cannot drift and self-heals each period.
+
+What makes this an honest "budget" for the demo is window SIZING, not a pool: a
+window at least as long as a demo run makes the per-window ceiling a de-facto cap
+for that run. The default window is generous for exactly this reason; `validated()`
+enforces `window > 0` but does not (and cannot, without a notion of "a run")
+force it longer, so the sizing is a documented operational choice, not a proof.
+Over a long-lived deployment this bounds the provider *rate*, which is the anti-
+runaway guarantee that matters; a true lifetime budget with a refill lever is
+post-POC (payment handoff, M10-and-later).
+
+**Where it is checked, and the honest scope.** The `global` guard lives inside
+`reserve()` — so it is all-or-nothing with the rest of the turn, and it binds
+every turn that reaches the meter. A turn reaches the meter only for a sender the
+dispatcher has resolved through the directory (an unresolved number is refused at
+`dispatcher.rs`, before the Freeform arm and the meter), and in this system the
+directory and the channel bindings name the SAME set — the equality M8-1 already
+leans on (ADR-026/-027). So in the POC the global ceiling binds every metered
+turn there is. Its one un-closed edge is a directory/binding SPLIT — a
+directory-known sender the server cannot resolve to a binding takes M8-1's
+fail-open `Ok(())` and is counted by neither the per-account guards nor the
+global one, because the global increment is (for now) reached only after account
+resolution. Making the global counter principal-INDEPENDENT (counting an unbound
+sender's provider turn on the `global` key alone) is a no-account reserve path
+M8-2 does not build; the residual is named here, and a witness asserts the
+dispatcher gates an unresolved sender before the meter, so the gap has no path in
+the POC.
+
+### Three denials, all 429, kept apart by a code not a status
+
+§25/§10.2 map every resource exhaustion to 429, so the three new refusals —
+`PrincipalRateLimited`, `ChannelRateLimited`, `ProviderBudgetExhausted` — cannot
+be told apart by status. Each is its own variant through all four parallel enums
+(store `StoreError`, service `UsageDenied`, http `UsageMeterError`, orchestrator
+`UsageDenied`), carries a distinct `denial_code` in the 429 body
+(`rate_limited_principal` / `rate_limited_channel` / `provider_budget_exhausted`,
+beside M8-1's `quota_exhausted`), and gets its own SMS line — a rate limit says
+"try again shortly" (a bounded wait clears the window); the budget and the quota
+say a bare retry will not help. Each denial is provable in isolation, which is the
+gate's word.
+
+Two plumbing facts this forces, because the code is where distinctness lives:
+- The reserve endpoint must emit a STRUCTURED body — `{"denial_code": "…"}` — for
+  every resource 429 (the new three AND M8-1's quota, which today goes out as a
+  bare `{"error": …}` with no code). So this slice reshapes that one response.
+- The two clients that collapse any 429 to `QuotaExhausted` (the sms-simulator
+  adapter and the test double) must read the body code and map it to the right
+  variant. The fallback when the body is absent or unparseable is
+  `QuotaExhausted` — still a 429, still refused, still fail-closed — so a garbled
+  body degrades to "refused for a resource reason", never to "allowed".
+
+### Safety exits, again, are never rate-limited — by construction
+
+The three guards live ONLY inside `reserve()`, reached only from the dispatcher's
+Freeform arm. STOP/HELP/BALANCE/REVOKE and the keyword `CANCEL <ref>`/`STATUS`
+are answered and returned before identity resolution and before that arm, so a hit
+rate window or a spent global budget can no more trap them than an exhausted quota
+could (ADR-027). M8-2's obligation is the same negative one: add no rate, budget
+or reserve call to the control or resource arms. This is NOT the best-effort,
+logged-and-dropped posture of the denial log — the rate/budget guards sit in the
+transactional reserve path and fail CLOSED for the metered turn.
+
+### Time is controlled where it can be
+
+The store and service take `now_ms` as a parameter, so the window semantics —
+the Nth turn allowed, the (N+1)th refused, recovery after the window rolls — are
+witnessed deterministically at those layers. The server derives `now_ms` from the
+wall clock with no seam, and M8-2 adds none: an end-to-end window-RECOVERY test
+would need a settable clock, and that is deferred until something needs it. Above
+the store, the budget and distinctness are witnessed COUNT-based within a single
+(large) window, driven by real turns against a small ceiling — no clock, no
+flakiness.
+
+### Config, and the demo's small ceilings
+
+`UsagePolicy` gains six fields (a max and a window per dimension) with generous
+defaults and a `validated()` that requires each `max >= units_per_turn` (so the
+counter's unchecked fresh-INSERT path is always safe) and each `window > 0`.
+Three CLI flags (`--principal-rate-max`, `--channel-rate-max`,
+`--global-budget-max`) let an acceptance test spawn the server with a tiny
+ceiling and a default-large window, so a few real turns exhaust it inside one
+window — the count-based witness above, with no seeding and no clock.
+
+### The forks, and how they were settled
+
+- **Windowed rate vs lifetime pool for the provider budget** — windowed (and
+  named a rate, honestly: it auto-resets, where a lifetime pool bricks the system
+  with no un-brick lever). Its cap-for-a-run property comes from window SIZING,
+  not from depletion.
+- **Per-channel: ship or defer** — ship it. The spec bullet says "per
+  principal/channel", the unified counter makes it nearly free, and though it is
+  near-degenerate with a global rate while the POC has one provider/account, the
+  seam is where a second provider later plugs in. Order principal → channel →
+  global, each with a stable `denial_code`.
+- **Breach → deny-only, not suspend** — a tripped ceiling refuses new reserves;
+  in-flight reservations still settle (a Debit is unconditional once reserved).
+  `usage_accounts.status = 'suspended'` stays a separate operator lever (0009
+  reserved it), not something a rate breach flips.
+- **Rate counts reserved turns, not attempts** — a quota- or budget-denied turn
+  rolls the whole transaction back and burns no rate token. Bounding attempts
+  would need a best-effort counter write outside the transaction, trading the
+  all-or-nothing guarantee for it; not worth it.
+- **Disabling a dimension** — there is no separate "off" sentinel; a dimension is
+  effectively unlimited when its `max` is set above any turn count a window could
+  reach (the generous default). `validated()` rejects `max < units_per_turn` (a
+  permanent brick that denies every turn), so "off" is a large number, not a
+  zero — deliberate, since a real zero is never a valid ceiling here.
+
+### What the spec latitude does — and the amendment trail
+
+Per-principal/channel/global ceilings, the fixed window, the counter table, the
+windowed budget and units-not-pence are all within §15.1/§16 latitude — no line
+of `technical-spec-v0.4.2.md` is overridden. The §25 Usage error row (currently
+`InsufficientUnits, DuplicateUsageIntent, PricingUnavailable`) gains the three new
+resource denials THROUGH this amendment trail, not by editing the spec:
+
+| Added (not superseded) | Where | By |
+|---|---|---|
+| `PrincipalRateLimited`, `ChannelRateLimited`, `ProviderBudgetExhausted` — all HTTP 429, `denial_code` in the body | §25 Usage error row | The three new ceilings realize §15.1's "rate limits per principal/channel plus global provider budget"; each is a distinct resource denial the §25 taxonomy did not yet enumerate. |

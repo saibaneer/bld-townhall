@@ -122,6 +122,12 @@ fn spawn_ready(mut command: Command) -> (Child, u16) {
 
 /// A world with the REAL resolver: no `--dev-authority`, so nothing can mint.
 fn lane() -> Lane {
+    lane_with(&[])
+}
+
+/// As [`lane`], but with extra server flags — e.g. a tight `--global-budget-max`
+/// so a rate/budget 429 is reachable in a few turns (M8-2).
+fn lane_with(extra: &[&str]) -> Lane {
     build_binaries();
     let dir = tempfile::tempdir().expect("tempdir");
     let council_db = dir.path().join("council.sqlite");
@@ -152,7 +158,8 @@ fn lane() -> Lane {
             "0",
             "--reconcile-interval-ms",
             "50",
-        ]);
+        ])
+        .args(extra);
     let (server, port) = spawn_ready(server);
 
     Lane {
@@ -825,6 +832,44 @@ fn a_usage_turn_meters_then_the_quota_is_exhausted() {
         .expect("json");
     assert_eq!(balance["remaining"].as_i64(), Some(0), "nothing left");
     assert_eq!(balance["limit"].as_i64(), Some(1));
+}
+
+/// M8-2 over the wire: a spent global budget is a 429 whose STRUCTURED body names
+/// the denial — `provider_budget_exhausted`, distinct from a quota's
+/// `quota_exhausted`. Status alone cannot tell them apart; the code can (ADR-028).
+#[test]
+fn a_spent_budget_is_a_429_with_a_distinct_denial_code() {
+    // One global turn per window; a long default window, so two quick turns are in
+    // the same window and the second is refused deterministically.
+    let lane = lane_with(&["--global-budget-max", "1"]);
+    bind_lucy(&lane);
+    let client = http();
+
+    let first = client
+        .post(format!("{}/usage/reserve", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-1"))
+        .send()
+        .expect("answer");
+    assert_eq!(
+        first.status().as_u16(),
+        200,
+        "the first turn fits the budget"
+    );
+
+    let refused = client
+        .post(format!("{}/usage/reserve", lane.url))
+        .header("authorization", AGENT)
+        .json(&usage_body("turn-2"))
+        .send()
+        .expect("answer");
+    assert_eq!(refused.status().as_u16(), 429, "the budget is spent");
+    let body: serde_json::Value = refused.json().expect("json body");
+    assert_eq!(
+        body["denial_code"].as_str(),
+        Some("provider_budget_exhausted"),
+        "the 429 body names the budget, not a bare quota: {body}"
+    );
 }
 
 /// Metering grants NO authority (§16): a fully metered turn does not let a change

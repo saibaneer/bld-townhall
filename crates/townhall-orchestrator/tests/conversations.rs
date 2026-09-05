@@ -22,7 +22,7 @@ use townhall_orchestrator::{
 };
 use townhall_testkit::{
     RecordingProxy, WORKLOAD, World, arm_fault, council_count, seed_usage_quota, usage_debited,
-    world_real,
+    world_real, world_real_with,
 };
 
 #[path = "support/mod.rs"]
@@ -844,6 +844,56 @@ async fn b18_a_natural_language_cancellation_is_zero_unit() {
         usage_debited(&world.townhall_db, "lucy"),
         2,
         "the cancellation reserved but RELEASED its unit — still two, not three"
+    );
+}
+
+// ------------------------------------------------------------------ B19 (M8-2)
+
+/// The M8-2 gate, end to end: a spent GLOBAL provider budget blocks a metered
+/// turn — with its own distinct reply, distinct from a quota's — but never a
+/// safety exit. Drives the real dispatcher → real `/usage/*` → real windowed
+/// counter, with the budget flagged tiny so two real turns spend it.
+#[tokio::test]
+async fn b19_a_spent_budget_blocks_a_turn_but_never_a_safety_exit() {
+    // Two global units: BOOK (1) + YES (1) reach Booked, then the budget is spent.
+    let world = world_real_with(&["--global-budget-max", "2"]);
+    let talk = talk(&world, &world.server_url);
+
+    let booked = talk.book_and_approve(LUCY_PHONE).await;
+    assert!(booked.contains("Booked. Council ref"), "{booked}");
+    let reference = council_ref(&booked);
+
+    // A third metered turn is refused for a PROVIDER-budget reason — the reply
+    // names capacity, not a personal allowance (the distinct denial round-trips
+    // as its own `denial_code`).
+    let blocked = talk
+        .say(
+            LUCY_PHONE,
+            "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000",
+        )
+        .await;
+    assert!(
+        blocked.contains("capacity"),
+        "the budget denial reads as a system-wide one: {blocked}"
+    );
+
+    // Every safety exit still answers under a spent budget — none reserves a unit.
+    assert!(
+        talk.say(LUCY_PHONE, "HELP").await.contains("BOOK date="),
+        "HELP is reachable"
+    );
+    assert!(
+        talk.say(LUCY_PHONE, "STATUS").await.contains("Booked"),
+        "STATUS is reachable"
+    );
+    let cancelled = talk.say(LUCY_PHONE, &format!("CANCEL {reference}")).await;
+    assert!(
+        cancelled.contains("Cancelled"),
+        "CANCEL <ref> cancels under a spent budget: {cancelled}"
+    );
+    assert!(
+        talk.say(LUCY_PHONE, "STOP").await.contains("Stopped"),
+        "STOP is reachable"
     );
 }
 

@@ -34,12 +34,33 @@ pub struct UsageBalanceView {
     pub limit: i64,
 }
 
-/// Why a metering call was refused.
+/// Why a metering call was refused. Every resource denial is HTTP 429; they are
+/// told apart by the `denial_code` in the body, not the status (ADR-028).
 pub enum UsageMeterError {
-    /// The account is out of quota — a 429.
+    /// The account is out of total quota (M8-1).
     QuotaExhausted,
+    /// This principal hit its per-window rate (M8-2).
+    PrincipalRateLimited,
+    /// This channel hit its per-window rate (M8-2).
+    ChannelRateLimited,
+    /// The global per-window provider ceiling is spent (M8-2).
+    ProviderBudgetExhausted,
     /// The store could not be reached — a 503.
     Unavailable(String),
+}
+
+impl UsageMeterError {
+    /// The stable body code a client reads to tell the four 429 denials apart.
+    #[must_use]
+    pub const fn denial_code(&self) -> &'static str {
+        match self {
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::PrincipalRateLimited => "rate_limited_principal",
+            Self::ChannelRateLimited => "rate_limited_channel",
+            Self::ProviderBudgetExhausted => "provider_budget_exhausted",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
 }
 
 /// What the usage endpoints need, without naming a concrete meter or store. The
@@ -88,14 +109,17 @@ async fn reserve(
     }
     match state.meter.reserve(&body).await {
         Ok(()) => mapping::json_response(StatusCode::OK, &serde_json::json!({ "reserved": true })),
-        // 429: the resource denial the gate turns on. A retry does not help until
-        // the person frees quota, which is exactly what 429 means.
-        Err(UsageMeterError::QuotaExhausted) => {
-            mapping::plain_error(StatusCode::TOO_MANY_REQUESTS, "usage quota exhausted")
-        }
         Err(UsageMeterError::Unavailable(why)) => {
             mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, &why)
         }
+        // Every resource denial is 429, distinguished by the STRUCTURED body's
+        // `denial_code` — status alone cannot tell quota from a rate limit from
+        // the provider budget (ADR-028). The client reads the code; a client that
+        // reads only the status still sees "refused for a resource reason".
+        Err(denied) => mapping::json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({ "denial_code": denied.denial_code() }),
+        ),
     }
 }
 
@@ -141,9 +165,8 @@ async fn balance(
         Err(UsageMeterError::Unavailable(why)) => {
             mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, &why)
         }
-        // Balance never exhausts — it is a read — but map defensively.
-        Err(UsageMeterError::QuotaExhausted) => {
-            mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, "usage read unavailable")
-        }
+        // Balance never exhausts — it is a read that charges nothing — but map any
+        // resource denial defensively rather than leak a 429 from a read.
+        Err(_) => mapping::plain_error(StatusCode::SERVICE_UNAVAILABLE, "usage read unavailable"),
     }
 }

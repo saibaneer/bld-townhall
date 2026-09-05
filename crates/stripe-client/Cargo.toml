@@ -20,6 +20,15 @@ townhall-domain = { path = "../townhall-domain" }
 townhall-payment = { path = "../townhall-payment" }
 townhall-service = { path = "../townhall-service" }
 
+[features]
+# The isolated live lane (M10, ADR-030): opt-in, never part of a normal
+# `cargo test` run. It gates `tests/live.rs`, which drives the SAME adapter
+# protocol as `checkout.rs` against the REAL Stripe sandbox at api.stripe.com —
+# the one thing the hermetic mock cannot prove (our request encoding and response
+# parsing match real Stripe). Needs a test-mode `sk_test_…` key in
+# STRIPE_SECRET_KEY and network; that is why it is a feature, not a default.
+stripe-live = []
+
 [dev-dependencies]
 mock-stripe = { path = "../../services/mock-stripe", features = ["test-faults"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

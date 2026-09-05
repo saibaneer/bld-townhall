@@ -21,6 +21,97 @@
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 
+use bld_kernel::{VerificationError, Verified, Verifier};
+use bld_types::{BoundedString, EffectIntentId, PaymentIntentId, PaymentRef};
+use townhall_domain::VerifiedProviderFact;
+
+/// Unverified Stripe state returned by the transport adapter.
+///
+/// The evidence shape lives beside its verifier so the trusted fact-minter does
+/// not acquire the adapter's service/store dependency graph. `stripe-client`
+/// re-exports it, preserving the adapter-facing `stripe_client::StripeRaw` path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StripeRaw {
+    SessionCreated {
+        effect_intent_id: EffectIntentId,
+        stripe_session_id: String,
+        hosted_url: String,
+        payment_intent_id: PaymentIntentId,
+        expires_at_ms: i64,
+    },
+    SessionRetrieved {
+        effect_intent_id: EffectIntentId,
+        stripe_session_id: String,
+        payment_intent_id: Option<PaymentIntentId>,
+        checkout_status: Option<String>,
+        payment_status: String,
+        payment_intent_status: Option<String>,
+        expires_at_ms: i64,
+    },
+}
+
+/// Establishes the provider facts carried by Stripe API responses.
+///
+/// The transport adapter deliberately returns only [`StripeRaw`]. This trusted
+/// verifier is the audit point where an attributable Stripe observation becomes
+/// a fact the domain can bind to its persisted canonical payment plan.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StripeVerifier;
+
+impl Verifier<StripeRaw, VerifiedProviderFact> for StripeVerifier {
+    fn verify(&self, raw: StripeRaw) -> Result<Verified<VerifiedProviderFact>, VerificationError> {
+        let fact = match raw {
+            StripeRaw::SessionCreated {
+                effect_intent_id,
+                stripe_session_id,
+                payment_intent_id,
+                ..
+            } => VerifiedProviderFact::SessionCreated {
+                effect_intent_id,
+                payment_intent_id,
+                payment_ref: PaymentRef::new(stripe_session_id),
+            },
+            StripeRaw::SessionRetrieved {
+                effect_intent_id,
+                stripe_session_id,
+                payment_intent_id: Some(payment_intent_id),
+                checkout_status: _,
+                payment_intent_status,
+                ..
+            } if payment_intent_status.as_deref() == Some("succeeded") => {
+                VerifiedProviderFact::PaymentConfirmed {
+                    effect_intent_id,
+                    payment_intent_id,
+                    payment_ref: PaymentRef::new(stripe_session_id),
+                }
+            }
+            StripeRaw::SessionRetrieved {
+                effect_intent_id,
+                stripe_session_id,
+                payment_intent_id: Some(payment_intent_id),
+                checkout_status,
+                payment_intent_status,
+                ..
+            } if checkout_status.as_deref() == Some("expired")
+                || payment_intent_status.as_deref() == Some("canceled") =>
+            {
+                VerifiedProviderFact::PaymentAbandoned {
+                    effect_intent_id,
+                    payment_intent_id,
+                    payment_ref: PaymentRef::new(stripe_session_id),
+                }
+            }
+            StripeRaw::SessionRetrieved { .. } => {
+                return Err(VerificationError::Unknown(BoundedString::truncating(
+                    "Stripe has not established a terminal payment outcome",
+                )));
+            }
+        };
+
+        Ok(Verified::assert_verified(fact))
+    }
+}
+
 /// The endpoint's Stripe webhook signing secret (`whsec_…`).
 ///
 /// Unlike the delegation [`EnvelopeKey`](../townhall_authority), there is no

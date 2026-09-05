@@ -15,6 +15,8 @@ use thiserror::Error;
 use townhall_domain::{BookingEffect, OperationKind};
 use townhall_service::{EffectResolver, Resolved};
 
+pub use townhall_payment::StripeRaw;
+
 /// A Stripe secret API key whose debug representation never reveals the key.
 #[derive(Clone)]
 pub struct StripeSecretKey(String);
@@ -30,25 +32,6 @@ impl fmt::Debug for StripeSecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("StripeSecretKey(****)")
     }
-}
-
-/// Unverified Stripe state returned by the transport adapter.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StripeRaw {
-    SessionCreated {
-        stripe_session_id: String,
-        hosted_url: String,
-        payment_intent_id: PaymentIntentId,
-        expires_at_ms: i64,
-    },
-    SessionRetrieved {
-        stripe_session_id: String,
-        payment_intent_id: Option<PaymentIntentId>,
-        checkout_status: Option<String>,
-        payment_status: String,
-        payment_intent_status: Option<String>,
-        expires_at_ms: i64,
-    },
 }
 
 /// Talks to one Stripe-compatible Checkout API.
@@ -176,6 +159,7 @@ impl Capability<BookingEffect> for StripeClient {
         }
 
         Ok(StripeRaw::SessionCreated {
+            effect_intent_id: attempt.id.clone(),
             stripe_session_id: session.id,
             hosted_url: session
                 .url
@@ -215,6 +199,7 @@ impl EffectResolver<StripeRaw> for StripeClient {
             .await?;
 
         Ok(Resolved::Answer(StripeRaw::SessionRetrieved {
+            effect_intent_id: attempt.id.clone(),
             stripe_session_id: session.id,
             payment_intent_id: session.metadata.payment_intent_id.map(PaymentIntentId::new),
             checkout_status: session.status,

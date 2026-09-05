@@ -325,6 +325,8 @@ async fn a_fee_at_the_payment_threshold_selects_the_offer_in_turn() {
         fee: Money::from_pence(10_000),
         ..facts()
     };
+    h.council
+        .set_availability(expensive.clone(), AvailabilityGrant::new(FAKE_GRANT));
     let coordinator = Coordinator::new(
         Arc::clone(&h.repo),
         Arc::clone(&h.council),

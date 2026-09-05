@@ -21,13 +21,15 @@ use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use council_client::{CouncilClient, CouncilVerifier};
+use council_client::CouncilClient;
 use council_wire::CouncilKey;
+use stripe_client::{StripeClient, StripeSecretKey};
 mod authority;
 mod usage;
 
 use authority::{OsEntropy, RealAuthority};
 use townhall_authority::AuthorityService;
+use townhall_effects_router::EffectsRouter;
 use townhall_http::{AuthorityResolver, ServerState};
 use townhall_service::{BookingApi, Coordinator, PursuitConfig, Reconciliation};
 use townhall_store::{SqliteBookingRepository, StoreClock, SystemStoreClock};
@@ -636,18 +638,34 @@ async fn main() -> ExitCode {
             .verifying_key(),
     );
     let client = || Arc::new(CouncilClient::new(&args.council_url, key));
+    let council = client();
+    let availability = client();
+    let routed_availability: Arc<dyn townhall_service::AvailabilitySource> = availability.clone();
+    // Layer 6 adds payment enablement and public configuration. Until then the
+    // Stripe route is dormant in the existing server journeys, but it is a real
+    // client so enabling the later gate requires no coordinator change.
+    let stripe = Arc::new(StripeClient::new(
+        "http://127.0.0.1:4011",
+        StripeSecretKey::new("sk_test_townhall_layer5"),
+        "http://127.0.0.1/payments/success",
+        "http://127.0.0.1/payments/cancel",
+    ));
+    let effects = Arc::new(EffectsRouter::new(council, stripe, routed_availability));
 
     let coordinator = Arc::new(
         Coordinator::new(
             Arc::clone(&repository),
-            client(),
-            Arc::new(CouncilVerifier::new(key)),
-            client(),
+            Arc::clone(&effects),
+            Arc::clone(&effects),
+            availability,
         )
         .with_denial_log(denials)
         .with_config(config),
     );
-    let reconciliation = Arc::new(Reconciliation::new(Arc::clone(&coordinator), client()));
+    let reconciliation = Arc::new(Reconciliation::new(
+        Arc::clone(&coordinator),
+        Arc::clone(&effects),
+    ));
     let api = Arc::new(BookingApi::new(
         coordinator,
         Arc::clone(&reconciliation),

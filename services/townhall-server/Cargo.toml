@@ -11,6 +11,7 @@ edition = "2024"
 axum.workspace = true
 council-client = { path = "../../crates/council-client" }
 council-wire = { path = "../../crates/council-wire" }
+stripe-client = { path = "../../crates/stripe-client" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 # The dev resolver issues real grants now — nothing asserts its own
 # authority any more (ADR-025).
@@ -21,6 +22,7 @@ sqlx = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
 townhall-channel = { path = "../../crates/townhall-channel" }
 townhall-domain = { path = "../../crates/townhall-domain" }
+townhall-effects-router = { path = "../../crates/townhall-effects-router" }
 townhall-http = { path = "../../crates/townhall-http" }
 townhall-service = { path = "../../crates/townhall-service" }
 townhall-store = { path = "../../crates/townhall-store" }

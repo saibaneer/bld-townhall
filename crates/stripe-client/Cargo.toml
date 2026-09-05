@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 townhall-domain = { path = "../townhall-domain" }
+townhall-payment = { path = "../townhall-payment" }
 townhall-service = { path = "../townhall-service" }
 
 [dev-dependencies]

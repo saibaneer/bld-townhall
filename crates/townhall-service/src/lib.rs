@@ -637,12 +637,14 @@ where
             expires_at_ms: intent.expires_at_ms,
         };
 
-        // INTERIM (until the Layer-5 effects router): availability is a
-        // synchronous provider already held by the coordinator. Route that
-        // effect to the trusted AvailabilitySource and turn its verified
-        // observation into the provider fact Phase C expects. It must not go
-        // through the council effect wire: that adapter owns booking and
-        // cancellation effects, not this eager read capability.
+        // Availability is a SYNCHRONOUS provider the coordinator already holds, so
+        // the Verify effect is answered here rather than parked. The Layer-5
+        // composite router subsumes this for the SERVER (and every other effect
+        // routes through `self.capability`), but retaining this keeps a coordinator
+        // built with a plain `CouncilClient` — as the council-client / gateway /
+        // protocol test harnesses do — able to answer `VerifyAvailability` without
+        // each having to assemble a composite. Fully retiring it (every harness
+        // adopting the router) is a deferred cleanup, not a Layer-5 requirement.
         let synchronous_availability = match &intent.canonical_plan {
             BookingEffect::VerifyAvailability { selection, .. } => {
                 match self
@@ -685,7 +687,7 @@ where
             {
                 // Neither success nor failure. The aggregate stays in flight and
                 // reconciliation resolves it; treating this as failure would return
-                // the booking to a re-proposable state while the council may hold a
+                // the booking to a re-proposable state while the provider may hold a
                 // live one.
                 Err(Unknown { .. }) => Ok(BoundaryOutcome::Unresolved),
                 Ok(raw) => match self.verifier.verify(raw) {

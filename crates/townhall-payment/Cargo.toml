@@ -15,9 +15,12 @@ rust-version.workspace = true
 # surface (store/service/http); the fact-minting layer (which names townhall-domain,
 # as council-client's verifier does) is added with the domain's payment facts.
 [dependencies]
+bld-kernel = { path = "../bld-kernel" }
+bld-types = { path = "../bld-types" }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+townhall-domain = { path = "../townhall-domain" }
 
 [dev-dependencies]
 # Test-only: `resolved_dependencies` (cargo metadata) for the boundary test. Never

@@ -75,6 +75,7 @@ async fn create_retry_and_retrieve_are_real_protocol_witnesses() {
         .await
         .expect("create session");
     let StripeRaw::SessionCreated {
+        effect_intent_id,
         stripe_session_id,
         hosted_url,
         payment_intent_id,
@@ -83,6 +84,7 @@ async fn create_retry_and_retrieve_are_real_protocol_witnesses() {
     else {
         panic!("expected a created session, got {first:?}");
     };
+    assert_eq!(effect_intent_id, &effect_attempt.id);
     assert_eq!(stripe_session_id, "cs_test_00000001");
     assert_eq!(hosted_url, "https://checkout.stripe.test/cs_test_00000001");
     assert_eq!(payment_intent_id, &PaymentIntentId::new("PAY-BKG-1-3"));
@@ -102,6 +104,7 @@ async fn create_retry_and_retrieve_are_real_protocol_witnesses() {
         .await
         .expect("retrieve session");
     let Resolved::Answer(StripeRaw::SessionRetrieved {
+        effect_intent_id: retrieved_effect_id,
         stripe_session_id: retrieved_id,
         payment_intent_id: retrieved_payment_id,
         checkout_status,
@@ -112,6 +115,7 @@ async fn create_retry_and_retrieve_are_real_protocol_witnesses() {
     else {
         panic!("expected retrieved Stripe state");
     };
+    assert_eq!(retrieved_effect_id, EffectIntentId::new(stripe_session_id));
     assert_eq!(retrieved_id, *stripe_session_id);
     assert_eq!(
         retrieved_payment_id,
@@ -131,19 +135,45 @@ async fn payment_metadata_alone_is_an_idempotency_key() {
     let world = MockStripeProcess::spawn();
     let stripe = client(&world);
 
-    let first = stripe
+    // The SAME payment metadata, but two DIFFERENT attempts (different effect
+    // intents). Stripe returns the SAME session; only the per-attempt
+    // effect_intent_id — which the verifier needs to name the intent this raw
+    // settles — legitimately differs. So the SESSION identity is what must match,
+    // not the whole struct.
+    let StripeRaw::SessionCreated {
+        stripe_session_id: first_session,
+        hosted_url: first_url,
+        payment_intent_id: first_intent,
+        ..
+    } = stripe
         .execute(&payment("PAY-BKG-2-3"), &attempt("EFF-BKG-2-PAY-4"))
         .await
-        .expect("first create");
-    let repeated = stripe
+        .expect("first create")
+    else {
+        panic!("create returns a session");
+    };
+    let StripeRaw::SessionCreated {
+        stripe_session_id: repeated_session,
+        hosted_url: repeated_url,
+        payment_intent_id: repeated_intent,
+        effect_intent_id: repeated_effect,
+        ..
+    } = stripe
         .execute(&payment("PAY-BKG-2-3"), &attempt("EFF-BKG-2-PAY-99"))
         .await
-        .expect("metadata-idempotent create");
+        .expect("metadata-idempotent create")
+    else {
+        panic!("create returns a session");
+    };
 
     assert_eq!(
-        repeated, first,
+        repeated_session, first_session,
         "payment metadata must identify one session"
     );
+    assert_eq!(repeated_url, first_url);
+    assert_eq!(repeated_intent, first_intent);
+    // The second attempt's own effect id rides on the same session.
+    assert_eq!(repeated_effect, EffectIntentId::new("EFF-BKG-2-PAY-99"));
 }
 
 #[tokio::test]

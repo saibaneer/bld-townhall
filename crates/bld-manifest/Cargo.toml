@@ -1,0 +1,23 @@
+[package]
+name = "bld-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The BLD discovery manifest (M9, ADR-029): the struct, its canonical digest, and
+# ed25519 sign/verify. Shared by the SERVER (which signs and serves it at
+# /.well-known/bld) and the untrusted BLD CLIENT (which verifies it) so the
+# canonicalization has exactly one definition. It names no domain, store, socket
+# or authority type — it is a pure wire+crypto artifact, so the untrusted client
+# may depend on it.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

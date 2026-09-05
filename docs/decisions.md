@@ -2797,3 +2797,176 @@ resource denials THROUGH this amendment trail, not by editing the spec:
 | Added (not superseded) | Where | By |
 |---|---|---|
 | `PrincipalRateLimited`, `ChannelRateLimited`, `ProviderBudgetExhausted` — all HTTP 429, `denial_code` in the body | §25 Usage error row | The three new ceilings realize §15.1's "rate limits per principal/channel plus global provider budget"; each is a distinct resource denial the §25 taxonomy did not yet enumerate. |
+
+## ADR-029 — Discovery: M9's decisions before M9's code
+
+Decided 2026-09-05 with the project owner. Plans M9 (Discovery + BLD client),
+depends on M5 (the HTTP service) and M7 (authority/delegation), and realizes §12
+("BLD Discovery and Local Marketplace Catalogue") and its gate (§M9): "a generic
+client discovers the service and drives the API without hard-coded behaviour URLs
+beyond bootstrap." An understand pass (four readers over §12, the HTTP surface,
+the existing client + signing infrastructure, and the conventions) produced the
+blueprint this records; the decisions were read adversarially before code. No
+line of `technical-spec-v0.4.2.md` is edited; §12's seven manifest fields all
+survive verbatim, and the additions are recorded in the amendment table below.
+
+### The fact that shapes everything: the projection speaks PascalCase, the route speaks kebab
+
+`available_behaviours` in a projection is PascalCase (`SelectVenue`, `Cancel`) —
+the same spelling `Behaviour::name()` gives. But the behaviour route matches
+kebab (`select-venue`, `cancel`), and that spelling lives ONLY in the router's
+`parse_proposal` match arms; nothing maps one to the other. So a client that
+concatenates a projection name onto the URL template posts
+`/booking-intents/{id}/behaviours/SelectVenue` and gets a 404. A generic client
+therefore cannot drive the API from the projection alone — the name→segment
+mapping must live somewhere the client can read, or the client must hard-code the
+transform, which the gate forbids. This one gap decides the manifest's shape.
+
+It also decides how the gate is WITNESSED, and here the first draft was wrong. A
+naive-PascalCase client 404s, yes — but that only proves the client did not use
+the RAW name; a client that applied a generic kebab transform, or that read the
+segment out of `bld-types`, would pass while never touching the manifest. So a
+plain end-to-end drive does NOT prove discovery. Two things fix it: the client
+does not depend on `bld-types` at all (it works in strings — see below), which
+removes the shortcut and makes a source-scan for kebab literals meaningful; and
+the DECISIVE witness is a manifest whose behaviour segment is relabelled to a
+well-formed but WRONG value and re-signed — a manifest-driven client posts the
+relabelled segment (and diverges from a hard-coded/transform client, which posts
+the real one). That relabel-resign test, not a bare happy-path drive, is the gate
+proof.
+
+### The manifest carries a behaviour link table, not a bare resource list
+
+The served manifest keeps §12's seven fields and adds a `resource_links` section:
+per resource, the collection/item paths, the behaviour URL template
+(`{resource}/{id}/behaviours/{segment}`), and a table mapping each behaviour's
+discovery name (the PascalCase the projection returns) to its wire segment (the
+kebab the route needs). The client builds every behaviour URL from three facts,
+none hard-coded: the resource base and template (manifest), the segment (manifest
+table, keyed by the projection name), and which behaviours are legal now (the
+live projection's `available_behaviours`). The stable fact (name→segment) is the
+manifest's; the live fact (which names apply in this state) is the projection's —
+the "one fact, one home" discipline extended to the wire.
+
+A rejected alternative — "resources only, client derives the segment by
+convention" — fails because the segment SPELLING is not derivable (PascalCase ≠
+kebab), so deriving it means hard-coding the transform. The other — "one literal
+URL per behaviour in the manifest" — fails because the legal behaviour set is
+state-scoped and belongs to the projection, not a static manifest.
+
+To keep the router, the wire spelling, and the manifest from drifting, the kebab
+segments become one source of truth beside `Behaviour` in `bld-types`
+(`Behaviour::segment()`), consumed by BOTH `parse_proposal` and the manifest
+generator — the three-witness rule the domain already keeps for the behaviour
+menu. (Retiring the dispatcher's and the gateway's own hard-coded kebab literals
+onto this table is real debt, but it is a SEPARATE slice; M9's gate needs only
+the standalone client, so that retirement is out of scope here and tracked.)
+
+### Signed means ed25519 over the canonical core bytes, verified against a pinned publisher key
+
+`manifest_digest = base64(sha256(canonical core bytes))` (core = every field but
+the digest and the signature); `manifest_signature = base64(ed25519_sign(publisher
+key, canonical core BYTES))` — the signature covers the content directly, not the
+digest string, so there is no gap where a tampered core could ride a stale digest.
+The client recomputes the core bytes from the received manifest, checks the digest
+against them (integrity), AND verifies the signature over those same bytes
+(authenticity) — both BEFORE it drives anything. (An attacker who edits the core
+and recomputes a matching digest still fails the signature, which only the
+publisher key can produce — witnessed directly.)
+
+ed25519, not HMAC, because the manifest has two parties — a publisher signs, a
+distinct untrusted client verifies — and is relayed and listed in a local
+catalogue. That is the codebase's own rule: HMAC where one party both writes and
+reads (the delegation envelope); a signature where an answer is "verifiable after
+it has been stored, relayed or replayed" (the council effect). The manifest is
+the latter. The ed25519 primitive already exists (council-wire); M9 reuses the
+pattern, not the council's key.
+
+The manifest struct + its digest/sign/verify live in one small shared crate,
+`bld-manifest`, used by both the server (to sign) and the client (to verify), so
+canonicalization has exactly one definition. It names no forbidden type, so the
+untrusted client may depend on it.
+
+### The BLD client is a new, untrusted crate — not the Gateway
+
+`crates/bld-client` is a new library, not an extension of `townhall-gateway`. The
+gateway's own doc says why: "every route below is hard-coded … the pre-M9 state
+… calling this the generic client would have claimed M9's deliverable inside M6."
+The client is graded an untrusted driver that "must not bypass server checks," so
+its resolved-dependency test forbids the same set the gateway's does —
+`townhall-service`, `-store`, `-http`, `-domain`, `bld-kernel`, `sqlx` — PLUS
+`townhall-authority` (it reaches authority only over the wire, the orchestrator's
+seat) AND, deliberately, **`bld-types`**. The client works entirely in strings:
+the projection publishes behaviour names as strings, the manifest's behaviour
+table is keyed by those strings, and the ids/references it carries are strings.
+Giving it `bld-types` would hand it `Behaviour::segment()` — the very name→segment
+mapping the gate says it must DISCOVER — and it could then shortcut the manifest
+and still pass a happy-path drive. Forbidding `bld-types` closes that shortcut and
+is what makes "no hard-coded behaviour URLs" enforceable rather than asserted. It
+may depend on `reqwest`, `serde`/`serde_json`, `thiserror`, `tokio`, and
+`bld-manifest` (the manifest struct + verify — a correctness object, not a
+contract to test). It re-declares its wire DTOs independently (ADR-023).
+
+What it may hard-code is exactly the BOOTSTRAP and the BLD-generic protocol: one
+entry point per service (`{base}/.well-known/bld`), the header names
+(`authorization`, `x-bld-principal`, `x-bld-delegation`, `if-match`), and the
+template SHAPE. Everything service-specific — resource bases, behaviour segments,
+the live behaviour set — is discovered. And before it drives anything it checks
+the manifest's `bld_version` for a compatible major, refusing a manifest it does
+not understand (the reason §12 carries the field) — verification is crypto AND
+compatibility, both ahead of the first API call.
+
+### The catalogue is a std::fs JSON list; delegation transport is unchanged
+
+The local catalogue is a JSON file of `{ base_url, publisher_key }` entries — the
+registry stand-in §12 calls for, with the publisher key as the out-of-band trust
+anchor the client pins per service. Discovery is: for each entry, GET its
+`/.well-known/bld`, verify against that entry's key, then drive. `std::fs`
+because the crate graph forbids `sqlx` (the `FileSuppression`/`FileContinuation`
+precedent).
+
+Delegation rides the EXISTING `x-bld-delegation` header plus `Authorization:
+Bearer`, exactly as the gateway sends them; `authority_profile:
+"bld-demo-delegation-v1"` in the manifest is the label that tells the client this
+transport applies. The client resolves nothing and mutates nothing — the server
+resolves the grant and refuses a change with no delegation (401). The delegation
+reference is an OPAQUE input the client is handed (a constructor argument), never
+one it synthesizes: in the dev lane that reference happens to equal the booking id,
+but a client that computed `reference = created_booking_id` itself would bake the
+dev lane in and 401 in the real lane, where the reference is a random id an
+approval flow issued. The client treats it as a token, as the gateway does. M9
+adds no authority surface; the client stays an untrusted driver.
+
+### What the gate demo drives, and what it does not source
+
+The acceptance demo drives create → read-the-menu → one behaviour, so there IS a
+behaviour URL to prove un-hard-coded. It uses a behaviour whose body the CALLER
+supplies (a cancellation's reason), so the walk needs no venue catalogue: sourcing
+a real `venue_id`/`slot_id` would need the `/venues` read surface, which is out of
+this gate's scope (the gate is "create/read a booking-intent … without hard-coded
+behaviour URLs", not a full book-to-confirmation walk). `resource_links` carries
+`booking-intents` only; discovering `/venues` and a full book walk is a later
+extension, noted so the boundary is explicit rather than an omission.
+
+### A dedicated `--manifest-key`, because each key has one job
+
+The manifest is signed with its own ed25519 key, provisioned by a new
+`--manifest-key` flag beside `--key-hex` (council) and `--authority-key`. Reusing
+the council key would be zero extra plumbing and `publisher: "demo-council"`
+would make it truthful — but this codebase keeps one key to one job (council
+effects, delegation envelopes, and now manifest publishing are three roles), and
+the tests already carry three distinct fixture keys. A dedicated key keeps the
+separation legible and lets a manifest key rotate without touching council
+signing.
+
+### What the spec latitude does — and the amendment trail
+
+Discovery at `/.well-known/bld`, the local catalogue, the ed25519 signature and
+the client are all within §12/§M9 latitude. Two additions extend §12's manifest
+BODY beyond its seven-field stub; they are recorded here, not by editing the spec:
+
+| Added (not superseded) | Where | By |
+|---|---|---|
+| `resource_links` — per-resource collection/item paths, a behaviour URL template, and a PascalCase-name → kebab-segment behaviour table | §12 manifest body | The gate ("drive without hard-coded behaviour URLs") is unachievable without a readable name→segment mapping, because the projection's PascalCase names are not the route's kebab segments; the manifest is where that stable fact belongs. |
+| `manifest_signature` (ed25519 over the canonical core bytes) | §12 manifest body | §12 says the manifest is "signed" and carries a `manifest_digest`, but a digest alone is integrity, not authenticity; the signature is what a relayed manifest needs, and what a second-party client verifies. It signs the core bytes, not the digest string, so no tampered core can ride a stale digest. |
+| Per-behaviour `body` field-name hints inside `resource_links` | §12 manifest body | So a client can assemble a behaviour's request body (e.g. `["venue_id","slot_id"]`) without hard-coding it; secondary to the URL gate, but the same discover-don't-hard-code principle. |

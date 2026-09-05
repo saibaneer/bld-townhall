@@ -96,6 +96,46 @@ impl Behaviour {
             Self::Cancel => "Cancel",
         }
     }
+
+    /// The kebab-case URL segment this behaviour is driven by, e.g.
+    /// `/booking-intents/{id}/behaviours/select-venue`.
+    ///
+    /// This is the ONE home for the wire segment (M9/ADR-029). The name the
+    /// projection publishes (`Self::name`, `PascalCase`) is NOT the segment the
+    /// route matches (kebab), and a generic client cannot derive one from the
+    /// other — so the manifest publishes this mapping and the router matches on
+    /// it, both reading HERE rather than each spelling kebab in its own literals.
+    #[must_use]
+    pub const fn segment(self) -> &'static str {
+        match self {
+            Self::SelectVenue => "select-venue",
+            Self::VerifySlot => "verify-slot",
+            Self::ChangeVenue => "change-venue",
+            Self::UpdateRequirements => "update-requirements",
+            Self::RevalidateVenue => "revalidate-venue",
+            Self::Book => "book",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// Resolve a wire segment back to its behaviour — the router's parse step and
+    /// the manifest generator share this, so the segment spelling has one source.
+    #[must_use]
+    pub fn from_segment(segment: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.segment() == segment)
+    }
+
+    /// Every behaviour, in a stable order — for the manifest's behaviour table and
+    /// for `from_segment`'s search.
+    pub const ALL: [Self; 7] = [
+        Self::SelectVenue,
+        Self::VerifySlot,
+        Self::ChangeVenue,
+        Self::UpdateRequirements,
+        Self::RevalidateVenue,
+        Self::Book,
+        Self::Cancel,
+    ];
 }
 
 impl fmt::Display for Behaviour {

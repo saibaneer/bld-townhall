@@ -13,6 +13,7 @@ edition = "2024"
 async-trait.workspace = true
 axum.workspace = true
 bld-types = { path = "../bld-types" }
+bld-manifest = { path = "../bld-manifest" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "macros"] }

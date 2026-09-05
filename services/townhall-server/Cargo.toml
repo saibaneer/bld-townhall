@@ -26,6 +26,8 @@ townhall-service = { path = "../../crates/townhall-service" }
 townhall-store = { path = "../../crates/townhall-store" }
 townhall-usage = { path = "../../crates/townhall-usage" }
 bld-types = { path = "../../crates/bld-types" }
+bld-manifest = { path = "../../crates/bld-manifest" }
+serde_json = { workspace = true }
 
 [features]
 # The M5 stand-in authority (ADR-021, amended by ADR-022): a fixed three-token

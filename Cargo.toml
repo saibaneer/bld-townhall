@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
   "crates/bld-types",
+  "crates/bld-manifest",
+  "crates/bld-client",
   "crates/bld-kernel",
   "crates/townhall-domain",
   "crates/townhall-store",

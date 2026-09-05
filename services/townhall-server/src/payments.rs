@@ -85,8 +85,14 @@ impl StripeWebhookPort for StripeWebhookHandler {
         // SECURITY GATE, first and unconditional: the signature over the RAW bytes.
         // A success redirect, a forged body, or an agent's claim has no valid
         // signature and is refused here, before a field is read.
-        verify_webhook(&self.secret, raw_body, signature_header, now_secs, TOLERANCE_SECS)
-            .map_err(|_| WebhookRejection::BadSignature)?;
+        verify_webhook(
+            &self.secret,
+            raw_body,
+            signature_header,
+            now_secs,
+            TOLERANCE_SECS,
+        )
+        .map_err(|_| WebhookRejection::BadSignature)?;
 
         // Verified: the event is genuine. Parse and map it to a booking through the
         // payment records. An event we cannot map is Ignored (a 200 — Stripe should
@@ -118,7 +124,13 @@ impl StripeWebhookPort for StripeWebhookHandler {
         // the CAS + active_effect guard inside `observe`.
         let _ = self
             .payments
-            .record_event(&event.id, &payment_intent_id, &event.event_type, "verified", now_ms)
+            .record_event(
+                &event.id,
+                &payment_intent_id,
+                &event.event_type,
+                "verified",
+                now_ms,
+            )
             .await;
 
         // Only genuinely terminal outcomes advance. A decline / processing / 3DS is
@@ -160,10 +172,16 @@ impl StripeWebhookPort for StripeWebhookHandler {
         let _ = self.observer.observe_fact(&record.booking_id, fact).await;
         match is_terminal_success {
             Some(true) => {
-                let _ = self.payments.mark_confirmed(&payment_intent_id, now_ms).await;
+                let _ = self
+                    .payments
+                    .mark_confirmed(&payment_intent_id, now_ms)
+                    .await;
             }
             _ => {
-                let _ = self.payments.mark_abandoned(&payment_intent_id, now_ms).await;
+                let _ = self
+                    .payments
+                    .mark_abandoned(&payment_intent_id, now_ms)
+                    .await;
             }
         }
         Ok(WebhookOutcome::Advanced)

@@ -73,6 +73,12 @@ struct Args {
     /// discovery. When set, the two Stripe secrets are read from the ENVIRONMENT
     /// (a real secret in argv is world-readable via `ps`/procfs).
     enable_payments: bool,
+    /// The *configured* fee threshold (spec §17) above which a booking routes
+    /// through human payment. Honored only with `--enable-payments`; the default
+    /// (`m10-fixed-v1`, £100) is unchanged when absent. The catalogue's fees top
+    /// out below the default, so a deployment that wants the payment path
+    /// reachable sets this — the demo lane does.
+    payment_threshold_pence: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -88,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
     let mut usage_global_budget_max = None;
     let mut manifest_key = None;
     let mut enable_payments = false;
+    let mut payment_threshold_pence = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -147,6 +154,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--manifest-key" => manifest_key = Some(value()?),
             "--enable-payments" => enable_payments = true,
+            "--payment-threshold-pence" => {
+                payment_threshold_pence =
+                    Some(value()?.parse::<u64>().map_err(|_| {
+                        "--payment-threshold-pence needs a pence amount".to_owned()
+                    })?);
+            }
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -166,6 +179,7 @@ fn parse_args() -> Result<Args, String> {
         usage_global_budget_max,
         manifest_key,
         enable_payments,
+        payment_threshold_pence,
     })
 }
 
@@ -739,6 +753,19 @@ async fn main() -> ExitCode {
         if let Some(store) = &payment_store {
             coordinator = coordinator.with_payment_records(Arc::clone(store));
         }
+        // The configured threshold (spec §17) — only with payments on, so a stray
+        // flag can never open a payment route the dormant Stripe client cannot
+        // serve. The version tracks the pence, so a booking frozen under one
+        // threshold is detectably stale if the policy later changes (ADR-030).
+        if payment_settings.is_some()
+            && let Some(pence) = args.payment_threshold_pence
+        {
+            coordinator =
+                coordinator.with_payment_policy(townhall_domain::PaymentThresholdPolicy {
+                    threshold: bld_types::Money::from_pence(pence),
+                    version: format!("m10-threshold-{pence}p"),
+                });
+        }
         coordinator
     });
 
@@ -953,6 +980,7 @@ mod feature_gate {
             usage_global_budget_max: None,
             manifest_key: None,
             enable_payments: false,
+            payment_threshold_pence: None,
         }
     }
 

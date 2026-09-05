@@ -236,6 +236,39 @@ pub fn verify_webhook(
     Err(SignatureError::BadSignature)
 }
 
+/// Mint a valid `Stripe-Signature` header over `raw_body` for `timestamp` — the
+/// exact inverse of [`verify_webhook`].
+///
+/// `sign_webhook(secret, body, t)` returns a `t=…,v1=…` header that
+/// `verify_webhook(secret, body, header, t, tol)` accepts. Behind the
+/// `test-signing` feature so it never enters a production build: an end-to-end
+/// harness (and the `stripe-live` lane) signs HERE, so the signed-bytes format
+/// lives in one place and a test can never pass against a subtly different one.
+///
+/// # Panics
+/// Never in practice: `Hmac::<Sha256>` accepts a key of any length, so the keying
+/// step cannot fail — the `expect` documents that invariant rather than a
+/// reachable panic.
+#[cfg(feature = "test-signing")]
+#[must_use]
+pub fn sign_webhook(secret: &WebhookSecret, raw_body: &[u8], timestamp: i64) -> String {
+    let ts = timestamp.to_string();
+    let mut signed = Vec::with_capacity(ts.len() + 1 + raw_body.len());
+    signed.extend_from_slice(ts.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(raw_body);
+    // HMAC accepts a key of any length, so this never errs.
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret.0).expect("HMAC accepts any key length");
+    mac.update(&signed);
+    let tag = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(tag.len() * 2);
+    for byte in tag {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("t={ts},v1={hex}")
+}
+
 /// Decode an even-length hex string to bytes — a variable-length mirror of
 /// `bld_manifest::decode_hex_32`, kept dependency-free.
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {

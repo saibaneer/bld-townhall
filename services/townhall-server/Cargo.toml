@@ -53,6 +53,10 @@ tempfile.workspace = true
 tokio = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
 townhall-store = { path = "../../crates/townhall-store" }
+# The M10 payment E2E signs webhooks with `sign_webhook` — the verifier's exact
+# inverse, so the test presents a provably-real Stripe signature, not one merely
+# self-consistent with our own verifier. `test-signing` is test-only.
+townhall-payment = { path = "../../crates/townhall-payment", features = ["test-signing"] }
 
 [lints]
 workspace = true

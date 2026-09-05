@@ -122,3 +122,22 @@ fn the_secret_is_masked_in_debug() {
         "the raw secret must never appear in Debug: {shown}"
     );
 }
+
+/// W9 (the test harness's own witness): `sign_webhook` reproduces the SAME
+/// header the OpenSSL reference computed — byte for byte. This is what makes the
+/// end-to-end happy path meaningful rather than circular: the signature the E2E
+/// test presents to the server is provably a real Stripe signature (it equals an
+/// independently-computed one), not merely self-consistent with our own verifier.
+#[cfg(feature = "test-signing")]
+#[test]
+fn sign_webhook_reproduces_the_independent_vector() {
+    let minted = townhall_payment::sign_webhook(&secret(), KAT_PAYLOAD.as_bytes(), KAT_TS);
+    assert_eq!(
+        minted,
+        kat_header(),
+        "the helper must sign exactly what OpenSSL did"
+    );
+    // And it round-trips through the verifier it mirrors.
+    verify_webhook(&secret(), KAT_PAYLOAD.as_bytes(), &minted, KAT_TS, 300)
+        .expect("the minted header verifies");
+}

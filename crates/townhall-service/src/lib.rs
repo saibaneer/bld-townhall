@@ -293,6 +293,14 @@ pub struct Coordinator<R, C, V, A> {
     /// booking, and the human's link has a home. `None` = payments off; the hook is
     /// a no-op, so every existing journey is byte-for-byte unchanged.
     payment_records: Option<Arc<townhall_store::payment::SqlPaymentStore>>,
+    /// The fee threshold above which a booking routes through human payment
+    /// (spec §17: "Above *configured* risk/value threshold …"). The default is
+    /// the fixed `m10-fixed-v1` policy (£100); a deployment overrides it, and the
+    /// version tracks the pence so a booking frozen under one threshold is
+    /// detectably stale if the policy later changes (ADR-030's config-drift
+    /// freeze). Held on the coordinator, not hard-coded at the door, because the
+    /// spec makes it configuration.
+    payment_policy: PaymentThresholdPolicy,
     /// Every pursuit knob, in one validated place — cadences, the lease, the
     /// escalation budget, and the Phase C re-classification budget (ADR-021).
     ///
@@ -325,6 +333,10 @@ where
             domain: TownHallDomain,
             denials: None,
             payment_records: None,
+            payment_policy: PaymentThresholdPolicy {
+                threshold: Money::from_pence(10_000),
+                version: "m10-fixed-v1".to_owned(),
+            },
             config: PursuitConfig::default(),
         }
     }
@@ -355,6 +367,17 @@ where
         store: Arc<townhall_store::payment::SqlPaymentStore>,
     ) -> Self {
         self.payment_records = Some(store);
+        self
+    }
+
+    /// Replace the payment threshold policy (spec §17's *configured* threshold).
+    /// The default is `m10-fixed-v1` (£100); a deployment lowers it where the
+    /// value that requires human financial consent is lower. The `version` a
+    /// caller supplies is what a booking freezes and revalidates against, so it
+    /// must change whenever the threshold does (ADR-030).
+    #[must_use]
+    pub fn with_payment_policy(mut self, policy: PaymentThresholdPolicy) -> Self {
+        self.payment_policy = policy;
         self
     }
 
@@ -585,10 +608,7 @@ where
         BookingContext {
             selected_facts,
             pending_effect,
-            payment_policy: PaymentThresholdPolicy {
-                threshold: Money::from_pence(10_000),
-                version: "m10-fixed-v1".to_owned(),
-            },
+            payment_policy: self.payment_policy.clone(),
         }
     }
 

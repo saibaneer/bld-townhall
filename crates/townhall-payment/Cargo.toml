@@ -14,6 +14,13 @@ rust-version.workspace = true
 # no domain, no store, no socket. Its `boundary.rs` test forbids the mutation
 # surface (store/service/http); the fact-minting layer (which names townhall-domain,
 # as council-client's verifier does) is added with the domain's payment facts.
+[features]
+# Test-only: exposes `sign_webhook`, the exact inverse of `verify_webhook`, so an
+# end-to-end harness (and the `stripe-live` lane) can mint a valid
+# `Stripe-Signature` over the SAME bytes the verifier checks — one source of truth
+# for the wire format, never a hand-rolled second copy that could quietly drift.
+test-signing = []
+
 [dependencies]
 bld-kernel = { path = "../bld-kernel" }
 bld-types = { path = "../bld-types" }

@@ -264,6 +264,17 @@ impl PursuitConfig {
 const ATTEMPT_BUDGET: u32 = 5;
 
 /// Sequences the three phases around one proposal.
+/// Wall-clock milliseconds. The coordinator is infrastructure, not the domain, so
+/// it may read the clock — the payment records it stamps are audit rows, and
+/// nothing's correctness turns on the value (idempotency is keyed on ids/states).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 pub struct Coordinator<R, C, V, A> {
     repository: Arc<R>,
     capability: Arc<C>,
@@ -275,6 +286,13 @@ pub struct Coordinator<R, C, V, A> {
     /// "wire one door and call ADR-017 done" — the failure review predicted —
     /// is not expressible: either every refusal records, or none do.
     denials: Option<Arc<townhall_store::denials::DenialLog>>,
+    /// The payment records, when payments are enabled (M10). A turn that settles a
+    /// booking into `OfferSelected` freezes the checkout here; one that settles it
+    /// into `AwaitingHumanPayment` records the Stripe session, the await intent id,
+    /// and the hosted URL — so a later webhook can map the session back to the
+    /// booking, and the human's link has a home. `None` = payments off; the hook is
+    /// a no-op, so every existing journey is byte-for-byte unchanged.
+    payment_records: Option<Arc<townhall_store::payment::SqlPaymentStore>>,
     /// Every pursuit knob, in one validated place — cadences, the lease, the
     /// escalation budget, and the Phase C re-classification budget (ADR-021).
     ///
@@ -306,6 +324,7 @@ where
             kernel: Kernel,
             domain: TownHallDomain,
             denials: None,
+            payment_records: None,
             config: PursuitConfig::default(),
         }
     }
@@ -325,6 +344,72 @@ where
     pub fn with_denial_log(mut self, log: Arc<townhall_store::denials::DenialLog>) -> Self {
         self.denials = Some(log);
         self
+    }
+
+    /// Wire the payment records (M10). Enables the freeze-at-`OfferSelected` and
+    /// record-session-at-`AwaitingHumanPayment` projection; without it, payments
+    /// are off and the hook does nothing.
+    #[must_use]
+    pub fn with_payment_records(
+        mut self,
+        store: Arc<townhall_store::payment::SqlPaymentStore>,
+    ) -> Self {
+        self.payment_records = Some(store);
+        self
+    }
+
+    /// Project a just-settled booking into the payment records. Best-effort and
+    /// idempotent: `prepare` is `ON CONFLICT DO NOTHING`, `record_session` is
+    /// guarded on `prepared`, so a re-settled turn (reclassification) writes
+    /// nothing twice. A no-op unless payments are wired.
+    async fn record_payment(
+        &self,
+        id: &BookingId,
+        aggregate: &BookingAggregate,
+        fact: &Verified<VerifiedProviderFact>,
+    ) {
+        let Some(store) = &self.payment_records else {
+            return;
+        };
+        let now = now_ms();
+        match &aggregate.state {
+            townhall_domain::BookingState::OfferSelected(offer) => {
+                // Freeze the canonical checkout the moment the fee crosses the
+                // threshold. The hash binds the amount to the id (§9.1).
+                let intent = townhall_store::payment::NewPaymentIntent {
+                    payment_intent_id: offer.payment_intent_id.clone(),
+                    booking_id: id.clone(),
+                    amount: offer.verified_fee,
+                    currency: "gbp".to_owned(),
+                    checkout_hash: format!(
+                        "chk:{}:{}",
+                        offer.payment_intent_id,
+                        offer.verified_fee.pence()
+                    ),
+                    frozen_grant: offer.grant.clone(),
+                    threshold_policy_version: offer.threshold_policy_version.clone(),
+                };
+                let _ = store.prepare(&intent, now).await;
+            }
+            townhall_domain::BookingState::AwaitingHumanPayment(awaiting) => {
+                // The SessionCreated fact carried the hosted URL; bind it, the
+                // session ref, and the AWAIT intent id (what the webhook advances).
+                if let VerifiedProviderFact::SessionCreated { hosted_url, .. } = fact.get() {
+                    let session = townhall_store::payment::SessionCreated {
+                        payment_intent_id: awaiting.payment_intent_id.clone(),
+                        stripe_session_id: awaiting.payment_ref.as_str().to_owned(),
+                        hosted_url: hosted_url.clone(),
+                        await_effect_intent_id: awaiting.effect_intent_id.clone(),
+                        // The mock/real session expiry is ~24h; the reconciler
+                        // cadence uses it, the hermetic tests drive the webhook
+                        // directly.
+                        expires_at_ms: now.saturating_add(86_400_000),
+                    };
+                    let _ = store.record_session(&session, now).await;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Override the Phase C re-classification budget. For tests that want
@@ -838,6 +923,9 @@ where
                     return Ok(BoundaryOutcome::Converged);
                 }
                 Ok(Committed { aggregate, .. }) => {
+                    // Project the fresh commit into the payment records (a no-op
+                    // unless payments are wired and the state is a payment one).
+                    self.record_payment(id, &aggregate, fact).await;
                     return Ok(BoundaryOutcome::Committed(aggregate));
                 }
                 // Someone else moved the booking between the load and the commit.

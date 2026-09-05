@@ -349,6 +349,7 @@ fn facts_about(effect: &str) -> Vec<VerifiedProviderFact> {
             effect_intent_id: EffectIntentId::new(effect),
             payment_intent_id: PaymentIntentId::new("PAY-1"),
             payment_ref: PaymentRef::new("cs_1"),
+            hosted_url: "https://checkout.stripe.test/cs_1".to_owned(),
         },
         VerifiedProviderFact::PaymentConfirmed {
             effect_intent_id: EffectIntentId::new(effect),

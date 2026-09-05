@@ -38,6 +38,7 @@ fn a_created_session_mints_its_exact_payment_fact() {
             effect_intent_id: EffectIntentId::new("EFF-BKG-PAY-4"),
             payment_intent_id: PaymentIntentId::new("PAY-BKG-3"),
             payment_ref: PaymentRef::new("cs_test_created"),
+            hosted_url: "https://checkout.stripe.test/cs_test_created".to_owned(),
         }
     );
 }

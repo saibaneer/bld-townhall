@@ -64,12 +64,14 @@ impl Verifier<StripeRaw, VerifiedProviderFact> for StripeVerifier {
             StripeRaw::SessionCreated {
                 effect_intent_id,
                 stripe_session_id,
+                hosted_url,
                 payment_intent_id,
                 ..
             } => VerifiedProviderFact::SessionCreated {
                 effect_intent_id,
                 payment_intent_id,
                 payment_ref: PaymentRef::new(stripe_session_id),
+                hosted_url,
             },
             StripeRaw::SessionRetrieved {
                 effect_intent_id,

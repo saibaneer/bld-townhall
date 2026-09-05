@@ -123,6 +123,7 @@ async fn prepare_payment_routes_to_stripe_and_mints_the_session_fact() {
             effect_intent_id: EffectIntentId::new("EFF-BKG-ROUTER-PAY-4"),
             payment_intent_id: PaymentIntentId::new("PAY-BKG-ROUTER-3"),
             payment_ref: bld_types::PaymentRef::new("cs_test_00000001"),
+            hosted_url: "https://checkout.stripe.test/cs_test_00000001".to_owned(),
         }
     );
 }

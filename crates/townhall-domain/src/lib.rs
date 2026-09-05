@@ -1156,6 +1156,11 @@ pub enum VerifiedProviderFact {
         effect_intent_id: EffectIntentId,
         payment_intent_id: PaymentIntentId,
         payment_ref: PaymentRef,
+        /// The Stripe-hosted Checkout URL. Carried through so the coordinator can
+        /// record it against the payment intent when the session settles the
+        /// booking into `AwaitingHumanPayment` — that is where the human's link
+        /// comes from (spec §17's "SMS/test client receives Checkout URL").
+        hosted_url: String,
     },
     PaymentConfirmed {
         effect_intent_id: EffectIntentId,
@@ -5554,6 +5559,7 @@ mod fact_topology {
                 effect_intent_id: EffectIntentId::new(id),
                 payment_intent_id: PaymentIntentId::new("PAY-1"),
                 payment_ref: PaymentRef::new("cs_1"),
+                hosted_url: "https://checkout.stripe.test/cs_1".to_owned(),
             },
             6 => VerifiedProviderFact::PaymentConfirmed {
                 effect_intent_id: EffectIntentId::new(id),

@@ -107,6 +107,10 @@ impl<'a> Driver<'a> {
     ) -> Journey {
         let venues = self.venues().await;
         let mut journey = Journey::default();
+        // A proposer making no progress — refused twice, or a model that keeps
+        // proposing Create for a booking that already exists — ends the run rather
+        // than burning the whole step budget on it.
+        let mut no_progress = 0u32;
 
         for _ in 0..max_steps {
             // The authoritative projection, or a note that the booking is not there
@@ -134,8 +138,19 @@ impl<'a> Driver<'a> {
                 Err(_) => break,
             };
 
+            let booking_exists = context.state.is_some();
             match proposer.propose(&context).await {
                 ProposedAction::Done => break,
+                ProposedAction::Create { .. } if booking_exists => {
+                    // The booking already exists — a Create is the proposer losing
+                    // track. Never re-submit it (the boundary would 409); count it
+                    // as no progress and re-prompt, bounded by the stall guard.
+                    no_progress += 1;
+                    if no_progress >= 2 {
+                        break;
+                    }
+                    continue;
+                }
                 ProposedAction::Create { mut body } => {
                     // The driver assigns the routing id (non-authoritative); the
                     // proposer supplies only the requirements.
@@ -167,6 +182,20 @@ impl<'a> Driver<'a> {
                         outcome,
                     });
                 }
+            }
+
+            // Stop if the proposer is making no progress against the boundary.
+            if let Some(Step {
+                outcome: Outcome::Refused { .. },
+                ..
+            }) = journey.steps.last()
+            {
+                no_progress += 1;
+                if no_progress >= 2 {
+                    break;
+                }
+            } else {
+                no_progress = 0;
             }
         }
         journey

@@ -13,6 +13,13 @@ rust-version.workspace = true
 # same adversarial suite runs against any proposer and safety is a property of the
 # boundary, not the model. Layer 1 is the seam + the deterministic HostileProposer;
 # the LlmProposer (thin OpenAI-compatible client) and the driver arrive next.
+[features]
+# The opt-in live lane (M11, ADR-031): the REAL model completes the booking +
+# cancellation journey against a spawned server. Never part of a normal
+# `cargo test` or ci/run.sh — it needs a running Ollama endpoint (AGENT_BASE_URL /
+# AGENT_MODEL), so it is a feature, exactly like `stripe-live`.
+agent-live = []
+
 [dependencies]
 async-trait = { workspace = true }
 bld-client = { path = "../bld-client" }

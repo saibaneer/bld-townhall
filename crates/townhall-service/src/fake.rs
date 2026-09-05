@@ -75,6 +75,10 @@ pub struct RawResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawBody {
+    Availability {
+        facts: townhall_domain::VenueFacts,
+        grant: AvailabilityGrant,
+    },
     Created {
         booking_ref: CouncilBookingRef,
         principal: PrincipalId,
@@ -370,6 +374,7 @@ impl crate::EffectResolver<RawResponse> for FakeCouncil {
 impl Capability<BookingEffect> for FakeCouncil {
     type Raw = RawResponse;
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         effect: &BookingEffect,
@@ -436,6 +441,22 @@ impl Capability<BookingEffect> for FakeCouncil {
             Script::RefusePermanently(reason) => RawBody::RefusedPermanently { reason },
             Script::RefuseTemporarily(reason) => RawBody::RefusedForNow { reason },
             Script::Succeed | Script::Forge => match effect {
+                BookingEffect::VerifyAvailability { selection, .. } => RawBody::Availability {
+                    facts: townhall_domain::VenueFacts {
+                        venue_id: selection.venue_id.clone(),
+                        slot_id: selection.slot_id.clone(),
+                        capacity: 30,
+                        wheelchair_accessible: true,
+                        fee: Money::from_pence(4_500),
+                        available: true,
+                    },
+                    grant: AvailabilityGrant::new(FAKE_GRANT),
+                },
+                BookingEffect::PreparePayment { .. } => {
+                    return Err(Unknown::new(BoundedString::truncating(
+                        "payment effects require the deferred payment router",
+                    )));
+                }
                 BookingEffect::Book {
                     principal,
                     attendees,
@@ -515,6 +536,11 @@ impl Verifier<RawResponse, VerifiedProviderFact> for CouncilVerifier {
         }
 
         let fact = match raw.body {
+            RawBody::Availability { facts, grant } => VerifiedProviderFact::AvailabilityVerified {
+                effect_intent_id: raw.effect_intent_id,
+                facts,
+                grant,
+            },
             RawBody::Created {
                 booking_ref,
                 principal,

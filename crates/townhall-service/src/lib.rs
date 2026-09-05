@@ -40,13 +40,13 @@ use bld_kernel::{
     BoundaryOutcome, Capability, FactResolution, Kernel, Resolution, TransitionPlan, Unknown,
     Verified, Verifier,
 };
-use bld_types::{BookingId, EffectAttempt, EffectIntentId, SlotId, VenueId};
+use bld_types::{BookingId, EffectAttempt, EffectIntentId, Money, SlotId, VenueId};
 use std::sync::Arc;
 use thiserror::Error;
 use townhall_domain::{
     Booking, BookingAggregate, BookingContext, BookingEffect, BookingError, BookingProposal,
-    FactContext, ObservedAvailability, OperationKind, SystemEvent, TownHallDomain,
-    VerifiedAuthority, VerifiedProviderFact,
+    FactContext, ObservedAvailability, OperationKind, PaymentThresholdPolicy, SystemEvent,
+    TownHallDomain, VerifiedAuthority, VerifiedProviderFact,
 };
 use townhall_store::{
     BookingRepository, ClaimedEffect, FinalizeEffect, HandoffEffect, PrepareEffect, StoreError,
@@ -500,6 +500,10 @@ where
         BookingContext {
             selected_facts,
             pending_effect,
+            payment_policy: PaymentThresholdPolicy {
+                threshold: Money::from_pence(10_000),
+                version: "m10-fixed-v1".to_owned(),
+            },
         }
     }
 
@@ -633,23 +637,64 @@ where
             expires_at_ms: intent.expires_at_ms,
         };
 
+        // INTERIM (until the Layer-5 effects router): availability is a
+        // synchronous provider already held by the coordinator. Route that
+        // effect to the trusted AvailabilitySource and turn its verified
+        // observation into the provider fact Phase C expects. It must not go
+        // through the council effect wire: that adapter owns booking and
+        // cancellation effects, not this eager read capability.
+        let synchronous_availability = match &intent.canonical_plan {
+            BookingEffect::VerifyAvailability { selection, .. } => {
+                match self
+                    .availability
+                    .read(&selection.venue_id, &selection.slot_id)
+                    .await
+                {
+                    ObservedAvailability::Answered(Some(observation)) => {
+                        let observation = observation.into_inner();
+                        Some(Verified::assert_verified(
+                            VerifiedProviderFact::AvailabilityVerified {
+                                effect_intent_id: effect_id.clone(),
+                                facts: observation.facts,
+                                grant: observation.grant,
+                            },
+                        ))
+                    }
+                    ObservedAvailability::Answered(None) | ObservedAvailability::Unavailable => {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // PHASE B — outside, with no transaction open.
-        let outcome = match self
-            .capability
-            .execute(&intent.canonical_plan, &attempt)
-            .await
-        {
-            // Neither success nor failure. The aggregate stays in flight and
-            // reconciliation resolves it; treating this as failure would return
-            // the booking to a re-proposable state while the council may hold a
-            // live one.
-            Err(Unknown { .. }) => Ok(BoundaryOutcome::Unresolved),
-            Ok(raw) => match self.verifier.verify(raw) {
-                // Provenance is the verifier's to establish. A response this
-                // crate cannot have verified is not evidence.
-                Err(_) => Ok(BoundaryOutcome::Unresolved),
-                Ok(fact) => self.settle(id, &fact).await,
-            },
+        let outcome = if matches!(
+            &intent.canonical_plan,
+            BookingEffect::VerifyAvailability { .. }
+        ) {
+            match synchronous_availability {
+                Some(fact) => self.settle(id, &fact).await,
+                None => Ok(BoundaryOutcome::Unresolved),
+            }
+        } else {
+            match self
+                .capability
+                .execute(&intent.canonical_plan, &attempt)
+                .await
+            {
+                // Neither success nor failure. The aggregate stays in flight and
+                // reconciliation resolves it; treating this as failure would return
+                // the booking to a re-proposable state while the council may hold a
+                // live one.
+                Err(Unknown { .. }) => Ok(BoundaryOutcome::Unresolved),
+                Ok(raw) => match self.verifier.verify(raw) {
+                    // Provenance is the verifier's to establish. A response this
+                    // crate cannot have verified is not evidence.
+                    Err(_) => Ok(BoundaryOutcome::Unresolved),
+                    Ok(fact) => self.settle(id, &fact).await,
+                },
+            }
         };
 
         // The call returned control — answer or not.
@@ -676,7 +721,21 @@ where
         id: &BookingId,
         fact: &Verified<VerifiedProviderFact>,
     ) -> Result<Turn, ServiceError> {
-        for _ in 0..self.config.reclassify_attempts {
+        // The deterministic-429 seam (`reclassify_attempts == 0` → immediate
+        // `Contended`) simulates PROVIDER-booking contention — a Book/Cancel whose
+        // CAS a reconciler is racing. A synchronous, side-effect-free availability
+        // verification (M10) is not that: it always gets at least one attempt, so
+        // `VerifySlot` still commits in a zero-attempt world while `Book` there
+        // still surfaces `Contended`.
+        let attempts = if matches!(
+            fact.get(),
+            VerifiedProviderFact::AvailabilityVerified { .. }
+        ) {
+            self.config.reclassify_attempts.max(1)
+        } else {
+            self.config.reclassify_attempts
+        };
+        for _ in 0..attempts {
             let aggregate = self.repository.load(id).await?;
             let booking = Booking::from(&aggregate);
             let audit = TransitionAudit::driven_by(fact.get());
@@ -853,6 +912,8 @@ fn principal_of_plan(plan: &BookingEffect) -> String {
         BookingEffect::Book { principal, .. } | BookingEffect::CancelBooking { principal, .. } => {
             principal.to_string()
         }
+        BookingEffect::VerifyAvailability { principal, .. }
+        | BookingEffect::PreparePayment { principal, .. } => principal.to_string(),
     }
 }
 

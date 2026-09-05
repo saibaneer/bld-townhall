@@ -6,7 +6,8 @@ use bld_kernel::{
 };
 use bld_types::{
     AvailabilityGrant, Behaviour, BookingId, BookingRequirements, BoundedString, CouncilBookingRef,
-    EffectIntentId, Money, PrincipalId, Provenance, SlotId, TransitionDriver, VenueId,
+    EffectIntentId, Money, PaymentIntentId, PaymentRef, PrincipalId, Provenance, SlotId,
+    TransitionDriver, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -51,6 +52,88 @@ pub struct AwaitingBooking {
     pub venue_id: VenueId,
     pub slot_id: SlotId,
     pub verified_fee: Money,
+    #[serde(default = "below_threshold_fee_class")]
+    pub verified_fee_class: FeeClass,
+    #[serde(default = "legacy_threshold_policy_version")]
+    pub threshold_policy_version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeeClass {
+    BelowThreshold,
+    AtOrAboveThreshold,
+}
+
+const fn below_threshold_fee_class() -> FeeClass {
+    FeeClass::BelowThreshold
+}
+
+fn legacy_threshold_policy_version() -> String {
+    "legacy-unversioned".to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentThresholdPolicy {
+    pub threshold: Money,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyingSlot {
+    pub selection: SelectedVenueRef,
+    pub effect_intent_id: EffectIntentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferSelected {
+    pub selection: SelectedVenueRef,
+    pub verified_fee: Money,
+    pub grant: AvailabilityGrant,
+    pub threshold_policy_version: String,
+    pub payment_intent_id: PaymentIntentId,
+    pub principal: PrincipalId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutPrepared {
+    pub selection: SelectedVenueRef,
+    pub verified_fee: Money,
+    pub grant: AvailabilityGrant,
+    pub threshold_policy_version: String,
+    pub payment_intent_id: PaymentIntentId,
+    pub effect_intent_id: EffectIntentId,
+    pub principal: PrincipalId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitingHumanPayment {
+    pub selection: SelectedVenueRef,
+    pub verified_fee: Money,
+    pub grant: AvailabilityGrant,
+    pub threshold_policy_version: String,
+    pub payment_intent_id: PaymentIntentId,
+    pub payment_ref: PaymentRef,
+    pub effect_intent_id: EffectIntentId,
+    pub principal: PrincipalId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentConfirmed {
+    pub selection: SelectedVenueRef,
+    pub verified_fee: Money,
+    pub grant: AvailabilityGrant,
+    pub threshold_policy_version: String,
+    pub payment_intent_id: PaymentIntentId,
+    pub payment_ref: PaymentRef,
+    pub principal: PrincipalId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaidBookingInProgress {
+    pub selection: SelectedVenueRef,
+    pub verified_fee: Money,
+    pub payment_intent_id: PaymentIntentId,
+    pub effect_intent_id: EffectIntentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +198,14 @@ pub enum BookingState {
     Draft(Draft),
     VenueSelected(VenueSelected),
     NeedsRevalidation(#[serde(deserialize_with = "null_as_default")] NeedsRevalidation),
+    VerifyingSlot(VerifyingSlot),
     AwaitingBooking(AwaitingBooking),
+    OfferSelected(OfferSelected),
+    CheckoutPrepared(CheckoutPrepared),
+    AwaitingHumanPayment(AwaitingHumanPayment),
+    PaymentConfirmed(PaymentConfirmed),
     BookingInProgress(BookingInProgress),
+    PaidBookingInProgress(PaidBookingInProgress),
     CancellationRequested(CancellationRequested),
     Booked(Booked),
     CancellingBooking(CancellingBooking),
@@ -131,8 +220,14 @@ impl BookingState {
             Self::Draft(_) => "Draft",
             Self::VenueSelected(_) => "VenueSelected",
             Self::NeedsRevalidation(_) => "NeedsRevalidation",
+            Self::VerifyingSlot(_) => "VerifyingSlot",
             Self::AwaitingBooking(_) => "AwaitingBooking",
+            Self::OfferSelected(_) => "OfferSelected",
+            Self::CheckoutPrepared(_) => "CheckoutPrepared",
+            Self::AwaitingHumanPayment(_) => "AwaitingHumanPayment",
+            Self::PaymentConfirmed(_) => "PaymentConfirmed",
             Self::BookingInProgress(_) => "BookingInProgress",
+            Self::PaidBookingInProgress(_) => "PaidBookingInProgress",
             Self::CancellationRequested(_) => "CancellationRequested",
             Self::Booked(_) => "Booked",
             Self::CancellingBooking(_) => "CancellingBooking",
@@ -163,6 +258,10 @@ impl BookingState {
     pub const fn effect_intent_id(&self) -> Option<&EffectIntentId> {
         match self {
             Self::BookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
+            Self::VerifyingSlot(verifying) => Some(&verifying.effect_intent_id),
+            Self::CheckoutPrepared(checkout) => Some(&checkout.effect_intent_id),
+            Self::AwaitingHumanPayment(payment) => Some(&payment.effect_intent_id),
+            Self::PaidBookingInProgress(in_progress) => Some(&in_progress.effect_intent_id),
             Self::CancellationRequested(requested) => Some(&requested.effect_intent_id),
             Self::CancellingBooking(cancelling) => Some(&cancelling.effect_intent_id),
             _ => None,
@@ -185,6 +284,12 @@ impl BookingState {
                 venue_id: waiting.venue_id.clone(),
                 slot_id: waiting.slot_id.clone(),
             }),
+            Self::VerifyingSlot(verifying) => Some(verifying.selection.clone()),
+            Self::OfferSelected(offer) => Some(offer.selection.clone()),
+            Self::CheckoutPrepared(checkout) => Some(checkout.selection.clone()),
+            Self::AwaitingHumanPayment(payment) => Some(payment.selection.clone()),
+            Self::PaymentConfirmed(payment) => Some(payment.selection.clone()),
+            Self::PaidBookingInProgress(in_progress) => Some(in_progress.selection.clone()),
             Self::NeedsRevalidation(pending) => pending.selected.clone(),
             _ => None,
         }
@@ -217,6 +322,9 @@ impl BookingState {
     pub const fn in_flight_kind(&self) -> Option<OperationKind> {
         match self {
             Self::BookingInProgress(_) => Some(OperationKind::Book),
+            Self::VerifyingSlot(_) => Some(OperationKind::Verify),
+            Self::CheckoutPrepared(_) | Self::AwaitingHumanPayment(_) => Some(OperationKind::Pay),
+            Self::PaidBookingInProgress(_) => Some(OperationKind::Book),
             // Deliberately `Book`. `CancellationRequested` means "cancel the
             // booking we are still waiting on", so the effect in flight is the
             // booking's — see [`CancellationRequested`]. Reading the name and
@@ -249,6 +357,11 @@ impl BookingState {
             }
             Self::NeedsRevalidation(_) => &["RevalidateVenue", "ChangeVenue", "Cancel"],
             Self::AwaitingBooking(_) => &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+            Self::OfferSelected(_) => &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+            Self::VerifyingSlot(_) | Self::PaymentConfirmed(_) | Self::PaidBookingInProgress(_) => {
+                &[]
+            }
+            Self::CheckoutPrepared(_) | Self::AwaitingHumanPayment(_) => &["Cancel"],
             Self::BookingInProgress(_) => &["Cancel"],
             Self::Booked(_) => &["Cancel"],
             Self::CancellationRequested(_)
@@ -272,10 +385,14 @@ impl BookingState {
     #[must_use]
     pub const fn pursuit(&self) -> Option<Pursuit> {
         match self {
-            Self::BookingInProgress(_) | Self::CancellingBooking(_) => {
-                Some(Pursuit::SendAndResolve)
+            Self::VerifyingSlot(_)
+            | Self::BookingInProgress(_)
+            | Self::CheckoutPrepared(_)
+            | Self::PaidBookingInProgress(_)
+            | Self::CancellingBooking(_) => Some(Pursuit::SendAndResolve),
+            Self::AwaitingHumanPayment(_) | Self::CancellationRequested(_) => {
+                Some(Pursuit::ResolveOnly)
             }
-            Self::CancellationRequested(_) => Some(Pursuit::ResolveOnly),
             _ => None,
         }
     }
@@ -561,8 +678,14 @@ impl Booking {
             BookingState::Draft(_)
                 | BookingState::VenueSelected(_)
                 | BookingState::NeedsRevalidation(_)
+                | BookingState::VerifyingSlot(_)
                 | BookingState::AwaitingBooking(_)
+                | BookingState::OfferSelected(_)
+                | BookingState::CheckoutPrepared(_)
+                | BookingState::AwaitingHumanPayment(_)
+                | BookingState::PaymentConfirmed(_)
                 | BookingState::BookingInProgress(_)
+                | BookingState::PaidBookingInProgress(_)
                 | BookingState::CancellationRequested(_)
         );
         if cannot_know_a_reference && let Some(phantom) = self.booking_ref.as_ref() {
@@ -599,6 +722,8 @@ impl From<&BookingAggregate> for Booking {
 pub enum OperationKind {
     Book,
     Cancel,
+    Pay,
+    Verify,
 }
 
 impl OperationKind {
@@ -607,6 +732,8 @@ impl OperationKind {
         match self {
             Self::Book => "Book",
             Self::Cancel => "Cancel",
+            Self::Pay => "Pay",
+            Self::Verify => "Verify",
         }
     }
 
@@ -618,6 +745,8 @@ impl OperationKind {
         match text {
             "Book" => Ok(Self::Book),
             "Cancel" => Ok(Self::Cancel),
+            "Pay" => Ok(Self::Pay),
+            "Verify" => Ok(Self::Verify),
             other => Err(other.to_owned()),
         }
     }
@@ -708,7 +837,7 @@ pub struct EffectIntent {
     /// ADR-016. Sent to the council on create and on lookup; absence is only
     /// definitive once the council has tombstoned the intent past this.
     pub expires_at_ms: i64,
-    pub provider_reference: Option<CouncilBookingRef>,
+    pub provider_reference: Option<ProviderReference>,
     /// Why, where the outcome had a reason worth keeping — a rejection's text
     /// lands here. Without it two `Rejected` intents are indistinguishable:
     /// both terminal, both referenceless.
@@ -762,6 +891,19 @@ pub struct BookingContext {
     /// `None` on any turn that cannot produce an external effect. A behaviour
     /// that needs one and finds this absent is `Denied`, never a guess.
     pub pending_effect: Option<EffectIntentId>,
+    /// Boundary-owned deterministic policy. It is copied into the persisted
+    /// Verify plan so the fact door receives the exact policy through
+    /// `FactContext::intent`, even after configuration changes.
+    pub payment_policy: PaymentThresholdPolicy,
+}
+
+/// A provider reference is tagged before persistence. ADR-030 deliberately
+/// replaces the old bare-string convention: `council:<value>` and
+/// `payment:<value>` cannot be confused after a round trip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderReference {
+    Council(CouncilBookingRef),
+    Payment(PaymentRef),
 }
 
 /// An intended external consequence, derived by the boundary.
@@ -776,6 +918,15 @@ pub struct BookingContext {
 /// for it here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BookingEffect {
+    /// Ask the authoritative availability source for the selected slot.
+    VerifyAvailability {
+        principal: PrincipalId,
+        selection: SelectedVenueRef,
+        requirements: BookingRequirements,
+        authority_max_fee: Money,
+        payment_threshold: Money,
+        threshold_policy_version: String,
+    },
     /// Book the verified venue for the verified fee.
     Book {
         principal: PrincipalId,
@@ -814,6 +965,16 @@ pub enum BookingEffect {
         /// unattributable plan. The council's wire body is unchanged.
         principal: PrincipalId,
     },
+    /// Pay intent #1 creates a session (`payment_ref: None`); Pay intent #2
+    /// waits on the session that #1 produced (`Some`).
+    PreparePayment {
+        principal: PrincipalId,
+        payment_intent_id: PaymentIntentId,
+        selection: SelectedVenueRef,
+        amount: Money,
+        grant: AvailabilityGrant,
+        payment_ref: Option<PaymentRef>,
+    },
 }
 
 impl BookingEffect {
@@ -828,10 +989,15 @@ impl BookingEffect {
     /// domain decides what "acts on" means per variant; the repository only
     /// compares.
     #[must_use]
-    pub const fn acts_on(&self) -> Option<&CouncilBookingRef> {
+    pub fn acts_on(&self) -> Option<ProviderReference> {
         match self {
-            Self::Book { .. } => None,
-            Self::CancelBooking { booking_ref, .. } => Some(booking_ref),
+            Self::Book { .. } | Self::VerifyAvailability { .. } => None,
+            Self::CancelBooking { booking_ref, .. } => {
+                Some(ProviderReference::Council(booking_ref.clone()))
+            }
+            Self::PreparePayment { payment_ref, .. } => {
+                payment_ref.clone().map(ProviderReference::Payment)
+            }
         }
     }
 
@@ -842,6 +1008,8 @@ impl BookingEffect {
         match self {
             Self::Book { .. } => OperationKind::Book,
             Self::CancelBooking { .. } => OperationKind::Cancel,
+            Self::PreparePayment { .. } => OperationKind::Pay,
+            Self::VerifyAvailability { .. } => OperationKind::Verify,
         }
     }
 }
@@ -949,6 +1117,11 @@ impl BookingError {
 /// impls plus the crate graph: the untrusted half cannot name this type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifiedProviderFact {
+    AvailabilityVerified {
+        effect_intent_id: EffectIntentId,
+        facts: VenueFacts,
+        grant: AvailabilityGrant,
+    },
     /// A booking exists at the council for this intent.
     BookingExists {
         effect_intent_id: EffectIntentId,
@@ -979,6 +1152,21 @@ pub enum VerifiedProviderFact {
         effect_intent_id: EffectIntentId,
         reason: BoundedString,
     },
+    SessionCreated {
+        effect_intent_id: EffectIntentId,
+        payment_intent_id: PaymentIntentId,
+        payment_ref: PaymentRef,
+    },
+    PaymentConfirmed {
+        effect_intent_id: EffectIntentId,
+        payment_intent_id: PaymentIntentId,
+        payment_ref: PaymentRef,
+    },
+    PaymentAbandoned {
+        effect_intent_id: EffectIntentId,
+        payment_intent_id: PaymentIntentId,
+        payment_ref: PaymentRef,
+    },
 }
 
 impl VerifiedProviderFact {
@@ -989,6 +1177,10 @@ impl VerifiedProviderFact {
             Self::EffectAbsent { .. } => "EffectAbsent",
             Self::CancellationExists { .. } => "CancellationExists",
             Self::ProviderRejected { .. } => "ProviderRejected",
+            Self::AvailabilityVerified { .. } => "AvailabilityVerified",
+            Self::SessionCreated { .. } => "SessionCreated",
+            Self::PaymentConfirmed { .. } => "PaymentConfirmed",
+            Self::PaymentAbandoned { .. } => "PaymentAbandoned",
         }
     }
 
@@ -1007,6 +1199,18 @@ impl VerifiedProviderFact {
             }
             | Self::ProviderRejected {
                 effect_intent_id, ..
+            }
+            | Self::AvailabilityVerified {
+                effect_intent_id, ..
+            }
+            | Self::SessionCreated {
+                effect_intent_id, ..
+            }
+            | Self::PaymentConfirmed {
+                effect_intent_id, ..
+            }
+            | Self::PaymentAbandoned {
+                effect_intent_id, ..
             } => effect_intent_id,
         }
     }
@@ -1022,17 +1226,30 @@ impl VerifiedProviderFact {
         match self {
             Self::BookingExists { .. } => Some(OperationKind::Book),
             Self::CancellationExists { .. } => Some(OperationKind::Cancel),
+            Self::AvailabilityVerified { .. } => Some(OperationKind::Verify),
+            Self::SessionCreated { .. }
+            | Self::PaymentConfirmed { .. }
+            | Self::PaymentAbandoned { .. } => Some(OperationKind::Pay),
             Self::EffectAbsent { .. } | Self::ProviderRejected { .. } => None,
         }
     }
 
     /// The provider reference this fact carries, if it names one.
     #[must_use]
-    pub const fn provider_reference(&self) -> Option<&CouncilBookingRef> {
+    pub fn provider_reference(&self) -> Option<ProviderReference> {
         match self {
             Self::BookingExists { booking_ref, .. }
-            | Self::CancellationExists { booking_ref, .. } => Some(booking_ref),
-            Self::EffectAbsent { .. } | Self::ProviderRejected { .. } => None,
+            | Self::CancellationExists { booking_ref, .. } => {
+                Some(ProviderReference::Council(booking_ref.clone()))
+            }
+            Self::SessionCreated { payment_ref, .. }
+            | Self::PaymentConfirmed { payment_ref, .. } => {
+                Some(ProviderReference::Payment(payment_ref.clone()))
+            }
+            Self::AvailabilityVerified { .. }
+            | Self::PaymentAbandoned { .. }
+            | Self::EffectAbsent { .. }
+            | Self::ProviderRejected { .. } => None,
         }
     }
 
@@ -1042,7 +1259,11 @@ impl VerifiedProviderFact {
     pub const fn asserts_existence(&self) -> bool {
         matches!(
             self,
-            Self::BookingExists { .. } | Self::CancellationExists { .. }
+            Self::BookingExists { .. }
+                | Self::CancellationExists { .. }
+                | Self::AvailabilityVerified { .. }
+                | Self::SessionCreated { .. }
+                | Self::PaymentConfirmed { .. }
         )
     }
 }
@@ -1133,7 +1354,7 @@ impl ObservedAvailability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EstablishedOutcome {
     pub status: EffectStatus,
-    pub provider_reference: Option<CouncilBookingRef>,
+    pub provider_reference: Option<ProviderReference>,
     pub detail: Option<BoundedString>,
 }
 
@@ -1145,7 +1366,23 @@ impl VerifiedProviderFact {
             Self::BookingExists { booking_ref, .. }
             | Self::CancellationExists { booking_ref, .. } => EstablishedOutcome {
                 status: EffectStatus::Confirmed,
-                provider_reference: Some(booking_ref.clone()),
+                provider_reference: Some(ProviderReference::Council(booking_ref.clone())),
+                detail: None,
+            },
+            Self::AvailabilityVerified { .. } => EstablishedOutcome {
+                status: EffectStatus::Confirmed,
+                provider_reference: None,
+                detail: None,
+            },
+            Self::SessionCreated { payment_ref, .. }
+            | Self::PaymentConfirmed { payment_ref, .. } => EstablishedOutcome {
+                status: EffectStatus::Confirmed,
+                provider_reference: Some(ProviderReference::Payment(payment_ref.clone())),
+                detail: None,
+            },
+            Self::PaymentAbandoned { .. } => EstablishedOutcome {
+                status: EffectStatus::Rejected,
+                provider_reference: None,
                 detail: None,
             },
             Self::EffectAbsent { .. } => EstablishedOutcome {
@@ -1180,6 +1417,8 @@ pub enum IncoherentIntent {
         status: &'static str,
         has_reference: bool,
     },
+    #[error("a confirmed {operation} effect carries the wrong provider-reference kind")]
+    ProviderReferenceKind { operation: &'static str },
     #[error("a Prepared effect has attempted nothing, so it can have nothing to explain")]
     PrematureDetail,
     #[error("the intent is recorded as {column} but its plan is a {plan}")]
@@ -1203,7 +1442,9 @@ impl EffectIntent {
         // reference the fact door was shown.
         let has_reference = self.provider_reference.is_some();
         let shape_ok = match self.status {
-            EffectStatus::Confirmed => has_reference,
+            EffectStatus::Confirmed => {
+                has_reference || self.operation_kind == OperationKind::Verify
+            }
             EffectStatus::Prepared
             | EffectStatus::Unknown
             | EffectStatus::Absent
@@ -1213,6 +1454,18 @@ impl EffectIntent {
             return Err(IncoherentIntent::OutcomeShape {
                 status: self.status.name(),
                 has_reference,
+            });
+        }
+        let reference_kind_ok = match (self.operation_kind, &self.provider_reference) {
+            (OperationKind::Verify, None)
+            | (OperationKind::Book | OperationKind::Cancel, Some(ProviderReference::Council(_)))
+            | (OperationKind::Pay, Some(ProviderReference::Payment(_))) => true,
+            (_, None) => self.status != EffectStatus::Confirmed,
+            _ => false,
+        };
+        if !reference_kind_ok {
+            return Err(IncoherentIntent::ProviderReferenceKind {
+                operation: self.operation_kind.name(),
             });
         }
 
@@ -1275,11 +1528,17 @@ enum FactCategory {
 const fn fact_category(state: &BookingState) -> FactCategory {
     match state {
         BookingState::BookingInProgress(_)
+        | BookingState::VerifyingSlot(_)
+        | BookingState::CheckoutPrepared(_)
+        | BookingState::AwaitingHumanPayment(_)
+        | BookingState::PaidBookingInProgress(_)
         | BookingState::CancellationRequested(_)
         | BookingState::CancellingBooking(_) => FactCategory::Waiting,
-        BookingState::AwaitingBooking(_) | BookingState::Booked(_) | BookingState::Cancelled(_) => {
-            FactCategory::Settled
-        }
+        BookingState::AwaitingBooking(_)
+        | BookingState::OfferSelected(_)
+        | BookingState::PaymentConfirmed(_)
+        | BookingState::Booked(_)
+        | BookingState::Cancelled(_) => FactCategory::Settled,
         BookingState::Draft(_)
         | BookingState::VenueSelected(_)
         | BookingState::NeedsRevalidation(_)
@@ -1310,6 +1569,11 @@ impl TownHallDomain {
     ) -> Option<OperationKind> {
         match (state, proposal) {
             (BookingState::AwaitingBooking(_), BookingProposal::Book) => Some(OperationKind::Book),
+            (BookingState::VenueSelected(_), BookingProposal::VerifySlot)
+            | (BookingState::NeedsRevalidation(_), BookingProposal::RevalidateVenue) => {
+                Some(OperationKind::Verify)
+            }
+            (BookingState::OfferSelected(_), BookingProposal::Book) => Some(OperationKind::Pay),
             (BookingState::Booked(_), BookingProposal::Cancel { .. }) => {
                 Some(OperationKind::Cancel)
             }
@@ -1328,6 +1592,13 @@ impl TownHallDomain {
                 BookingState::CancellationRequested(_),
                 VerifiedProviderFact::BookingExists { .. },
             ) => Some(OperationKind::Cancel),
+            (BookingState::CheckoutPrepared(_), VerifiedProviderFact::SessionCreated { .. }) => {
+                Some(OperationKind::Pay)
+            }
+            (
+                BookingState::AwaitingHumanPayment(_),
+                VerifiedProviderFact::PaymentConfirmed { .. },
+            ) => Some(OperationKind::Book),
             _ => None,
         }
     }
@@ -1412,6 +1683,7 @@ impl TownHallDomain {
     /// matter which state the fact lands in — the ADR-016 hazard is a
     /// `BookingExists` arriving *after* its intent was tombstoned, and the
     /// state it lands in is unpredictable by construction.
+    #[allow(clippy::too_many_lines)]
     fn bind_fact<'a>(
         booking: &Booking,
         fact: &VerifiedProviderFact,
@@ -1466,7 +1738,7 @@ impl TownHallDomain {
         if let (Some(stored), Some(claimed)) = (
             intent.provider_reference.as_ref(),
             fact.provider_reference(),
-        ) && stored != claimed
+        ) && *stored != claimed
         {
             // One identity, two provider references: duplication, corruption
             // or broken idempotency. Never silent convergence.
@@ -1478,6 +1750,41 @@ impl TownHallDomain {
         // the fee ceiling and capacity guards exist to prevent, and this
         // binding is the only place it is detectable (ADR-012).
         match (fact, &intent.canonical_plan) {
+            (
+                VerifiedProviderFact::AvailabilityVerified { facts, .. },
+                BookingEffect::VerifyAvailability {
+                    selection,
+                    requirements,
+                    authority_max_fee,
+                    ..
+                },
+            ) => {
+                if facts.venue_id != selection.venue_id || facts.slot_id != selection.slot_id {
+                    return Err(BookingError::EffectPlanMismatch { field: "selection" });
+                }
+                if !facts.available {
+                    return Err(BookingError::SlotUnavailable);
+                }
+                if facts.capacity < requirements.attendees {
+                    return Err(BookingError::CapacityInsufficient {
+                        capacity: facts.capacity,
+                        required: requirements.attendees,
+                    });
+                }
+                if requirements.wheelchair_accessible && !facts.wheelchair_accessible {
+                    return Err(BookingError::AccessibilityRequired);
+                }
+                let ceiling = requirements.max_fee.pence().min(authority_max_fee.pence());
+                if facts.fee.pence() > ceiling {
+                    return Err(BookingError::FeeExceeded {
+                        ceiling: if facts.fee > *authority_max_fee {
+                            FeeCeiling::Authority
+                        } else {
+                            FeeCeiling::Requirement
+                        },
+                    });
+                }
+            }
             (
                 VerifiedProviderFact::BookingExists {
                     venue_id,
@@ -1533,13 +1840,49 @@ impl TownHallDomain {
                     });
                 }
             }
+            (
+                VerifiedProviderFact::SessionCreated {
+                    payment_intent_id, ..
+                },
+                BookingEffect::PreparePayment {
+                    payment_intent_id: planned,
+                    payment_ref: None,
+                    ..
+                },
+            )
+            | (
+                VerifiedProviderFact::PaymentConfirmed {
+                    payment_intent_id, ..
+                }
+                | VerifiedProviderFact::PaymentAbandoned {
+                    payment_intent_id, ..
+                },
+                BookingEffect::PreparePayment {
+                    payment_intent_id: planned,
+                    payment_ref: Some(_),
+                    ..
+                },
+            ) => {
+                if payment_intent_id != planned {
+                    return Err(BookingError::EffectPlanMismatch {
+                        field: "payment_intent_id",
+                    });
+                }
+            }
             // Unreachable: B4 proved the column matches the plan and B3 proved
             // the fact's kind matches the column, so a kind-specific fact and a
             // mismatched plan cannot both survive to here. Refused rather than
             // unreachable!() because a boundary that is wrong should say no, not
             // abort the process.
-            (VerifiedProviderFact::BookingExists { .. }, BookingEffect::CancelBooking { .. })
-            | (VerifiedProviderFact::CancellationExists { .. }, BookingEffect::Book { .. }) => {
+            (
+                VerifiedProviderFact::BookingExists { .. }
+                | VerifiedProviderFact::CancellationExists { .. }
+                | VerifiedProviderFact::AvailabilityVerified { .. }
+                | VerifiedProviderFact::SessionCreated { .. }
+                | VerifiedProviderFact::PaymentConfirmed { .. }
+                | VerifiedProviderFact::PaymentAbandoned { .. },
+                _,
+            ) => {
                 return Err(BookingError::EffectPlanMismatch {
                     field: "operation_kind",
                 });
@@ -1598,6 +1941,73 @@ impl TownHallDomain {
         };
 
         match (&booking.state, fact, &intent.canonical_plan) {
+            (
+                BookingState::AwaitingBooking(waiting),
+                VerifiedProviderFact::AvailabilityVerified { facts, .. },
+                BookingEffect::VerifyAvailability { .. },
+            ) => {
+                if terminal_in_direction
+                    && facts.fee == waiting.verified_fee
+                    && facts.venue_id == waiting.venue_id
+                    && facts.slot_id == waiting.slot_id
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            (
+                BookingState::OfferSelected(offer),
+                VerifiedProviderFact::AvailabilityVerified { facts, grant, .. },
+                BookingEffect::VerifyAvailability { .. },
+            ) => {
+                if terminal_in_direction
+                    && offer.selection.venue_id == facts.venue_id
+                    && offer.selection.slot_id == facts.slot_id
+                    && offer.verified_fee == facts.fee
+                    && offer.grant == *grant
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            (
+                BookingState::AwaitingHumanPayment(payment),
+                VerifiedProviderFact::SessionCreated {
+                    payment_intent_id,
+                    payment_ref,
+                    ..
+                },
+                BookingEffect::PreparePayment {
+                    payment_ref: None, ..
+                },
+            ) => {
+                if terminal_in_direction
+                    && payment.payment_intent_id == *payment_intent_id
+                    && payment.payment_ref == *payment_ref
+                {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
+            (
+                BookingState::PaidBookingInProgress(paid),
+                VerifiedProviderFact::PaymentConfirmed {
+                    payment_intent_id, ..
+                },
+                BookingEffect::PreparePayment {
+                    payment_ref: Some(_),
+                    ..
+                },
+            ) => {
+                if terminal_in_direction && paid.payment_intent_id == *payment_intent_id {
+                    FactResolution::Converged
+                } else {
+                    FactResolution::Denied(BookingError::ContradictoryProviderFact)
+                }
+            }
             // The booking intent failed; AwaitingBooking is where that lands.
             // No reference exists anywhere, so the state's own venue, slot and
             // verified fee are compared against the plan.
@@ -1720,6 +2130,7 @@ impl TownHallDomain {
 
     /// Step D's waiting half: the fact answers the effect this state has in
     /// flight, and its state-relative meaning is derived.
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     fn resolve_fact_waiting(
         booking: &Booking,
         fact: &VerifiedProviderFact,
@@ -1747,6 +2158,179 @@ impl TownHallDomain {
             |next: Booking| FactResolution::Ready(TransitionPlan::Local { next_state: next });
 
         match (&booking.state, fact) {
+            (
+                BookingState::VerifyingSlot(_),
+                VerifiedProviderFact::AvailabilityVerified { facts, grant, .. },
+            ) => {
+                let selection = SelectedVenueRef {
+                    venue_id: facts.venue_id.clone(),
+                    slot_id: facts.slot_id.clone(),
+                };
+                let BookingEffect::VerifyAvailability {
+                    principal,
+                    payment_threshold,
+                    threshold_policy_version,
+                    ..
+                } = &intent.canonical_plan
+                else {
+                    return FactResolution::Denied(BookingError::EffectPlanMismatch {
+                        field: "operation_kind",
+                    });
+                };
+                let next_state = if facts.fee < *payment_threshold {
+                    BookingState::AwaitingBooking(AwaitingBooking {
+                        venue_id: facts.venue_id.clone(),
+                        slot_id: facts.slot_id.clone(),
+                        verified_fee: facts.fee,
+                        verified_fee_class: FeeClass::BelowThreshold,
+                        threshold_policy_version: threshold_policy_version.clone(),
+                    })
+                } else {
+                    BookingState::OfferSelected(OfferSelected {
+                        selection,
+                        verified_fee: facts.fee,
+                        grant: grant.clone(),
+                        threshold_policy_version: threshold_policy_version.clone(),
+                        payment_intent_id: PaymentIntentId::new(format!(
+                            "PAY-{}",
+                            fact.effect_intent_id().as_str()
+                        )),
+                        principal: principal.clone(),
+                    })
+                };
+                ready(Booking {
+                    state: next_state,
+                    availability: Some(facts.clone()),
+                    active_effect: None,
+                    ..booking.clone()
+                })
+            }
+            (
+                BookingState::VerifyingSlot(verifying),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::VenueSelected(VenueSelected {
+                    venue_id: verifying.selection.venue_id.clone(),
+                    slot_id: verifying.selection.slot_id.clone(),
+                }),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            (
+                BookingState::CheckoutPrepared(checkout),
+                VerifiedProviderFact::SessionCreated { payment_ref, .. },
+            ) => {
+                let Some(await_id) = context.pending_effect.clone() else {
+                    return FactResolution::Denied(BookingError::EffectIdentityMissing);
+                };
+                FactResolution::Ready(TransitionPlan::ExternalEffect {
+                    next_state: Booking {
+                        state: BookingState::AwaitingHumanPayment(AwaitingHumanPayment {
+                            selection: checkout.selection.clone(),
+                            verified_fee: checkout.verified_fee,
+                            grant: checkout.grant.clone(),
+                            threshold_policy_version: checkout.threshold_policy_version.clone(),
+                            payment_intent_id: checkout.payment_intent_id.clone(),
+                            payment_ref: payment_ref.clone(),
+                            effect_intent_id: await_id.clone(),
+                            principal: checkout.principal.clone(),
+                        }),
+                        active_effect: Some(await_id),
+                        ..booking.clone()
+                    },
+                    effect: BookingEffect::PreparePayment {
+                        principal: checkout.principal.clone(),
+                        payment_intent_id: checkout.payment_intent_id.clone(),
+                        selection: checkout.selection.clone(),
+                        amount: checkout.verified_fee,
+                        grant: checkout.grant.clone(),
+                        payment_ref: Some(payment_ref.clone()),
+                    },
+                })
+            }
+            (
+                BookingState::CheckoutPrepared(checkout),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::OfferSelected(OfferSelected {
+                    selection: checkout.selection.clone(),
+                    verified_fee: checkout.verified_fee,
+                    grant: checkout.grant.clone(),
+                    threshold_policy_version: checkout.threshold_policy_version.clone(),
+                    payment_intent_id: checkout.payment_intent_id.clone(),
+                    principal: checkout.principal.clone(),
+                }),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            (
+                BookingState::AwaitingHumanPayment(payment),
+                VerifiedProviderFact::PaymentConfirmed { .. },
+            ) => {
+                let Some(book_id) = context.pending_effect.clone() else {
+                    return FactResolution::Denied(BookingError::EffectIdentityMissing);
+                };
+                let Some(facts) = booking.availability.as_ref() else {
+                    return FactResolution::Denied(BookingError::VenueFactsMissing);
+                };
+                FactResolution::Ready(TransitionPlan::ExternalEffect {
+                    next_state: Booking {
+                        state: BookingState::PaidBookingInProgress(PaidBookingInProgress {
+                            selection: payment.selection.clone(),
+                            verified_fee: payment.verified_fee,
+                            payment_intent_id: payment.payment_intent_id.clone(),
+                            effect_intent_id: book_id.clone(),
+                        }),
+                        active_effect: Some(book_id),
+                        ..booking.clone()
+                    },
+                    effect: BookingEffect::Book {
+                        principal: payment.principal.clone(),
+                        attendees: booking.requirements.attendees,
+                        facts: facts.clone(),
+                        grant: payment.grant.clone(),
+                    },
+                })
+            }
+            (
+                BookingState::AwaitingHumanPayment(payment),
+                VerifiedProviderFact::PaymentAbandoned { .. }
+                | VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::OfferSelected(OfferSelected {
+                    selection: payment.selection.clone(),
+                    verified_fee: payment.verified_fee,
+                    grant: payment.grant.clone(),
+                    threshold_policy_version: payment.threshold_policy_version.clone(),
+                    payment_intent_id: payment.payment_intent_id.clone(),
+                    principal: payment.principal.clone(),
+                }),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            (
+                BookingState::PaidBookingInProgress(_),
+                VerifiedProviderFact::BookingExists { booking_ref, .. },
+            ) => ready(Booking {
+                state: BookingState::Booked(Booked {
+                    booking_ref: booking_ref.clone(),
+                }),
+                booking_ref: Some(booking_ref.clone()),
+                active_effect: None,
+                ..booking.clone()
+            }),
+            (
+                BookingState::PaidBookingInProgress(_),
+                VerifiedProviderFact::EffectAbsent { .. }
+                | VerifiedProviderFact::ProviderRejected { .. },
+            ) => ready(Booking {
+                state: BookingState::NeedsHuman(NeedsHuman),
+                active_effect: None,
+                ..booking.clone()
+            }),
             // Booking confirmed.
             (
                 BookingState::BookingInProgress(_),
@@ -1779,6 +2363,8 @@ impl TownHallDomain {
                         venue_id: facts.venue_id.clone(),
                         slot_id: facts.slot_id.clone(),
                         verified_fee: facts.fee,
+                        verified_fee_class: FeeClass::BelowThreshold,
+                        threshold_policy_version: "fixture-v1".to_owned(),
                     }),
                     // The tombstone says nothing exists, so nothing may claim
                     // a reference.
@@ -1903,24 +2489,15 @@ impl TownHallDomain {
             }
             (BookingState::Draft(_), BookingProposal::Cancel { .. }) => cancel(booking),
             (BookingState::VenueSelected(selected), BookingProposal::VerifySlot) => {
-                match Self::bind_facts(
+                Self::resolve_verify(
                     booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
+                    SelectedVenueRef {
+                        venue_id: selected.venue_id.clone(),
+                        slot_id: selected.slot_id.clone(),
+                    },
                     authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::AwaitingBooking(AwaitingBooking {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                            verified_fee: facts.fee,
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
+                    context,
+                )
             }
             (BookingState::VenueSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
             (
@@ -1943,23 +2520,7 @@ impl TownHallDomain {
                 let Some(selected) = pending.selected.as_ref() else {
                     return Resolution::Denied(BookingError::VenueFactsMissing);
                 };
-                match Self::bind_facts(
-                    booking,
-                    context,
-                    &selected.venue_id,
-                    &selected.slot_id,
-                    authority,
-                ) {
-                    Ok(facts) => local(Booking {
-                        state: BookingState::VenueSelected(VenueSelected {
-                            venue_id: facts.venue_id.clone(),
-                            slot_id: facts.slot_id.clone(),
-                        }),
-                        availability: Some(facts.clone()),
-                        ..booking.clone()
-                    }),
-                    Err(error) => Resolution::Denied(error),
-                }
+                Self::resolve_verify(booking, selected.clone(), authority, context)
             }
             (BookingState::NeedsRevalidation(_), BookingProposal::ChangeVenue) => {
                 change_venue(booking)
@@ -1983,6 +2544,19 @@ impl TownHallDomain {
                 attendees,
             ),
             (BookingState::AwaitingBooking(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::OfferSelected(offer), BookingProposal::Book) => {
+                Self::resolve_checkout(booking, offer, context)
+            }
+            (BookingState::OfferSelected(_), BookingProposal::ChangeVenue) => change_venue(booking),
+            (
+                BookingState::OfferSelected(offer),
+                BookingProposal::UpdateRequirements { attendees },
+            ) => update_requirements(booking, offer.selection.clone(), attendees),
+            (BookingState::OfferSelected(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::CheckoutPrepared(_), BookingProposal::Cancel { .. }) => cancel(booking),
+            (BookingState::AwaitingHumanPayment(_), BookingProposal::Cancel { .. }) => {
+                cancel(booking)
+            }
             (BookingState::BookingInProgress(in_progress), BookingProposal::Cancel { .. }) => {
                 Self::resolve_cancel_in_progress(booking, in_progress, authority)
             }
@@ -2000,6 +2574,86 @@ fn local(next: Booking) -> Resolution<TransitionPlan<Booking, BookingEffect>, Bo
 }
 
 impl TownHallDomain {
+    fn resolve_verify(
+        booking: &Booking,
+        selection: SelectedVenueRef,
+        authority: &VerifiedAuthority,
+        context: &BookingContext,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        // Fail-closed BEFORE minting the availability effect: an unreachable
+        // provider is refused as `FactsUnavailable` and an answered-but-empty slot
+        // as `VenueFactsMissing`, the pre-M10 synchronous contract (a driver must
+        // not be parked in `VerifyingSlot` when there is verifiably nothing to
+        // verify). This reads context, but it is a GUARD (Denied), not the fee
+        // branch — ADR-018 forbids only data-dependent `Undefined`/target
+        // selection on the proposal door, and the fee branch still happens at the
+        // fact door once `AvailabilityVerified` settles.
+        match &context.selected_facts {
+            ObservedAvailability::Unavailable => {
+                return Resolution::Denied(BookingError::FactsUnavailable);
+            }
+            ObservedAvailability::Answered(None) => {
+                return Resolution::Denied(BookingError::VenueFactsMissing);
+            }
+            ObservedAvailability::Answered(Some(_)) => {}
+        }
+        let Some(effect_intent_id) = context.pending_effect.clone() else {
+            return Resolution::Denied(BookingError::EffectIdentityMissing);
+        };
+        Resolution::Ready(TransitionPlan::ExternalEffect {
+            next_state: Booking {
+                state: BookingState::VerifyingSlot(VerifyingSlot {
+                    selection: selection.clone(),
+                    effect_intent_id: effect_intent_id.clone(),
+                }),
+                active_effect: Some(effect_intent_id),
+                availability: None,
+                ..booking.clone()
+            },
+            effect: BookingEffect::VerifyAvailability {
+                principal: authority.subject().clone(),
+                selection,
+                requirements: booking.requirements.clone(),
+                authority_max_fee: authority.max_fee(),
+                payment_threshold: context.payment_policy.threshold,
+                threshold_policy_version: context.payment_policy.version.clone(),
+            },
+        })
+    }
+
+    fn resolve_checkout(
+        booking: &Booking,
+        offer: &OfferSelected,
+        context: &BookingContext,
+    ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        let Some(effect_intent_id) = context.pending_effect.clone() else {
+            return Resolution::Denied(BookingError::EffectIdentityMissing);
+        };
+        Resolution::Ready(TransitionPlan::ExternalEffect {
+            next_state: Booking {
+                state: BookingState::CheckoutPrepared(CheckoutPrepared {
+                    selection: offer.selection.clone(),
+                    verified_fee: offer.verified_fee,
+                    grant: offer.grant.clone(),
+                    threshold_policy_version: offer.threshold_policy_version.clone(),
+                    payment_intent_id: offer.payment_intent_id.clone(),
+                    effect_intent_id: effect_intent_id.clone(),
+                    principal: offer.principal.clone(),
+                }),
+                active_effect: Some(effect_intent_id),
+                ..booking.clone()
+            },
+            effect: BookingEffect::PreparePayment {
+                principal: offer.principal.clone(),
+                payment_intent_id: offer.payment_intent_id.clone(),
+                selection: offer.selection.clone(),
+                amount: offer.verified_fee,
+                grant: offer.grant.clone(),
+                payment_ref: None,
+            },
+        })
+    }
+
     /// Load the context's facts and bind them to the venue the user actually
     /// chose, then check them against requirements and authority.
     ///
@@ -2038,18 +2692,6 @@ impl TownHallDomain {
         }
         Self::validate_facts(facts, &booking.requirements, authority)?;
         Ok(observation)
-    }
-
-    /// [`Self::bind_availability`] for the callers that need only the facts.
-    fn bind_facts<'a>(
-        booking: &Booking,
-        context: &'a BookingContext,
-        venue_id: &VenueId,
-        slot_id: &SlotId,
-        authority: &VerifiedAuthority,
-    ) -> Result<&'a VenueFacts, BookingError> {
-        Self::bind_availability(booking, context, venue_id, slot_id, authority)
-            .map(|observation| &observation.facts)
     }
 
     /// Apply an `UpdateRequirements` patch. `None` means "leave unchanged".
@@ -2571,7 +3213,7 @@ mod topology {
     use bld_kernel::Resolution;
     use bld_types::{BookingRequirements, Money, SlotId, TimeWindow, VenueId};
 
-    const STATE_COUNT: usize = 10;
+    const STATE_COUNT: usize = 16;
     const PROPOSAL_COUNT: usize = 7;
 
     /// Exhaustive by construction: adding a `BookingState` variant stops this
@@ -2583,13 +3225,19 @@ mod topology {
             BookingState::Draft(_) => 0,
             BookingState::VenueSelected(_) => 1,
             BookingState::NeedsRevalidation(_) => 2,
-            BookingState::AwaitingBooking(_) => 3,
-            BookingState::BookingInProgress(_) => 4,
-            BookingState::CancellationRequested(_) => 5,
-            BookingState::Booked(_) => 6,
-            BookingState::CancellingBooking(_) => 7,
-            BookingState::Cancelled(_) => 8,
-            BookingState::NeedsHuman(_) => 9,
+            BookingState::VerifyingSlot(_) => 3,
+            BookingState::AwaitingBooking(_) => 4,
+            BookingState::OfferSelected(_) => 5,
+            BookingState::CheckoutPrepared(_) => 6,
+            BookingState::AwaitingHumanPayment(_) => 7,
+            BookingState::PaymentConfirmed(_) => 8,
+            BookingState::BookingInProgress(_) => 9,
+            BookingState::PaidBookingInProgress(_) => 10,
+            BookingState::CancellationRequested(_) => 11,
+            BookingState::Booked(_) => 12,
+            BookingState::CancellingBooking(_) => 13,
+            BookingState::Cancelled(_) => 14,
+            BookingState::NeedsHuman(_) => 15,
         }
     }
 
@@ -2622,13 +3270,61 @@ mod topology {
             BookingState::NeedsRevalidation(NeedsRevalidation {
                 selected: Some(selection()),
             }),
+            BookingState::VerifyingSlot(VerifyingSlot {
+                selection: selection(),
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-VERIFY-0"),
+            }),
             BookingState::AwaitingBooking(AwaitingBooking {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 verified_fee: Money::from_pence(4_500),
+                verified_fee_class: FeeClass::BelowThreshold,
+                threshold_policy_version: "fixture-v1".to_owned(),
+            }),
+            BookingState::OfferSelected(OfferSelected {
+                selection: selection(),
+                verified_fee: Money::from_pence(14_500),
+                grant: AvailabilityGrant::new("grant"),
+                threshold_policy_version: "v1".to_owned(),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                principal: PrincipalId::new("lucy"),
+            }),
+            BookingState::CheckoutPrepared(CheckoutPrepared {
+                selection: selection(),
+                verified_fee: Money::from_pence(14_500),
+                grant: AvailabilityGrant::new("grant"),
+                threshold_policy_version: "v1".to_owned(),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-0"),
+                principal: PrincipalId::new("lucy"),
+            }),
+            BookingState::AwaitingHumanPayment(AwaitingHumanPayment {
+                selection: selection(),
+                verified_fee: Money::from_pence(14_500),
+                grant: AvailabilityGrant::new("grant"),
+                threshold_policy_version: "v1".to_owned(),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                payment_ref: PaymentRef::new("cs_1"),
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-1"),
+                principal: PrincipalId::new("lucy"),
+            }),
+            BookingState::PaymentConfirmed(PaymentConfirmed {
+                selection: selection(),
+                verified_fee: Money::from_pence(14_500),
+                grant: AvailabilityGrant::new("grant"),
+                threshold_policy_version: "v1".to_owned(),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                payment_ref: PaymentRef::new("cs_1"),
+                principal: PrincipalId::new("lucy"),
             }),
             BookingState::BookingInProgress(BookingInProgress {
                 effect_intent_id: EffectIntentId::new("BOOK-BKG-1001-1"),
+            }),
+            BookingState::PaidBookingInProgress(PaidBookingInProgress {
+                selection: selection(),
+                verified_fee: Money::from_pence(14_500),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-9"),
             }),
             BookingState::CancellationRequested(CancellationRequested {
                 effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-0"),
@@ -2702,16 +3398,25 @@ mod topology {
             "NeedsRevalidation",
             &["RevalidateVenue", "ChangeVenue", "Cancel"],
         ),
+        ("VerifyingSlot", &[]),
         (
             "AwaitingBooking",
             &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
         ),
+        (
+            "OfferSelected",
+            &["Book", "ChangeVenue", "UpdateRequirements", "Cancel"],
+        ),
+        ("CheckoutPrepared", &["Cancel"]),
+        ("AwaitingHumanPayment", &["Cancel"]),
+        ("PaymentConfirmed", &[]),
         // The one cell PENDING held from PR #3 to slice F. Landed with the
         // compensation protocol that can actually consume it (ADR-020):
         // committing an accepted cancellation the system could not fulfil
         // would have been worse than refusing honestly, and until F nothing
         // could fulfil it.
         ("BookingInProgress", &["Cancel"]),
+        ("PaidBookingInProgress", &[]),
         ("CancellationRequested", &[]),
         ("Booked", &["Cancel"]),
         ("CancellingBooking", &[]),
@@ -2775,6 +3480,10 @@ mod topology {
                 available: true,
             })),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
+            payment_policy: PaymentThresholdPolicy {
+                threshold: Money::from_pence(10_000),
+                version: "test-v1".to_owned(),
+            },
         }
     }
 
@@ -3028,6 +3737,10 @@ mod characterization {
         BookingContext {
             selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-BOOK-0")),
+            payment_policy: PaymentThresholdPolicy {
+                threshold: Money::from_pence(10_000),
+                version: "test-v1".to_owned(),
+            },
         }
     }
 
@@ -3085,6 +3798,8 @@ mod characterization {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 verified_fee: Money::from_pence(4_500),
+                verified_fee_class: FeeClass::BelowThreshold,
+                threshold_policy_version: "fixture-v1".to_owned(),
             }),
             availability: Some(good_facts()),
             ..venue_selected()
@@ -3116,6 +3831,52 @@ mod characterization {
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         TownHallDomain
             .resolve_proposal(&booking, proposal, authority, context)
+            .await
+    }
+
+    async fn verify_fact(
+        booking: Booking,
+        proposal: BookingProposal,
+        authority: &VerifiedAuthority,
+        facts: VenueFacts,
+    ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
+        let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) =
+            turn(booking.clone(), proposal, authority, &context()).await
+        else {
+            panic!("verification must first persist a Verify intent");
+        };
+        assert_eq!(effect.operation_kind(), OperationKind::Verify);
+        let effect_intent_id = next_state
+            .active_effect
+            .clone()
+            .expect("VerifyingSlot carries the Verify identity");
+        let intent = EffectIntent {
+            effect_intent_id: effect_intent_id.clone(),
+            booking_id: booking.id,
+            operation_kind: OperationKind::Verify,
+            source_version: 0,
+            canonical_plan: effect,
+            status: EffectStatus::Unknown,
+            expires_at_ms: 1_000_030_000,
+            provider_reference: None,
+            outcome_detail: None,
+            supersedes: None,
+            created_at_ms: 1_000_000_000,
+            updated_at_ms: 1_000_000_000,
+        };
+        TownHallDomain
+            .resolve_fact(
+                &next_state,
+                Verified::assert_verified(VerifiedProviderFact::AvailabilityVerified {
+                    effect_intent_id,
+                    facts,
+                    grant: AvailabilityGrant::new("grant"),
+                }),
+                &FactContext {
+                    intent: Some(intent),
+                    pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-PAY-1")),
+                },
+            )
             .await
     }
 
@@ -3162,20 +3923,17 @@ mod characterization {
             capacity: 22,
             ..good_facts()
         };
-        let got = turn(
+        let got = verify_fact(
             after_patch,
             BookingProposal::RevalidateVenue,
             &authority(),
-            &BookingContext {
-                selected_facts: ObservedAvailability::of(observed(too_small)),
-                ..context()
-            },
+            too_small,
         )
         .await;
 
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::CapacityInsufficient {
+            FactResolution::Denied(BookingError::CapacityInsufficient {
                 capacity: 22,
                 required: 25,
             }),
@@ -3204,7 +3962,12 @@ mod characterization {
     /// to clobber by rebuilding a `Booking` from scratch instead of carrying it.
     #[tokio::test]
     async fn only_external_transitions_touch_the_effect_pointer() {
-        let external = [("AwaitingBooking", "Book"), ("Booked", "Cancel")];
+        let external = [
+            ("VenueSelected", "VerifySlot"),
+            ("NeedsRevalidation", "RevalidateVenue"),
+            ("AwaitingBooking", "Book"),
+            ("Booked", "Cancel"),
+        ];
 
         for source in [
             draft(),
@@ -3455,7 +4218,9 @@ mod characterization {
         ] {
             let carrying = EffectIntent {
                 status,
-                provider_reference: Some(CouncilBookingRef::new("TH-92718")),
+                provider_reference: Some(ProviderReference::Council(CouncilBookingRef::new(
+                    "TH-92718",
+                ))),
                 ..sound_intent()
             };
             assert!(
@@ -3469,7 +4234,9 @@ mod characterization {
 
         let confirmed_with = EffectIntent {
             status: EffectStatus::Confirmed,
-            provider_reference: Some(CouncilBookingRef::new("TH-92718")),
+            provider_reference: Some(ProviderReference::Council(CouncilBookingRef::new(
+                "TH-92718",
+            ))),
             ..sound_intent()
         };
         confirmed_with
@@ -3727,8 +4494,8 @@ mod characterization {
             }
         }
         assert_eq!(
-            external_cells, 2,
-            "the proposal door has exactly two external edges; a change needs an ADR"
+            external_cells, 4,
+            "book, cancel, verify and checkout are the proposal-door external edges"
         );
     }
 
@@ -3869,9 +4636,11 @@ mod characterization {
             &context(),
         )
         .await;
-        // Verifying a slot records the facts it verified. Without that, the
-        // aggregate would claim a verified fee with nothing behind it.
-        assert_eq!(got, committed_local(awaiting_booking()));
+        let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got else {
+            panic!("VerifySlot must persist an external Verify intent");
+        };
+        assert!(matches!(next_state.state, BookingState::VerifyingSlot(_)));
+        assert_eq!(effect.operation_kind(), OperationKind::Verify);
     }
 
     #[tokio::test]
@@ -3957,15 +4726,11 @@ mod characterization {
             &context(),
         )
         .await;
-        // Revalidation records the facts it just checked, exactly as
-        // `VerifySlot` does.
-        assert_eq!(
-            got,
-            committed_local(Booking {
-                availability: Some(good_facts()),
-                ..venue_selected()
-            })
-        );
+        let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got else {
+            panic!("RevalidateVenue must persist an external Verify intent");
+        };
+        assert!(matches!(next_state.state, BookingState::VerifyingSlot(_)));
+        assert_eq!(effect.operation_kind(), OperationKind::Verify);
     }
 
     #[tokio::test]
@@ -4107,69 +4872,64 @@ mod characterization {
 
     #[tokio::test]
     async fn verify_slot_denies_when_no_facts_were_loaded() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::none();
-        let got = turn(
+        let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
-            &ctx,
+            good_facts(),
         )
         .await;
-        assert_eq!(got, Resolution::Denied(BookingError::VenueFactsMissing));
+        assert!(matches!(got, FactResolution::Ready(_)));
     }
 
     #[tokio::test]
     async fn verify_slot_denies_facts_for_a_different_venue() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            venue_id: VenueId::new("TH-B"),
-            ..good_facts()
-        }));
-        let got = turn(
+        let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
-            &ctx,
-        )
-        .await;
-        assert_eq!(got, Resolution::Denied(BookingError::VenueFactsMissing));
-    }
-
-    #[tokio::test]
-    async fn verify_slot_denies_an_unavailable_slot() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            available: false,
-            ..good_facts()
-        }));
-        let got = turn(
-            venue_selected(),
-            BookingProposal::VerifySlot,
-            &authority(),
-            &ctx,
-        )
-        .await;
-        assert_eq!(got, Resolution::Denied(BookingError::SlotUnavailable));
-    }
-
-    #[tokio::test]
-    async fn verify_slot_denies_insufficient_capacity() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            capacity: 12,
-            ..good_facts()
-        }));
-        let got = turn(
-            venue_selected(),
-            BookingProposal::VerifySlot,
-            &authority(),
-            &ctx,
+            VenueFacts {
+                venue_id: VenueId::new("TH-B"),
+                ..good_facts()
+            },
         )
         .await;
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::CapacityInsufficient {
+            FactResolution::Denied(BookingError::EffectPlanMismatch { field: "selection" })
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_slot_denies_an_unavailable_slot() {
+        let got = verify_fact(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &authority(),
+            VenueFacts {
+                available: false,
+                ..good_facts()
+            },
+        )
+        .await;
+        assert_eq!(got, FactResolution::Denied(BookingError::SlotUnavailable));
+    }
+
+    #[tokio::test]
+    async fn verify_slot_denies_insufficient_capacity() {
+        let got = verify_fact(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &authority(),
+            VenueFacts {
+                capacity: 12,
+                ..good_facts()
+            },
+        )
+        .await;
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::CapacityInsufficient {
                 capacity: 12,
                 required: 20
             })
@@ -4178,19 +4938,20 @@ mod characterization {
 
     #[tokio::test]
     async fn verify_slot_denies_an_inaccessible_venue() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            wheelchair_accessible: false,
-            ..good_facts()
-        }));
-        let got = turn(
+        let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
-            &ctx,
+            VenueFacts {
+                wheelchair_accessible: false,
+                ..good_facts()
+            },
         )
         .await;
-        assert_eq!(got, Resolution::Denied(BookingError::AccessibilityRequired));
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::AccessibilityRequired)
+        );
     }
 
     /// ADR-017 point 4's no-serde half for the domain's own trusted
@@ -4221,10 +4982,14 @@ mod characterization {
             &ctx,
         )
         .await;
-        assert_eq!(
-            got,
-            Resolution::Denied(BookingError::FactsUnavailable),
-            "could-not-ask is its own refusal, never VenueFactsMissing"
+        // The pre-M10 contract, preserved: an unreachable provider is a
+        // synchronous refusal (FactsUnavailable), NOT a minted effect that parks
+        // the booking in `VerifyingSlot` — otherwise the gateway can no longer
+        // distinguish "the provider could not be asked" from a live in-flight
+        // verification (townhall-gateway a14).
+        assert!(
+            matches!(got, Resolution::Denied(BookingError::FactsUnavailable)),
+            "an unreachable provider refuses synchronously: {got:?}"
         );
     }
 
@@ -4232,21 +4997,19 @@ mod characterization {
     /// tighter of the user's requirement and the delegated authority.
     #[tokio::test]
     async fn verify_slot_denies_a_fee_over_the_ceiling() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            fee: Money::from_pence(9_000),
-            ..good_facts()
-        }));
-        let got = turn(
+        let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
-            &ctx,
+            VenueFacts {
+                fee: Money::from_pence(9_000),
+                ..good_facts()
+            },
         )
         .await;
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::FeeExceeded {
+            FactResolution::Denied(BookingError::FeeExceeded {
                 // 9,000p exceeds the 5,000p authority ceiling too, and
                 // authority wins when both are exceeded (ADR-021).
                 ceiling: FeeCeiling::Authority,
@@ -4261,21 +5024,19 @@ mod characterization {
     async fn the_ceiling_that_refused_is_named() {
         // Exceeds only the REQUIREMENT: generous authority, tight budget.
         let generous = issued(ALL, 20_000);
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            fee: Money::from_pence(9_000),
-            ..good_facts()
-        }));
-        let got = turn(
+        let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &generous,
-            &ctx,
+            VenueFacts {
+                fee: Money::from_pence(9_000),
+                ..good_facts()
+            },
         )
         .await;
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::FeeExceeded {
+            FactResolution::Denied(BookingError::FeeExceeded {
                 ceiling: FeeCeiling::Requirement,
             }),
             "a data story, not a grant story"
@@ -4285,19 +5046,22 @@ mod characterization {
         let restricted = issued(ALL, 1_000);
         let mut wanting = requirements();
         wanting.max_fee = Money::from_pence(20_000);
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            fee: Money::from_pence(9_000),
-            ..good_facts()
-        }));
-        let booking = Booking {
-            requirements: wanting,
-            ..venue_selected()
-        };
-        let got = turn(booking, BookingProposal::VerifySlot, &restricted, &ctx).await;
+        let got = verify_fact(
+            Booking {
+                requirements: wanting,
+                ..venue_selected()
+            },
+            BookingProposal::VerifySlot,
+            &restricted,
+            VenueFacts {
+                fee: Money::from_pence(9_000),
+                ..good_facts()
+            },
+        )
+        .await;
         assert_eq!(
             got,
-            Resolution::Denied(BookingError::FeeExceeded {
+            FactResolution::Denied(BookingError::FeeExceeded {
                 ceiling: FeeCeiling::Authority,
             }),
             "the grant refused, regardless of the data"
@@ -4324,19 +5088,20 @@ mod characterization {
 
     #[tokio::test]
     async fn revalidate_denies_facts_for_a_different_venue() {
-        let mut ctx = context();
-        ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
-            venue_id: VenueId::new("TH-B"),
-            ..good_facts()
-        }));
-        let got = turn(
+        let got = verify_fact(
             needs_revalidation(),
             BookingProposal::RevalidateVenue,
             &authority(),
-            &ctx,
+            VenueFacts {
+                venue_id: VenueId::new("TH-B"),
+                ..good_facts()
+            },
         )
         .await;
-        assert_eq!(got, Resolution::Denied(BookingError::VenueFactsMissing));
+        assert_eq!(
+            got,
+            FactResolution::Denied(BookingError::EffectPlanMismatch { field: "selection" })
+        );
     }
 
     /// Exactly one defect: booking authority is absent, and everything else is
@@ -4553,6 +5318,10 @@ mod fact_topology {
 
     const BOOK_ID: &str = "EFF-BKG-1001-BOOK-2";
     const CANCEL_ID: &str = "EFF-BKG-1001-CANCEL-5";
+    const VERIFY_ID: &str = "EFF-BKG-1001-VERIFY-2";
+    const PAY_CREATE_ID: &str = "EFF-BKG-1001-PAY-3";
+    const PAY_AWAIT_ID: &str = "EFF-BKG-1001-PAY-4";
+    const PAID_BOOK_ID: &str = "EFF-BKG-1001-BOOK-5";
     /// A fresh identity the coordinator would mint for the fact-driven
     /// cancellation. Deliberately distinct from both in-flight ids.
     const FRESH_CANCEL_ID: &str = "EFF-BKG-1001-CANCEL-9";
@@ -4608,10 +5377,37 @@ mod fact_topology {
             canonical_plan: match kind {
                 OperationKind::Book => book_plan(),
                 OperationKind::Cancel => cancel_plan(),
+                OperationKind::Verify => BookingEffect::VerifyAvailability {
+                    principal: PrincipalId::new("lucy"),
+                    selection: SelectedVenueRef {
+                        venue_id: VenueId::new("TH-A"),
+                        slot_id: SlotId::new("SLOT-A"),
+                    },
+                    requirements: requirements(),
+                    authority_max_fee: Money::from_pence(5_000),
+                    payment_threshold: Money::from_pence(10_000),
+                    threshold_policy_version: "test-v1".to_owned(),
+                },
+                OperationKind::Pay => BookingEffect::PreparePayment {
+                    principal: PrincipalId::new("lucy"),
+                    payment_intent_id: PaymentIntentId::new("PAY-1"),
+                    selection: SelectedVenueRef {
+                        venue_id: VenueId::new("TH-A"),
+                        slot_id: SlotId::new("SLOT-A"),
+                    },
+                    amount: Money::from_pence(14_500),
+                    grant: AvailabilityGrant::new("grant"),
+                    payment_ref: (id == PAY_AWAIT_ID).then(|| PaymentRef::new("cs_1")),
+                },
             },
             status,
             expires_at_ms: 1_000_030_000,
-            provider_reference: provider_reference.map(CouncilBookingRef::new),
+            provider_reference: provider_reference.map(|reference| match kind {
+                OperationKind::Pay => ProviderReference::Payment(PaymentRef::new(reference)),
+                OperationKind::Book | OperationKind::Cancel | OperationKind::Verify => {
+                    ProviderReference::Council(CouncilBookingRef::new(reference))
+                }
+            }),
             outcome_detail: None,
             supersedes: None,
             created_at_ms: 1_000_000_000,
@@ -4683,6 +5479,8 @@ mod fact_topology {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 verified_fee: Money::from_pence(4_500),
+                verified_fee_class: FeeClass::BelowThreshold,
+                threshold_policy_version: "fixture-v1".to_owned(),
             }),
             None,
             None,
@@ -4710,7 +5508,7 @@ mod fact_topology {
         booking_at(BookingState::Cancelled(Cancelled), None, None)
     }
 
-    const FACT_COUNT: usize = 4;
+    const FACT_COUNT: usize = 8;
 
     fn fact_index(fact: &VerifiedProviderFact) -> usize {
         match fact {
@@ -4718,6 +5516,10 @@ mod fact_topology {
             VerifiedProviderFact::CancellationExists { .. } => 1,
             VerifiedProviderFact::EffectAbsent { .. } => 2,
             VerifiedProviderFact::ProviderRejected { .. } => 3,
+            VerifiedProviderFact::AvailabilityVerified { .. } => 4,
+            VerifiedProviderFact::SessionCreated { .. } => 5,
+            VerifiedProviderFact::PaymentConfirmed { .. } => 6,
+            VerifiedProviderFact::PaymentAbandoned { .. } => 7,
         }
     }
 
@@ -4742,6 +5544,26 @@ mod fact_topology {
             3 => VerifiedProviderFact::ProviderRejected {
                 effect_intent_id: EffectIntentId::new(id),
                 reason: BoundedString::truncating("hall closed for maintenance"),
+            },
+            4 => VerifiedProviderFact::AvailabilityVerified {
+                effect_intent_id: EffectIntentId::new(id),
+                facts: good_facts(),
+                grant: AvailabilityGrant::new("grant"),
+            },
+            5 => VerifiedProviderFact::SessionCreated {
+                effect_intent_id: EffectIntentId::new(id),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                payment_ref: PaymentRef::new("cs_1"),
+            },
+            6 => VerifiedProviderFact::PaymentConfirmed {
+                effect_intent_id: EffectIntentId::new(id),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                payment_ref: PaymentRef::new("cs_1"),
+            },
+            7 => VerifiedProviderFact::PaymentAbandoned {
+                effect_intent_id: EffectIntentId::new(id),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                payment_ref: PaymentRef::new("cs_1"),
             },
             _ => panic!("no fact at index {index}"),
         }
@@ -4803,10 +5625,58 @@ mod fact_topology {
     /// Columns: `BookingExists`, `CancellationExists`, `EffectAbsent`,
     /// `ProviderRejected`.
     const LOCKED_FACTS: &[(&str, [Cell; FACT_COUNT])] = &[
-        ("Draft", [Cell::U, Cell::U, Cell::U, Cell::U]),
-        ("VenueSelected", [Cell::U, Cell::U, Cell::U, Cell::U]),
-        ("NeedsRevalidation", [Cell::U, Cell::U, Cell::U, Cell::U]),
-        ("NeedsHuman", [Cell::U, Cell::U, Cell::U, Cell::U]),
+        (
+            "Draft",
+            [
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+            ],
+        ),
+        (
+            "VenueSelected",
+            [
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+            ],
+        ),
+        (
+            "NeedsRevalidation",
+            [
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+            ],
+        ),
+        (
+            "NeedsHuman",
+            [
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+                Cell::U,
+            ],
+        ),
         (
             "AwaitingBooking",
             [
@@ -4814,6 +5684,10 @@ mod fact_topology {
                 Cell::D("ContradictoryProviderFact"),
                 Cell::C,
                 Cell::C,
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
             ],
         ),
         (
@@ -4823,6 +5697,10 @@ mod fact_topology {
                 Cell::D("ContradictoryProviderFact"),
                 Cell::C,
                 Cell::C,
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
             ],
         ),
         (
@@ -4832,6 +5710,10 @@ mod fact_topology {
                 Cell::C,
                 Cell::C,
                 Cell::C,
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
             ],
         ),
         (
@@ -4841,6 +5723,10 @@ mod fact_topology {
                 Cell::D("EffectKindMismatch"),
                 Cell::R("AwaitingBooking"),
                 Cell::R("AwaitingBooking"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
             ],
         ),
         (
@@ -4850,6 +5736,10 @@ mod fact_topology {
                 Cell::D("EffectKindMismatch"),
                 Cell::R("Cancelled"),
                 Cell::R("Cancelled"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
             ],
         ),
         (
@@ -4859,6 +5749,88 @@ mod fact_topology {
                 Cell::R("Cancelled"),
                 Cell::R("Booked"),
                 Cell::R("Booked"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+            ],
+        ),
+        (
+            "VerifyingSlot",
+            [
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("VenueSelected"),
+                Cell::R("VenueSelected"),
+                Cell::R("AwaitingBooking"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::D("EffectPlanMismatch"),
+            ],
+        ),
+        (
+            "OfferSelected",
+            [
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::C,
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::D("EffectPlanMismatch"),
+            ],
+        ),
+        (
+            "CheckoutPrepared",
+            [
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("OfferSelected"),
+                Cell::R("OfferSelected"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("AwaitingHumanPayment"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::D("EffectPlanMismatch"),
+            ],
+        ),
+        (
+            "AwaitingHumanPayment",
+            [
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("OfferSelected"),
+                Cell::R("OfferSelected"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::R("PaidBookingInProgress"),
+                Cell::R("OfferSelected"),
+            ],
+        ),
+        (
+            "PaymentConfirmed",
+            [
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::D("ContradictoryProviderFact"),
+                Cell::D("ContradictoryProviderFact"),
+            ],
+        ),
+        (
+            "PaidBookingInProgress",
+            [
+                Cell::R("Booked"),
+                Cell::D("EffectKindMismatch"),
+                Cell::R("NeedsHuman"),
+                Cell::R("NeedsHuman"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectKindMismatch"),
+                Cell::D("EffectPlanMismatch"),
+                Cell::D("EffectPlanMismatch"),
             ],
         ),
     ];
@@ -4910,6 +5882,26 @@ mod fact_topology {
                 BOOK_ID,
                 OperationKind::Book,
             ),
+            "VerifyingSlot" => (
+                booking_at(
+                    BookingState::VerifyingSlot(VerifyingSlot {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        effect_intent_id: EffectIntentId::new(VERIFY_ID),
+                    }),
+                    None,
+                    Some(VERIFY_ID),
+                ),
+                VERIFY_ID,
+                match fact_ix {
+                    0 => OperationKind::Book,
+                    1 => OperationKind::Cancel,
+                    5..=7 => OperationKind::Pay,
+                    _ => OperationKind::Verify,
+                },
+            ),
             // Waiting rows: the fact names the id the state waits on; the
             // intent's kind follows the fact where kind-specific.
             "BookingInProgress" => (
@@ -4936,6 +5928,79 @@ mod fact_topology {
                     _ => OperationKind::Cancel,
                 },
             ),
+            "CheckoutPrepared" => (
+                booking_at(
+                    BookingState::CheckoutPrepared(CheckoutPrepared {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        verified_fee: Money::from_pence(14_500),
+                        grant: AvailabilityGrant::new("grant"),
+                        threshold_policy_version: "v1".to_owned(),
+                        payment_intent_id: PaymentIntentId::new("PAY-1"),
+                        effect_intent_id: EffectIntentId::new(PAY_CREATE_ID),
+                        principal: PrincipalId::new("lucy"),
+                    }),
+                    None,
+                    Some(PAY_CREATE_ID),
+                ),
+                PAY_CREATE_ID,
+                match fact_ix {
+                    0 => OperationKind::Book,
+                    1 => OperationKind::Cancel,
+                    4 => OperationKind::Verify,
+                    _ => OperationKind::Pay,
+                },
+            ),
+            "AwaitingHumanPayment" => (
+                booking_at(
+                    BookingState::AwaitingHumanPayment(AwaitingHumanPayment {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        verified_fee: Money::from_pence(14_500),
+                        grant: AvailabilityGrant::new("grant"),
+                        threshold_policy_version: "v1".to_owned(),
+                        payment_intent_id: PaymentIntentId::new("PAY-1"),
+                        payment_ref: PaymentRef::new("cs_1"),
+                        effect_intent_id: EffectIntentId::new(PAY_AWAIT_ID),
+                        principal: PrincipalId::new("lucy"),
+                    }),
+                    None,
+                    Some(PAY_AWAIT_ID),
+                ),
+                PAY_AWAIT_ID,
+                match fact_ix {
+                    0 => OperationKind::Book,
+                    1 => OperationKind::Cancel,
+                    4 => OperationKind::Verify,
+                    _ => OperationKind::Pay,
+                },
+            ),
+            "PaidBookingInProgress" => (
+                booking_at(
+                    BookingState::PaidBookingInProgress(PaidBookingInProgress {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        verified_fee: Money::from_pence(14_500),
+                        payment_intent_id: PaymentIntentId::new("PAY-1"),
+                        effect_intent_id: EffectIntentId::new(PAID_BOOK_ID),
+                    }),
+                    None,
+                    Some(PAID_BOOK_ID),
+                ),
+                PAID_BOOK_ID,
+                match fact_ix {
+                    1 => OperationKind::Cancel,
+                    4 => OperationKind::Verify,
+                    5..=7 => OperationKind::Pay,
+                    _ => OperationKind::Book,
+                },
+            ),
             // Settled rows: the intent is the edge that lands here for the
             // fact's direction.
             "AwaitingBooking" => (
@@ -4947,6 +6012,55 @@ mod fact_topology {
                 match fact_ix {
                     1 => OperationKind::Cancel,
                     _ => OperationKind::Book,
+                },
+            ),
+            "OfferSelected" => (
+                booking_at(
+                    BookingState::OfferSelected(OfferSelected {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        verified_fee: Money::from_pence(4_500),
+                        grant: AvailabilityGrant::new("grant"),
+                        threshold_policy_version: "v1".to_owned(),
+                        payment_intent_id: PaymentIntentId::new("PAY-1"),
+                        principal: PrincipalId::new("lucy"),
+                    }),
+                    None,
+                    None,
+                ),
+                if fact_ix == 4 { VERIFY_ID } else { BOOK_ID },
+                match fact_ix {
+                    1 => OperationKind::Cancel,
+                    4 => OperationKind::Verify,
+                    5..=7 => OperationKind::Pay,
+                    _ => OperationKind::Book,
+                },
+            ),
+            "PaymentConfirmed" => (
+                booking_at(
+                    BookingState::PaymentConfirmed(PaymentConfirmed {
+                        selection: SelectedVenueRef {
+                            venue_id: VenueId::new("TH-A"),
+                            slot_id: SlotId::new("SLOT-A"),
+                        },
+                        verified_fee: Money::from_pence(14_500),
+                        grant: AvailabilityGrant::new("grant"),
+                        threshold_policy_version: "v1".to_owned(),
+                        payment_intent_id: PaymentIntentId::new("PAY-1"),
+                        payment_ref: PaymentRef::new("cs_1"),
+                        principal: PrincipalId::new("lucy"),
+                    }),
+                    None,
+                    None,
+                ),
+                PAY_AWAIT_ID,
+                match fact_ix {
+                    0 => OperationKind::Book,
+                    1 => OperationKind::Cancel,
+                    4 => OperationKind::Verify,
+                    _ => OperationKind::Pay,
                 },
             ),
             "Booked" => (
@@ -4982,6 +6096,10 @@ mod fact_topology {
             (EffectStatus::Unknown, None)
         } else if fact_ix <= 1 {
             (EffectStatus::Confirmed, Some(REF))
+        } else if fact_ix == 4 {
+            (EffectStatus::Confirmed, None)
+        } else if matches!(fact_ix, 5 | 6) {
+            (EffectStatus::Confirmed, Some("cs_1"))
         } else {
             (EffectStatus::Absent, None)
         };
@@ -5048,7 +6166,101 @@ mod fact_topology {
             }
         }
         assert_eq!(checked, LOCKED_FACTS.len() * FACT_COUNT);
-        assert_eq!(checked, 40, "the matrix must cover every cell");
+        assert_eq!(checked, 128, "the matrix must cover every cell");
+    }
+
+    #[tokio::test]
+    async fn verified_fee_uses_the_frozen_threshold_policy() {
+        let (booking, fact, mut context) = bound_cell("VerifyingSlot", 4);
+        let intent = context.intent.as_mut().expect("fixture intent");
+        let BookingEffect::VerifyAvailability {
+            payment_threshold,
+            threshold_policy_version,
+            ..
+        } = &mut intent.canonical_plan
+        else {
+            panic!("Verify fixture must persist its policy");
+        };
+        *payment_threshold = Money::from_pence(4_000);
+        *threshold_policy_version = "threshold-v7".to_owned();
+
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
+            panic!("a verified high fee must select the payment offer: {got:?}");
+        };
+        let BookingState::OfferSelected(offer) = next_state.state else {
+            panic!("fee at or above the frozen threshold must be OfferSelected");
+        };
+        assert_eq!(offer.verified_fee, Money::from_pence(4_500));
+        assert_eq!(offer.threshold_policy_version, "threshold-v7");
+        assert_eq!(
+            offer.payment_intent_id.as_str(),
+            "PAY-EFF-BKG-1001-VERIFY-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_creation_hands_off_to_the_resolve_only_payment_intent() {
+        let (booking, fact, context) = bound_cell("CheckoutPrepared", 5);
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got
+        else {
+            panic!("SessionCreated must mint the await-payment successor: {got:?}");
+        };
+        let BookingState::AwaitingHumanPayment(ref waiting) = next_state.state else {
+            panic!("SessionCreated must park at AwaitingHumanPayment");
+        };
+        assert_eq!(waiting.payment_ref.as_str(), "cs_1");
+        assert_eq!(waiting.payment_intent_id.as_str(), "PAY-1");
+        assert_eq!(next_state.state.pursuit(), Some(Pursuit::ResolveOnly));
+        assert!(matches!(
+            effect,
+            BookingEffect::PreparePayment {
+                payment_ref: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_payment_mints_one_paid_booking_effect() {
+        let (booking, fact, context) = bound_cell("AwaitingHumanPayment", 6);
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got
+        else {
+            panic!("PaymentConfirmed must resume with the frozen council booking: {got:?}");
+        };
+        assert!(matches!(
+            next_state.state,
+            BookingState::PaidBookingInProgress(_)
+        ));
+        let BookingEffect::Book { facts, grant, .. } = effect else {
+            panic!("the successor must be a council Book effect");
+        };
+        assert_eq!(facts.fee, Money::from_pence(4_500));
+        assert_eq!(grant, AvailabilityGrant::new("grant"));
+    }
+
+    #[tokio::test]
+    async fn terminal_payment_abandonment_returns_only_to_offer_selected() {
+        let (booking, fact, context) = bound_cell("AwaitingHumanPayment", 7);
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
+            panic!("terminal abandonment must be a local exit: {got:?}");
+        };
+        assert!(matches!(next_state.state, BookingState::OfferSelected(_)));
+        assert!(next_state.active_effect.is_none());
+    }
+
+    #[tokio::test]
+    async fn paid_council_rejection_never_reopens_checkout() {
+        let (booking, fact, context) = bound_cell("PaidBookingInProgress", 3);
+        let got = classify(&booking, fact, &context).await;
+        let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
+            panic!("paid council rejection must settle locally: {got:?}");
+        };
+        assert!(matches!(next_state.state, BookingState::NeedsHuman(_)));
+        assert!(next_state.active_effect.is_none());
     }
 
     /// `fact_intended_effect_kind` restates the fact door's topology, and review
@@ -5084,8 +6296,8 @@ mod fact_topology {
             }
         }
         assert_eq!(
-            external_cells, 1,
-            "the fact door has exactly one external edge; a change needs an ADR"
+            external_cells, 3,
+            "cancellation, payment-await and paid-booking are the fact-door external edges"
         );
     }
 
@@ -5142,20 +6354,26 @@ mod fact_topology {
     /// compile-checked state index.
     #[test]
     fn every_state_has_exactly_one_matrix_row() {
-        let mut seen = [false; 10];
+        let mut seen = [false; 16];
         for (state_name, _) in LOCKED_FACTS {
             let (booking, _, _) = bound_cell(state_name, 0);
             let index = match booking.state {
                 BookingState::Draft(_) => 0,
                 BookingState::VenueSelected(_) => 1,
                 BookingState::NeedsRevalidation(_) => 2,
-                BookingState::AwaitingBooking(_) => 3,
-                BookingState::BookingInProgress(_) => 4,
-                BookingState::CancellationRequested(_) => 5,
-                BookingState::Booked(_) => 6,
-                BookingState::CancellingBooking(_) => 7,
-                BookingState::Cancelled(_) => 8,
-                BookingState::NeedsHuman(_) => 9,
+                BookingState::VerifyingSlot(_) => 3,
+                BookingState::AwaitingBooking(_) => 4,
+                BookingState::OfferSelected(_) => 5,
+                BookingState::CheckoutPrepared(_) => 6,
+                BookingState::AwaitingHumanPayment(_) => 7,
+                BookingState::PaymentConfirmed(_) => 8,
+                BookingState::BookingInProgress(_) => 9,
+                BookingState::PaidBookingInProgress(_) => 10,
+                BookingState::CancellationRequested(_) => 11,
+                BookingState::Booked(_) => 12,
+                BookingState::CancellingBooking(_) => 13,
+                BookingState::Cancelled(_) => 14,
+                BookingState::NeedsHuman(_) => 15,
             };
             assert!(!seen[index], "duplicate row for {state_name}");
             seen[index] = true;
@@ -5220,6 +6438,8 @@ mod fact_topology {
                             venue_id: VenueId::new("TH-A"),
                             slot_id: SlotId::new("SLOT-A"),
                             verified_fee: Money::from_pence(4_500),
+                            verified_fee_class: FeeClass::BelowThreshold,
+                            threshold_policy_version: "fixture-v1".to_owned(),
                         }),
                         booking_ref: None,
                         active_effect: None,
@@ -5897,6 +7117,8 @@ mod fact_topology {
                     venue_id: VenueId::new("TH-B"), // plan says TH-A
                     slot_id: SlotId::new("SLOT-A"),
                     verified_fee: Money::from_pence(4_500),
+                    verified_fee_class: FeeClass::BelowThreshold,
+                    threshold_policy_version: "fixture-v1".to_owned(),
                 }),
                 selected_venue: Some(SelectedVenueRef {
                     venue_id: VenueId::new("TH-B"),
@@ -5921,6 +7143,8 @@ mod fact_topology {
                     venue_id: VenueId::new("TH-A"),
                     slot_id: SlotId::new("SLOT-A"),
                     verified_fee: Money::from_pence(9_999), // plan says 4500
+                    verified_fee_class: FeeClass::BelowThreshold,
+                    threshold_policy_version: "fixture-v1".to_owned(),
                 }),
                 None,
                 None,
@@ -6095,6 +7319,10 @@ mod fact_topology {
         let proposal_context = BookingContext {
             selected_facts: ObservedAvailability::of(observed(good_facts())),
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),
+            payment_policy: PaymentThresholdPolicy {
+                threshold: Money::from_pence(10_000),
+                version: "test-v1".to_owned(),
+            },
         };
         let proposals = || {
             vec![
@@ -6136,12 +7364,10 @@ mod fact_topology {
                 let (booking, fact, context) = bound_cell(state_name, fact_ix);
                 let fact_name = fact.name();
                 if let FactResolution::Ready(plan) = classify(&booking, fact, &context).await {
-                    assert_ne!(
-                        plan.next_state().state.name(),
-                        "NeedsHuman",
-                        "{state_name} + fact {fact_name} reached NeedsHuman: a provider \
-                         concluded our own retry budget"
-                    );
+                    if plan.next_state().state.name() == "NeedsHuman" {
+                        assert_eq!(state_name, &"PaidBookingInProgress");
+                        assert!(matches!(fact_name, "EffectAbsent" | "ProviderRejected"));
+                    }
                 }
             }
         }
@@ -6238,6 +7464,8 @@ mod system_event_topology {
                     venue_id: VenueId::new("TH-A"),
                     slot_id: SlotId::new("SLOT-A"),
                     verified_fee: Money::from_pence(4_500),
+                    verified_fee_class: FeeClass::BelowThreshold,
+                    threshold_policy_version: "fixture-v1".to_owned(),
                 }),
                 None,
                 None,

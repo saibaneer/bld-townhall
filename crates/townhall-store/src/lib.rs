@@ -22,7 +22,7 @@ pub mod denials;
 pub mod usage;
 use townhall_domain::{
     Booking, BookingAggregate, BookingEffect, BookingState, Draft, EffectIntent, EffectStatus,
-    IncoherentBooking, IncoherentIntent, OperationKind,
+    IncoherentBooking, IncoherentIntent, OperationKind, ProviderReference,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -1074,14 +1074,30 @@ impl BookingRepository for SqliteBookingRepository {
                 reason: "a successor effect exists only because its predecessor succeeded",
             });
         }
-        if request.successor_plan.acts_on() != request.finalising_reference.as_ref() {
+        let successor_reference = request.successor_plan.acts_on();
+        let predecessor_is_payment = matches!(
+            request.finalising_reference,
+            Some(ProviderReference::Payment(_))
+        );
+        if (!predecessor_is_payment
+            && successor_reference.as_ref() != request.finalising_reference.as_ref())
+            || (predecessor_is_payment
+                && successor_reference.is_some()
+                && successor_reference.as_ref() != request.finalising_reference.as_ref())
+        {
             return Err(StoreError::IncoherentHandoff {
                 reason: "the successor must act on the reference its predecessor produced",
             });
         }
         // And the aggregate must record that reference too, or the booking would
         // point at one thing while its in-flight effect acts on another.
-        if request.next.booking_ref != request.finalising_reference {
+        let finalising_council_reference = match &request.finalising_reference {
+            Some(ProviderReference::Council(reference)) => Some(reference),
+            Some(ProviderReference::Payment(_)) | None => None,
+        };
+        if !predecessor_is_payment
+            && request.next.booking_ref.as_ref() != finalising_council_reference
+        {
             return Err(StoreError::IncoherentHandoff {
                 reason: "the next booking must record the reference its predecessor produced",
             });
@@ -2838,7 +2854,7 @@ pub struct FinalizeEffect {
     /// The effect ending.
     pub effect_intent_id: EffectIntentId,
     pub status: EffectStatus,
-    pub provider_reference: Option<CouncilBookingRef>,
+    pub provider_reference: Option<ProviderReference>,
     /// Why, where the outcome has a reason worth keeping.
     pub outcome_detail: Option<BoundedString>,
     /// The complete next booking the domain decided.
@@ -2863,7 +2879,7 @@ pub struct HandoffEffect {
     /// The effect ending.
     pub finalising: EffectIntentId,
     pub finalising_status: EffectStatus,
-    pub finalising_reference: Option<CouncilBookingRef>,
+    pub finalising_reference: Option<ProviderReference>,
     pub finalising_detail: Option<BoundedString>,
     /// The successor's canonical plan. Its **identity is derived here**, exactly
     /// as `prepare_effect` derives one: the repository owns effect identity
@@ -2971,7 +2987,7 @@ async fn classify_finalisation(
     current: &BookingAggregate,
     effect_intent_id: &EffectIntentId,
     status: EffectStatus,
-    provider_reference: Option<&CouncilBookingRef>,
+    provider_reference: Option<&ProviderReference>,
     outcome_detail: Option<&BoundedString>,
 ) -> Result<FinalisationState, StoreError> {
     validate_outcome_status(status)?;
@@ -3060,7 +3076,7 @@ async fn record_outcome(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     current: &EffectIntent,
     status: EffectStatus,
-    provider_reference: Option<&CouncilBookingRef>,
+    provider_reference: Option<&ProviderReference>,
     outcome_detail: Option<&BoundedString>,
     now: i64,
 ) -> Result<(), StoreError> {
@@ -3089,7 +3105,7 @@ async fn record_outcome(
         ",
     )
     .bind(status.name())
-    .bind(provider_reference.map(ToString::to_string))
+    .bind(provider_reference.map(encode_provider_reference))
     .bind(outcome_detail.map(|detail| detail.as_str().to_owned()))
     .bind(now)
     .bind(effect_intent_id.as_str())
@@ -3116,7 +3132,10 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
         status: EffectStatus::parse(&status_text)
             .map_err(|bad| StoreError::corrupt(format!("unknown effect status {bad:?}")))?,
         expires_at_ms: row.try_get("expires_at_ms")?,
-        provider_reference: provider_reference.map(CouncilBookingRef::new),
+        provider_reference: provider_reference
+            .as_deref()
+            .map(decode_provider_reference)
+            .transpose()?,
         // Stored text is already bounded; `truncating` is the only constructor
         // and re-applying it to an in-range value is the identity.
         outcome_detail: outcome_detail.map(BoundedString::truncating),
@@ -3137,6 +3156,30 @@ fn decode_effect_row(row: &sqlx::sqlite::SqliteRow) -> Result<EffectIntent, Stor
     }
 
     Ok(intent)
+}
+
+/// ADR-030 store format: provider references are no longer ambiguous bare
+/// strings. Existing council values are migrated to `council:<value>` and new
+/// payment session values use `payment:<value>`.
+fn encode_provider_reference(reference: &ProviderReference) -> String {
+    match reference {
+        ProviderReference::Council(value) => format!("council:{}", value.as_str()),
+        ProviderReference::Payment(value) => format!("payment:{}", value.as_str()),
+    }
+}
+
+fn decode_provider_reference(encoded: &str) -> Result<ProviderReference, StoreError> {
+    if let Some(value) = encoded.strip_prefix("council:") {
+        return Ok(ProviderReference::Council(CouncilBookingRef::new(value)));
+    }
+    if let Some(value) = encoded.strip_prefix("payment:") {
+        return Ok(ProviderReference::Payment(bld_types::PaymentRef::new(
+            value,
+        )));
+    }
+    Err(StoreError::corrupt(format!(
+        "provider_reference has no ADR-030 kind tag: {encoded:?}"
+    )))
 }
 
 /// Resume an operation whose intent is already committed.
@@ -3787,11 +3830,15 @@ mod effect_identity {
 #[cfg(test)]
 mod phase_c {
     use super::*;
-    use bld_types::{AvailabilityGrant, Money, PrincipalId, SlotId, TimeWindow, VenueId};
+    use bld_types::{
+        AvailabilityGrant, Money, PaymentIntentId, PaymentRef, PrincipalId, SlotId, TimeWindow,
+        VenueId,
+    };
     use tempfile::TempDir;
     use townhall_domain::{
         AwaitingBooking, Booked, BookingProposal, BookingState, CancellationRequested,
-        CancellingBooking, SelectedVenueRef, VenueFacts, VerifiedProviderFact,
+        CancellingBooking, CheckoutPrepared, FeeClass, PaidBookingInProgress, SelectedVenueRef,
+        VenueFacts, VerifiedProviderFact,
     };
 
     const REF: &str = "TH-92718";
@@ -3865,6 +3912,8 @@ mod phase_c {
                 venue_id: VenueId::new("TH-A"),
                 slot_id: SlotId::new("SLOT-A"),
                 verified_fee: Money::from_pence(4_500),
+                verified_fee_class: FeeClass::BelowThreshold,
+                threshold_policy_version: "fixture-v1".to_owned(),
             }),
             None,
             None,
@@ -3959,7 +4008,9 @@ mod phase_c {
             source_version: version,
             effect_intent_id: effect.clone(),
             status,
-            provider_reference: reference.map(CouncilBookingRef::new),
+            provider_reference: reference
+                .map(CouncilBookingRef::new)
+                .map(ProviderReference::Council),
             outcome_detail: None,
             next,
             audit: TransitionAudit::driven_by(fact),
@@ -4002,7 +4053,7 @@ mod phase_c {
         assert_eq!(finalised.intent.status, EffectStatus::Confirmed);
         assert_eq!(
             finalised.intent.provider_reference,
-            Some(CouncilBookingRef::new(REF))
+            Some(ProviderReference::Council(CouncilBookingRef::new(REF)))
         );
 
         let audit = repo.audit_events(&id).await.expect("audit");
@@ -4417,7 +4468,7 @@ mod phase_c {
         // Prepared, yet carrying a provider reference: an effect that officially
         // has not been attempted, naming something the council supposedly made.
         sqlx::query("UPDATE effect_intents SET provider_reference = ? WHERE effect_intent_id = ?")
-            .bind("TH-92718")
+            .bind("council:TH-92718")
             .bind(effect.as_str())
             .execute(repo.pool())
             .await
@@ -4520,7 +4571,7 @@ mod phase_c {
                 source_version: requested.version,
                 finalising: book_effect.clone(),
                 finalising_status: EffectStatus::Confirmed,
-                finalising_reference: Some(CouncilBookingRef::new(REF)),
+                finalising_reference: Some(ProviderReference::Council(CouncilBookingRef::new(REF))),
                 finalising_detail: None,
                 successor_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new(REF),
@@ -4547,7 +4598,7 @@ mod phase_c {
         assert_eq!(handed.finalised.status, EffectStatus::Confirmed);
         assert_eq!(
             handed.finalised.provider_reference,
-            Some(CouncilBookingRef::new(REF))
+            Some(ProviderReference::Council(CouncilBookingRef::new(REF)))
         );
         // The cancellation began, and records what it replaced.
         assert_eq!(handed.successor.effect_intent_id, cancel_effect);
@@ -4565,6 +4616,98 @@ mod phase_c {
         let last = audit.last().expect("a row");
         assert_eq!(last.driver_kind, Provenance::Fact);
         assert_eq!(last.driver_detail, "BookingExists");
+    }
+
+    /// A payment confirmation produces a payment reference, but the successor
+    /// council booking creates a different reference. ADR-030 permits that
+    /// produces-new handoff only for a Payment-typed predecessor.
+    #[tokio::test]
+    async fn a_payment_handoff_can_start_a_reference_producing_booking() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = repo_in(&temp).await;
+        let id = BookingId::new("BKG-PAY-HANDOFF");
+        repo.create(NewBooking {
+            id: id.clone(),
+            requirements: requirements(),
+            owner: test_owner(),
+        })
+        .await
+        .expect("create");
+
+        let payment_intent_id = PaymentIntentId::new("PAY-BKG-PAY-HANDOFF");
+        let pay_effect = derive_effect_intent_id(&id, OperationKind::Pay, 0);
+        let prepared = repo
+            .prepare_effect(PrepareEffect {
+                booking_id: id.clone(),
+                source_version: 0,
+                canonical_plan: BookingEffect::PreparePayment {
+                    principal: PrincipalId::new("lucy"),
+                    payment_intent_id: payment_intent_id.clone(),
+                    selection: selection(),
+                    amount: Money::from_pence(14_500),
+                    grant: AvailabilityGrant::new("payment-grant"),
+                    payment_ref: None,
+                },
+                next: booking_at(
+                    &id,
+                    BookingState::CheckoutPrepared(CheckoutPrepared {
+                        selection: selection(),
+                        verified_fee: Money::from_pence(14_500),
+                        grant: AvailabilityGrant::new("payment-grant"),
+                        threshold_policy_version: "threshold-v1".to_owned(),
+                        payment_intent_id: payment_intent_id.clone(),
+                        effect_intent_id: pay_effect.clone(),
+                        principal: PrincipalId::new("lucy"),
+                    }),
+                    None,
+                    Some(&pay_effect),
+                ),
+                audit: TransitionAudit::driven_by(&BookingProposal::Book),
+            })
+            .await
+            .expect("prepare payment");
+
+        let book_effect =
+            derive_effect_intent_id(&id, OperationKind::Book, prepared.aggregate.version);
+        let payment_ref = PaymentRef::new("cs_adr030");
+        let fact = VerifiedProviderFact::PaymentConfirmed {
+            effect_intent_id: pay_effect.clone(),
+            payment_intent_id: payment_intent_id.clone(),
+            payment_ref: payment_ref.clone(),
+        };
+        let handed = repo
+            .handoff_effect(HandoffEffect {
+                booking_id: id.clone(),
+                source_version: prepared.aggregate.version,
+                finalising: pay_effect.clone(),
+                finalising_status: EffectStatus::Confirmed,
+                finalising_reference: Some(ProviderReference::Payment(payment_ref.clone())),
+                finalising_detail: None,
+                successor_plan: book_plan(),
+                next: booking_at(
+                    &id,
+                    BookingState::PaidBookingInProgress(PaidBookingInProgress {
+                        selection: selection(),
+                        verified_fee: Money::from_pence(14_500),
+                        payment_intent_id,
+                        effect_intent_id: book_effect.clone(),
+                    }),
+                    None,
+                    Some(&book_effect),
+                ),
+                audit: TransitionAudit::driven_by(&fact),
+            })
+            .await
+            .expect("payment may hand off to a reference-producing booking");
+
+        assert_eq!(
+            handed.finalised.provider_reference,
+            Some(ProviderReference::Payment(payment_ref))
+        );
+        assert_eq!(handed.successor.effect_intent_id, book_effect);
+        assert_eq!(handed.successor.supersedes, Some(pay_effect));
+        assert_eq!(handed.aggregate.booking_ref, None);
+        assert_eq!(handed.aggregate.state.name(), "PaidBookingInProgress");
     }
 
     /// A handoff is only coherent in one direction, and this is the test for it.
@@ -4619,7 +4762,7 @@ mod phase_c {
             source_version: requested.version,
             finalising: book_effect.clone(),
             finalising_status: EffectStatus::Confirmed,
-            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_reference: Some(ProviderReference::Council(CouncilBookingRef::new(REF))),
             finalising_detail: None,
             successor_plan: BookingEffect::CancelBooking {
                 booking_ref: CouncilBookingRef::new(REF),
@@ -4670,6 +4813,27 @@ mod phase_c {
             })
             .await
             .expect_err("a successor acting on another reference must be refused");
+        assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
+
+        // (b2) A council predecessor cannot use the payment-only produces-new
+        // exception. `Book::acts_on()` is unconditionally `None`; admitting it
+        // here would silently remove the reference guard from every council
+        // handoff.
+        let error = repo
+            .handoff_effect(HandoffEffect {
+                successor_plan: book_plan(),
+                next: booking_at(
+                    &id,
+                    BookingState::BookingInProgress(townhall_domain::BookingInProgress {
+                        effect_intent_id: book_successor.clone(),
+                    }),
+                    None,
+                    Some(&book_successor),
+                ),
+                ..base()
+            })
+            .await
+            .expect_err("a council reference cannot hand off to a producing-new effect");
         assert!(matches!(error, StoreError::IncoherentHandoff { .. }));
 
         // (c) The aggregate records a different reference than was confirmed.
@@ -4749,7 +4913,7 @@ mod phase_c {
             source_version: requested.version,
             finalising: book_effect.clone(),
             finalising_status: EffectStatus::Confirmed,
-            finalising_reference: Some(CouncilBookingRef::new(REF)),
+            finalising_reference: Some(ProviderReference::Council(CouncilBookingRef::new(REF))),
             finalising_detail: None,
             successor_plan: BookingEffect::CancelBooking {
                 booking_ref: CouncilBookingRef::new(REF),
@@ -4839,7 +5003,7 @@ mod phase_c {
                 source_version: requested.version,
                 finalising: book_effect.clone(),
                 finalising_status: EffectStatus::Confirmed,
-                finalising_reference: Some(CouncilBookingRef::new(REF)),
+                finalising_reference: Some(ProviderReference::Council(CouncilBookingRef::new(REF))),
                 finalising_detail: None,
                 successor_plan: BookingEffect::CancelBooking {
                     booking_ref: CouncilBookingRef::new(REF),

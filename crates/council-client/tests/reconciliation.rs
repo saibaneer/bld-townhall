@@ -229,7 +229,7 @@ async fn the_dropped_response_converges_to_exactly_one_booking() {
     let effect = townhall_service::effect_identity_for(
         &id,
         townhall_domain::OperationKind::Book,
-        2, // Book departs from version 2: create(0) -> select(1) -> verify(2)
+        3, // VerifySlot prepares at 2 and its synchronous fact settles at 3.
     );
     let armed: serde_json::Value = reqwest::Client::new()
         .post(format!("{}/test/faults", world.council_url))
@@ -296,7 +296,7 @@ async fn a_crash_before_the_call_is_finished_by_recovery() {
 
     let id = BookingId::new("BKG-DIES-EARLY");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     // The crash state, asserted from the two databases BEFORE recovery runs:
     // the intent is durable, and the provider has nothing — read from its
@@ -343,7 +343,7 @@ async fn a_crash_before_the_call_that_outlives_its_deadline_fails_closed() {
 
     let id = BookingId::new("BKG-DIES-UNSEEN");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
     assert!(!council_knows(&world, effect.as_str()).await);
 
     // The deadline is the COUNCIL's to judge, on the COUNCIL's clock (ADR-016)
@@ -381,7 +381,7 @@ async fn a_crash_after_the_councils_commit_adopts_rather_than_duplicates() {
 
     let id = BookingId::new("BKG-DIES-LATE");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     let (reconciliation, repo, clock) = reconciler_over(&world).await;
     clock.advance(60_000);
@@ -426,7 +426,7 @@ async fn an_unreachable_council_leaves_the_booking_unknown_and_in_flight() {
     // unsettled: the council booked the room and nobody heard.
     let id = BookingId::new("BKG-OUTAGE");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
     reqwest::Client::new()
         .post(format!("{}/test/faults", world.council_url))
         .json(&serde_json::json!({
@@ -633,7 +633,7 @@ async fn garbage_and_delay_become_unknown_never_facts() {
     let world = spawn_council(dir.path());
     let id = BookingId::new("BKG-MANGLE");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     // The create's answer is dropped FIRST, so the intent stays unsettled and
     // every attend below genuinely asks — a settled intent never calls out, its
@@ -794,7 +794,7 @@ async fn ambiguous_cancellation(
 ) -> (BookingId, EffectIntentId, EffectIntentId) {
     let id = BookingId::new(booking);
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
     reqwest::Client::new()
         .post(format!("{}/test/faults", world.council_url))
         .json(&serde_json::json!({
@@ -879,7 +879,7 @@ async fn a_cancellation_requested_for_a_booking_nobody_received_fails_closed() {
     assert!(!status.success(), "the create never left the process");
     let id = BookingId::new("BKG-AMBIG-B");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
     assert!(!council_knows(&world, effect.as_str()).await);
 
     let (reconciliation, repo, clock) = reconciler_over(&world).await;
@@ -919,12 +919,17 @@ async fn a_cancellation_requested_for_a_booking_nobody_received_fails_closed() {
     // "Never minted" is read from the table itself, not inferred from an empty
     // due-list — a wrong implementation could mint a dormant or terminal cancel
     // successor that due() would never surface (map audit, row 9).
-    let intents: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM effect_intents WHERE booking_id = ?")
-            .bind(id.to_string())
-            .fetch_one(repo.pool())
-            .await
-            .expect("count");
+    // Council effects only (Book/Cancel): since M10 `VerifySlot` also mints a
+    // `Verify` availability intent, and the property here is that NO cancellation
+    // effect was ever minted — a dormant cancel successor would make this 2.
+    let intents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM effect_intents \
+         WHERE booking_id = ? AND operation_kind IN ('Book', 'Cancel')",
+    )
+    .bind(id.to_string())
+    .fetch_one(repo.pool())
+    .await
+    .expect("count");
     assert_eq!(
         intents, 1,
         "exactly the booking intent: no cancellation effect ever existed"
@@ -1214,7 +1219,7 @@ async fn an_unsigned_not_yet_authorizes_nothing() {
     assert!(!status.success());
     let id = BookingId::new("BKG-NOSIG");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     let armed: serde_json::Value = reqwest::Client::new()
         .post(format!("{}/test/faults", world.council_url))
@@ -1273,7 +1278,7 @@ async fn a_signed_not_yet_for_someone_else_authorizes_nothing() {
     assert!(!status.success());
     let id = BookingId::new("BKG-WRONGID");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     reqwest::Client::new()
         .post(format!("{}/test/faults", world.council_url))
@@ -1378,7 +1383,7 @@ async fn a_lookup_killed_mid_tombstone_leaves_the_workflow_unknown_and_retrying(
     }
     let id = BookingId::new("BKG-K20");
     let effect =
-        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 2);
+        townhall_service::effect_identity_for(&id, townhall_domain::OperationKind::Book, 3);
 
     // A council past the deadline, pausing INSIDE the tombstone settlement our
     // own lookup is about to trigger.

@@ -12,6 +12,7 @@ members = [
   "crates/council-client",
   "crates/townhall-http",
   "crates/townhall-authority",
+  "crates/townhall-payment",
   "crates/townhall-usage",
   "crates/townhall-channel",
   "crates/townhall-gateway",

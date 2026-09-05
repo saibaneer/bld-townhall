@@ -181,12 +181,19 @@ impl Harness {
             .get("n")
     }
 
+    /// How many COUNCIL effect intents exist — `Book`/`Cancel`, the ones that
+    /// reach the provider. Since M10 (ADR-030) `VerifySlot` mints a `Verify`
+    /// availability intent too, but these tests are about council effects
+    /// ("reaches the council", booking idempotency), so `Verify` is excluded —
+    /// a double council booking still fails the count.
     async fn effect_count(&self) -> i64 {
-        sqlx::query("SELECT COUNT(*) AS n FROM effect_intents")
-            .fetch_one(self.repo.pool())
-            .await
-            .expect("count our effect intents")
-            .get("n")
+        sqlx::query(
+            "SELECT COUNT(*) AS n FROM effect_intents WHERE operation_kind IN ('Book', 'Cancel')",
+        )
+        .fetch_one(self.repo.pool())
+        .await
+        .expect("count our council effect intents")
+        .get("n")
     }
 }
 

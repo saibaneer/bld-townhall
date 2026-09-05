@@ -31,8 +31,9 @@ use townhall_testkit::issuer::{GrantSpec, issue_blocking};
 
 // --------------------------------------------------------------- fixtures
 
-/// The version `Book` is proposed from: create (0), `SelectVenue` (1), `VerifySlot` (2).
-const AT_BOOK: u64 = 2;
+/// The version `Book` is proposed from: create (0), `SelectVenue` (1),
+/// `VerifySlot` prepares verification (2), then its synchronous fact settles (3).
+const AT_BOOK: u64 = 3;
 
 fn requirements() -> BookingRequirements {
     BookingRequirements {
@@ -264,7 +265,12 @@ async fn lucy_books_a_room() {
         .await
         .expect("the intent");
     assert_eq!(intent.status, EffectStatus::Confirmed);
-    assert_eq!(intent.provider_reference, aggregate.booking_ref);
+    assert_eq!(
+        intent.provider_reference,
+        aggregate
+            .booking_ref
+            .map(townhall_domain::ProviderReference::Council)
+    );
 
     // The trail says who drove each step. Before ADR-017 the confirmation had to
     // claim a proposal caused it.
@@ -287,6 +293,11 @@ async fn lucy_books_a_room() {
             (
                 Provenance::Proposal,
                 "VerifySlot".to_owned(),
+                "VerifyingSlot".to_owned()
+            ),
+            (
+                Provenance::Fact,
+                "AvailabilityVerified".to_owned(),
                 "AwaitingBooking".to_owned()
             ),
             (
@@ -301,6 +312,63 @@ async fn lucy_books_a_room() {
             ),
         ],
         "the fact door, not Lucy, is what confirmed the booking"
+    );
+}
+
+/// Availability at the payment threshold settles verification in-turn, but
+/// stops at the payment-owned state rather than becoming directly bookable.
+#[tokio::test]
+async fn a_fee_at_the_payment_threshold_selects_the_offer_in_turn() {
+    let h = harness().await;
+    let id = BookingId::new("BKG-PAYMENT-THRESHOLD");
+    let expensive = VenueFacts {
+        fee: Money::from_pence(10_000),
+        ..facts()
+    };
+    let coordinator = Coordinator::new(
+        Arc::clone(&h.repo),
+        Arc::clone(&h.council),
+        Arc::new(CouncilVerifier),
+        Arc::new(FixedAvailability::new(expensive)),
+    );
+    h.repo
+        .create(NewBooking {
+            id: id.clone(),
+            requirements: BookingRequirements {
+                max_fee: Money::from_pence(15_000),
+                ..requirements()
+            },
+            owner: PrincipalId::new("lucy"),
+        })
+        .await
+        .expect("create");
+    let authority = issue_blocking(&GrantSpec::own("lucy", id.as_str(), 15_000));
+
+    let selected = coordinator
+        .propose(&id, select(), &authority)
+        .await
+        .expect("select");
+    assert!(matches!(selected, BoundaryOutcome::Committed(_)));
+    let verified = coordinator
+        .propose(&id, BookingProposal::VerifySlot, &authority)
+        .await
+        .expect("verify");
+    let BoundaryOutcome::Committed(aggregate) = verified else {
+        panic!("synchronous availability must settle in-turn: {verified:?}");
+    };
+    let townhall_domain::BookingState::OfferSelected(offer) = aggregate.state else {
+        panic!("a fee at the threshold must stop at OfferSelected");
+    };
+    assert_eq!(offer.verified_fee, Money::from_pence(10_000));
+    assert_eq!(offer.threshold_policy_version, "m10-fixed-v1");
+    assert_eq!(
+        offer.payment_intent_id.as_str(),
+        "PAY-EFF-BKG-PAYMENT-THRESHOLD-VERIFY-1"
+    );
+    assert_eq!(
+        h.council.call_count(),
+        0,
+        "availability is not a council effect call"
     );
 }
 
@@ -2938,13 +3006,13 @@ async fn projection_menu_of(h: &Harness, id: &BookingId) -> &'static [&'static s
     h.repo.load(id).await.expect("load").state.proposal_menu()
 }
 
-/// ADR-021's 503/local pair at the protocol level: with the availability
-/// provider unreachable, asking about a slot is refused as `FactsUnavailable`
-/// (the wire's 503 — nothing durable exists yet), while CANCELLING an
-/// in-flight booking still commits — its cell never binds facts, and a dead
-/// provider must not hold Lucy's withdrawal hostage.
+/// With the availability provider unreachable, synchronous verification is
+/// REFUSED (`FactsUnavailable`, the pre-M10 fail-closed contract — a driver is not
+/// parked in `VerifyingSlot` when there is verifiably nothing to verify), while
+/// CANCELLING an unrelated in-flight booking still commits — a dead provider must
+/// not hold Lucy's withdrawal hostage.
 #[tokio::test]
-async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
+async fn an_unreachable_provider_refuses_verification_but_not_cancellation() {
     let h = harness().await;
     let id = BookingId::new("BKG-DEADPROV");
     awaiting(&h, &id, requirements()).await;
@@ -2961,8 +3029,8 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
         Arc::new(FixedAvailability::unreachable(facts())),
     );
 
-    // A fresh booking that needs facts: refused as could-not-ask, not as
-    // answered-nothing.
+    // A fresh verification against an unreachable provider is refused
+    // synchronously, committing nothing.
     let other = BookingId::new("BKG-DEADPROV-2");
     h.repo
         .create(NewBooking {
@@ -2985,8 +3053,15 @@ async fn an_unreachable_provider_denies_asking_but_not_cancelling() {
             refused,
             BoundaryOutcome::Denied(BookingError::FactsUnavailable)
         ),
-        "could-not-ask has its own name: {refused:?}"
+        "an unreachable provider refuses verification synchronously: {refused:?}"
     );
+    let waiting = h.repo.load(&other).await.expect("load the booking");
+    assert_eq!(
+        waiting.state.name(),
+        "VenueSelected",
+        "a refused verification commits nothing"
+    );
+    assert!(waiting.active_effect.is_none());
 
     // Lucy's mid-flight withdrawal needs nothing from the provider.
     let cancelled = unreachable
@@ -3061,8 +3136,8 @@ async fn a_rejected_booking_under_cancellation_ends_cancelled_with_nothing_cause
             .await
             .expect("count");
     assert_eq!(
-        intents, 1,
-        "no cancellation effect was ever minted — there was nothing to cancel"
+        intents, 2,
+        "only verification and booking exist; no cancellation effect was minted"
     );
 }
 

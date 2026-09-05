@@ -36,6 +36,11 @@ id_type!(PrincipalId);
 id_type!(ActorId);
 id_type!(EffectIntentId);
 id_type!(CouncilBookingRef);
+// M10's stable payment identity and opaque provider session reference
+// (spec §17, ADR-030). A payment identity spans the create-session and
+// await-payment effect intents; neither type grants payment authority.
+id_type!(PaymentIntentId);
+id_type!(PaymentRef);
 // M7's identifiers (spec §9.1). Ids only — minting one of these grants nothing,
 // which is why they live in the shared vocabulary while the envelope they name
 // lives in `townhall-authority` behind a private constructor (ADR-025).

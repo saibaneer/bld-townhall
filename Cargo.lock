@@ -129,6 +129,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bld-client"
+version = "0.1.0"
+dependencies = [
+ "bld-manifest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "townhall-testkit",
+]
+
+[[package]]
 name = "bld-kernel"
 version = "0.1.0"
 dependencies = [
@@ -137,6 +151,18 @@ dependencies = [
  "serde",
  "static_assertions",
  "tokio",
+]
+
+[[package]]
+name = "bld-manifest"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -2117,6 +2143,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bld-manifest",
  "bld-types",
  "serde",
  "serde_json",
@@ -2149,6 +2176,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bld-manifest",
  "bld-types",
  "council-client",
  "council-wire",

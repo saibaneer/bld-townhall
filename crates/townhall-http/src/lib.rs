@@ -28,7 +28,8 @@ use axum::{
     routing::{get, post},
 };
 use bld_types::{
-    ActorId, BookingId, BookingRequirements, Money, PrincipalId, SlotId, TimeWindow, VenueId,
+    ActorId, Behaviour, BookingId, BookingRequirements, Money, PrincipalId, SlotId, TimeWindow,
+    VenueId,
 };
 use townhall_domain::{BookingProposal, VerifiedAuthority};
 use townhall_service::{
@@ -36,6 +37,7 @@ use townhall_service::{
 };
 
 pub mod approvals;
+pub mod discovery;
 pub mod mapping;
 pub mod usage;
 
@@ -667,8 +669,17 @@ fn parse_proposal(
     payload: serde_json::Value,
 ) -> Result<BookingProposal, Response> {
     let bad_body = |detail: &str| mapping::plain_error(StatusCode::UNPROCESSABLE_ENTITY, detail);
+    // Resolve the wire segment through the ONE segment table (bld-types), rather
+    // than matching kebab literals here — the router, the manifest and the client
+    // now read the same source (M9/ADR-029). The body shape stays per-behaviour.
+    let Some(behaviour) = Behaviour::from_segment(behaviour) else {
+        return Err(mapping::plain_error(
+            StatusCode::NOT_FOUND,
+            "no such behaviour route",
+        ));
+    };
     match behaviour {
-        "select-venue" => {
+        Behaviour::SelectVenue => {
             let body: SelectVenueBody = serde_json::from_value(payload)
                 .map_err(|_| bad_body("select-venue needs venue_id and slot_id"))?;
             Ok(BookingProposal::SelectVenue {
@@ -676,29 +687,25 @@ fn parse_proposal(
                 slot_id: SlotId::new(body.slot_id),
             })
         }
-        "verify-slot" => Ok(BookingProposal::VerifySlot),
-        "change-venue" => Ok(BookingProposal::ChangeVenue),
-        "update-requirements" => {
+        Behaviour::VerifySlot => Ok(BookingProposal::VerifySlot),
+        Behaviour::ChangeVenue => Ok(BookingProposal::ChangeVenue),
+        Behaviour::UpdateRequirements => {
             let body: UpdateRequirementsBody = serde_json::from_value(payload)
                 .map_err(|_| bad_body("update-requirements carries optional attendees"))?;
             Ok(BookingProposal::UpdateRequirements {
                 attendees: body.attendees,
             })
         }
-        "revalidate-venue" => Ok(BookingProposal::RevalidateVenue),
+        Behaviour::RevalidateVenue => Ok(BookingProposal::RevalidateVenue),
         // Deliberately empty-bodied: parameters are boundary-derived (spec §10).
-        "book" => Ok(BookingProposal::Book),
-        "cancel" => {
+        Behaviour::Book => Ok(BookingProposal::Book),
+        Behaviour::Cancel => {
             let body: CancelBody =
                 serde_json::from_value(payload).map_err(|_| bad_body("cancel needs a reason"))?;
             Ok(BookingProposal::Cancel {
                 reason: body.reason,
             })
         }
-        _ => Err(mapping::plain_error(
-            StatusCode::NOT_FOUND,
-            "no such behaviour route",
-        )),
     }
 }
 

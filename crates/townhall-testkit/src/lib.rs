@@ -39,6 +39,15 @@ pub const LUCY: &str = "dev-lucy";
 pub const MARCO: &str = "dev-marco-restricted";
 pub const PRIYA: &str = "dev-priya-nobook";
 
+/// The publisher signing key a discoverable world serves its manifest under
+/// (M9). Its own DISTINCT value — not the council key, not the authority key —
+/// so a test that crossed the wires would fail rather than pass by coincidence.
+/// A test derives the matching verifying key from this (to pin discovery), and
+/// the gate witness re-signs a tampered manifest with it, exactly as the real
+/// publisher would.
+pub const MANIFEST_KEY_HEX: &str =
+    "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
+
 pub struct World {
     #[allow(dead_code)]
     dir: tempfile::TempDir,
@@ -181,6 +190,13 @@ pub const LUCY_ADDR: &str = "+447700900123";
 
 pub fn world() -> World {
     world_with(&[])
+}
+
+/// A dev-lane world whose server also serves a signed discovery manifest at
+/// `GET /.well-known/bld`, signed with [`MANIFEST_KEY_HEX`] (M9). Discovery is
+/// opt-in on `--manifest-key`, so the other worlds carry no manifest route.
+pub fn world_discoverable() -> World {
+    world_with(&["--manifest-key", MANIFEST_KEY_HEX])
 }
 
 /// A world whose server takes extra flags — the deterministic-429 seam
@@ -550,11 +566,23 @@ fn forward_once(
     }
 }
 
-/// The RESOLVED dependency names of one workspace package, by kind.
+/// The RESOLVED, TRANSITIVE dependency names of one workspace package.
 ///
-/// `resolve.nodes`, not `packages[].dependencies` — the declared list is what
-/// a manifest says; the resolved list is what the resolver linked, and only
-/// the linked graph shows a forbidden crate arriving transitively.
+/// `resolve.nodes`, not `packages[].dependencies` — the declared list is what a
+/// manifest says; the resolved list is what the resolver linked. And it is the
+/// LINKED CLOSURE, not the direct edges: a forbidden crate that arrives through a
+/// dependency's re-export (`bld-manifest` gaining `pub use bld_types::Behaviour`)
+/// links into the subject just the same, and a direct-deps-only check would miss
+/// it while its own docstring claimed otherwise. This walks the graph so the
+/// promise the boundary tests rest on — "cannot NAME the forbidden crate" — is the
+/// one actually enforced.
+///
+/// `kinds` selects which of the SUBJECT's own edges to enter by (callers pass
+/// `["normal"]` for the shipping graph, so a dev-only dependency like this testkit
+/// never counts). Past that first hop the walk follows NORMAL edges only: a
+/// dependency's normal deps are linked into the subject's build; its dev-deps are
+/// not, and its build-deps are compiled but their types are not nameable from the
+/// subject's code — which is exactly what "cannot name" is about.
 pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--format-version", "1"])
@@ -564,10 +592,6 @@ pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("metadata json");
 
-    // `resolve.nodes`, not `packages[].dependencies` — the review's point: the
-    // latter is what the manifest DECLARED, the former is what the resolver
-    // actually LINKED, and only the linked graph shows a forbidden crate
-    // arriving through a re-export or a transitive edge.
     let subject_id = metadata["packages"]
         .as_array()
         .expect("packages")
@@ -577,25 +601,59 @@ pub fn resolved_dependencies(package: &str, kinds: &[&str]) -> Vec<String> {
         .as_str()
         .expect("id")
         .to_owned();
+
     let nodes = metadata["resolve"]["nodes"].as_array().expect("nodes");
-    let node = nodes
-        .iter()
-        .find(|n| n["id"] == subject_id.as_str())
-        .expect("a resolve node");
-    node["deps"]
-        .as_array()
-        .expect("deps")
-        .iter()
-        .filter(|dep| {
-            dep["dep_kinds"].as_array().is_none_or(|dep_kinds| {
-                dep_kinds.iter().any(|dk| {
-                    let kind = dk["kind"].as_str().unwrap_or("normal");
-                    kinds.contains(&kind)
-                })
+    let node_of = |id: &str| -> Option<&serde_json::Value> {
+        nodes.iter().find(|n| n["id"].as_str() == Some(id))
+    };
+    // A node carries its own package id, not its name; names come from `packages`.
+    let name_of = |id: &str| -> Option<String> {
+        metadata["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|p| p["id"].as_str() == Some(id))
+            .and_then(|p| p["name"].as_str())
+            .map(|name| name.replace('_', "-"))
+    };
+    // An edge is entered if any of its kinds is in `want` (a missing `dep_kinds`,
+    // from an older cargo, is a normal edge).
+    let edge_matches = |dep: &serde_json::Value, want: &[&str]| -> bool {
+        dep["dep_kinds"].as_array().is_none_or(|dep_kinds| {
+            dep_kinds.iter().any(|dk| {
+                let kind = dk["kind"].as_str().unwrap_or("normal");
+                want.contains(&kind)
             })
         })
-        .map(|dep| dep["name"].as_str().expect("name").replace('_', "-"))
-        .collect()
+    };
+
+    // BFS the linked closure: the subject's edges by `kinds`, everything deeper by
+    // normal edges. `reached` holds package ids, never the subject itself.
+    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut queue: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    queue.push_back((subject_id.clone(), true));
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    visited.insert(subject_id);
+
+    while let Some((id, is_subject)) = queue.pop_front() {
+        let Some(node) = node_of(&id) else { continue };
+        let want: &[&str] = if is_subject { kinds } else { &["normal"] };
+        for dep in node["deps"].as_array().into_iter().flatten() {
+            if !edge_matches(dep, want) {
+                continue;
+            }
+            let Some(pkg) = dep["pkg"].as_str() else {
+                continue;
+            };
+            if visited.insert(pkg.to_owned()) {
+                queue.push_back((pkg.to_owned(), false));
+            }
+            if let Some(name) = name_of(pkg) {
+                reached.insert(name);
+            }
+        }
+    }
+    reached.into_iter().collect()
 }
 
 /// How a test obtains authority.

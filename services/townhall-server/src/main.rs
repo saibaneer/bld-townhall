@@ -61,6 +61,10 @@ struct Args {
     usage_principal_rate_max: Option<i64>,
     usage_channel_rate_max: Option<i64>,
     usage_global_budget_max: Option<i64>,
+    /// The ed25519 key (64 hex) the BLD discovery manifest is signed with (M9,
+    /// ADR-029). Its own key — each key has one job. When absent, the server
+    /// serves no `/.well-known/bld` (discovery is opt-in).
+    manifest_key: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -74,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
     let mut usage_principal_rate_max = None;
     let mut usage_channel_rate_max = None;
     let mut usage_global_budget_max = None;
+    let mut manifest_key = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -131,6 +136,7 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| "--global-budget-max needs a unit count".to_owned())?,
                 );
             }
+            "--manifest-key" => manifest_key = Some(value()?),
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -148,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
         usage_principal_rate_max,
         usage_channel_rate_max,
         usage_global_budget_max,
+        manifest_key,
     })
 }
 
@@ -716,9 +723,37 @@ async fn main() -> ExitCode {
         }),
         authority: Arc::clone(&authority),
     });
-    let router = townhall_http::router(ServerState { api, authority })
+    // BLD discovery (M9, ADR-029): when a manifest key is provided, build the
+    // manifest from the ONE behaviour table, sign it with that key, and serve it
+    // at /.well-known/bld. Opt-in — a server without the key serves no discovery.
+    let mut router = townhall_http::router(ServerState { api, authority })
         .merge(approvals)
         .merge(usage_routes);
+    if let Some(hex) = args.manifest_key.as_deref() {
+        let Some(signing) = bld_manifest::signing_key_from_hex(hex) else {
+            eprintln!("townhall-server: --manifest-key must be 64 hex characters (32 bytes)");
+            return ExitCode::from(2);
+        };
+        let signed = match townhall_http::discovery::booking_manifest().sign(&signing) {
+            Ok(signed) => signed,
+            Err(error) => {
+                eprintln!("townhall-server: could not sign the discovery manifest: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let manifest = match serde_json::to_value(&signed) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("townhall-server: could not serialize the discovery manifest: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        router = router.merge(townhall_http::discovery::discovery_router(
+            townhall_http::discovery::DiscoveryState {
+                manifest: std::sync::Arc::new(manifest),
+            },
+        ));
+    }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -791,6 +826,7 @@ mod feature_gate {
             usage_principal_rate_max: None,
             usage_channel_rate_max: None,
             usage_global_budget_max: None,
+            manifest_key: None,
         }
     }
 

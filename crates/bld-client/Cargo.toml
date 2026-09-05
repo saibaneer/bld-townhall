@@ -1,0 +1,39 @@
+[package]
+name = "bld-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The generic BLD client (M9, ADR-029): an UNTRUSTED driver that discovers a
+# service from its signed manifest and drives the API — resource paths and
+# behaviour segments come from the manifest, never hard-coded (the gate).
+#
+# The dependency list IS the trust posture. Absent, deliberately: townhall-service,
+# -store, -http, -domain, bld-kernel, townhall-authority, sqlx — the untrusted-
+# driver set (a socket is its only route to booking state) plus authority (it
+# reaches authority only over the wire). AND absent: bld-types — the client works
+# in strings, so it cannot reach `Behaviour::segment()` and shortcut the manifest
+# it is supposed to discover (the gate would become unenforceable). Its own wire
+# DTOs are re-declared here (ADR-023); the one shared artifact is `bld-manifest`.
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bld-manifest = { path = "../bld-manifest" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The witnesses drive a REAL townhall-server (spawned by the testkit) over a
+# socket — the only route this crate has to booking state. The testkit is a
+# dev-dependency ONLY: it never enters bld-client's normal graph (boundary.rs
+# checks the "normal" kind), so the untrusted-driver posture stands for what
+# ships. bld-types arrives here transitively THROUGH the testkit, which is why
+# the boundary test scopes itself to normal deps — the shortcut it forbids is
+# one the shipping crate could take, not one a test harness pulls in.
+townhall-testkit = { path = "../townhall-testkit" }
+
+[lints]
+workspace = true

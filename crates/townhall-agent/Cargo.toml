@@ -1,0 +1,26 @@
+[package]
+name = "townhall-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The UNTRUSTED proposer (M11, ADR-031): the "Rig Agent Runtime" of Figure 1,
+# sitting between the orchestrator and `bld-client`. Everything here is OUTSIDE
+# the BLD authority boundary — a proposer inspects a PROJECTED view and emits one
+# typed proposal, which the driver submits over `bld-client`'s public HTTP
+# surface. It names no domain, store, authority, council or payment type, so the
+# same adversarial suite runs against any proposer and safety is a property of the
+# boundary, not the model. Layer 1 is the seam + the deterministic HostileProposer;
+# the LlmProposer (thin OpenAI-compatible client) and the driver arrive next.
+[dependencies]
+async-trait = { workspace = true }
+bld-client = { path = "../bld-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

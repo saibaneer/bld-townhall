@@ -19,6 +19,7 @@ members = [
   "crates/townhall-channel",
   "crates/townhall-gateway",
   "crates/townhall-orchestrator",
+  "crates/townhall-agent",
   "crates/townhall-testkit",
   "services/mock-council",
   "services/mock-stripe",

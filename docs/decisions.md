@@ -3426,3 +3426,80 @@ text are recorded here, not by editing the spec:
 | `InvalidPaymentEvidence` denial (HTTP-mapped), state stays `AwaitingHumanPayment` | §23.7 / §25 taxonomy | The spec names this exact denial and non-transition for a forged-evidence claim; a new resource denial the taxonomy did not yet enumerate. |
 | Crate names `townhall-payment` + `stripe-client` + `townhall-effects-router` + `mock-stripe`, each with a `boundary.rs` trust test (fact-minting confined to `townhall-payment`); `--enable-payments` flag opt-in with secret VALUES from the environment; `reqwest` gains a graph-wide `rustls-tls` feature when payments are built | §4 layout / composition-root convention | Repo convention is `townhall-*`/`mock-*` not `payment-handoff/`+`stripe-test-adapter/`; a real secret in `argv` leaks via `ps`/procfs (env is safer, flag makes the opt-in testable); and per-package feature unification means TLS cannot be "scoped" to one crate — stated honestly rather than hidden. |
 | An isolated `stripe-live` integration lane calling the real Stripe sandbox, excluded from `cargo test --workspace`/`ci/run.sh`; plus a frozen Stripe known-answer signature vector asserted in the hermetic lane | §20 test layer / §M10 gate | Keeps the fast/CI suite hermetic (mock-stripe) while proving the real integration on an explicit, network-isolated step; the KAT vector pins the byte-exact signing contract offline so mock+verifier cannot be wrong-but-self-consistent. |
+
+## ADR-031 — M11: the untrusted proposer, model independence, and the hostile twin
+
+M11 adds the probabilistic half at last — but strictly OUTSIDE the boundary (spec
+§18: "Rig is used only on the proposer side … not part of the BLD authority
+boundary"). The spec text survives verbatim; the additions and the one
+owner-directed relaxation are recorded in the amendment table below, not by
+editing the spec.
+
+### The decisions
+
+- **The agent is an untrusted client, never a boundary component.** It lives in a
+  new `townhall-agent` crate that depends ONLY on `bld-client` (M9) — the same
+  public HTTP surface any caller uses. It names no domain, store, authority,
+  council or payment type — only the public surface, so the state machine stays
+  "executable without Rig" (spec §2), and trivially so.
+
+- **A thin OpenAI-compatible client, not `rig-core` (owner-approved deviation).**
+  The spec names Rig as the agent framework, but the agent's entire need is to
+  POST messages to an OpenAI-compatible endpoint and parse back a validated JSON
+  proposal. `rig-core` is a heavy, 0.x, fast-moving dependency of which we would
+  use a sliver; a ~one-file `reqwest` client (reqwest is already in the tree) is
+  leaner, fully in our control, and offline-clean. The model/provider abstraction
+  Rig would have supplied is instead the `AGENT_BASE_URL` / `AGENT_MODEL` config
+  seam. The deviation is recorded in the amendment table below.
+
+- **One seam, two proposers.** A `Proposer` trait —
+  `propose_next(&ProjectedContext) -> ProposedAction` — that BOTH the LLM agent
+  and a deterministic `HostileProposer` implement. `ProjectedContext` carries
+  only what a proposer may see (the projection, `available_behaviours`, the NL
+  request, the delegation reference, the latest ETag); `ProposedAction` is one
+  typed BLD proposal. The same driver runs any proposer through `bld-client`, so
+  the adversarial suite proves safety is a property of the BOUNDARY, not the
+  model's obedience.
+
+- **Structured JSON, not tool-calling.** The reference model is not assumed to do
+  reliable native tool-calls (validated: the local endpoint returns clean JSON
+  without one). The agent constrains it to emit a JSON proposal that a
+  DETERMINISTIC parser validates — behaviour ∈ `available_behaviours`, arguments
+  well-typed — before anything reaches `bld-client`. A malformed or hallucinated
+  proposal is a proposer-side validation refusal; it never becomes a boundary
+  call. The model chooses; the parser disposes.
+
+- **The model decides no authoritative fact** (spec §18.1): not price, scope,
+  version/ETag, payment status, effect/idempotency ids, or whether an effect
+  succeeded. Those are read from the projection or supplied by the boundary; the
+  agent fills only non-authoritative constraints (venue, purpose, headcount)
+  drawn from the request.
+
+- **Model/provider is configuration** — `AGENT_BASE_URL` + `AGENT_MODEL` over an
+  OpenAI-compatible endpoint. Swapping the local qwen3:4b, an Ollama-cloud
+  open-weight model (GLM/DeepSeek), or the from-scratch Qwen3-0.6B is a one-line
+  change and alters no invariant. The from-scratch 0.6B becomes a model-
+  independence demo: even a weak model cannot enlarge authority or corrupt state.
+
+- **The model-hosting relaxation (owner-directed).** The spec's acceptance names
+  "at least one locally hosted/open-source model". The owner has directed that an
+  OPEN-WEIGHT model reachable over an OpenAI-compatible endpoint satisfies the
+  requirement whether it is hosted locally OR in the cloud. The property the
+  requirement protects — independence from a PROPRIETARY FRONTIER model, and that
+  boundary safety never depends on model choice — holds for any open-weight,
+  swappable model; "locally hosted" is offline / clean-machine reproducibility, a
+  demo convenience rather than a boundary-safety property. The local path
+  (qwen3:4b, pulled) is kept as the offline swap, so the stronger claim stays
+  available on demand. A proprietary frontier model remains optional comparison
+  only, never a POC dependency (spec §18 unchanged on that point).
+
+### The amendment trail
+
+The additions beyond the spec's literal text, recorded here rather than by
+editing the spec:
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| The reference proposer may be any **open-weight** model over an OpenAI-compatible endpoint — **cloud-hosted or local**, not only "locally hosted"; model/provider stays swappable configuration; a proprietary frontier model stays optional-comparison-only | §1.3 / §18.2 / §21 "locally hosted/open-source" | Owner-directed. The requirement protects independence from a proprietary frontier model and boundary-safety-independent-of-model — both hold for any open-weight swappable model. Local hosting is offline-reproducibility convenience, kept available (qwen3:4b) as a swap, not required for the reference. |
+| A new **`townhall-agent`** crate: the untrusted proposer, the `Proposer` seam, the `LlmProposer` (structured-JSON over an OpenAI-compatible endpoint), and the deterministic `HostileProposer`; it depends only on `bld-client` | §3 Figure 1 / §18 | Realizes "Rig Agent Runtime → BLD Client → typed proposal"; the agent names only the public surface, so the same adversarial suite runs against any proposer and the framework never touches the boundary. |
+| The agent talks to the model through a **thin, hand-rolled OpenAI-compatible `reqwest` client**, NOT `rig-core` — a deviation from the spec's named "Rig" framework | §2 principles ("Agent framework: Rig") / §18 | Owner-approved. The need is narrow (POST chat messages, parse a validated JSON proposal); `rig-core` is a heavy 0.x dependency used only in sliver, and reqwest is already in the tree. The provider abstraction Rig offered is the `AGENT_BASE_URL`/`AGENT_MODEL` config seam. Safety is unaffected — the model is untrusted either way and the parser + boundary dispose. |

@@ -42,6 +42,12 @@ impl ServiceMeter {
         InboundIdentity::new(&inbound.provider, &inbound.account, &inbound.message_id)
             .usage_intent_id()
     }
+
+    /// The channel-rate key: the provider account, from the transport triple —
+    /// the caller does not name it (M8-2).
+    fn channel(inbound: &InboundEvidence) -> String {
+        format!("{}|{}", inbound.provider, inbound.account)
+    }
 }
 
 #[async_trait::async_trait]
@@ -56,7 +62,12 @@ impl UsageMeter for ServiceMeter {
             return Ok(());
         };
         self.usage
-            .reserve(&principal, &Self::intent(inbound), now_ms())
+            .reserve(
+                &principal,
+                &Self::intent(inbound),
+                &Self::channel(inbound),
+                now_ms(),
+            )
             .await
             .map_err(map_denied)
     }
@@ -97,6 +108,9 @@ impl UsageMeter for ServiceMeter {
 fn map_denied(error: UsageDenied) -> UsageMeterError {
     match error {
         UsageDenied::QuotaExhausted => UsageMeterError::QuotaExhausted,
+        UsageDenied::PrincipalRateLimited => UsageMeterError::PrincipalRateLimited,
+        UsageDenied::ChannelRateLimited => UsageMeterError::ChannelRateLimited,
+        UsageDenied::ProviderBudgetExhausted => UsageMeterError::ProviderBudgetExhausted,
         UsageDenied::Unavailable(why) => UsageMeterError::Unavailable(why),
     }
 }

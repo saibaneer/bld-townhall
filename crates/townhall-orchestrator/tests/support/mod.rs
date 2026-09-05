@@ -378,7 +378,17 @@ impl UsageLedger for HttpUsage {
             .map_err(UsageDenied::Transport)?;
         match response.status().as_u16() {
             200 => Ok(()),
-            429 => Err(UsageDenied::QuotaExhausted),
+            // Read the 429 body's `denial_code` to pick the variant; a missing or
+            // unparseable body degrades to QuotaExhausted (still a refusal).
+            429 => {
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                Err(match body["denial_code"].as_str() {
+                    Some("rate_limited_principal") => UsageDenied::PrincipalRateLimited,
+                    Some("rate_limited_channel") => UsageDenied::ChannelRateLimited,
+                    Some("provider_budget_exhausted") => UsageDenied::ProviderBudgetExhausted,
+                    _ => UsageDenied::QuotaExhausted,
+                })
+            }
             other => Err(UsageDenied::Transport(format!("reserve: {other}"))),
         }
     }

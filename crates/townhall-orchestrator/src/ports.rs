@@ -60,11 +60,19 @@ pub trait UsageLedger: Send + Sync {
     async fn describe_balance(&self, evidence: &InboundEvidence) -> String;
 }
 
-/// Why a metered turn was refused before it ran.
+/// Why a metered turn was refused before it ran. The three resource denials are
+/// distinct so the person gets a true reason and the gate can prove each alone,
+/// even though the server sent them all as one HTTP 429 (ADR-028).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UsageDenied {
-    /// The account is out of quota. The person is told, and the turn does not run.
+    /// The account is out of TOTAL quota (M8-1).
     QuotaExhausted,
+    /// This principal hit its per-window turn rate (M8-2).
+    PrincipalRateLimited,
+    /// This channel hit its per-window turn rate (M8-2).
+    ChannelRateLimited,
+    /// The global per-window provider ceiling is spent (M8-2).
+    ProviderBudgetExhausted,
     /// The meter could not be reached — not a denial, a call that got no answer,
     /// which must not read as "quota spent".
     Transport(String),

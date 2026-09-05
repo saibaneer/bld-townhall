@@ -8,7 +8,7 @@
 
 use bld_types::{PrincipalId, UsageAccountId, UsageIntentId};
 use sqlx::{Row, SqlitePool};
-use townhall_usage::store::{Balance, StoreError, UsageStore};
+use townhall_usage::store::{Balance, RateLimits, StoreError, UsageStore};
 
 /// `townhall-usage`'s ports, over SQLite.
 #[derive(Clone, Debug)]
@@ -76,13 +76,17 @@ impl UsageStore for SqlUsageStore {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)] // the service passes each derived primitive once
+    #[allow(clippy::too_many_lines)] // the expiry sweep + three rate guards + the quota guard, in one transaction
     async fn reserve(
         &self,
         principal: &PrincipalId,
         intent: &UsageIntentId,
+        channel: &str,
         units: i64,
         now_ms: u64,
         expires_at_ms: u64,
+        limits: RateLimits,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
 
@@ -152,10 +156,42 @@ impl UsageStore for SqlUsageStore {
             return Ok(());
         }
 
-        // (2) The guard: insert the hold ONLY if it fits under the ceiling. The
-        // conditional INSERT-SELECT re-reads the totals in one statement, so two
-        // concurrent reserves cannot both pass one ceiling — `rows_affected() == 0`
-        // IS the over-quota signal.
+        // (2) The three per-window rate ceilings, in order (principal, channel,
+        // global) — the FIRST hit names the denial. Each is one conditional upsert
+        // inside this same transaction, so it is race-safe (the write lock is
+        // held) and all-or-nothing (a later guard's failure, or the quota guard's,
+        // rolls these increments back — a denied turn burns no rate token).
+        for (key, window_ms, max, denial) in [
+            (
+                format!("principal:{}", principal.as_str()),
+                limits.principal_window_ms,
+                limits.principal_max,
+                StoreError::PrincipalRateLimited,
+            ),
+            (
+                format!("channel:{channel}"),
+                limits.channel_window_ms,
+                limits.channel_max,
+                StoreError::ChannelRateLimited,
+            ),
+            (
+                "global".to_owned(),
+                limits.global_window_ms,
+                limits.global_max,
+                StoreError::ProviderBudgetExhausted,
+            ),
+        ] {
+            let window = window_floor(now_ms, window_ms);
+            if !bump_counter(&mut tx, &key, window, units, max).await? {
+                tx.rollback().await.map_err(unavailable)?;
+                return Err(denial);
+            }
+        }
+
+        // (3) The quota guard: insert the hold ONLY if it fits under the total
+        // ceiling. The conditional INSERT-SELECT re-reads the totals in one
+        // statement, so two concurrent reserves cannot both pass one ceiling —
+        // `rows_affected() == 0` IS the over-quota signal.
         let held = sqlx::query(
             r"
             INSERT INTO usage_reservations
@@ -307,6 +343,48 @@ impl UsageStore for SqlUsageStore {
         tx.commit().await.map_err(unavailable)?;
         Ok(())
     }
+}
+
+/// The window a timestamp falls in: `now_ms - now_ms % window_ms`. `checked_rem`
+/// makes a `window_ms` of 0 total (it yields `now_ms`) rather than a panic —
+/// `UsagePolicy::validated` refuses 0 for the service, and this keeps a direct
+/// store caller safe too.
+fn window_floor(now_ms: u64, window_ms: u64) -> u64 {
+    now_ms - now_ms.checked_rem(window_ms).unwrap_or(0)
+}
+
+/// Add `units` to a windowed rate counter, but ONLY if it stays within `max`.
+/// One conditional upsert: a fresh window inserts `units` (safe because
+/// `validated()` requires `max >= units_per_turn`); an existing window updates
+/// only when `used + units <= max`. Returns `true` if the token was taken,
+/// `false` if the ceiling was hit (`rows_affected() == 0`) — the caller's denial
+/// signal, exactly as the quota guard reads its conditional write.
+async fn bump_counter(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    counter_key: &str,
+    window_start_ms: u64,
+    units: i64,
+    max: i64,
+) -> Result<bool, StoreError> {
+    let affected = sqlx::query(
+        r"
+        INSERT INTO usage_rate_counters (counter_key, window_start_ms, used_units)
+        VALUES (?, ?, ?)
+        ON CONFLICT (counter_key, window_start_ms)
+        DO UPDATE SET used_units = used_units + ? WHERE used_units + ? <= ?
+        ",
+    )
+    .bind(counter_key)
+    .bind(as_i64(window_start_ms))
+    .bind(units)
+    .bind(units)
+    .bind(units)
+    .bind(max)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .rows_affected();
+    Ok(affected == 1)
 }
 
 /// Recompute an account's `reserved_units` cache as the sum of its LIVE

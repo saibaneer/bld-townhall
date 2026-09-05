@@ -255,8 +255,13 @@ impl UsageLedger for HttpUsage {
             .map_err(UsageDenied::Transport)?;
         match response.status().as_u16() {
             200 => Ok(()),
-            // 429: the quota is spent. A retry does not help until units free up.
-            429 => Err(UsageDenied::QuotaExhausted),
+            // Every resource denial is 429; the body's `denial_code` says which.
+            // A missing or unparseable body degrades to QuotaExhausted — still a
+            // refusal for a resource reason, never an allow.
+            429 => {
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                Err(usage_denied_from_code(body["denial_code"].as_str()))
+            }
             other => Err(UsageDenied::Transport(format!("reserve: {other}"))),
         }
     }
@@ -283,6 +288,18 @@ impl UsageLedger for HttpUsage {
             }
             _ => "Balance unavailable right now. This command costs nothing.".to_owned(),
         }
+    }
+}
+
+/// Map a 429's `denial_code` body to the usage denial it names. An absent or
+/// unrecognized code falls back to `QuotaExhausted` — still a resource refusal,
+/// never an allow (ADR-028).
+fn usage_denied_from_code(code: Option<&str>) -> UsageDenied {
+    match code {
+        Some("rate_limited_principal") => UsageDenied::PrincipalRateLimited,
+        Some("rate_limited_channel") => UsageDenied::ChannelRateLimited,
+        Some("provider_budget_exhausted") => UsageDenied::ProviderBudgetExhausted,
+        _ => UsageDenied::QuotaExhausted,
     }
 }
 

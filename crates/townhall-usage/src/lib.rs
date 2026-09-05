@@ -21,4 +21,4 @@ pub mod service;
 pub mod store;
 
 pub use service::{PricingSchedule, UsageDenied, UsagePolicy, UsageService};
-pub use store::{Balance, MemoryUsageStore, StoreError, UsageStore};
+pub use store::{Balance, MemoryUsageStore, RateLimits, StoreError, UsageStore};

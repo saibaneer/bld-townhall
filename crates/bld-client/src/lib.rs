@@ -335,6 +335,30 @@ impl BldClient {
         self.send(request).await
     }
 
+    /// GET a read-only path under the discovered service and return its JSON body
+    /// verbatim — the permitted read-only surface a proposer searches for venue
+    /// candidates over (spec §18.3). It carries the caller's identity like any
+    /// call, so the server scopes it; it drives nothing and sends no version.
+    ///
+    /// # Errors
+    /// The transport failed, or the server refused.
+    pub async fn browse(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .authorized(self.http.get(self.url(path)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ClientError::Refused { status, detail });
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| ClientError::BadResponse(e.to_string()))
+    }
+
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Fetched, ClientError> {
         let response = request
             .send()

@@ -25,6 +25,7 @@
 //! [`ProjectedContext`] carries only projected facts and [`ProposedAction`]
 //! carries only a behaviour name plus its arguments.
 
+pub mod driver;
 pub mod hostile;
 pub mod llm;
 pub mod openai;

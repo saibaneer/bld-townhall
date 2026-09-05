@@ -242,6 +242,7 @@ fn all_states() -> Vec<BookingState> {
             threshold_policy_version: "v1".to_owned(),
             payment_intent_id: PaymentIntentId::new("PAY-1"),
             payment_ref: PaymentRef::new("cs_1"),
+            hosted_url: "https://checkout.stripe.com/c/pay/cs_1".to_owned(),
             effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-1"),
             principal: PrincipalId::new("lucy"),
         }),

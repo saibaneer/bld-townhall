@@ -113,6 +113,10 @@ pub struct AwaitingHumanPayment {
     pub threshold_policy_version: String,
     pub payment_intent_id: PaymentIntentId,
     pub payment_ref: PaymentRef,
+    /// The Stripe-hosted Checkout URL the human pays at. Carried on the state (not
+    /// just the payment store) so the read projection is a pure fold — a GET
+    /// surfaces the link without the read path touching the payment records.
+    pub hosted_url: String,
     pub effect_intent_id: EffectIntentId,
     pub principal: PrincipalId,
 }
@@ -301,6 +305,17 @@ impl BookingState {
         match self {
             Self::Booked(booked) => Some(&booked.booking_ref),
             Self::CancellingBooking(cancelling) => Some(&cancelling.booking_ref),
+            _ => None,
+        }
+    }
+
+    /// The human's Checkout URL, present only while a booking awaits payment.
+    /// This is what the read projection surfaces so an SMS/test client can hand
+    /// the payer their link (spec §17).
+    #[must_use]
+    pub fn checkout_url(&self) -> Option<&str> {
+        match self {
+            Self::AwaitingHumanPayment(payment) => Some(payment.hosted_url.as_str()),
             _ => None,
         }
     }
@@ -2224,7 +2239,11 @@ impl TownHallDomain {
             }),
             (
                 BookingState::CheckoutPrepared(checkout),
-                VerifiedProviderFact::SessionCreated { payment_ref, .. },
+                VerifiedProviderFact::SessionCreated {
+                    payment_ref,
+                    hosted_url,
+                    ..
+                },
             ) => {
                 let Some(await_id) = context.pending_effect.clone() else {
                     return FactResolution::Denied(BookingError::EffectIdentityMissing);
@@ -2238,6 +2257,7 @@ impl TownHallDomain {
                             threshold_policy_version: checkout.threshold_policy_version.clone(),
                             payment_intent_id: checkout.payment_intent_id.clone(),
                             payment_ref: payment_ref.clone(),
+                            hosted_url: hosted_url.clone(),
                             effect_intent_id: await_id.clone(),
                             principal: checkout.principal.clone(),
                         }),
@@ -3310,6 +3330,7 @@ mod topology {
                 threshold_policy_version: "v1".to_owned(),
                 payment_intent_id: PaymentIntentId::new("PAY-1"),
                 payment_ref: PaymentRef::new("cs_1"),
+                hosted_url: "https://checkout.stripe.com/c/pay/cs_1".to_owned(),
                 effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-1"),
                 principal: PrincipalId::new("lucy"),
             }),
@@ -5971,6 +5992,7 @@ mod fact_topology {
                         threshold_policy_version: "v1".to_owned(),
                         payment_intent_id: PaymentIntentId::new("PAY-1"),
                         payment_ref: PaymentRef::new("cs_1"),
+                        hosted_url: "https://checkout.stripe.com/c/pay/cs_1".to_owned(),
                         effect_intent_id: EffectIntentId::new(PAY_AWAIT_ID),
                         principal: PrincipalId::new("lucy"),
                     }),

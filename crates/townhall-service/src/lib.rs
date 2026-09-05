@@ -954,6 +954,44 @@ where
     }
 }
 
+/// The webhook's one door into the boundary: carry a verified payment fact and
+/// advance the booking. A trait so the webhook handler (in the composition root)
+/// holds `Arc<dyn PaymentObserver>` rather than the Coordinator's four type
+/// parameters — the same decoupling the `ApprovalIssuer` port gives the approval
+/// route.
+#[async_trait]
+pub trait PaymentObserver: Send + Sync {
+    /// As [`Coordinator::observe`] — settle the fact against fresh state,
+    /// idempotently (the version-CAS + `active_effect` guard make it exactly-once).
+    ///
+    /// # Errors
+    /// A transport or store failure; a stale/unmatched fact converges rather than
+    /// erroring.
+    async fn observe_fact(
+        &self,
+        id: &BookingId,
+        fact: Verified<VerifiedProviderFact>,
+    ) -> Result<Turn, ServiceError>;
+}
+
+#[async_trait]
+impl<R, C, V, A> PaymentObserver for Coordinator<R, C, V, A>
+where
+    R: BookingRepository + Send + Sync,
+    C: Capability<BookingEffect> + Send + Sync,
+    C::Raw: Send,
+    V: Verifier<C::Raw, VerifiedProviderFact> + Send + Sync,
+    A: AvailabilitySource + Send + Sync,
+{
+    async fn observe_fact(
+        &self,
+        id: &BookingId,
+        fact: Verified<VerifiedProviderFact>,
+    ) -> Result<Turn, ServiceError> {
+        self.observe(id, fact).await
+    }
+}
+
 /// What a Phase C commit produced, and whether this turn is what produced it.
 ///
 /// The flag is the whole point: the repository's Phase C operations are
@@ -1398,6 +1436,9 @@ pub struct Projection {
     pub requirements: bld_types::BookingRequirements,
     pub selected_venue: Option<townhall_domain::SelectedVenueRef>,
     pub booking_ref: Option<bld_types::CouncilBookingRef>,
+    /// The human's Checkout URL, present only while `AwaitingHumanPayment` (M10) —
+    /// the link an SMS/test client hands the payer.
+    pub checkout_url: Option<String>,
     pub available_behaviours: &'static [&'static str],
 }
 
@@ -1796,6 +1837,7 @@ where
             requirements: aggregate.requirements.clone(),
             selected_venue: aggregate.selected_venue.clone(),
             booking_ref: aggregate.booking_ref.clone(),
+            checkout_url: aggregate.state.checkout_url().map(str::to_owned),
             available_behaviours: aggregate.state.proposal_menu(),
         }
     }

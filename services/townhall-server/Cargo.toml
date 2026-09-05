@@ -12,6 +12,8 @@ axum.workspace = true
 council-client = { path = "../../crates/council-client" }
 council-wire = { path = "../../crates/council-wire" }
 stripe-client = { path = "../../crates/stripe-client" }
+bld-kernel = { path = "../../crates/bld-kernel" }
+townhall-payment = { path = "../../crates/townhall-payment" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 # The dev resolver issues real grants now — nothing asserts its own
 # authority any more (ADR-025).
@@ -30,6 +32,7 @@ townhall-usage = { path = "../../crates/townhall-usage" }
 bld-types = { path = "../../crates/bld-types" }
 bld-manifest = { path = "../../crates/bld-manifest" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 
 [features]
 # The M5 stand-in authority (ADR-021, amended by ADR-022): a fixed three-token

@@ -1,0 +1,41 @@
+[package]
+name = "townhall-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The UNTRUSTED proposer (M11, ADR-031): the "Rig Agent Runtime" of Figure 1,
+# sitting between the orchestrator and `bld-client`. Everything here is OUTSIDE
+# the BLD authority boundary — a proposer inspects a PROJECTED view and emits one
+# typed proposal, which the driver submits over `bld-client`'s public HTTP
+# surface. It names no domain, store, authority, council or payment type, so the
+# same adversarial suite runs against any proposer and safety is a property of the
+# boundary, not the model. Layer 1 is the seam + the deterministic HostileProposer;
+# the LlmProposer (thin OpenAI-compatible client) and the driver arrive next.
+[features]
+# The opt-in live lane (M11, ADR-031): the REAL model completes the booking +
+# cancellation journey against a spawned server. Never part of a normal
+# `cargo test` or ci/run.sh — it needs a running Ollama endpoint (AGENT_BASE_URL /
+# AGENT_MODEL), so it is a feature, exactly like `stripe-live`.
+agent-live = []
+
+[dependencies]
+async-trait = { workspace = true }
+bld-client = { path = "../bld-client" }
+# The thin OpenAI-compatible client (ADR-031's deviation from Rig) talks to a
+# local Ollama endpoint; http-to-localhost needs no TLS, so the workspace
+# json-only reqwest is enough.
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The journey test drives a REAL discoverable server (spawned by the testkit)
+# through the driver — the same public surface any caller uses.
+bld-manifest = { path = "../bld-manifest" }
+tokio = { workspace = true }
+townhall-testkit = { path = "../townhall-testkit" }
+
+[lints]
+workspace = true

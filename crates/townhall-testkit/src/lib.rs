@@ -61,6 +61,11 @@ pub struct World {
     pub townhall_db: std::path::PathBuf,
     server: Option<Child>,
     pub server_url: String,
+    /// The mock-stripe process, spawned only for a paying world (M10/M11). `None`
+    /// for every other world.
+    stripe: Option<Child>,
+    /// The mock-stripe base URL, when a paying world spawned one.
+    pub stripe_url: Option<String>,
 }
 
 impl World {
@@ -77,6 +82,10 @@ impl Drop for World {
         if let Some(mut server) = self.server.take() {
             let _ = server.kill();
             let _ = server.wait();
+        }
+        if let Some(mut stripe) = self.stripe.take() {
+            let _ = stripe.kill();
+            let _ = stripe.wait();
         }
         let _ = self.council.kill();
         let _ = self.council.wait();
@@ -176,6 +185,14 @@ fn build_binaries() {
             .expect("build");
         assert!(status.success(), "building {package} failed");
     }
+}
+
+fn build_mock_stripe() {
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "mock-stripe"])
+        .status()
+        .expect("build mock-stripe");
+    assert!(status.success(), "building mock-stripe failed");
 }
 
 fn target_dir() -> std::path::PathBuf {
@@ -280,6 +297,82 @@ fn spawn_world(dev_authority: bool, extra: &[&str]) -> World {
         townhall_db,
         server: Some(server),
         server_url: format!("http://127.0.0.1:{server_port}"),
+        stripe: None,
+        stripe_url: None,
+    }
+}
+
+/// A dev-lane world that is BOTH discoverable (a signed `/.well-known/bld`
+/// manifest, [`MANIFEST_KEY_HEX`]) AND payments-enabled (M11): council +
+/// mock-stripe + a server with `--enable-payments` and `--payment-threshold-pence`
+/// so a below-authority booking still routes through the human-payment handoff.
+/// The two Stripe secrets go through the child's ENVIRONMENT, exactly as the
+/// composition root reads them.
+#[must_use]
+pub fn world_paying_discoverable(threshold_pence: u64) -> World {
+    build_binaries();
+    build_mock_stripe();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let council_db = dir.path().join("council.sqlite");
+    let mut command = Command::new(target_dir().join("mock-council"));
+    command
+        .arg("--db")
+        .arg(&council_db)
+        .args(["--key-hex", KEY_HEX, "--port", "0"]);
+    let (council, council_port) = spawn_ready(command);
+    let council_url = format!("http://127.0.0.1:{council_port}");
+
+    let mut command = Command::new(target_dir().join("mock-stripe"));
+    command.args(["--port", "0"]);
+    let (stripe, stripe_port) = spawn_ready(command);
+    let stripe_url = format!("http://127.0.0.1:{stripe_port}");
+
+    let townhall_db = dir.path().join("townhall.sqlite");
+    let threshold = threshold_pence.to_string();
+    let mut command = Command::new(target_dir().join("townhall-server"));
+    command
+        .arg("--db")
+        .arg(&townhall_db)
+        .arg("--denials-db")
+        .arg(dir.path().join("denials.sqlite"))
+        .args([
+            "--council-url",
+            &council_url,
+            "--key-hex",
+            KEY_HEX,
+            "--port",
+            "0",
+            "--authority-key",
+            AUTHORITY_KEY_HEX,
+            "--retry-cadence-ms",
+            "200",
+            "--reconcile-interval-ms",
+            "100",
+            "--dev-authority",
+            "--manifest-key",
+            MANIFEST_KEY_HEX,
+            "--enable-payments",
+            "--payment-threshold-pence",
+            &threshold,
+        ])
+        .env("STRIPE_SECRET_KEY", "sk_test_townhall_testkit")
+        .env("STRIPE_WEBHOOK_SECRET", "whsec_townhall_testkit")
+        .env("STRIPE_BASE_URL", &stripe_url)
+        .env("STRIPE_SUCCESS_URL", "https://townhall.test/paid")
+        .env("STRIPE_CANCEL_URL", "https://townhall.test/cancelled");
+    let (server, server_port) = spawn_ready(command);
+
+    World {
+        dir,
+        council,
+        council_url,
+        council_db,
+        townhall_db,
+        server: Some(server),
+        server_url: format!("http://127.0.0.1:{server_port}"),
+        stripe: Some(stripe),
+        stripe_url: Some(stripe_url),
     }
 }
 

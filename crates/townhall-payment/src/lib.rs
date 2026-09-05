@@ -201,9 +201,12 @@ pub fn verify_webhook(
     }
 
     // Anti-replay: the signed timestamp must be recent. Checked BEFORE the HMAC so
-    // a valid-but-old captured event cannot be replayed.
-    let skew = now_unix - timestamp;
-    if skew.abs() > tolerance_secs {
+    // a valid-but-old captured event cannot be replayed. `timestamp` is
+    // attacker-supplied (it came off the wire), so the arithmetic is saturating —
+    // a crafted `t` near i64::MIN/MAX cannot overflow-panic this unauthenticated
+    // endpoint. A saturated skew is enormous, so it is still (correctly) Expired.
+    let skew = now_unix.saturating_sub(timestamp);
+    if skew.saturating_abs() > tolerance_secs {
         return Err(SignatureError::Expired { skew_secs: skew });
     }
 

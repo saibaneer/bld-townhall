@@ -9,10 +9,11 @@
 //! double.
 //!
 //! The load-bearing witness is [`a_forged_webhook_advances_nothing`]: a webhook
-//! whose signature does not verify is a 400 and changes NO state. If the handler
-//! skipped verification — or verified after parsing, or trusted a success
-//! redirect — that test would advance the booking and fail. Everything else
-//! proves the handoff works; that one proves it cannot be forged.
+//! signed with the wrong secret is a 400 and changes NO state. If the handler
+//! skipped verification, that test would advance the booking and fail. And
+//! [`a_completed_but_unpaid_webhook_does_not_advance`] holds the other half —
+//! a verified event is only PAID evidence when Stripe says `paid`. Everything
+//! else proves the handoff works; those two prove it cannot be forged or faked.
 //!
 //! Wall-clock honesty: the server runs on a clock no test can move, so the two
 //! convergence points (reaching payment, and booking after payment) use a SHORT
@@ -368,13 +369,17 @@ fn now_secs() -> i64 {
 }
 
 /// The bytes of a `checkout.session.completed` event for this session — exactly
-/// the fields the handler reads: the session id and its `payment_intent_id`.
-fn completed_event(event_id: &str, session: &serde_json::Value) -> Vec<u8> {
+/// the fields the handler reads: the session id, its `payment_intent_id`, and the
+/// `payment_status` that decides whether it is genuinely PAID evidence (a real
+/// completed card payment carries `"paid"`; a delayed method can complete a
+/// session still `"unpaid"`).
+fn completed_event(event_id: &str, session: &serde_json::Value, payment_status: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "id": event_id,
         "type": "checkout.session.completed",
         "data": { "object": {
             "id": session["id"],
+            "payment_status": payment_status,
             "metadata": { "payment_intent_id": session["metadata"]["payment_intent_id"] },
         }},
     });
@@ -435,7 +440,7 @@ fn a_valid_signed_webhook_advances_the_booking() {
 
     let session_id = session_id_from_url(booking.body["checkout_url"].as_str().unwrap());
     let session = fetch_session(&world, &session_id);
-    let raw = completed_event("evt_pay_2", &session);
+    let raw = completed_event("evt_pay_2", &session, "paid");
     let status = post_webhook(&world, &raw, &valid_signature(&raw));
     assert_eq!(status, 200, "a verified event is accepted");
 
@@ -451,13 +456,16 @@ fn a_valid_signed_webhook_advances_the_booking() {
     );
 }
 
-/// THE load-bearing witness. A webhook whose signature does not verify is a 400
-/// and changes NOTHING: the booking is still awaiting payment. A forged body, a
-/// success redirect, or an agent's claim carries no valid signature — this is
-/// what makes "only verified evidence advances a payment" a fact and not a hope.
+/// THE load-bearing witness. A webhook signed with the WRONG secret — the shape
+/// an attacker who cannot know the endpoint secret can produce — is a 400 and
+/// changes NOTHING: the booking is still awaiting payment, and nothing booked.
+/// This is what makes "only verified evidence advances a payment" a fact and not
+/// a hope: no valid signature, no advance.
 ///
 /// Mutation check: delete the `verify_webhook` gate in the handler and this
 /// test's booking advances past `AwaitingHumanPayment` — the assert fails.
+/// (It witnesses that verification GATES the advance; the verify-BEFORE-parse
+/// ordering is a separate property the handler's structure enforces.)
 #[test]
 fn a_forged_webhook_advances_nothing() {
     let world = paying_world(Some(PAY_THRESHOLD_PENCE));
@@ -466,7 +474,7 @@ fn a_forged_webhook_advances_nothing() {
 
     let session_id = session_id_from_url(booking.body["checkout_url"].as_str().unwrap());
     let session = fetch_session(&world, &session_id);
-    let raw = completed_event("evt_forged", &session);
+    let raw = completed_event("evt_forged", &session, "paid");
 
     // A signature that is well-formed but computed with the WRONG secret — the
     // shape an attacker who cannot know the endpoint secret can produce.
@@ -492,6 +500,42 @@ fn a_forged_webhook_advances_nothing() {
     );
 }
 
+/// A verified `checkout.session.completed` that is NOT paid — a delayed / async
+/// payment method that finished the session while the money is still settling —
+/// is a 200 (Stripe should stop redelivering it), but advances NOTHING. "Resumes
+/// only after verified payment evidence" (spec §17) means paid, not merely a
+/// finished Checkout.
+///
+/// Mutation check: drop the `payment_status == "paid"` gate in the handler and
+/// this booking advances to `Booked` on an unpaid completion — the assert fails.
+#[test]
+fn a_completed_but_unpaid_webhook_does_not_advance() {
+    let world = paying_world(Some(PAY_THRESHOLD_PENCE));
+    let booking = drive_through_book(&world, "BKG-PAY-5");
+    assert_eq!(state_of(&booking), "AwaitingHumanPayment");
+
+    let session_id = session_id_from_url(booking.body["checkout_url"].as_str().unwrap());
+    let session = fetch_session(&world, &session_id);
+    // A genuinely-signed completed event whose session is still UNPAID.
+    let raw = completed_event("evt_unpaid", &session, "unpaid");
+    let status = post_webhook(&world, &raw, &valid_signature(&raw));
+    assert_eq!(
+        status, 200,
+        "a verified event is accepted (and here, parked)"
+    );
+
+    let state = poll_state(&world, "BKG-PAY-5", "Booked", Duration::from_secs(2));
+    assert_eq!(
+        state, "AwaitingHumanPayment",
+        "an unpaid completion is not payment evidence — the booking must not advance"
+    );
+    assert_eq!(
+        council_count(&world, "SELECT COUNT(*) FROM bookings"),
+        0,
+        "and nothing booked at the council"
+    );
+}
+
 /// Stripe redelivers events; a second copy of a verified event must converge, not
 /// double-book. Both deliveries are 200, and exactly one council booking exists.
 #[test]
@@ -502,7 +546,7 @@ fn a_duplicate_webhook_is_idempotent() {
 
     let session_id = session_id_from_url(booking.body["checkout_url"].as_str().unwrap());
     let session = fetch_session(&world, &session_id);
-    let raw = completed_event("evt_pay_4", &session);
+    let raw = completed_event("evt_pay_4", &session, "paid");
 
     // The same signed event, delivered twice.
     assert_eq!(post_webhook(&world, &raw, &valid_signature(&raw)), 200);

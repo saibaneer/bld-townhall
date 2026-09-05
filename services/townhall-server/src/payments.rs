@@ -65,6 +65,11 @@ struct EventObject {
     id: String,
     #[serde(default)]
     metadata: Metadata,
+    /// The session's own payment status. A `checkout.session.completed` is only
+    /// PAID evidence when Stripe reports this as `paid` (or `no_payment_required`);
+    /// a delayed/async payment method can complete a session while still `unpaid`.
+    #[serde(default)]
+    payment_status: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -134,35 +139,48 @@ impl StripeWebhookPort for StripeWebhookHandler {
             .await;
 
         // Only genuinely terminal outcomes advance. A decline / processing / 3DS is
-        // recorded and parks (no `observe`, no transition).
-        let (raw, is_terminal_success) = match event.event_type.as_str() {
-            "checkout.session.completed" | "payment_intent.succeeded" => (
-                StripeRaw::SessionRetrieved {
-                    effect_intent_id: await_id,
-                    stripe_session_id: session_ref,
-                    payment_intent_id: Some(payment_intent_id.clone()),
-                    checkout_status: Some("complete".to_owned()),
-                    payment_status: "paid".to_owned(),
-                    payment_intent_status: Some("succeeded".to_owned()),
-                    expires_at_ms: 0,
-                },
-                Some(true),
-            ),
-            "checkout.session.expired" | "payment_intent.canceled" => (
-                StripeRaw::SessionRetrieved {
-                    effect_intent_id: await_id,
-                    stripe_session_id: session_ref,
-                    payment_intent_id: Some(payment_intent_id.clone()),
-                    checkout_status: Some("expired".to_owned()),
-                    payment_status: "unpaid".to_owned(),
-                    payment_intent_status: Some("canceled".to_owned()),
-                    expires_at_ms: 0,
-                },
-                Some(false),
-            ),
+        // recorded and parks (no `observe`, no transition). "Verified payment
+        // evidence" (spec §17) means PAID, not merely a finished session: a
+        // `checkout.session.completed` whose `payment_status` is not `paid` (a
+        // delayed/async method still settling) is parked, never advanced.
+        let is_terminal_success = match event.event_type.as_str() {
+            "checkout.session.completed" => match event.data.object.payment_status.as_deref() {
+                Some("paid" | "no_payment_required") => true,
+                _ => return Ok(WebhookOutcome::Recorded),
+            },
+            "payment_intent.succeeded" => true,
+            "checkout.session.expired" | "payment_intent.canceled" => false,
             // Non-terminal (payment_failed / processing / requires_action): recorded
             // above, no advance.
             _ => return Ok(WebhookOutcome::Recorded),
+        };
+        let raw = StripeRaw::SessionRetrieved {
+            effect_intent_id: await_id,
+            stripe_session_id: session_ref,
+            payment_intent_id: Some(payment_intent_id.clone()),
+            checkout_status: Some(
+                if is_terminal_success {
+                    "complete"
+                } else {
+                    "expired"
+                }
+                .to_owned(),
+            ),
+            payment_status: if is_terminal_success {
+                "paid"
+            } else {
+                "unpaid"
+            }
+            .to_owned(),
+            payment_intent_status: Some(
+                if is_terminal_success {
+                    "succeeded"
+                } else {
+                    "canceled"
+                }
+                .to_owned(),
+            ),
+            expires_at_ms: 0,
         };
 
         // Mint the fact in the trusted verifier and carry it into the boundary.
@@ -170,19 +188,16 @@ impl StripeWebhookPort for StripeWebhookHandler {
             return Ok(WebhookOutcome::Ignored);
         };
         let _ = self.observer.observe_fact(&record.booking_id, fact).await;
-        match is_terminal_success {
-            Some(true) => {
-                let _ = self
-                    .payments
-                    .mark_confirmed(&payment_intent_id, now_ms)
-                    .await;
-            }
-            _ => {
-                let _ = self
-                    .payments
-                    .mark_abandoned(&payment_intent_id, now_ms)
-                    .await;
-            }
+        if is_terminal_success {
+            let _ = self
+                .payments
+                .mark_confirmed(&payment_intent_id, now_ms)
+                .await;
+        } else {
+            let _ = self
+                .payments
+                .mark_abandoned(&payment_intent_id, now_ms)
+                .await;
         }
         Ok(WebhookOutcome::Advanced)
     }

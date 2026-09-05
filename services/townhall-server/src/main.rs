@@ -1000,3 +1000,76 @@ mod feature_gate {
         );
     }
 }
+
+/// The payment-config fail-fast (M10). `payment_config` takes a getter precisely
+/// so these rules are exercised without touching the process environment — the
+/// untestable-config-in-`main` lesson `--dev-authority` already records. Runs in
+/// BOTH feature lanes: the rules are independent of the authority resolver.
+#[cfg(test)]
+mod payment_config_tests {
+    use super::payment_config;
+
+    /// A getter over a fixed table — nothing in the real environment is read.
+    fn getter(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn both_secrets_present_yields_config_with_url_defaults() {
+        let config = payment_config(getter(&[
+            ("STRIPE_SECRET_KEY", "sk_test_x"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_x"),
+        ]))
+        .expect("both secrets present is Ok");
+        assert_eq!(config.secret_key, "sk_test_x");
+        assert_eq!(config.webhook_secret, "whsec_x");
+        assert_eq!(config.base_url, "https://api.stripe.com");
+    }
+
+    #[test]
+    fn a_missing_secret_key_is_refused() {
+        assert!(
+            payment_config(getter(&[("STRIPE_WEBHOOK_SECRET", "whsec_x")])).is_err(),
+            "STRIPE_SECRET_KEY is required under --enable-payments"
+        );
+    }
+
+    #[test]
+    fn a_missing_webhook_secret_is_refused() {
+        assert!(
+            payment_config(getter(&[("STRIPE_SECRET_KEY", "sk_test_x")])).is_err(),
+            "STRIPE_WEBHOOK_SECRET is required under --enable-payments"
+        );
+    }
+
+    /// The security control, exercised: an EMPTY webhook secret would key the HMAC
+    /// on empty bytes — a hollow signature gate. `require` treats empty as missing,
+    /// so the server refuses to start rather than boot with it.
+    #[test]
+    fn an_empty_secret_is_refused_as_if_absent() {
+        assert!(
+            payment_config(getter(&[
+                ("STRIPE_SECRET_KEY", "sk_test_x"),
+                ("STRIPE_WEBHOOK_SECRET", ""),
+            ]))
+            .is_err(),
+            "an empty webhook secret must be refused, not accepted"
+        );
+    }
+
+    #[test]
+    fn url_overrides_are_honored_over_the_defaults() {
+        let config = payment_config(getter(&[
+            ("STRIPE_SECRET_KEY", "sk_test_x"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_x"),
+            ("STRIPE_BASE_URL", "http://127.0.0.1:4011"),
+        ]))
+        .expect("Ok");
+        assert_eq!(config.base_url, "http://127.0.0.1:4011");
+    }
+}

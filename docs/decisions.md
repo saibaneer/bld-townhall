@@ -3119,6 +3119,23 @@ the architecture):
   the availability fact, so a threshold changed between verify, a CAS retry, or a fact
   replay cannot make identical evidence choose different states. The branch is decided
   once, on persisted evidence.
+- **The proposal-door inertness guard (found by the M10 acceptance sweep).** Making
+  `VerifySlot` commit `VerifyingSlot` before the fee is bound created a regression the
+  §10.2 refusal battery caught: a slot the caller cannot AFFORD (fee over the
+  authority/requirement ceiling) — or that is unavailable, too small, or inaccessible —
+  would commit `VerifyingSlot`, move the version, and only then be refused at the fact
+  door, stranding a driver in-flight on a refusal that must be INERT. The fix restores
+  the pre-M10 synchronous contract IN FULL at the proposal door: `resolve_verify` runs
+  the same `validate_facts` guard (via `bind_availability`) over the
+  synchronously-observed facts and refuses — `FeeExceeded{Authority|Requirement}`,
+  `CapacityInsufficient`, `AccessibilityRequired`, `SlotUnavailable` — with NO commit
+  and NO version movement, exactly where the availability-unreachable guard already
+  lived. This is the CEILING guard (can-the-caller-book-this-at-all), distinct from and
+  upstream of the fee BRANCH (threshold → `AwaitingBooking` vs `OfferSelected`), which
+  stays at the fact door on persisted evidence. The fact-door binding keeps the same
+  checks as defence-in-depth for the future where the observed read and the verified
+  fact can legitimately differ (a real async council); today, in the synchronous
+  interim, they share one source, so the guard makes the refusal inert.
 
 The scope cost is real and stated plainly: availability moves from eager context to a
 verify-then-settle protocol (a `VerifyingSlot` state + an `AvailabilityVerified` fact

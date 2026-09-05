@@ -2605,22 +2605,30 @@ impl TownHallDomain {
         authority: &VerifiedAuthority,
         context: &BookingContext,
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        // Fail-closed BEFORE minting the availability effect: an unreachable
-        // provider is refused as `FactsUnavailable` and an answered-but-empty slot
-        // as `VenueFactsMissing`, the pre-M10 synchronous contract (a driver must
-        // not be parked in `VerifyingSlot` when there is verifiably nothing to
-        // verify). This reads context, but it is a GUARD (Denied), not the fee
-        // branch — ADR-018 forbids only data-dependent `Undefined`/target
-        // selection on the proposal door, and the fee branch still happens at the
-        // fact door once `AvailabilityVerified` settles.
-        match &context.selected_facts {
-            ObservedAvailability::Unavailable => {
-                return Resolution::Denied(BookingError::FactsUnavailable);
-            }
-            ObservedAvailability::Answered(None) => {
-                return Resolution::Denied(BookingError::VenueFactsMissing);
-            }
-            ObservedAvailability::Answered(Some(_)) => {}
+        // Fail-closed BEFORE minting the availability effect, the pre-M10
+        // synchronous contract IN FULL: an unreachable provider is
+        // `FactsUnavailable`, an answered-but-empty slot `VenueFactsMissing`, and
+        // — the completion of this guard — a slot the synchronously-observed
+        // facts already show cannot be booked (unavailable, too small,
+        // inaccessible, or over a fee ceiling) is refused with that exact reason.
+        // A driver must never be parked in `VerifyingSlot` on a refusal the read
+        // could already see; leaving these to the fact door stranded the booking
+        // in-flight and moved its version on a refusal that must be INERT.
+        //
+        // This reads context, but it is a GUARD (Denied), not the fee BRANCH —
+        // ADR-018 forbids only data-dependent `Undefined`/target selection on the
+        // proposal door, and the threshold branch still happens at the fact door
+        // once `AvailabilityVerified` settles (ADR-030). The fact-door binding
+        // keeps the same checks as defence-in-depth for the day the observed read
+        // and the verified fact can differ.
+        if let Err(denial) = Self::bind_availability(
+            booking,
+            context,
+            &selection.venue_id,
+            &selection.slot_id,
+            authority,
+        ) {
+            return Resolution::Denied(denial);
         }
         let Some(effect_intent_id) = context.pending_effect.clone() else {
             return Resolution::Denied(BookingError::EffectIdentityMissing);
@@ -5048,21 +5056,32 @@ mod characterization {
     /// are), the requirement's when only the booking's own budget is.
     #[tokio::test]
     async fn the_ceiling_that_refused_is_named() {
+        // Under Option A (ADR-030) the fee refusal is INERT at the proposal door:
+        // the synchronous guard sees the observed £90 and refuses `VerifySlot`
+        // before any `VerifyingSlot` is committed — a driver is never parked
+        // in-flight on a fee it could never afford. Which ceiling refused is still
+        // named exactly, because that is what decides the 403-vs-422 story
+        // (ADR-021), and it is decided here now rather than at the fact door.
+        let expensive = || BookingContext {
+            selected_facts: ObservedAvailability::of(observed(VenueFacts {
+                fee: Money::from_pence(9_000),
+                ..good_facts()
+            })),
+            ..context()
+        };
+
         // Exceeds only the REQUIREMENT: generous authority, tight budget.
         let generous = issued(ALL, 20_000);
-        let got = verify_fact(
+        let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
             &generous,
-            VenueFacts {
-                fee: Money::from_pence(9_000),
-                ..good_facts()
-            },
+            &expensive(),
         )
         .await;
         assert_eq!(
             got,
-            FactResolution::Denied(BookingError::FeeExceeded {
+            Resolution::Denied(BookingError::FeeExceeded {
                 ceiling: FeeCeiling::Requirement,
             }),
             "a data story, not a grant story"
@@ -5072,22 +5091,19 @@ mod characterization {
         let restricted = issued(ALL, 1_000);
         let mut wanting = requirements();
         wanting.max_fee = Money::from_pence(20_000);
-        let got = verify_fact(
+        let got = turn(
             Booking {
                 requirements: wanting,
                 ..venue_selected()
             },
             BookingProposal::VerifySlot,
             &restricted,
-            VenueFacts {
-                fee: Money::from_pence(9_000),
-                ..good_facts()
-            },
+            &expensive(),
         )
         .await;
         assert_eq!(
             got,
-            FactResolution::Denied(BookingError::FeeExceeded {
+            Resolution::Denied(BookingError::FeeExceeded {
                 ceiling: FeeCeiling::Authority,
             }),
             "the grant refused, regardless of the data"

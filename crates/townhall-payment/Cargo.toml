@@ -1,0 +1,38 @@
+[package]
+name = "townhall-payment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The trusted PAYMENT verifier (M10, ADR-030). This crate is where a Stripe
+# webhook's HMAC-SHA256 signature is checked, and (later) where a verified webhook
+# becomes a `Verified<VerifiedProviderFact::Payment*>` — fact-minting lives HERE,
+# never in the untrusted stripe-client adapter that touches raw webhook bytes.
+#
+# This first layer is the signature verifier + the masked secret type: pure crypto,
+# no domain, no store, no socket. Its `boundary.rs` test forbids the mutation
+# surface (store/service/http); the fact-minting layer (which names townhall-domain,
+# as council-client's verifier does) is added with the domain's payment facts.
+[features]
+# Test-only: exposes `sign_webhook`, the exact inverse of `verify_webhook`, so an
+# end-to-end harness (and the `stripe-live` lane) can mint a valid
+# `Stripe-Signature` over the SAME bytes the verifier checks — one source of truth
+# for the wire format, never a hand-rolled second copy that could quietly drift.
+test-signing = []
+
+[dependencies]
+bld-kernel = { path = "../bld-kernel" }
+bld-types = { path = "../bld-types" }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+townhall-domain = { path = "../townhall-domain" }
+
+[dev-dependencies]
+# Test-only: `resolved_dependencies` (cargo metadata) for the boundary test. Never
+# enters the normal graph — boundary.rs checks the "normal" kind.
+townhall-testkit = { path = "../townhall-testkit" }
+
+[lints]
+workspace = true

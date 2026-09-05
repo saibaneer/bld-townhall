@@ -558,9 +558,9 @@ fn a_dropped_response_answers_202_and_the_loop_converges_it() {
     }
     spawn_server(&mut world, &["--retry-cadence-ms", "7300"]);
     let etag = awaiting(&world, "BKG-202");
-    // The book effect departs from version 2 — the identity is derivable, so
+    // The book effect departs from version 3 — the identity is derivable, so
     // the fault is armed exactly (E's discipline).
-    let fault = arm_fault(&world, "EFF-BKG-202-BOOK-2", "create", "drop_response");
+    let fault = arm_fault(&world, "EFF-BKG-202-BOOK-3", "create", "drop_response");
 
     let reply = call(
         &world,
@@ -1054,7 +1054,7 @@ fn a_dead_council_answers_503_for_asks_but_cancel_still_commits() {
     );
     let ask_etag = etag_version(&reply);
     // Book with the answer eaten so the booking is genuinely in flight.
-    let effect = "EFF-BKG-DEAD-BOOK-2";
+    let effect = "EFF-BKG-DEAD-BOOK-3";
     arm_fault(&world, effect, "create", "drop_response");
     let reply = call(
         &world,
@@ -1134,7 +1134,7 @@ fn a_zero_reclassification_budget_answers_429_with_retry_after() {
 fn the_trigger_racing_the_live_loop_duplicates_nothing() {
     let world = world();
     let etag = awaiting(&world, "BKG-RACE");
-    arm_fault(&world, "EFF-BKG-RACE-BOOK-2", "create", "drop_response");
+    arm_fault(&world, "EFF-BKG-RACE-BOOK-3", "create", "drop_response");
     let reply = call(
         &world,
         "POST",
@@ -1187,7 +1187,7 @@ fn the_reconcile_trigger_converges_and_races_the_loop_safely() {
     // The loop effectively out of the way: a huge interval.
     spawn_server(&mut world, &["--reconcile-interval-ms", "3600000"]);
     let etag = awaiting(&world, "BKG-TRIGGER");
-    let effect = "EFF-BKG-TRIGGER-BOOK-2";
+    let effect = "EFF-BKG-TRIGGER-BOOK-3";
     arm_fault(&world, effect, "create", "drop_response");
     let reply = call(
         &world,
@@ -1273,7 +1273,7 @@ fn the_reconcile_trigger_converges_and_races_the_loop_safely() {
 fn the_chase_survives_a_server_restart() {
     let mut world = world();
     let etag = awaiting(&world, "BKG-RESTART");
-    let effect = "EFF-BKG-RESTART-BOOK-2";
+    let effect = "EFF-BKG-RESTART-BOOK-3";
     arm_fault(&world, effect, "create", "drop_response");
     let reply = call(
         &world,
@@ -1561,7 +1561,7 @@ fn a_booking_mid_escalation_reads_as_its_inflight_truth() {
     // Book with the answer eaten (the Book turn itself needs the availability
     // read, so the council must be ALIVE for it — killing it first would
     // honestly answer 503, which is its own test elsewhere)…
-    arm_fault(&world, "EFF-BKG-ESC-BOOK-2", "create", "drop_response");
+    arm_fault(&world, "EFF-BKG-ESC-BOOK-3", "create", "drop_response");
     let reply = call(
         &world,
         "POST",

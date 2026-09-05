@@ -47,15 +47,16 @@
 use bld_kernel::{BoundaryDomain, FactResolution, Resolution, TransitionPlan, Verified};
 use bld_types::{
     AvailabilityGrant, BookingId, BookingRequirements, CouncilBookingRef, EffectIntentId, Money,
-    PrincipalId, SlotId, TimeWindow, VenueId,
+    PaymentIntentId, PaymentRef, PrincipalId, SlotId, TimeWindow, VenueId,
 };
 use std::{fmt::Write as _, fs, path::PathBuf};
 use townhall_domain::{
-    AwaitingBooking, Booked, Booking, BookingContext, BookingEffect, BookingProposal, BookingState,
-    CancellationRequested, Cancelled, CancellingBooking, Draft, EffectIntent, EffectStatus,
-    FactContext, NeedsHuman, NeedsRevalidation, OperationKind, SelectedVenueRef, SystemEvent,
-    TownHallDomain, VenueFacts, VenueSelected, VerifiedAuthority, VerifiedAvailability,
-    VerifiedProviderFact,
+    AwaitingBooking, AwaitingHumanPayment, Booked, Booking, BookingContext, BookingEffect,
+    BookingProposal, BookingState, CancellationRequested, Cancelled, CancellingBooking,
+    CheckoutPrepared, Draft, EffectIntent, EffectStatus, FactContext, FeeClass, NeedsHuman,
+    NeedsRevalidation, OfferSelected, OperationKind, PaidBookingInProgress, PaymentConfirmed,
+    ProviderReference, SelectedVenueRef, SystemEvent, TownHallDomain, VenueFacts, VenueSelected,
+    VerifiedAuthority, VerifiedAvailability, VerifiedProviderFact, VerifyingSlot,
 };
 
 /// One cell of the topology: what happens to this state on this input.
@@ -206,13 +207,62 @@ fn all_states() -> Vec<BookingState> {
         BookingState::NeedsRevalidation(NeedsRevalidation {
             selected: Some(selection()),
         }),
+        BookingState::VerifyingSlot(VerifyingSlot {
+            selection: selection(),
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-VERIFY-0"),
+        }),
         BookingState::AwaitingBooking(AwaitingBooking {
             venue_id: VenueId::new("TH-A"),
             slot_id: SlotId::new("SLOT-A"),
             verified_fee: Money::from_pence(4_500),
+            verified_fee_class: FeeClass::BelowThreshold,
+            threshold_policy_version: "v1".to_owned(),
+        }),
+        BookingState::OfferSelected(OfferSelected {
+            selection: selection(),
+            verified_fee: Money::from_pence(14_500),
+            grant: AvailabilityGrant::new("export-grant"),
+            threshold_policy_version: "v1".to_owned(),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            principal: PrincipalId::new("lucy"),
+        }),
+        BookingState::CheckoutPrepared(CheckoutPrepared {
+            selection: selection(),
+            verified_fee: Money::from_pence(14_500),
+            grant: AvailabilityGrant::new("export-grant"),
+            threshold_policy_version: "v1".to_owned(),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-0"),
+            principal: PrincipalId::new("lucy"),
+        }),
+        BookingState::AwaitingHumanPayment(AwaitingHumanPayment {
+            selection: selection(),
+            verified_fee: Money::from_pence(14_500),
+            grant: AvailabilityGrant::new("export-grant"),
+            threshold_policy_version: "v1".to_owned(),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            payment_ref: PaymentRef::new("cs_1"),
+            hosted_url: "https://checkout.stripe.com/c/pay/cs_1".to_owned(),
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-PAY-1"),
+            principal: PrincipalId::new("lucy"),
+        }),
+        BookingState::PaymentConfirmed(PaymentConfirmed {
+            selection: selection(),
+            verified_fee: Money::from_pence(14_500),
+            grant: AvailabilityGrant::new("export-grant"),
+            threshold_policy_version: "v1".to_owned(),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            payment_ref: PaymentRef::new("cs_1"),
+            principal: PrincipalId::new("lucy"),
         }),
         BookingState::BookingInProgress(townhall_domain::BookingInProgress {
             effect_intent_id: EffectIntentId::new(BOOK_EFFECT),
+        }),
+        BookingState::PaidBookingInProgress(PaidBookingInProgress {
+            selection: selection(),
+            verified_fee: Money::from_pence(14_500),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            effect_intent_id: EffectIntentId::new("EFF-BKG-1001-BOOK-9"),
         }),
         BookingState::CancellationRequested(CancellationRequested {
             effect_intent_id: EffectIntentId::new(BOOK_EFFECT),
@@ -291,6 +341,27 @@ fn facts_about(effect: &str) -> Vec<VerifiedProviderFact> {
             effect_intent_id: EffectIntentId::new(effect),
             reason: bld_types::BoundedString::truncating("the council refused"),
         },
+        VerifiedProviderFact::AvailabilityVerified {
+            effect_intent_id: EffectIntentId::new(effect),
+            facts: facts(),
+            grant: AvailabilityGrant::new("export-grant"),
+        },
+        VerifiedProviderFact::SessionCreated {
+            effect_intent_id: EffectIntentId::new(effect),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            payment_ref: PaymentRef::new("cs_1"),
+            hosted_url: "https://checkout.stripe.test/cs_1".to_owned(),
+        },
+        VerifiedProviderFact::PaymentConfirmed {
+            effect_intent_id: EffectIntentId::new(effect),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            payment_ref: PaymentRef::new("cs_1"),
+        },
+        VerifiedProviderFact::PaymentAbandoned {
+            effect_intent_id: EffectIntentId::new(effect),
+            payment_intent_id: PaymentIntentId::new("PAY-1"),
+            payment_ref: PaymentRef::new("cs_1"),
+        },
     ]
 }
 
@@ -325,10 +396,35 @@ fn intent_for(
                 booking_ref: CouncilBookingRef::new(REFERENCE),
                 principal: PrincipalId::new("lucy"),
             },
+            OperationKind::Verify => BookingEffect::VerifyAvailability {
+                principal: PrincipalId::new("lucy"),
+                selection: selection(),
+                requirements: requirements(),
+                authority_max_fee: Money::from_pence(9_000),
+                payment_threshold: Money::from_pence(10_000),
+                threshold_policy_version: "topology-v1".to_owned(),
+            },
+            OperationKind::Pay => BookingEffect::PreparePayment {
+                principal: PrincipalId::new("lucy"),
+                payment_intent_id: PaymentIntentId::new("PAY-1"),
+                selection: selection(),
+                amount: Money::from_pence(14_500),
+                grant: AvailabilityGrant::new("export-grant"),
+                payment_ref: matches!(state, BookingState::AwaitingHumanPayment(_))
+                    .then(|| PaymentRef::new("cs_1")),
+            },
         },
         status,
         expires_at_ms: 1_000_030_000,
-        provider_reference: None,
+        provider_reference: match (status, kind) {
+            (EffectStatus::Confirmed, OperationKind::Book | OperationKind::Cancel) => Some(
+                ProviderReference::Council(CouncilBookingRef::new(REFERENCE)),
+            ),
+            (EffectStatus::Confirmed, OperationKind::Pay) => {
+                Some(ProviderReference::Payment(PaymentRef::new("cs_1")))
+            }
+            _ => None,
+        },
         outcome_detail: None,
         supersedes: None,
         created_at_ms: 1_000_000_000,
@@ -348,6 +444,8 @@ fn classify_plan(plan: &TransitionPlan<Booking, BookingEffect>) -> Cell {
             effect: match effect {
                 BookingEffect::Book { .. } => "Book".to_owned(),
                 BookingEffect::CancelBooking { .. } => "CancelBooking".to_owned(),
+                BookingEffect::VerifyAvailability { .. } => "VerifyAvailability".to_owned(),
+                BookingEffect::PreparePayment { .. } => "PreparePayment".to_owned(),
             },
         },
     }
@@ -369,6 +467,10 @@ async fn proposal_door() -> Door {
                     }),
                 ),
                 pending_effect: Some(EffectIntentId::new(BOOK_EFFECT)),
+                payment_policy: townhall_domain::PaymentThresholdPolicy {
+                    threshold: Money::from_pence(10_000),
+                    version: "topology-v1".to_owned(),
+                },
             };
             let proposal_name = proposal.name();
             let resolved = TownHallDomain
@@ -413,12 +515,9 @@ async fn fact_door() -> Door {
         let booking = booking_for(&state);
         let effect = state
             .effect_intent_id()
-            .map_or(BOOK_EFFECT, |id| match id.as_str() {
-                CANCEL_EFFECT => CANCEL_EFFECT,
-                _ => BOOK_EFFECT,
-            });
+            .map_or(BOOK_EFFECT, EffectIntentId::as_str);
         let mut row = Vec::new();
-        for (kind, status, fact) in fact_inputs() {
+        for (kind, status, fact) in fact_inputs(effect) {
             // Mirrors how the coordinator builds this context, which is the only
             // way the artifact describes the machine rather than the fixture.
             //
@@ -457,7 +556,7 @@ async fn fact_door() -> Door {
     Door {
         name: "fact",
         arrow: "-.->",
-        inputs: fact_inputs()
+        inputs: fact_inputs(BOOK_EFFECT)
             .iter()
             .map(|(kind, status, fact)| {
                 format!("{} · intent {} {status:?}", fact.name(), kind.name())
@@ -481,7 +580,7 @@ async fn fact_door() -> Door {
 ///
 /// Enumerating facts alone exported a quarter of the input space and called it
 /// total.
-fn fact_inputs() -> Vec<(OperationKind, EffectStatus, VerifiedProviderFact)> {
+fn fact_inputs(effect: &str) -> Vec<(OperationKind, EffectStatus, VerifiedProviderFact)> {
     let statuses = [
         EffectStatus::Prepared,
         EffectStatus::Unknown,
@@ -490,16 +589,21 @@ fn fact_inputs() -> Vec<(OperationKind, EffectStatus, VerifiedProviderFact)> {
         EffectStatus::Absent,
     ];
 
-    [OperationKind::Book, OperationKind::Cancel]
-        .into_iter()
-        .flat_map(move |kind| {
-            statuses.into_iter().flat_map(move |status| {
-                facts_about(BOOK_EFFECT)
-                    .into_iter()
-                    .map(move |fact| (kind, status, fact))
-            })
+    [
+        OperationKind::Book,
+        OperationKind::Cancel,
+        OperationKind::Pay,
+        OperationKind::Verify,
+    ]
+    .into_iter()
+    .flat_map(move |kind| {
+        statuses.into_iter().flat_map(move |status| {
+            facts_about(effect)
+                .into_iter()
+                .map(move |fact| (kind, status, fact))
         })
-        .collect()
+    })
+    .collect()
 }
 
 async fn system_event_door() -> Door {

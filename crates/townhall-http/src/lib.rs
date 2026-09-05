@@ -40,6 +40,7 @@ pub mod approvals;
 pub mod discovery;
 pub mod mapping;
 pub mod usage;
+pub mod webhooks;
 
 /// The two decisions every request needs, and they are not the same decision.
 ///

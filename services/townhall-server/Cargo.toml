@@ -11,6 +11,9 @@ edition = "2024"
 axum.workspace = true
 council-client = { path = "../../crates/council-client" }
 council-wire = { path = "../../crates/council-wire" }
+stripe-client = { path = "../../crates/stripe-client" }
+bld-kernel = { path = "../../crates/bld-kernel" }
+townhall-payment = { path = "../../crates/townhall-payment" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 # The dev resolver issues real grants now — nothing asserts its own
 # authority any more (ADR-025).
@@ -21,6 +24,7 @@ sqlx = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
 townhall-channel = { path = "../../crates/townhall-channel" }
 townhall-domain = { path = "../../crates/townhall-domain" }
+townhall-effects-router = { path = "../../crates/townhall-effects-router" }
 townhall-http = { path = "../../crates/townhall-http" }
 townhall-service = { path = "../../crates/townhall-service" }
 townhall-store = { path = "../../crates/townhall-store" }
@@ -28,6 +32,7 @@ townhall-usage = { path = "../../crates/townhall-usage" }
 bld-types = { path = "../../crates/bld-types" }
 bld-manifest = { path = "../../crates/bld-manifest" }
 serde_json = { workspace = true }
+serde = { workspace = true }
 
 [features]
 # The M5 stand-in authority (ADR-021, amended by ADR-022): a fixed three-token
@@ -48,6 +53,10 @@ tempfile.workspace = true
 tokio = { workspace = true }
 townhall-authority = { path = "../../crates/townhall-authority" }
 townhall-store = { path = "../../crates/townhall-store" }
+# The M10 payment E2E signs webhooks with `sign_webhook` — the verifier's exact
+# inverse, so the test presents a provably-real Stripe signature, not one merely
+# self-consistent with our own verifier. `test-signing` is test-only.
+townhall-payment = { path = "../../crates/townhall-payment", features = ["test-signing"] }
 
 [lints]
 workspace = true

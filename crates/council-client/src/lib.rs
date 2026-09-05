@@ -146,6 +146,16 @@ impl Capability<BookingEffect> for CouncilClient {
         attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
         let request = match effect {
+            BookingEffect::VerifyAvailability { .. } => {
+                return Err(Unknown::new(BoundedString::truncating(
+                    "availability effects require the M10 effects router",
+                )));
+            }
+            BookingEffect::PreparePayment { .. } => {
+                return Err(Unknown::new(BoundedString::truncating(
+                    "payment effects are not council effects",
+                )));
+            }
             BookingEffect::Book {
                 principal,
                 attendees,

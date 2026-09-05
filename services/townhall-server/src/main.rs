@@ -21,13 +21,16 @@ use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use council_client::{CouncilClient, CouncilVerifier};
+use council_client::CouncilClient;
 use council_wire::CouncilKey;
+use stripe_client::{StripeClient, StripeSecretKey};
 mod authority;
+mod payments;
 mod usage;
 
 use authority::{OsEntropy, RealAuthority};
 use townhall_authority::AuthorityService;
+use townhall_effects_router::EffectsRouter;
 use townhall_http::{AuthorityResolver, ServerState};
 use townhall_service::{BookingApi, Coordinator, PursuitConfig, Reconciliation};
 use townhall_store::{SqliteBookingRepository, StoreClock, SystemStoreClock};
@@ -65,6 +68,17 @@ struct Args {
     /// ADR-029). Its own key — each key has one job. When absent, the server
     /// serves no `/.well-known/bld` (discovery is opt-in).
     manifest_key: Option<String>,
+    /// Opt into the human-payment handoff (M10). Gates the `/webhooks/stripe`
+    /// route and the payment-records projection, exactly as `--manifest-key` gates
+    /// discovery. When set, the two Stripe secrets are read from the ENVIRONMENT
+    /// (a real secret in argv is world-readable via `ps`/procfs).
+    enable_payments: bool,
+    /// The *configured* fee threshold (spec §17) above which a booking routes
+    /// through human payment. Honored only with `--enable-payments`; the default
+    /// (`m10-fixed-v1`, £100) is unchanged when absent. The catalogue's fees top
+    /// out below the default, so a deployment that wants the payment path
+    /// reachable sets this — the demo lane does.
+    payment_threshold_pence: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -79,6 +93,8 @@ fn parse_args() -> Result<Args, String> {
     let mut usage_channel_rate_max = None;
     let mut usage_global_budget_max = None;
     let mut manifest_key = None;
+    let mut enable_payments = false;
+    let mut payment_threshold_pence = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -137,6 +153,13 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--manifest-key" => manifest_key = Some(value()?),
+            "--enable-payments" => enable_payments = true,
+            "--payment-threshold-pence" => {
+                payment_threshold_pence =
+                    Some(value()?.parse::<u64>().map_err(|_| {
+                        "--payment-threshold-pence needs a pence amount".to_owned()
+                    })?);
+            }
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -155,6 +178,8 @@ fn parse_args() -> Result<Args, String> {
         usage_channel_rate_max,
         usage_global_budget_max,
         manifest_key,
+        enable_payments,
+        payment_threshold_pence,
     })
 }
 
@@ -167,6 +192,43 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(key)
+}
+
+/// The Stripe configuration, read from the environment when `--enable-payments`
+/// is set — the two secrets kept out of `argv` (world-readable via `ps`/procfs).
+struct PaymentConfig {
+    secret_key: String,
+    webhook_secret: String,
+    base_url: String,
+    success_url: String,
+    cancel_url: String,
+}
+
+/// Read the payment configuration from a variable-getter. A pure function of
+/// `get`, so a unit test exercises the fail-fast rules without touching the
+/// process environment (the untestable-config-in-`main` lesson `--dev-authority`
+/// already documents). Both secrets are required; the URLs default.
+///
+/// # Errors
+/// Either `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET` is missing or empty.
+fn payment_config(get: impl Fn(&str) -> Option<String>) -> Result<PaymentConfig, String> {
+    let require = |name: &'static str| {
+        get(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{name} is required when --enable-payments is set"))
+    };
+    let or_default = |name: &str, fallback: &str| {
+        get(name)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    Ok(PaymentConfig {
+        secret_key: require("STRIPE_SECRET_KEY")?,
+        webhook_secret: require("STRIPE_WEBHOOK_SECRET")?,
+        base_url: or_default("STRIPE_BASE_URL", "https://api.stripe.com"),
+        success_url: or_default("STRIPE_SUCCESS_URL", "https://townhall.example/paid"),
+        cancel_url: or_default("STRIPE_CANCEL_URL", "https://townhall.example/cancelled"),
+    })
 }
 
 /// The M5 stand-in resolver (ADR-021, amended by ADR-022): a FIXED three-token
@@ -579,6 +641,20 @@ async fn main() -> ExitCode {
         eprintln!("townhall-server: {problem}");
         return ExitCode::from(2);
     }
+    // Fail fast, before any I/O: --enable-payments requires the two Stripe secrets
+    // in the environment. `None` means payments are off and the server behaves
+    // exactly as it did pre-M10.
+    let payment_settings = if args.enable_payments {
+        match payment_config(|name| std::env::var(name).ok()) {
+            Ok(settings) => Some(settings),
+            Err(problem) => {
+                eprintln!("townhall-server: {problem}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     let Some(key_bytes) = parse_key(&args.key_hex) else {
         eprintln!("townhall-server: --key-hex must be exactly 64 hex characters");
         return ExitCode::from(2);
@@ -636,18 +712,78 @@ async fn main() -> ExitCode {
             .verifying_key(),
     );
     let client = || Arc::new(CouncilClient::new(&args.council_url, key));
+    let council = client();
+    let availability = client();
+    let routed_availability: Arc<dyn townhall_service::AvailabilitySource> = availability.clone();
+    // The Stripe adapter: real (env-configured) when payments are enabled, a
+    // dormant placeholder otherwise (never reached without --enable-payments).
+    let stripe = match &payment_settings {
+        Some(settings) => Arc::new(StripeClient::new(
+            settings.base_url.clone(),
+            StripeSecretKey::new(settings.secret_key.clone()),
+            settings.success_url.clone(),
+            settings.cancel_url.clone(),
+        )),
+        None => Arc::new(StripeClient::new(
+            "http://127.0.0.1:4011",
+            StripeSecretKey::new("sk_test_dormant"),
+            "http://127.0.0.1/payments/success",
+            "http://127.0.0.1/payments/cancel",
+        )),
+    };
+    let effects = Arc::new(EffectsRouter::new(council, stripe, routed_availability));
 
-    let coordinator = Arc::new(
-        Coordinator::new(
+    // The payment records, shared by the coordinator's projection (freeze /
+    // record-session) and the webhook (map / mark). Only when payments are on.
+    let payment_store = payment_settings.as_ref().map(|_| {
+        Arc::new(townhall_store::payment::SqlPaymentStore::new(
+            repository.pool().clone(),
+        ))
+    });
+
+    let coordinator = Arc::new({
+        let mut coordinator = Coordinator::new(
             Arc::clone(&repository),
-            client(),
-            Arc::new(CouncilVerifier::new(key)),
-            client(),
+            Arc::clone(&effects),
+            Arc::clone(&effects),
+            availability,
         )
         .with_denial_log(denials)
-        .with_config(config),
-    );
-    let reconciliation = Arc::new(Reconciliation::new(Arc::clone(&coordinator), client()));
+        .with_config(config);
+        if let Some(store) = &payment_store {
+            coordinator = coordinator.with_payment_records(Arc::clone(store));
+        }
+        // The configured threshold (spec §17) — only with payments on, so a stray
+        // flag can never open a payment route the dormant Stripe client cannot
+        // serve. The version tracks the pence, so a booking frozen under one
+        // threshold is detectably stale if the policy later changes (ADR-030).
+        if payment_settings.is_some()
+            && let Some(pence) = args.payment_threshold_pence
+        {
+            coordinator =
+                coordinator.with_payment_policy(townhall_domain::PaymentThresholdPolicy {
+                    threshold: bld_types::Money::from_pence(pence),
+                    version: format!("m10-threshold-{pence}p"),
+                });
+        }
+        coordinator
+    });
+
+    // The webhook's observe port — an upcast of the coordinator, taken before it
+    // is moved into the api below.
+    let payment_observer: Option<Arc<dyn townhall_service::PaymentObserver>> =
+        payment_settings.as_ref().map(|_| {
+            let concrete = Arc::clone(&coordinator);
+            // The unsizing coercion Coordinator -> dyn PaymentObserver fires on this
+            // annotated let (not inside Arc::clone, which fixes the concrete type).
+            let observer: Arc<dyn townhall_service::PaymentObserver> = concrete;
+            observer
+        });
+
+    let reconciliation = Arc::new(Reconciliation::new(
+        Arc::clone(&coordinator),
+        Arc::clone(&effects),
+    ));
     let api = Arc::new(BookingApi::new(
         coordinator,
         Arc::clone(&reconciliation),
@@ -754,6 +890,22 @@ async fn main() -> ExitCode {
             },
         ));
     }
+    // The Stripe webhook (M10, ADR-030): mounted only when payments are enabled,
+    // OUTSIDE the bearer gate — its authority is the signature, verified over the
+    // raw bytes before a field is read. The three payment parts (secret, store,
+    // observer) are present together or not at all.
+    if let (Some(settings), Some(store), Some(observer)) =
+        (payment_settings, payment_store, payment_observer)
+    {
+        let handler = Arc::new(payments::StripeWebhookHandler::new(
+            townhall_payment::WebhookSecret::new(settings.webhook_secret),
+            store,
+            observer,
+        ));
+        router = router.merge(townhall_http::webhooks::webhook_router(
+            townhall_http::webhooks::WebhookState { handler },
+        ));
+    }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -827,6 +979,8 @@ mod feature_gate {
             usage_channel_rate_max: None,
             usage_global_budget_max: None,
             manifest_key: None,
+            enable_payments: false,
+            payment_threshold_pence: None,
         }
     }
 
@@ -844,5 +998,78 @@ mod feature_gate {
             dev_authority_available(&args(false)).is_ok(),
             "not asking for the dev lane is always allowed"
         );
+    }
+}
+
+/// The payment-config fail-fast (M10). `payment_config` takes a getter precisely
+/// so these rules are exercised without touching the process environment — the
+/// untestable-config-in-`main` lesson `--dev-authority` already records. Runs in
+/// BOTH feature lanes: the rules are independent of the authority resolver.
+#[cfg(test)]
+mod payment_config_tests {
+    use super::payment_config;
+
+    /// A getter over a fixed table — nothing in the real environment is read.
+    fn getter(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn both_secrets_present_yields_config_with_url_defaults() {
+        let config = payment_config(getter(&[
+            ("STRIPE_SECRET_KEY", "sk_test_x"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_x"),
+        ]))
+        .expect("both secrets present is Ok");
+        assert_eq!(config.secret_key, "sk_test_x");
+        assert_eq!(config.webhook_secret, "whsec_x");
+        assert_eq!(config.base_url, "https://api.stripe.com");
+    }
+
+    #[test]
+    fn a_missing_secret_key_is_refused() {
+        assert!(
+            payment_config(getter(&[("STRIPE_WEBHOOK_SECRET", "whsec_x")])).is_err(),
+            "STRIPE_SECRET_KEY is required under --enable-payments"
+        );
+    }
+
+    #[test]
+    fn a_missing_webhook_secret_is_refused() {
+        assert!(
+            payment_config(getter(&[("STRIPE_SECRET_KEY", "sk_test_x")])).is_err(),
+            "STRIPE_WEBHOOK_SECRET is required under --enable-payments"
+        );
+    }
+
+    /// The security control, exercised: an EMPTY webhook secret would key the HMAC
+    /// on empty bytes — a hollow signature gate. `require` treats empty as missing,
+    /// so the server refuses to start rather than boot with it.
+    #[test]
+    fn an_empty_secret_is_refused_as_if_absent() {
+        assert!(
+            payment_config(getter(&[
+                ("STRIPE_SECRET_KEY", "sk_test_x"),
+                ("STRIPE_WEBHOOK_SECRET", ""),
+            ]))
+            .is_err(),
+            "an empty webhook secret must be refused, not accepted"
+        );
+    }
+
+    #[test]
+    fn url_overrides_are_honored_over_the_defaults() {
+        let config = payment_config(getter(&[
+            ("STRIPE_SECRET_KEY", "sk_test_x"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_x"),
+            ("STRIPE_BASE_URL", "http://127.0.0.1:4011"),
+        ]))
+        .expect("Ok");
+        assert_eq!(config.base_url, "http://127.0.0.1:4011");
     }
 }

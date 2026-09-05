@@ -1,0 +1,27 @@
+[package]
+name = "townhall-effects-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bld-kernel = { path = "../bld-kernel" }
+bld-types = { path = "../bld-types" }
+council-client = { path = "../council-client" }
+council-wire = { path = "../council-wire" }
+stripe-client = { path = "../stripe-client" }
+townhall-domain = { path = "../townhall-domain" }
+townhall-payment = { path = "../townhall-payment" }
+townhall-service = { path = "../townhall-service" }
+
+[dev-dependencies]
+axum.workspace = true
+mock-council = { path = "../../services/mock-council" }
+mock-stripe = { path = "../../services/mock-stripe" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true

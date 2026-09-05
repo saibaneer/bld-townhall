@@ -75,6 +75,10 @@ pub struct RawResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawBody {
+    Availability {
+        facts: townhall_domain::VenueFacts,
+        grant: AvailabilityGrant,
+    },
     Created {
         booking_ref: CouncilBookingRef,
         principal: PrincipalId,
@@ -137,6 +141,10 @@ struct Inner {
     /// blocking fake gate M3's composed race needs: a call held past its
     /// lease's expiry while a second worker moves.
     execute_gate: Option<std::sync::Arc<ExecuteGate>>,
+    /// The availability arm is the fake counterpart of Layer 5's synchronous
+    /// router route. It is deliberately outside the council call/script logs:
+    /// those witnesses count consequential council effects, not source reads.
+    availability: Option<(townhall_domain::VenueFacts, AvailabilityGrant)>,
 }
 
 /// The blocking fake's synchronisation, both directions signalled — a test
@@ -193,6 +201,11 @@ impl FakeCouncil {
     pub fn script(&self, steps: impl IntoIterator<Item = Script>) {
         let mut inner = self.lock();
         inner.script.extend(steps);
+    }
+
+    /// Override the synchronous availability answer routed by this test double.
+    pub fn set_availability(&self, facts: townhall_domain::VenueFacts, grant: AvailabilityGrant) {
+        self.lock().availability = Some((facts, grant));
     }
 
     /// Everything the council has been asked to do, in order.
@@ -370,11 +383,34 @@ impl crate::EffectResolver<RawResponse> for FakeCouncil {
 impl Capability<BookingEffect> for FakeCouncil {
     type Raw = RawResponse;
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         effect: &BookingEffect,
         attempt: &EffectAttempt,
     ) -> Result<Self::Raw, Unknown> {
+        if let BookingEffect::VerifyAvailability { selection, .. } = effect {
+            let configured = self.lock().availability.clone();
+            let (facts, grant) = configured.unwrap_or_else(|| {
+                (
+                    townhall_domain::VenueFacts {
+                        venue_id: selection.venue_id.clone(),
+                        slot_id: selection.slot_id.clone(),
+                        capacity: 30,
+                        wheelchair_accessible: true,
+                        fee: Money::from_pence(4_500),
+                        available: true,
+                    },
+                    AvailabilityGrant::new(FAKE_GRANT),
+                )
+            });
+            return Ok(RawResponse {
+                effect_intent_id: attempt.id.clone(),
+                body: RawBody::Availability { facts, grant },
+                attested: true,
+            });
+        }
+
         // The arrival is logged and announced BEFORE the gate, because arrival
         // is what happened. The gate, when armed, then holds the call HERE —
         // after the caller's durable attempt mark, before any work — which is
@@ -436,6 +472,14 @@ impl Capability<BookingEffect> for FakeCouncil {
             Script::RefusePermanently(reason) => RawBody::RefusedPermanently { reason },
             Script::RefuseTemporarily(reason) => RawBody::RefusedForNow { reason },
             Script::Succeed | Script::Forge => match effect {
+                BookingEffect::VerifyAvailability { .. } => {
+                    unreachable!("availability returns through the synchronous router arm above")
+                }
+                BookingEffect::PreparePayment { .. } => {
+                    return Err(Unknown::new(BoundedString::truncating(
+                        "payment effects require the deferred payment router",
+                    )));
+                }
                 BookingEffect::Book {
                     principal,
                     attendees,
@@ -515,6 +559,11 @@ impl Verifier<RawResponse, VerifiedProviderFact> for CouncilVerifier {
         }
 
         let fact = match raw.body {
+            RawBody::Availability { facts, grant } => VerifiedProviderFact::AvailabilityVerified {
+                effect_intent_id: raw.effect_intent_id,
+                facts,
+                grant,
+            },
             RawBody::Created {
                 booking_ref,
                 principal,

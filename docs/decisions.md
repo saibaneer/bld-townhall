@@ -2970,3 +2970,459 @@ BODY beyond its seven-field stub; they are recorded here, not by editing the spe
 | `resource_links` — per-resource collection/item paths, a behaviour URL template, and a PascalCase-name → kebab-segment behaviour table | §12 manifest body | The gate ("drive without hard-coded behaviour URLs") is unachievable without a readable name→segment mapping, because the projection's PascalCase names are not the route's kebab segments; the manifest is where that stable fact belongs. |
 | `manifest_signature` (ed25519 over the canonical core bytes) | §12 manifest body | §12 says the manifest is "signed" and carries a `manifest_digest`, but a digest alone is integrity, not authenticity; the signature is what a relayed manifest needs, and what a second-party client verifies. It signs the core bytes, not the digest string, so no tampered core can ride a stale digest. |
 | Per-behaviour `body` field-name hints inside `resource_links` | §12 manifest body | So a client can assemble a behaviour's request body (e.g. `["venue_id","slot_id"]`) without hard-coding it; secondary to the URL gate, but the same discover-don't-hard-code principle. |
+
+## ADR-030 — Human payment handoff: M10's decisions before M10's code
+
+Decided 2026-09-05 with the project owner. Plans M10 (Human payment handoff /
+Stripe), depends on M5 (the HTTP service) and M7 (authority/delegation), and
+realizes §17 ("Human Payment Handoff"), §17.1's state pattern, and the §M10 gate:
+"SMS/test client receives Checkout URL; Stripe test payment advances exact intent
+once; success redirect/agent claim cannot advance; duplicate webhook safe." An
+understand pass (four readers over §17/§19/§23.4/§23.7, the booking state machine,
+the external-effect + idempotency + reconcile plumbing, and the config/handoff/
+signing surface) produced the blueprint this records; the decisions were read
+adversarially before code. No line of `technical-spec-v0.4.2.md` is edited; the
+additions are recorded in the amendment table below.
+
+### The invariant that shapes everything: a "success" is not evidence
+
+§17 line 771, §19 line 853 and instruction #9: a success redirect, an agent's
+claim, model text or SMS text is NOT payment evidence; the workflow advances to
+`PaymentConfirmed` ONLY on verified Stripe webhook/API evidence bound to the
+expected `PaymentIntentId`/Checkout Session. This is the payment analogue of the
+project's spine (SMS text is never authority) and it decides the whole shape: the
+"you paid" signal must arrive through a channel the boundary can VERIFY, not the
+channel the human or the agent can assert on. So payment confirmation is a signed
+webhook the server verifies — never the browser redirect the human lands on, never
+a message the agent relays.
+
+> **Revised 2026-09-05 after the adversarial ADR review** (three lenses: spec
+> fidelity, exactly-once/security, codebase-fit). The review found the first
+> draft's premise — "payment rides the machinery *unchanged*" — false at both the
+> store and service layers, and three blockers besides. The sections below are the
+> corrected design; where the first draft was wrong the correction says so, so the
+> trail is legible.
+
+### Payment reuses the effect SPINE — but the service layer ROUTES, and PaymentIntentId is its own identity
+
+A Stripe payment is an external effect with the correctness needs the council
+booking already solved: durable-before-wire (ADR-014), a derive-once stable id,
+lease/token fencing, a reconcile loop as the retry, "an unreachable provider is
+Unknown, never absence." So M10 reuses the STORE-LAYER spine — `prepare_effect`
+(Phase A durable commit), `claim_effect` (lease), the reconciler
+(`run_reconciler`/`due`/`attend`), and the version-CAS + `active_effect` guard that
+makes `settle`/`observe` idempotent. **`OperationKind::Pay`** joins `Book`/`Cancel`
+so payment effects get retry-stable ids from the existing
+`(booking_id, operation_kind, source_version)` key — the id format is the
+UNCHANGED shared function's `EFF-{booking}-PAY-{version}` (the kind is embedded, it
+is NOT a new `PAY-` prefix — the first draft's "PAY- prefix" would have meant
+editing the shared, safety-critical `derive_effect_intent_id`, a migration hazard;
+corrected).
+
+But the review found the SERVICE layer is NOT reused unchanged, on two counts the
+first draft glossed:
+
+- **Dispatch (blocker).** The `Coordinator` is generic over a SINGLE
+  `C: Capability<BookingEffect>` and sends every effect's `canonical_plan` to that
+  one capability (the `CouncilClient`); `Reconciliation` binds one
+  `Verifier<C::Raw, VerifiedProviderFact>` and one `EffectResolver<C::Raw>`. A
+  payment effect dispatched there would be executed by the council client and
+  verified by the council verifier. The fix is a **composite** capability /
+  verifier / resolver (a new trusted `townhall-effects-router` crate) that routes
+  by effect variant / raw type: `Book`/`CancelBooking` → `CouncilClient`,
+  `PreparePayment` → `stripe-client`; a `CompositeRaw { Council(..), Stripe(..) }`
+  enum; the composite `Verifier` and `EffectResolver` route by the raw/kind. The
+  `Coordinator`/`Reconciliation` ARITY is unchanged (still one `C`/`V`/`L`), but
+  those are now the composites, wired in the composition root beside the council.
+  "Reconciler/`settle` unchanged" is corrected to "the store CAS layer is
+  unchanged; the service layer gains a routing seam."
+
+- **`PaymentIntentId` is its own identity, not the Pay effect id (blocker).** The
+  first draft set `PaymentIntentId == the Pay-kind EffectIntentId`. The review
+  showed that breaks: the payment flow needs TWO Pay-kind effect intents (create,
+  then await — see the state graph), so no single effect id spans the flow, and
+  binding the Stripe session to the wrong one strands a paid customer
+  (charged-but-not-booked). Corrected to the spec's own §9 shape: **`PaymentIntentId`
+  is a distinct, stable payment identity in `payment_intents`**, derived once at
+  `OfferSelected` and carried across the whole handoff. The Stripe session's
+  `metadata` carries it, so a webhook maps `Stripe session → payment_intents →
+  BookingId + the CURRENT await effect-intent id` (the id the state's
+  `active_effect` holds) before calling `observe`. The effect intents are the
+  wire/reconcile mechanism; `PaymentIntentId` is the payment's identity — three
+  tables, each with a job:
+  - **`payment_intents`** — `PaymentIntentId`, the canonical checkout (amount,
+    currency, merchant, resource identity) + its hash, the FROZEN `AvailabilityGrant`
+    the post-payment `Book` re-sends, the Stripe Checkout Session ref, status and
+    expiry. This is "bound to canonical checkout" (§9.1) and the freeze is what
+    stops a "fee that moved" (§19) from ever reaching the council.
+  - **`payment_events`** — every verified webhook, dedup key = Stripe `event.id`,
+    `ON CONFLICT(event_id) DO NOTHING`, written in the SAME transaction as the
+    advance. It is an audit + dedup LEDGER and defence-in-depth — **never a
+    skip-gate before `observe`** (a crash between a skip-insert and the advance would
+    strand a confirmed payment). Corrected per the review: `observe` is ALWAYS
+    invoked; the exactly-once authority is the version-CAS + `active_effect` guard,
+    exactly as for the council, NOT the ledger.
+
+Payment OUTCOMES are new `VerifiedProviderFact` variants riding the EXISTING
+`resolve_fact` door and `Coordinator::observe` seam — no new kernel associated
+type. A fact still enters only through a `Verifier` and is wrapped in
+`Verified<_>` whose only constructor is the greppable `assert_verified`; M10 pins
+(a boundary test) that payment facts are minted ONLY in the trusted verifier
+crate, never in the `stripe-client` adapter that touches untrusted webhook bytes.
+
+> **Revised again 2026-09-05 after a codex gpt-5.6-sol verdict and a second review
+> round** (owner-directed). The threshold branch is realized by **Option A** below;
+> codex confirmed A preserves ADR-018 exactly and that B corrodes it and C is not
+> race-closable without a kernel change — and surfaced three further points folded
+> in here: availability must become an explicit verified-fact PROTOCOL (not a hand-
+> wave), a config-drift trap, and that §17.1 wants `PaymentConfirmed` as a STATE.
+
+### Where the fee branch legitimately lives: availability becomes verified evidence (Option A)
+
+The blocker the reviews circled: a booking needs payment only when its verified fee
+≥ threshold, but the fee first appears at the `VerifySlot` PROPOSAL-door arm
+(`lib.rs:1905`, `bind_facts` over `BookingContext.selected_facts`, a same-turn LOCAL
+commit to `AwaitingBooking { verified_fee }`), and ADR-018 keeps the proposal door
+data-free (`fixed_table:true`; `intended_effect_kind` is a data-free const fn pinned
+across all cells). So a fee-based branch cannot live there. Amending ADR-018 for one
+data-dependent cell (option B) corrodes the invariant the topology sweep rests on; a
+boundary `SystemEvent` (option C) cannot return a transition plan
+(`SystemEventResolution` is only `Undefined`/`Denied`/`Record`) so its race is not
+closable without a kernel change. **Option A** is taken: the fee-branch moves to the
+FACT door — which is already `fixed_table:false` and may route on verified data — by
+making availability an actual verified fact rather than eager trusted context.
+
+Concretely, and as an EXPLICIT protocol (codex: "move to the fact door" understates
+the architecture):
+
+- `VerifySlot` stops being a same-turn local commit. It mints a **Verify intent** and
+  commits a new non-bookable in-flight state **`VerifyingSlot`** (durable-before-wire,
+  like `Book` commits `BookingInProgress`), then asks the availability source.
+- The answer returns through the fact door as a new **`AvailabilityVerified { fee,
+  grant, … }`** `VerifiedProviderFact`, bound to the Verify intent's `EffectIntentId`
+  + canonical plan (the `resolve_fact` contract). This is a security UPGRADE: the fee
+  that gates payment is now provenance-checked evidence, not eagerly-trusted context.
+- `resolve_fact` for `(VerifyingSlot, AvailabilityVerified)` compares `fact.fee`
+  against the boundary threshold policy and routes to a DISTINCT state —
+  `AwaitingBooking` (fee < threshold, the unchanged onward path) or **`OfferSelected`**
+  (fee ≥ threshold). Each state's proposal cell then stays single-target and
+  `(state, proposal)`-determined: `(AwaitingBooking, Book) → council Book`,
+  `(OfferSelected, Book) → PreparePayment`. `intended_effect_kind` stays data-free
+  (it keys on the state, which now encodes the branch). No new `Behaviour` variant;
+  the closed permission vocabulary is untouched.
+- **`RevalidateVenue` rides the same protocol** (it uses the same `bind_facts` today,
+  `lib.rs:1938`), so re-verification after `UpdateRequirements` re-runs the verify →
+  `AvailabilityVerified` → re-branch motion — a fee that crossed the threshold on a
+  headcount change is caught.
+- **Config-drift guard (codex).** The fee CLASS (below / at-or-above) and the
+  threshold POLICY VERSION used are frozen into the verified snapshot atomically with
+  the availability fact, so a threshold changed between verify, a CAS retry, or a fact
+  replay cannot make identical evidence choose different states. The branch is decided
+  once, on persisted evidence.
+- **The proposal-door inertness guard (found by the M10 acceptance sweep).** Making
+  `VerifySlot` commit `VerifyingSlot` before the fee is bound created a regression the
+  §10.2 refusal battery caught: a slot the caller cannot AFFORD (fee over the
+  authority/requirement ceiling) — or that is unavailable, too small, or inaccessible —
+  would commit `VerifyingSlot`, move the version, and only then be refused at the fact
+  door, stranding a driver in-flight on a refusal that must be INERT. The fix restores
+  the pre-M10 synchronous contract IN FULL at the proposal door: `resolve_verify` runs
+  the same `validate_facts` guard (via `bind_availability`) over the
+  synchronously-observed facts and refuses — `FeeExceeded{Authority|Requirement}`,
+  `CapacityInsufficient`, `AccessibilityRequired`, `SlotUnavailable` — with NO commit
+  and NO version movement, exactly where the availability-unreachable guard already
+  lived. This is the CEILING guard (can-the-caller-book-this-at-all), distinct from and
+  upstream of the fee BRANCH (threshold → `AwaitingBooking` vs `OfferSelected`), which
+  stays at the fact door on persisted evidence. The fact-door binding keeps the same
+  checks as defence-in-depth for the future where the observed read and the verified
+  fact can legitimately differ (a real async council); today, in the synchronous
+  interim, they share one source, so the guard makes the refusal inert.
+
+The scope cost is real and stated plainly: availability moves from eager context to a
+verify-then-settle protocol (a `VerifyingSlot` state + an `AvailabilityVerified` fact
++ a Verify intent), touching `VerifySlot`, `RevalidateVenue`, and the availability
+source. It is the price of keeping ADR-018 pristine and the fee trustworthy — and
+codex's verdict is that no cheaper option does both.
+
+### The payment sub-flow: five states, three chained effect intents, a generalized handoff
+
+§17.1: `OfferSelected -> CheckoutPrepared -> AwaitingHumanPayment -> PaymentConfirmed
+(verified evidence only) -> BookingInProgress -> Booked; expiry/cancel remain explicit
+exits.` The reviews showed the first draft's "one Pay intent across both new states,
+reuse the handoff unchanged" is unbuildable (`settle` terminalises the effect and
+clears `active_effect`; no session-created fact; `handoff_effect` demands a council
+reference a fresh `Book` cannot supply). The corrected model is a chain of three
+effect intents joined by a generalized handoff, faithful to §17.1's FIVE states
+including `PaymentConfirmed` as a state (codex's §17.1 point):
+
+1. **`OfferSelected` + `Book` → `CheckoutPrepared`** (in-flight, `Waiting`,
+   `SendAndResolve`), minting **Pay intent #1**. `Capability::execute` = create the
+   Stripe Checkout Session. Durable-before-wire. (Only `OfferSelected` reaches here —
+   `AwaitingBooking + Book` still goes straight to the council; the first draft's
+   "`AwaitingBooking`/`OfferSelected`" was the threshold-bypass contradiction,
+   corrected.)
+2. **`CheckoutPrepared` + `SessionCreated` fact → `AwaitingHumanPayment`** (in-flight,
+   `Waiting`, **`ResolveOnly`**), a HANDOFF finalising #1 and minting **Pay intent #2**
+   (the await intent, never "sent"; the human pays, the reconciler polls, the webhook
+   settles). `SessionCreated` carries the hosted URL + Stripe session ref, RECORDED in
+   `payment_intents` against the stable `PaymentIntentId`. Non-happy edge named:
+   session-creation failure/uncertainty → back to `OfferSelected` (retry) or `Cancel`
+   → `Cancelled`; never a silent advance.
+3. **`AwaitingHumanPayment` + `PaymentConfirmed` fact → `PaymentConfirmed` (state)**,
+   the verified-webhook settlement (payment banked; no council booking yet — this is
+   the §17.1 state the first draft skipped).
+4. **`PaymentConfirmed` (state) → `BookingInProgress` (paid)**, a HANDOFF finalising
+   #2 and minting **Book intent #3** (the council `Book`), committed before its wire
+   call (ADR-014 preserved, as `CancellationRequested → CancellingBooking` already
+   does), then `BookingExists → Booked`.
+
+**A DISTINCT post-payment booking state (corrects a codebase blocker).** Intent #3
+lands NOT in the shared `BookingInProgress` (whose `ProviderRejected`/`EffectAbsent`
+cells are pinned to `AwaitingBooking` — a re-charge path for a paid, high-value
+booking) but in a distinct **`PaidBookingInProgress`**, so a council rejection of the
+paid booking routes cleanly to **`NeedsHuman`** (paid-but-unbookable; ADR-019's
+retained state finally used) with no discriminator hack and no second charge. Refunds
+are deferred per §17's POC scope.
+
+**Generalized handoff + typed `provider_reference` (corrects the handoff blockers).**
+`handoff_effect`/`finalize_effect` gain a "produces-new" successor form, gated on the
+**PREDECESSOR being `Payment`-typed** — NOT on `successor.acts_on() == None` (which
+is unconditionally true for `Book`, and would drop the `booking_ref` guard for every
+council booking; the reviews caught this). `provider_reference` becomes a typed sum
+`{ Council(CouncilBookingRef), Payment(PaymentRef) }`: for `#1 → #2`, #2 acts on the
+`PaymentRef` (Stripe session ref) #1 produced; for `#3`, the council `Book` produces a
+`Council` ref as today. This is a **declared store migration** — `provider_reference`
+and `booking_ref` persist as bare strings today, so the column encoding gains a kind
+tag; the `PhantomReference` "cannot know a council reference" set becomes
+`Council`-variant-specific (so `AwaitingHumanPayment` may hold a `Payment` ref while
+holding no `Council` one), and handoff checks #2/#3 admit the `Payment` form. This is
+NOT "the store CAS layer unchanged" — that claim is corrected: the CAS/version
+mechanism is unchanged, the reference typing is a migration. The DEDUP guarantee
+(`supersedes` + `(booking, kind, version)` uniqueness) is preserved in every form,
+delivering §23.7's "one payment transition AND one downstream booking only."
+
+**The webhook binds to the RECORDED await id, not the live `active_effect`
+(corrects a security should-fix).** A `payment_intent.succeeded` maps `Stripe session
+→ payment_intents → BookingId + the await-intent id RECORDED for that session`, and
+`observe` presents a fact carrying THAT id. So a stale/cross-session late success is
+rejected by the `active_effect` CAS (→ Converged, no wrong advance) instead of
+advancing whatever intent happens to be current. `observe` is ALWAYS invoked;
+`payment_events` (dedup key `event.id`) is a same-transaction ledger, never a
+skip-gate.
+
+**Four new facts, not three:** `AvailabilityVerified`, `SessionCreated`,
+`PaymentConfirmed`, `PaymentAbandoned` — `FACT_COUNT` 4 → 8. Every existing state
+gets a pinned cell per new column (mostly `Undefined`); new
+`bind_fact`/`converge`/`establishes`/`implied_kind` arms; the payment in-flight
+states join the phantom set on the `Council` axis; `docs/topology.{json,md}` +
+`docs/state-machine.md` regenerate. `VerifyingSlot`, `OfferSelected`,
+`CheckoutPrepared`, `AwaitingHumanPayment`, `PaymentConfirmed`, `PaidBookingInProgress`
+are the new states; every per-state table gains its rows deliberately (no wildcards).
+(`OfferSelected` and `AwaitingBooking` expose the same proposal menu, which ADR-018's
+collapse rule would ordinarily merge — but §17.1 MANDATES the distinct payment state,
+and they diverge on the fact door and the effect kind their `Book` mints, so the
+split is deliberate and noted here rather than an oversight.)
+
+**Explicit exits, corrected for how Stripe actually behaves.** A card DECLINE
+(`payment_intent.payment_failed`) and `processing`/`requires_action` (3DS) are NOT
+terminal — the Checkout Session stays open for a retry — so they are recorded to
+`payment_events` and do NOT call `observe` (no fact, no transition; the booking parks
+in `AwaitingHumanPayment`). Only genuinely terminal Stripe events
+(`checkout.session.expired`/`payment_intent.canceled`) become `PaymentAbandoned` →
+**`OfferSelected`** (NOT `AwaitingBooking` — returning a ≥threshold booking to the
+no-payment state was a threshold BYPASS the review caught; `OfferSelected` lets the
+human start a fresh checkout or `Cancel`). `PaymentAbandoned` is produced ONLY from a
+verified Stripe terminal event, NEVER synthesized by the adapter from a boundary
+clock; the await intent #2's expiry is driven by Stripe's `session.expires_at` (up to
+24h) via a plan-carried expiry on the minted successor, not the short council
+`effect_ttl_ms`, and the reconciler cadence/attempt budget for a poll-only await
+intent is set for that human timescale. User `Cancel` from `AwaitingHumanPayment` is
+a LOCAL transition to `Cancelled`.
+
+**The availability-grant window.** The verified fee + `AvailabilityGrant` are FROZEN
+into `payment_intents` at `OfferSelected`; the post-payment council `Book` (#3)
+re-sends that frozen grant, so it can never book at a fee that moved. If the council
+rejects the frozen grant (its `valid_until_ms` lapsed during the human's payment
+window), the paid booking's distinct state routes it to `NeedsHuman`, never a silent
+stale book.
+
+### Verification is HMAC-SHA256, in a new trusted crate, on the raw body before parsing
+
+Stripe signs each webhook HMAC-SHA256 over `t + "." + raw_body` with the shared
+`whsec_` secret; the server verifies with the SAME symmetric secret and nothing is
+relayed to a third party. That is the codebase's HMAC case (a MAC is for one party
+that both writes and reads / shares the secret), NOT the ed25519 case — so M10
+MIRRORS the `EnvelopeKey` idiom (`Hmac::<Sha256>` + constant-time `verify_slice`),
+not the manifest's signature. `EnvelopeKey::verify` is `pub(crate)`, so the idiom
+is copied into the new payment crate, not called. Stripe-specific differences are
+handled: the signed message is `t.raw_body` (not the bare payload); the key is the
+raw `whsec_` ASCII bytes (so `MIN_KEY_BYTES` does not transfer); a timestamp
+tolerance on `t` (300s, Stripe's default) is REQUIRED as crypto anti-replay; and —
+corrected from the first draft's singular "the `v1` value" — the `Stripe-Signature`
+header can carry MULTIPLE `v1=` entries during secret rotation, so the verifier
+parses ALL of them and accepts if ANY matches (hex-decoding each with a
+variable-length mirror of `decode_hex_32`, constant-time compare per candidate),
+and supports more than one active secret. The signing contract is byte-exact and
+easy to get subtly wrong, so a FROZEN known-answer vector (a committed `(secret,
+raw body, Stripe-Signature header, expected accept/reject)` taken from Stripe's
+reference) is asserted in the HERMETIC lane — otherwise `mock-stripe` and the
+verifier could be wrong-but-self-consistent and ship green (a review should-fix).
+
+New crates, with the trust posture ENFORCED by `boundary.rs` dependency tests (the
+M9 lesson: a posture documented but not tested is not enforced), not merely
+asserted in prose:
+
+- **`townhall-payment`** (trusted verifier; may name `townhall-domain` to mint
+  facts, as `council-client`'s verifier does; `boundary.rs` forbids
+  `townhall-store`/`-service`/`-http`): the `PaymentEvidence` types, the HMAC
+  signature verifier that mints `Verified<VerifiedProviderFact::Payment*>` ONLY
+  after the signature checks, the canonical-checkout derivation, and the
+  `PaymentRef` type. A masked-`Debug` secret type mirrors `EnvelopeKey`'s `(****)`.
+- **`stripe-client`** (the adapter): implements `Capability<BookingEffect>` — NOT
+  `Capability<PaymentEffect>`, which was a first-draft error: the trait is
+  parameterised by the single `BookingEffect` type, so the adapter matches the
+  `PreparePayment` variant and ignores the rest — and `EffectResolver` (retrieve
+  session/intent status). It produces RAW Stripe responses and NEVER mints a fact
+  (`assert_verified` lives only in `townhall-payment`); a `boundary.rs` test +
+  source scan pin that. It does NOT inherit `council-client`'s vestigial
+  `townhall-store` dependency.
+- **`townhall-effects-router`** (trusted): the composite `Capability`/`Verifier`/
+  `EffectResolver` from the dispatch section, wiring council + stripe behind one
+  seam for the `Coordinator`.
+- **`services/mock-stripe`** (the test double, mirroring `mock-council`): a real
+  HTTP binary with its own SQLite/clock/secret, idempotent-on-key session creation,
+  commit-before-response, and a `test-faults` feature (DropResponse/Delay/Garbage/
+  Unsigned/WrongId) so a dropped/duplicate/slow/bad-signature webhook is a state a
+  test can create.
+
+Spec-layout deviations (amendment table): the spec §4 names `payment-handoff/` and
+`stripe-test-adapter/`, but the repo's convention is `townhall-*` / `mock-*`, so the
+crates are `townhall-payment` + `stripe-client` + `townhall-effects-router` +
+`mock-stripe`.
+
+**Outbound TLS is graph-wide, not "scoped" (corrected).** The first draft claimed
+TLS could be "scoped to `stripe-client`." It cannot: Cargo unifies features per
+package across the co-built graph, and `reqwest` is a shared workspace dependency
+(today `default-features=false, ["json"]`, no TLS anywhere). Enabling `rustls-tls`
+for `stripe-client` — a normal dependency of the server — unifies into the single
+`reqwest` build the council client, `mock-council`, `mock-stripe` and the server all
+link; `resolver="2"` does not prevent normal-dependency feature unification. So the
+honest statement is: **enabling payments links the rustls/ring/webpki stack into the
+server binary's `reqwest`**; the council and mock paths still speak plain localhost
+HTTP at runtime (the TLS stack is linked but unused for them). This is documented,
+not hidden.
+
+### The webhook route: signature is the authority, not a bearer
+
+A new `crates/townhall-http/src/webhooks.rs` exposes `POST /webhooks/stripe`,
+merged into the router the conditional, opt-in way M9's discovery route is — but
+gated on an explicit `--enable-payments` flag (see the secrets section) rather than
+env presence, so the opt-in is `Args`-driven and unit-testable exactly like
+discovery's `args.manifest_key`. Like discovery it sits OUTSIDE the
+bearer/`authorize_change` gate: its authority is the Stripe signature, not a token.
+Unlike every other handler it reads the RAW body (`axum::body::Bytes`) and verifies
+the signature BEFORE deserializing, because Stripe signs the exact bytes — under a
+small raw-body SIZE CAP (Stripe events are tiny; a cap in the low hundreds of KB),
+because this is the one unauthenticated, mutating endpoint and the bytes must be
+buffered to compute the MAC, so an uncapped body is a pre-verification
+memory-exhaustion vector (a review nit).
+
+Because it MUTATES, `townhall-http` names only a trusted PORT trait (mirroring
+`ApprovalIssuer`), implemented in a trusted crate, that owns the webhook secret +
+the clock and whose method takes `(raw bytes, Stripe-Signature header) -> Result`.
+The implementation: verify the signature (+ timestamp window); parse the event;
+look up `payment_intents` by the `PaymentIntentId` in the Stripe session
+`metadata` to recover the `BookingId` AND the await effect-intent id **RECORDED for
+THAT session** (not the state's live `active_effect`); build
+`Verified<VerifiedProviderFact::PaymentConfirmed{ effect_intent_id }>`; call
+`Coordinator::observe(booking_id, fact)`. Binding to the session-recorded id (not
+the live pointer) is what lets the `active_effect` CAS REJECT a stale/cross-session
+late success as Converged instead of advancing whatever intent is current — the
+charged-but-not-booked hazard the review caught. `observe` is ALWAYS invoked and is idempotent via the version-CAS +
+`active_effect` guard; `payment_events` (dedup key = `event.id`) is written in the
+SAME transaction, as ledger + defence-in-depth, never a short-circuit. So a
+replayed or out-of-order `payment_intent.succeeded` advances `PaymentConfirmed`
+exactly once and fans out no second council booking. A claim of payment with
+no/invalid evidence is `Denied(InvalidPaymentEvidence)` (§23.7); the state stays
+`AwaitingHumanPayment`.
+
+### The opt-in is a flag; the secret VALUES come from the environment
+
+Two separable questions, split after the review flagged the first draft for
+conflating them:
+
+- **The opt-in is a flag: `--enable-payments`.** It gates the checkout/webhook
+  routes exactly as `--manifest-key` gates discovery — `Args`-driven, so it is
+  unit-testable and the webhook merge keys off `args.enable_payments`, not ambient
+  env. An operator who reaches for a `--stripe-secret-key` flag out of habit gets a
+  clean "unknown flag", not a silent mis-config.
+- **The secret VALUES come from the environment**, read only when
+  `--enable-payments` is set: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`. A real
+  payment secret in `argv` is world-readable via `ps`/procfs — a genuine boundary
+  leak a flag cannot avoid — so env is the safer channel. If the flag is set but a
+  var is absent, the server fails fast at startup (argument-validation phase, before
+  any I/O), never serving a route it cannot verify.
+
+To keep this TESTABLE rather than buried in `main()` (the untestable-config-in-main
+problem `main.rs` already documents for `--dev-authority`), the two vars are read
+through a small PURE seam function (`payment_config(enabled, get_var) -> Result`)
+exercised by unit tests the way `dev_authority_available` is, and `spawn_world`
+gains a per-child env-injection path (`Command::env`, per-world isolated — the
+current `spawn_world` only calls `.args`, and a process-global `set_var` is `unsafe`
+in edition 2024 and would leak across parallel worlds). A committed `.env.example`
+documents the two variables; the real `.env` stays gitignored and is never read into
+code, logged, or committed. No `dotenv` dependency is added — operators export the
+vars (or `source .env`); tests inject fixtures per-world.
+
+### The Checkout URL reaches the human without the model, and the confirmation comes back by webhook
+
+Delivery mirrors the approval handoff (`Dispatcher::book`): when a booking enters
+`AwaitingHumanPayment`, the SERVER composes the human-facing text (the Checkout URL
++ instructions) and the dispatcher records a durable `Continuation` before relaying
+it via `OutboundMessage`. The asymmetry vs. approvals: the answer does NOT return
+over SMS — the human pays on Stripe's hosted page and Stripe notifies the server by
+webhook; a "payment confirmed / booked" nudge then goes out as
+`OutboundMessage::automated` (mirroring `queue_followup`/`run_followups`). Because
+M10 precedes M11 (Rig), the whole gate is driven by the DETERMINISTIC dispatcher /
+test client — "SMS/test client receives Checkout URL" is provable with no model in
+the loop.
+
+### Two test lanes: hermetic by default, live by explicit opt-in
+
+Per the owner's decision, the everyday and CI lanes are HERMETIC — they drive
+`mock-stripe` (a real process, fault-injectable), never the network, so payment
+correctness (signature verify, idempotency, replay, expiry/cancel, exactly-once,
+one-downstream-booking) is proven offline with no flakiness. A `world_paying()`
+testkit helper spawns `mock-stripe` + the server with a fixture
+`STRIPE_WEBHOOK_SECRET`, and a webhook test POSTs a body with a computed
+`HMAC-SHA256(secret, "t.body")` header — exercising the SAME public interfaces the
+helpful path uses (instruction #12). The hermetic lane ALSO asserts the frozen
+Stripe known-answer signature vector (above), so the byte-exact signing contract is
+pinned offline, independent of `mock-stripe`'s self-consistency.
+
+Separately, an ISOLATED live-integration lane calls the REAL Stripe sandbox with
+the operator's keys: a `stripe-live` cargo feature + a dedicated `tests/live.rs`
+that is NOT run by `cargo test --workspace` or `ci/run.sh` (the model is the loom
+lane — its own feature + file + CI step). It reads the real keys from the
+environment and SKIPS with a clear message when they are absent, so it never breaks
+a keyless checkout. It creates a real sandbox Checkout Session (a real URL) and
+verifies a real Stripe-signed webhook / API retrieve. This keeps the network's
+latency and flakiness entirely out of the fast suite while still proving the
+genuine integration on demand — the acceptance gate's "real Stripe test payment"
+clause, run as its own step.
+
+### What the spec latitude does — and the amendment trail
+
+The Stripe sandbox Checkout flow, the webhook verifier, the state pattern and the
+threshold are all within §17/§M10 latitude. The additions beyond the spec's literal
+text are recorded here, not by editing the spec:
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| **`PaymentIntentId` is a distinct stable identity in `payment_intents`** (derived once at `OfferSelected`, carried across the handoff, in the Stripe session `metadata`), NOT the Pay effect id; `payment_events` is the webhook dedup ledger. The effect machinery (Pay-kind `effect_intents`) is the wire/reconcile spine underneath | §9 tables / §9.1 ids | Reuses the durable-before-wire/lease/reconcile/exactly-once spine while honoring the spec's own three-object shape; the review showed a single Pay-effect-id cannot span the two-intent flow without a charged-but-not-booked binding hazard. |
+| Availability becomes a **verified fact** (`AvailabilityVerified`): `VerifySlot`/`RevalidateVenue` mint a **Verify intent** and commit a new in-flight **`VerifyingSlot`** state; the fee-branch (fee ≥ threshold) is decided at the FACT door, routing to `AwaitingBooking` vs **`OfferSelected`**; the fee class + threshold policy-version are frozen in the verified snapshot | §17 threshold / ADR-018 (Option A) | The fee first appears at the data-free proposal door, so the branch cannot live there; making availability provenance-checked evidence lets the branch live at the fact door (ADR-018 kept pristine) AND upgrades the fee from trusted context to verified evidence. Freezing the class+version kills a config-drift race. Codex gpt-5.6-sol verdict: A over B (corrodes the invariant) and C (race not closable without a kernel change). |
+| New booking states **`OfferSelected`**, **`CheckoutPrepared`**, **`AwaitingHumanPayment`**, **`PaymentConfirmed`** (a state, per §17.1), and a distinct **`PaidBookingInProgress`**; new `VerifiedProviderFact` variants **`AvailabilityVerified`/`SessionCreated`/`PaymentConfirmed`/`PaymentAbandoned`** (`FACT_COUNT` 4 → 8, every state's cells pinned); **`NeedsHuman` promoted** for paid-but-unbookable | §17.1 state pattern / ADR-019 | Realizes §17.1's full five-state pattern (incl. `PaymentConfirmed` as a state); a distinct paid booking state means a post-payment council rejection routes to `NeedsHuman` instead of the shared `BookingInProgress`'s re-charge path; card decline/3DS park (no `observe`); abandonment returns to `OfferSelected`, never the no-payment state. |
+| `OperationKind::Pay`; a `PreparePayment` `BookingEffect` variant; a **generalized `handoff_effect`** admitting a "produces-new" successor gated on the **predecessor being `Payment`-typed**; a typed, **persistence-migrated** `provider_reference { Council(CouncilBookingRef), Payment(PaymentRef) }` (a bare-string column gains a kind tag; the phantom-ref set becomes `Council`-specific) | §9 effect model | Payment is a chain of three effect intents (create→await→book) joined by handoffs; the Pay→Book successor creates a fresh booking (acts on nothing) so the relaxation must key on the predecessor's ref type, and the reference typing is a declared store migration, NOT "CAS unchanged". |
+| A **composite `Capability`/`Verifier`/`EffectResolver`** (`townhall-effects-router`) routing by effect variant / raw type, wired into the single-arity `Coordinator`/`Reconciliation` | §3 dispatch / §18.2 | The `Coordinator` dispatches every effect to ONE capability; a payment effect would otherwise be sent to the council client. Corrects the first draft's "reconciler/settle reused unchanged" (only the store CAS layer is unchanged). |
+| `InvalidPaymentEvidence` denial (HTTP-mapped), state stays `AwaitingHumanPayment` | §23.7 / §25 taxonomy | The spec names this exact denial and non-transition for a forged-evidence claim; a new resource denial the taxonomy did not yet enumerate. |
+| Crate names `townhall-payment` + `stripe-client` + `townhall-effects-router` + `mock-stripe`, each with a `boundary.rs` trust test (fact-minting confined to `townhall-payment`); `--enable-payments` flag opt-in with secret VALUES from the environment; `reqwest` gains a graph-wide `rustls-tls` feature when payments are built | §4 layout / composition-root convention | Repo convention is `townhall-*`/`mock-*` not `payment-handoff/`+`stripe-test-adapter/`; a real secret in `argv` leaks via `ps`/procfs (env is safer, flag makes the opt-in testable); and per-package feature unification means TLS cannot be "scoped" to one crate — stated honestly rather than hidden. |
+| An isolated `stripe-live` integration lane calling the real Stripe sandbox, excluded from `cargo test --workspace`/`ci/run.sh`; plus a frozen Stripe known-answer signature vector asserted in the hermetic lane | §20 test layer / §M10 gate | Keeps the fast/CI suite hermetic (mock-stripe) while proving the real integration on an explicit, network-isolated step; the KAT vector pins the byte-exact signing contract offline so mock+verifier cannot be wrong-but-self-consistent. |

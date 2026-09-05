@@ -190,6 +190,7 @@ pub fn projection_body(projection: &Projection) -> serde_json::Value {
             })
         }),
         "booking_ref": projection.booking_ref.as_ref().map(ToString::to_string),
+        "checkout_url": projection.checkout_url,
         "available_behaviours": projection.available_behaviours,
     })
 }

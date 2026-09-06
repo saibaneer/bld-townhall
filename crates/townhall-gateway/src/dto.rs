@@ -16,6 +16,12 @@ pub struct Projection {
     pub selected_venue: Option<SelectedVenue>,
     pub booking_ref: Option<String>,
     pub available_behaviours: Vec<String>,
+    /// The Stripe checkout URL, present only while a booking is
+    /// `AwaitingHumanPayment` (M10/M12). The server already emits this field; the
+    /// conversational layer needs it to hand the human a pay link, so the client
+    /// DTO must deserialize it rather than silently drop it.
+    #[serde(default)]
+    pub checkout_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -116,5 +122,52 @@ impl RawResponse {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(no error field)")
             .to_owned()
+    }
+}
+
+#[cfg(test)]
+mod checkout_url_tests {
+    use super::Projection;
+
+    /// The whole point of the field: a booking awaiting payment carries the Stripe
+    /// checkout URL through to the conversational layer, instead of serde silently
+    /// dropping it (the bug this fixes).
+    #[test]
+    fn awaiting_payment_deserializes_the_checkout_url() {
+        let json = serde_json::json!({
+            "id": "BKG-PAY", "version": 3, "state": "AwaitingHumanPayment",
+            "requirements": {
+                "purpose": "p", "requested_date": "2026-09-10", "from": "14:00",
+                "to": "17:00", "attendees": 20, "wheelchair_accessible": true,
+                "max_fee_pence": 9000
+            },
+            "selected_venue": {"venue_id": "TH-C", "slot_id": "SLOT-A"},
+            "booking_ref": null,
+            "available_behaviours": ["Cancel"],
+            "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_123"
+        });
+        let projection: Projection = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            projection.checkout_url.as_deref(),
+            Some("https://checkout.stripe.com/c/pay/cs_test_123")
+        );
+    }
+
+    /// And a booking that is NOT awaiting payment simply has no URL (the field is
+    /// optional, absent on every other state).
+    #[test]
+    fn a_booking_without_a_url_defaults_to_none() {
+        let json = serde_json::json!({
+            "id": "BKG", "version": 0, "state": "Draft",
+            "requirements": {
+                "purpose": "p", "requested_date": "2026-09-10", "from": "14:00",
+                "to": "17:00", "attendees": 20, "wheelchair_accessible": true,
+                "max_fee_pence": 5000
+            },
+            "selected_venue": null, "booking_ref": null,
+            "available_behaviours": ["SelectVenue", "Cancel"]
+        });
+        let projection: Projection = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(projection.checkout_url, None);
     }
 }

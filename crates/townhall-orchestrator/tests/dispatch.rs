@@ -742,6 +742,7 @@ impl BookingWire for AcceptingWire {
             selected_venue: None,
             booking_ref: Some("TH-1".to_owned()),
             available_behaviours: vec!["Cancel".to_owned()],
+            checkout_url: None,
         }])
     }
     async fn by_reference(&self, _: &CouncilBookingRef) -> Result<Vec<Projection>, GatewayError> {
@@ -905,6 +906,7 @@ fn mock_projection(id: &str, version: u64, state: &str) -> Projection {
         selected_venue: None,
         booking_ref: (state == "Booked").then(|| "TH-W7".to_owned()),
         available_behaviours: Vec::new(),
+        checkout_url: None,
     }
 }
 

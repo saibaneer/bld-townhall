@@ -1,0 +1,25 @@
+[package]
+name = "townhall-telegram-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The Telegram `HumanChannel` — kept OUT of `townhall-channel` on purpose:
+# that crate's manifest deliberately excludes `reqwest` (its §14 no-mutation
+# guarantee is a fact about its dependency graph). This crate carries the
+# provider dep (`telegram-client` → reqwest) and implements the same trait.
+
+[dependencies]
+async-trait.workspace = true
+townhall-channel = { path = "../townhall-channel" }
+telegram-client = { path = "../telegram-client" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
+axum = { workspace = true }
+serde_json.workspace = true
+
+[lints]
+workspace = true

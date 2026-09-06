@@ -22,7 +22,7 @@ use townhall_orchestrator::{
 };
 use townhall_testkit::{
     RecordingProxy, WORKLOAD, World, arm_fault, council_count, seed_usage_quota, usage_debited,
-    world_real, world_real_with,
+    world_real, world_real_paying, world_real_with,
 };
 
 #[path = "support/mod.rs"]
@@ -945,6 +945,44 @@ async fn b19_a_spent_budget_blocks_a_turn_but_never_a_safety_exit() {
     assert!(
         talk.say(LUCY_PHONE, "STOP").await.contains("Stopped"),
         "STOP is reachable"
+    );
+}
+
+// ------------------------------------------------------------------ B20 (M12 payment)
+
+/// The conversational payment handoff (M12): a booking whose verified fee is at
+/// or over the threshold routes to payment, and the boundary hands the person the
+/// Stripe checkout link — read from the projection, never invented — instead of a
+/// completed booking. This is the piece that was missing: the dispatcher used to
+/// hard-fail on `OfferSelected`.
+#[tokio::test]
+async fn b20_a_booking_over_the_threshold_replies_with_the_stripe_pay_link() {
+    // Threshold £30; the £45 TH-A booking `book_and_approve` makes is over it, so
+    // it routes through the human-payment handoff rather than booking directly.
+    let world = world_real_paying(3_000);
+    let talk = talk(&world, &world.server_url);
+
+    let reply = talk.book_and_approve(LUCY_PHONE).await;
+    assert!(
+        reply.contains("https://checkout.stripe.test/"),
+        "the reply carries the real Stripe checkout link the session created: {reply}"
+    );
+    assert!(
+        reply.to_lowercase().contains("pay"),
+        "and tells the person to pay: {reply}"
+    );
+    // NOT booked yet — a payment-routed booking has no council ref until the
+    // webhook confirms the payment.
+    assert!(
+        !reply.contains("Council ref"),
+        "a payment-routed booking is not Booked until payment is confirmed: {reply}"
+    );
+    // And nothing reached the council: no booking exists over the threshold that
+    // wasn't paid for.
+    assert_eq!(
+        council_count(&world, "SELECT COUNT(*) FROM bookings"),
+        0,
+        "no council booking is made before the human pays"
     );
 }
 

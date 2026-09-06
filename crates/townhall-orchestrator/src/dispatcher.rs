@@ -66,6 +66,11 @@ enum Walk {
     /// Submitted but not yet `Booked` — leave the continuation for the resume
     /// runner (or the follow-up queue) and reply the acknowledgement.
     InFlight(String),
+    /// The booking routed to payment (fee ≥ threshold): the human must pay a
+    /// Stripe checkout link before it can book. Leave the continuation durable
+    /// (like `InFlight`) and reply the link; the webhook advances it to `Booked`,
+    /// which the person sees on their next `STATUS` (M10/M12).
+    AwaitingPayment(String),
     /// A terminal refusal (no venue fits, a denial) — clear the continuation, the
     /// approval spent with nothing to book, and reply why.
     Failed(String),
@@ -725,6 +730,23 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 "NeedsRevalidation" => ("revalidate-venue", None),
                 "AwaitingBooking" => ("book", None),
                 "Booked" => return Walk::Booked(outcome_text("Booked", &projection)),
+                // The payment branch (fee ≥ threshold): the fact door routed the
+                // verified booking to OfferSelected instead of AwaitingBooking.
+                // `book` here mints the Stripe checkout (PreparePayment), not a
+                // council booking; settle to the payment state and hand back the
+                // pay link rather than "Booking now."
+                "OfferSelected" => {
+                    match wire.propose_at(id, projection.version, "book", None).await {
+                        Ok(Turn::Committed { .. } | Turn::Accepted { .. }) => {}
+                        other => return Walk::Failed(turn_text("book", other)),
+                    }
+                    return self.await_payment(id, reader).await;
+                }
+                // Transient while the PreparePayment effect settles into a Stripe
+                // session — nothing to propose; wait for AwaitingHumanPayment.
+                "CheckoutPrepared" => return self.await_payment(id, reader).await,
+                // Already has the session: hand back the link directly.
+                "AwaitingHumanPayment" => return Walk::AwaitingPayment(pay_text(&projection)),
                 other => {
                     return Walk::Failed(format!(
                         "Can't book from here ({other}). Reply STATUS to see it."
@@ -771,10 +793,42 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 let _ = self.continuations.clear(&continuation.challenge_id);
                 text
             }
-            // Left in place: the booking is submitted (in flight) or the service
-            // was briefly unreachable — either way the resume runner finishes it.
-            Walk::InFlight(text) | Walk::Unreachable(text) => text,
+            // Left in place: the booking is submitted (in flight), awaiting the
+            // human's payment, or the service was briefly unreachable — either way
+            // the continuation stays durable and the person is told what to do
+            // next (pay, or reply STATUS).
+            Walk::InFlight(text) | Walk::AwaitingPayment(text) | Walk::Unreachable(text) => text,
         }
+    }
+
+    /// After `book` from `OfferSelected`, wait for the Stripe session to be ready
+    /// and hand back the pay link. The chain is `OfferSelected` → (book) →
+    /// `CheckoutPrepared` → (`SessionCreated` fact) → `AwaitingHumanPayment`, so
+    /// this re-reads until the settled payment state appears. Bounded: if the link
+    /// isn't ready in time, tell the person to check back rather than hang.
+    async fn await_payment(&self, id: &BookingId, reader: &dyn crate::ports::BookingWire) -> Walk {
+        for _ in 0..40 {
+            match reader.read(id).await {
+                Ok(projection) => match projection.state.as_str() {
+                    "AwaitingHumanPayment" => {
+                        return Walk::AwaitingPayment(pay_text(&projection));
+                    }
+                    // A below-threshold edge or an already-paid booking that
+                    // converged straight through — treat as done.
+                    "Booked" => return Walk::Booked(outcome_text("Booked", &projection)),
+                    // Still settling the checkout.
+                    "OfferSelected" | "CheckoutPrepared" => {}
+                    other => {
+                        return Walk::Failed(format!(
+                            "Payment setup stopped at {other}. Reply STATUS to see it."
+                        ));
+                    }
+                },
+                Err(error) => return Walk::Unreachable(cannot_answer(&error)),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Walk::InFlight("Preparing your payment link — reply STATUS in a moment.".to_owned())
     }
 
     /// Map a reply-time error onto a reply, clearing the continuation when the
@@ -866,9 +920,10 @@ impl<C: HumanChannel<Address = ChannelAddress>> Dispatcher<C> {
                 Walk::Failed(_) => {
                     let _ = self.continuations.clear(&continuation.challenge_id);
                 }
-                // Still in flight or briefly unreachable — leave it for the next
-                // resume rather than declaring an outcome.
-                Walk::InFlight(_) | Walk::Unreachable(_) => {}
+                // Still in flight, awaiting the human's payment, or briefly
+                // unreachable — leave it for the next resume (or the webhook, for
+                // payment) rather than declaring an outcome.
+                Walk::InFlight(_) | Walk::AwaitingPayment(_) | Walk::Unreachable(_) => {}
             }
         }
     }
@@ -1071,6 +1126,24 @@ fn outcome_text(verb: &str, projection: &Projection) -> String {
             "{verb}. Council ref {reference}. Reply CANCEL {reference} at any time to cancel."
         ),
         None => format!("{verb}. ({}).", projection.state),
+    }
+}
+
+/// The reply for a booking that routed to payment: the Stripe checkout link, and
+/// what to do after paying. The URL is authoritative context read from the
+/// projection, never something the conversational layer invents.
+fn pay_text(projection: &Projection) -> String {
+    match &projection.checkout_url {
+        Some(url) => format!(
+            "Almost there — your booking needs payment. Pay here to confirm:\n{url}\n\
+             Once you've paid, reply STATUS and I'll confirm the booking."
+        ),
+        // AwaitingHumanPayment with no URL should not happen (the state carries it),
+        // but never claim a link we don't have.
+        None => {
+            "Your booking needs payment, but the link isn't ready yet — reply STATUS in a moment."
+                .to_owned()
+        }
     }
 }
 

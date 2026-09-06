@@ -42,6 +42,10 @@ pub use simulator::SmsSimulator;
 pub enum ChannelKind {
     /// The in-process simulator. M12 adds a real provider beside it.
     SmsSimulator,
+    /// The Telegram Bot API — M12's real human channel (ADR-033). The SMS
+    /// provider path was blocked by an unbounded chain of telecom compliance;
+    /// Telegram needs none of it, and the boundary is channel-agnostic.
+    Telegram,
 }
 
 /// What the provider asserted about a message.

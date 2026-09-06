@@ -143,6 +143,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bind-channel"
+version = "0.1.0"
+dependencies = [
+ "bld-types",
+ "tokio",
+ "townhall-authority",
+ "townhall-store",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1981,6 +1991,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2078,12 +2099,11 @@ dependencies = [
 name = "sms-simulator"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bld-types",
  "reqwest",
- "serde_json",
  "tokio",
  "townhall-channel",
+ "townhall-http-ports",
  "townhall-orchestrator",
 ]
 
@@ -2230,7 +2250,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.7",
  "rsa",
- "sha1",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "smallvec",
  "sqlx-core",
@@ -2388,6 +2408,32 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "telegram-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "telegram-runner"
+version = "0.1.0"
+dependencies = [
+ "bld-types",
+ "reqwest",
+ "telegram-client",
+ "tokio",
+ "townhall-channel",
+ "townhall-http-ports",
+ "townhall-orchestrator",
+ "townhall-telegram-channel",
 ]
 
 [[package]]
@@ -2658,6 +2704,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "townhall-http-ports"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde_json",
+ "townhall-orchestrator",
+]
+
+[[package]]
 name = "townhall-orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -2750,6 +2806,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "townhall-telegram-channel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "telegram-client",
+ "tokio",
+ "townhall-channel",
+]
+
+[[package]]
 name = "townhall-testkit"
 version = "0.1.0"
 dependencies = [
@@ -2838,6 +2907,22 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twilio-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "hmac 0.13.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "typenum"
@@ -3054,7 +3139,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

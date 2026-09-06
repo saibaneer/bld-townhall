@@ -117,6 +117,27 @@ impl ChannelAddress {
         Ok(Self(format!("+{e164}")))
     }
 
+    /// A Telegram chat, addressed by its numeric chat id (M12 / ADR-033).
+    ///
+    /// A SECOND kind of address the human edge can carry, named for what it is
+    /// (`tg:`) rather than disguised as a phone number. It bypasses [`Self::parse`]'s
+    /// phone grammar entirely and on purpose: a chat id is not an E.164 number and
+    /// must never be read as one — a negative group id would even collide under
+    /// `parse`'s separator stripping (`-` is dropped as presentation). Keeping the
+    /// two kinds textually distinct (`+…` vs `tg:…`) is what stops a chat id and a
+    /// phone number from ever comparing equal in the suppression list.
+    #[must_use]
+    pub fn telegram(chat_id: i64) -> Self {
+        Self(format!("tg:{chat_id}"))
+    }
+
+    /// The Telegram chat id, iff this is a Telegram address (`tg:<id>`); `None`
+    /// for a phone address. How a Telegram channel recovers the id to reply to.
+    #[must_use]
+    pub fn telegram_chat_id(&self) -> Option<i64> {
+        self.0.strip_prefix("tg:").and_then(|id| id.parse().ok())
+    }
+
     /// A raw, unparseable input, masked for an error message: the first three
     /// characters and the length. Enough to see "started with +44, 30 chars
     /// long" — not enough to identify a subscriber, which an unroutable string
@@ -172,5 +193,41 @@ impl fmt::Debug for ChannelAddress {
 impl fmt::Display for ChannelAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+mod telegram_tests {
+    use super::*;
+
+    #[test]
+    fn a_telegram_address_round_trips_its_chat_id() {
+        let addr = ChannelAddress::telegram(5_741_534_028);
+        assert_eq!(addr.revealed(), "tg:5741534028");
+        assert_eq!(addr.telegram_chat_id(), Some(5_741_534_028));
+    }
+
+    #[test]
+    fn a_negative_group_id_survives_where_a_phone_parse_would_corrupt_it() {
+        // Group chat ids are negative; `parse` strips `-` as a separator and would
+        // misread them. The `tg:` constructor keeps them exact.
+        let addr = ChannelAddress::telegram(-1_001_234_567_890);
+        assert_eq!(addr.telegram_chat_id(), Some(-1_001_234_567_890));
+    }
+
+    #[test]
+    fn a_phone_and_a_telegram_address_never_collide() {
+        let phone = ChannelAddress::parse("+447700900123", Region::Gb).expect("valid phone");
+        assert_eq!(
+            phone.telegram_chat_id(),
+            None,
+            "a phone is not a telegram chat"
+        );
+        // The two encodings are textually distinct, so equality can never confuse
+        // a chat id with a phone number in the suppression list.
+        let tg = ChannelAddress::telegram(447_700_900_123);
+        assert_ne!(phone, tg);
+        assert_eq!(phone.revealed(), "+447700900123");
+        assert_eq!(tg.revealed(), "tg:447700900123");
     }
 }

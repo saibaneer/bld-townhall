@@ -153,7 +153,14 @@ pub async fn run_reconciler(
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Echo `X-Request-ID`, or mint one — one transport attempt, one id.
+/// Request logging is opt-in: a demo or a debugging session sets
+/// `TOWNHALL_LOG_REQUESTS`, and a normal run (tests, CI) stays silent so the
+/// output isn't flooded. Read once, not per request.
+static LOG_REQUESTS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("TOWNHALL_LOG_REQUESTS").is_some());
+
+/// Echo `X-Request-ID`, or mint one — one transport attempt, one id. Also logs
+/// `method path -> status` (with the id) when `TOWNHALL_LOG_REQUESTS` is set.
 async fn request_id(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let incoming = request
         .headers()
@@ -169,7 +176,12 @@ async fn request_id(request: axum::extract::Request, next: axum::middleware::Nex
             REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
         )
     });
+    // Capture the request line BEFORE the body is consumed by `next.run`.
+    let line = (*LOG_REQUESTS).then(|| format!("{} {}", request.method(), request.uri().path()));
     let mut response = next.run(request).await;
+    if let Some(line) = line {
+        eprintln!("[{id}] {line} -> {}", response.status().as_u16());
+    }
     if let Ok(value) = header::HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);
     }

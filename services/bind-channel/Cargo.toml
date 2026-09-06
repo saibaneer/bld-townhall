@@ -1,0 +1,21 @@
+[package]
+name = "bind-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# A one-shot channel-binding utility (M12 demo support). The approve-first flow
+# requires a principal to be BOUND to a channel address before it will authorize
+# a booking, and binding is a store write with no HTTP endpoint (deliberately —
+# see bind_lucy in the authority-lane tests). This writes exactly that binding, so
+# a live Telegram (or SMS) demo can be set up from a script.
+
+[dependencies]
+bld-types = { path = "../../crates/bld-types" }
+tokio = { workspace = true }
+townhall-authority = { path = "../../crates/townhall-authority" }
+townhall-store = { path = "../../crates/townhall-store" }
+
+[lints]
+workspace = true

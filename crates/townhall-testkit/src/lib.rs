@@ -376,6 +376,81 @@ pub fn world_paying_discoverable(threshold_pence: u64) -> World {
     }
 }
 
+/// A REAL-authority world (approve-first resolver, channels bound) that is ALSO
+/// payments-enabled (M12): council + mock-stripe + a server with
+/// `--enable-payments` and `--payment-threshold-pence`, so a booking whose fee is
+/// at or over the threshold routes through the human-payment handoff. This is the
+/// world the CONVERSATIONAL payment path needs — `world_paying_discoverable` is
+/// the dev lane; this one runs the real resolver so BOOK/YES is authorized by a
+/// delegation, exactly as the Telegram/SMS runner composes it. The two Stripe
+/// secrets go through the child's ENVIRONMENT, as the composition root reads them.
+#[must_use]
+pub fn world_real_paying(threshold_pence: u64) -> World {
+    build_binaries();
+    build_mock_stripe();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let council_db = dir.path().join("council.sqlite");
+    let mut command = Command::new(target_dir().join("mock-council"));
+    command
+        .arg("--db")
+        .arg(&council_db)
+        .args(["--key-hex", KEY_HEX, "--port", "0"]);
+    let (council, council_port) = spawn_ready(command);
+    let council_url = format!("http://127.0.0.1:{council_port}");
+
+    let mut command = Command::new(target_dir().join("mock-stripe"));
+    command.args(["--port", "0"]);
+    let (stripe, stripe_port) = spawn_ready(command);
+    let stripe_url = format!("http://127.0.0.1:{stripe_port}");
+
+    let townhall_db = dir.path().join("townhall.sqlite");
+    let threshold = threshold_pence.to_string();
+    let mut command = Command::new(target_dir().join("townhall-server"));
+    command
+        .arg("--db")
+        .arg(&townhall_db)
+        .arg("--denials-db")
+        .arg(dir.path().join("denials.sqlite"))
+        .args([
+            "--council-url",
+            &council_url,
+            "--key-hex",
+            KEY_HEX,
+            "--port",
+            "0",
+            "--authority-key",
+            AUTHORITY_KEY_HEX,
+            "--retry-cadence-ms",
+            "200",
+            "--reconcile-interval-ms",
+            "100",
+            "--enable-payments",
+            "--payment-threshold-pence",
+            &threshold,
+        ])
+        .env("STRIPE_SECRET_KEY", "sk_test_townhall_testkit")
+        .env("STRIPE_WEBHOOK_SECRET", "whsec_townhall_testkit")
+        .env("STRIPE_BASE_URL", &stripe_url)
+        .env("STRIPE_SUCCESS_URL", "https://townhall.test/paid")
+        .env("STRIPE_CANCEL_URL", "https://townhall.test/cancelled");
+    let (server, server_port) = spawn_ready(command);
+
+    bind_channels(&townhall_db);
+
+    World {
+        dir,
+        council,
+        council_url,
+        council_db,
+        townhall_db,
+        server: Some(server),
+        server_url: format!("http://127.0.0.1:{server_port}"),
+        stripe: Some(stripe),
+        stripe_url: Some(stripe_url),
+    }
+}
+
 /// Bind Lucy's and Priya's channels in a real-authority world's store, so a
 /// challenge raised against either number can be answered. `sms-reply` is
 /// `AssuranceLevel::SmsReply.name()`, and the row shape is migration 0006's.

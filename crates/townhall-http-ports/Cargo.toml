@@ -1,0 +1,21 @@
+[package]
+name = "townhall-http-ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The orchestrator's ApprovalPort / EvidenceDeposit / UsageLedger, implemented
+# over HTTP against a running townhall-server. Extracted here so the several
+# composition roots that need them (sms-simulator, the telegram-runner) share one
+# copy rather than each carrying their own. It cannot live in townhall-orchestrator
+# itself: that crate keeps reqwest a dev-dependency by design.
+
+[dependencies]
+async-trait.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde_json.workspace = true
+townhall-orchestrator = { path = "../townhall-orchestrator" }
+
+[lints]
+workspace = true

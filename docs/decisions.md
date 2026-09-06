@@ -3503,3 +3503,134 @@ editing the spec:
 | The reference proposer may be any **open-weight** model over an OpenAI-compatible endpoint — **cloud-hosted or local**, not only "locally hosted"; model/provider stays swappable configuration; a proprietary frontier model stays optional-comparison-only | §1.3 / §18.2 / §21 "locally hosted/open-source" | Owner-directed. The requirement protects independence from a proprietary frontier model and boundary-safety-independent-of-model — both hold for any open-weight swappable model. Local hosting is offline-reproducibility convenience, kept available (qwen3:4b) as a swap, not required for the reference. |
 | A new **`townhall-agent`** crate: the untrusted proposer, the `Proposer` seam, the `LlmProposer` (structured-JSON over an OpenAI-compatible endpoint), and the deterministic `HostileProposer`; it depends only on `bld-client` | §3 Figure 1 / §18 | Realizes "Rig Agent Runtime → BLD Client → typed proposal"; the agent names only the public surface, so the same adversarial suite runs against any proposer and the framework never touches the boundary. |
 | The agent talks to the model through a **thin, hand-rolled OpenAI-compatible `reqwest` client**, NOT `rig-core` — a deviation from the spec's named "Rig" framework | §2 principles ("Agent framework: Rig") / §18 | Owner-approved. The need is narrow (POST chat messages, parse a validated JSON proposal); `rig-core` is a heavy 0.x dependency used only in sliver, and reqwest is already in the tree. The provider abstraction Rig offered is the `AGENT_BASE_URL`/`AGENT_MODEL` config seam. Safety is unaffected — the model is untrusted either way and the parser + boundary dispose. |
+
+## ADR-032 — M12: the real SMS provider is Twilio, adapted as trusted transport
+
+The spec (§M12) requires "one real SMS provider webhook/REST adapter, verification
+where supported, E.164 normalization, delivery handling and dedupe" but names no
+provider. This records the choice and the decisions the code makes before the code.
+
+- **The provider is Twilio.** Of the credible options it is the only one whose
+  entire account/number/webhook setup is drivable from a **CLI** (so the owner
+  provisions it from a terminal, not a console the agent cannot see), its inbound
+  webhooks are **signed** (`X-Twilio-Signature`) so authenticity is verifiable
+  after the fact rather than trusted from the transport — the same stance the
+  council's ed25519 and Stripe's HMAC take — and two-way SMS on one number is
+  first-class. It records nothing that binds the POC to Twilio: the provider is an
+  adapter behind the existing `HumanChannel` seam.
+
+- **The adapter is trusted transport, not a fact source** (mirrors ADR-030's
+  `stripe-client`). The new **`twilio-client`** crate carries a canonical outbound
+  reply to Twilio and returns the provider's raw observation (the message SID and
+  queue status). It mints no domain fact and asserts no identity — that authority
+  stays in the channel/domain layers. `TransportEvidence` already grades a
+  provider's claims as evidence-not-identity (spec §3.2); Twilio is one more source
+  of exactly that.
+
+- **`X-Twilio-Signature` is the inbound-authentication primitive.** It is
+  `base64(HMAC-SHA1(auth_token, url + params-sorted-by-key))`, verified in constant
+  time. **SHA-1 here is Twilio's fixed choice, a compatibility requirement, not a
+  security preference** — the MAC only authenticates a webhook against the
+  account's own Auth Token, and is never used for our own integrity anywhere. Its
+  format is locked against an **independent OpenSSL vector** in the crate's tests,
+  exactly as the Stripe signature is — an independent reference is as decisive as a
+  real provider signature for the bytes it signs.
+
+- **Both Twilio credential shapes are supported, and the path SID is kept
+  distinct from the auth username.** Twilio's REST URL always carries the **Account
+  SID** (`AC…`), while the basic-auth username is either that same Account SID
+  (Auth-Token auth) or a separate **API Key SID** (`SK…`, the recommended, scoped,
+  revocable credential). Conflating the two — using one field for both — makes an
+  API Key return `401` "no requested permission" (found the hard way against real
+  Twilio during increment 1). So `TwilioConfig` holds `account_sid` (the `AC…`
+  path) apart from `auth_sid` (the basic-auth username); env names match the
+  running `.env` — `TWILIO_SID` (username), `TWILIO_CLIENT_SECRET` (its secret),
+  `TWILIO_ACCOUNT_SID` (the `AC…` path, falling back to `TWILIO_SID` for Auth-Token
+  auth), `TWILIO_FROM_NUMBER`. The secret is loaded from the environment, held
+  behind a `Debug`-redacted `TwilioSecret`, and never appears in argv, a URL, a
+  log, or the repo. **Caveat:** `X-Twilio-Signature` (increment 2) is signed with
+  the **Account Auth Token specifically**, never an API Key Secret — so the inbound
+  path will require the Auth Token even when sending uses an API Key.
+
+- **The `twilio-live` lane** (opt-in feature, mirrors ADR-030's `stripe-live`)
+  sends ONE real SMS through `api.twilio.com` to prove request-encoding and
+  response-parsing match real Twilio — the one thing the hermetic mock cannot. It
+  **fails loudly** on missing config (a silent skip would let "green" mean "never
+  ran") and reads its recipient from `TWILIO_TEST_TO`, so no personal number is
+  committed. It is never part of a normal `cargo test`.
+
+- **The simulator stays the default.** Twilio is a second `HumanChannel` beside
+  `SmsSimulator` (the seam's own comment reserved "M12 adds a real provider beside
+  it"), selected only when configured, so CI and hermetic tests never touch the
+  network. Increment 1 (this ADR) lands the REST send + the signature primitive;
+  increment 2 adds the inbound webhook adapter with **dedupe on Twilio's
+  `MessageSid`** through the existing replay window; increment 3 is the acceptance
+  gate — a real phone completes the happy path and a replayed provider retry does
+  not duplicate work.
+
+- **WhatsApp is a channel of the SAME adapter, and the reachable one in practice.**
+  Getting real SMS to a UK phone runs a gauntlet of Twilio telecom gates — trial
+  message-template restrictions, Trust Hub KYC, a UK regulatory bundle for a UK
+  number, and the fact that US numbers cannot route SMS to the UK at all. Twilio's
+  **WhatsApp Sandbox** sidesteps every one: no number purchase, no bundle, no
+  per-country routing, two-way free-form messaging to any recipient who has joined
+  the sandbox. It is the SAME `Messages.json` endpoint, basic auth, and
+  `X-Twilio-Signature` verification — only the addressing differs (`whatsapp:<E.164>`
+  on both `From` and `To`). So `send_sms` and `send_whatsapp` share one internal
+  `send`, `from_number` and `whatsapp_from` are independent optional senders, and a
+  deployment picks whichever channel actually reaches its user. The boundary is
+  unchanged — WhatsApp text is provider transport-evidence exactly as SMS is.
+
+### The amendment trail
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| The real SMS provider is **Twilio**; a new **`twilio-client`** crate provides the REST send (`Messages.json`) and the `X-Twilio-Signature` verification primitive, as trusted transport behind the `HumanChannel` seam | §M12 ("one real SMS provider") / §3.2 transport-evidence | Twilio is the only credible option fully CLI-provisionable (owner sets it up from a terminal) with signed inbound webhooks; the adapter mints no fact, so the choice binds nothing. |
+| **HMAC-SHA1** is used for `X-Twilio-Signature` verification | §M12 "verification where supported" | Twilio's fixed algorithm — a compatibility requirement, not a security choice. It authenticates an inbound webhook against the account's own Auth Token only; locked against an independent OpenSSL vector, as the Stripe HMAC is. |
+| A `twilio-live` opt-in lane sends one real SMS; recipient read from `TWILIO_TEST_TO` | §M12 acceptance / ADR-030 precedent | Proves real request/response encoding the mock cannot; fail-loud on missing config; keeps personal numbers out of the repo. |
+| **WhatsApp** is added as a second channel of the same adapter (`send_whatsapp`, `whatsapp:` addressing, `TWILIO_WHATSAPP_FROM`) beside SMS | §M12 ("one real SMS provider") | Twilio's SMS path to a UK phone is blocked by a chain of telecom gates (trial templates, KYC, UK regulatory bundle, US→UK routing); the WhatsApp Sandbox reaches the phone with no number/bundle over the same endpoint + signature scheme, so the conversational demo is achievable. Owner-directed. |
+
+## ADR-033 — M12's real channel is Telegram (the SMS providers' telecom wall)
+
+The spec (§M12) names "one real SMS provider". Reaching a real UK phone over
+Twilio SMS/WhatsApp proved to require an unbounded chain of telecom compliance —
+proven live, each gate cleared only to reveal the next: trial message-template
+restriction (572006) → Trust Hub KYC approval (20003) → a UK **regulatory bundle**
+for any UK mobile number → and US numbers that cannot route SMS to the UK at all
+(21612). Each is real telephony bureaucracy with its own review delay; none is a
+property of the BLD boundary.
+
+- **The real channel is Telegram** — a `telegram-client` crate, trusted transport
+  behind the same `HumanChannel` seam, in the exact shape of `twilio-client`. A bot
+  token from `@BotFather` (no number, no KYC, no bundle, free) authenticates by
+  sitting in the request path; `send_message` is the outbound leg and `get_updates`
+  (**long-polling**) is the inbound leg.
+
+- **Long-polling removes the webhook/tunnel entirely.** Where SMS/WhatsApp inbound
+  needs a public endpoint and an `X-Twilio-Signature` check, the Telegram bot
+  *pulls* its updates — so M12's increments 2 and 3 (inbound + the acceptance gate)
+  need no ngrok, no webhook route, and no signature verification. Simpler, and with
+  fewer moving parts to get wrong.
+
+- **This is a channel substitution, not a boundary change** (the same reasoning as
+  ADR-031's model-hosting relaxation). The property §M12 protects is "a real
+  two-way human channel drives the conversational boundary flow to a real device";
+  "SMS" specifically was demo convenience, and one gated behind telephony
+  compliance that is out of scope for a POC. The boundary is channel-agnostic;
+  Telegram text is provider transport-evidence exactly as SMS is. `twilio-client`
+  stays as a proven SMS/WhatsApp adapter for whenever that compliance is cleared —
+  nothing is discarded.
+
+- **The bot token is the one secret**, held behind a `Debug`-redacted
+  `TelegramBotToken`, read from `TELEGRAM_BOT_TOKEN`, never committed. Because the
+  token rides in the URL path, transport errors are stripped of their URL
+  (`reqwest::Error::without_url`) so it cannot leak into a log. A `telegram-live`
+  opt-in lane (mirroring `twilio-live`) sends one real message to the chat that has
+  messaged the bot — fail-loud on a missing token or an un-started bot.
+
+### The amendment trail
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| M12's real messaging channel is **Telegram** (a `telegram-client` crate: `send_message` + long-poll `get_updates`), not an SMS provider | §M12 ("one real SMS provider") / §21 | Owner-directed. Real SMS to a UK phone is gated behind an unbounded telecom-compliance chain (templates → KYC → UK regulatory bundle → US-can't-reach-UK), each with review delays and none a boundary property. Telegram is a free, compliance-free real two-way channel; the boundary is channel-agnostic, so it proves the same thing. `twilio-client` is retained for SMS/WhatsApp. |
+| Telegram inbound is **long-polling** (`getUpdates`), so M12 increments 2–3 need **no webhook, tunnel, or signature verification** | §M12 "webhook/… adapter, verification where supported" | The bot pulls rather than being pushed to, so there is no push endpoint to expose or authenticate — a strictly simpler inbound path than a signed SMS webhook. |

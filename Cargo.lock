@@ -2089,12 +2089,11 @@ dependencies = [
 name = "sms-simulator"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bld-types",
  "reqwest",
- "serde_json",
  "tokio",
  "townhall-channel",
+ "townhall-http-ports",
  "townhall-orchestrator",
 ]
 
@@ -2414,6 +2413,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "telegram-runner"
+version = "0.1.0"
+dependencies = [
+ "bld-types",
+ "reqwest",
+ "telegram-client",
+ "tokio",
+ "townhall-channel",
+ "townhall-http-ports",
+ "townhall-orchestrator",
+ "townhall-telegram-channel",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2678,6 +2691,16 @@ dependencies = [
  "townhall-authority",
  "townhall-domain",
  "townhall-service",
+]
+
+[[package]]
+name = "townhall-http-ports"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde_json",
+ "townhall-orchestrator",
 ]
 
 [[package]]

@@ -1,0 +1,24 @@
+[package]
+name = "telegram-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The Telegram composition root (M12 / ADR-033): wires the Telegram HumanChannel,
+# the dispatcher, and a running townhall-server together, then long-polls the Bot
+# API and feeds each inbound message to the dispatcher. The seat sms-simulator
+# occupies for a script, this occupies for a live chat.
+
+[dependencies]
+bld-types = { path = "../../crates/bld-types" }
+reqwest = { workspace = true }
+telegram-client = { path = "../../crates/telegram-client" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+townhall-channel = { path = "../../crates/townhall-channel" }
+townhall-http-ports = { path = "../../crates/townhall-http-ports" }
+townhall-orchestrator = { path = "../../crates/townhall-orchestrator" }
+townhall-telegram-channel = { path = "../../crates/townhall-telegram-channel" }
+
+[lints]
+workspace = true

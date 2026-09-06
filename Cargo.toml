@@ -17,6 +17,7 @@ members = [
   "crates/twilio-client",
   "crates/telegram-client",
   "crates/townhall-telegram-channel",
+  "crates/townhall-http-ports",
   "crates/townhall-effects-router",
   "crates/townhall-usage",
   "crates/townhall-channel",
@@ -28,6 +29,7 @@ members = [
   "services/mock-stripe",
   "services/townhall-server",
   "services/sms-simulator",
+  "services/telegram-runner",
 ]
 
 [workspace.package]

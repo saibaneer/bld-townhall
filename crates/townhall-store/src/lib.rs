@@ -4112,6 +4112,109 @@ mod phase_c {
         assert_eq!(again.intent, first.intent);
     }
 
+    /// The same confirmation delivered by TWO overlapping webhook advances — a
+    /// redelivered `payment_intent.succeeded` racing itself — must advance the
+    /// booking EXACTLY once. Under `BEGIN IMMEDIATE` the two `finalize_effect` calls
+    /// serialise: the winner records the outcome and bumps the version; the loser
+    /// loads the already-terminal effect and returns an idempotent replay (NOT an
+    /// error), writing nothing. `re_recording_the_same_outcome_writes_nothing` proves
+    /// this SEQUENTIALLY; this proves it under real concurrency — closing the exact
+    /// "a sequential test never exercises two overlapping writers" gap. The
+    /// payment.rs exactly-once claim (a redelivered webhook still invokes the
+    /// advance) leans on this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_webhook_advances_confirm_exactly_once() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        for round in 0..32 {
+            let temp = TempDir::new().expect("temp dir");
+            let repo = repo_in(&temp).await;
+            let id = BookingId::new(format!("BKG-ADVANCE-{round}"));
+            let (aggregate, effect) = in_flight(&repo, &id).await;
+            let rows_before = repo.audit_events(&id).await.expect("audit").len();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let repo = repo.clone();
+                let id = id.clone();
+                let effect = effect.clone();
+                let barrier = Arc::clone(&barrier);
+                let version = aggregate.version;
+                handles.push(tokio::spawn(async move {
+                    // Build an IDENTICAL confirmation in each racer — same version,
+                    // effect, outcome and reference: the redelivered-webhook advance.
+                    let fact = confirmed_fact(&effect);
+                    let request = finalize(
+                        &id,
+                        version,
+                        &effect,
+                        EffectStatus::Confirmed,
+                        Some(REF),
+                        booked(&id),
+                        &fact,
+                    );
+                    barrier.wait().await;
+                    repo.finalize_effect(request).await
+                }));
+            }
+
+            let mut fresh = 0;
+            let mut replays = 0;
+            for handle in handles {
+                let finalised = handle
+                    .await
+                    .expect("task should not panic")
+                    .expect("both advances succeed — the loser replays, it does not error");
+                if finalised.replayed {
+                    replays += 1;
+                } else {
+                    fresh += 1;
+                }
+            }
+            assert_eq!(fresh, 1, "round {round}: exactly one advance is fresh");
+            assert_eq!(
+                replays, 1,
+                "round {round}: the loser idempotently replays, it is not an error"
+            );
+
+            // Assert from the STORE, not the returned flags: one version bump, one
+            // audit row, one coherent Booked end state, one Confirmed effect.
+            let current = repo.load(&id).await.expect("load after race");
+            assert_eq!(
+                current.version,
+                aggregate.version + 1,
+                "round {round}: the effect advanced exactly once"
+            );
+            assert_eq!(
+                repo.audit_events(&id).await.expect("audit").len(),
+                rows_before + 1,
+                "round {round}: exactly one commit audit row"
+            );
+            assert_eq!(
+                current.state.name(),
+                "Booked",
+                "round {round}: one end state"
+            );
+            assert_eq!(
+                current.active_effect, None,
+                "round {round}: the in-flight pointer is cleared exactly once"
+            );
+            let intent = repo.load_effect(&effect).await.expect("load effect");
+            assert_eq!(
+                intent.status,
+                EffectStatus::Confirmed,
+                "round {round}: the effect outcome is recorded once"
+            );
+            assert_eq!(
+                intent.provider_reference,
+                Some(ProviderReference::Council(CouncilBookingRef::new(REF))),
+                "round {round}: coherent single outcome, one reference"
+            );
+        }
+    }
+
     /// One identity cannot have two outcomes. `Confirmed` then `Absent` is not a
     /// retry — it is two contradictory determinations, and picking one would mean
     /// either forgetting a real booking or inventing one.

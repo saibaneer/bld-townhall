@@ -373,6 +373,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_sets_no_parse_mode_so_telegram_renders_plain_text() {
+        // Accessibility at the public HTTP boundary (spec §3.1 "must not be coupled
+        // to an app", §15/§15.1 feature phones + length bounds): a reply must reach a
+        // person on a minimal client as PLAIN TEXT — the exact bytes the dispatcher
+        // composed, uninterpreted. Telegram renders plain text ONLY when no
+        // `parse_mode` is set; under MarkdownV2/HTML an unescaped `.` or `-` in a real
+        // reply like "TH-92718." makes Telegram 400 the send ("can't parse entities")
+        // or garble it — the human is left nothing legible to act on.
+        let m = mock(serde_json::json!({
+            "ok": true,
+            "result": {"message_id": 1, "chat": {"id": 9}}
+        }))
+        .await;
+        client(&m.base)
+            .send_message(
+                9,
+                "Booked. Council ref TH-92718. Reply CANCEL TH-92718 to cancel.",
+            )
+            .await
+            .expect("the mock accepts the send");
+
+        let (_path, body) = m.captured.lock().expect("lock").clone();
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert!(
+            json.get("parse_mode").is_none(),
+            "outbound must be plain text: any parse_mode makes Telegram interpret \
+             markup and reject/garble a legible reply"
+        );
+        assert_eq!(
+            json["text"], "Booked. Council ref TH-92718. Reply CANCEL TH-92718 to cancel.",
+            "the composed bytes must pass through to the person verbatim, unescaped"
+        );
+    }
+
+    #[tokio::test]
     async fn an_ok_false_response_becomes_a_named_api_error() {
         let m = mock(serde_json::json!({
             "ok": false,

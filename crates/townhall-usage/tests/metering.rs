@@ -60,6 +60,48 @@ async fn the_same_intent_meters_at_most_once() {
     );
 }
 
+/// Reservation idempotency (M13): a REDELIVERED reserve for the same intent takes
+/// the hold at most once. Every other reserve test uses a fresh intent, so a wrong
+/// impl that re-holds — or re-decrements the quota/rate counter — on a carrier
+/// retry would pass them all. This is the only witness that a retried reserve is a
+/// no-op, not a second charge against the quota (store.rs's `contains_key` guard).
+#[tokio::test]
+async fn a_redelivered_reserve_holds_at_most_once() {
+    let service = service(5, 30_000);
+    let (p, i) = (lucy(), intent("turn-1"));
+
+    service
+        .reserve(&p, &i, CH, T0)
+        .await
+        .expect("first reserve");
+    let after_first = service.balance(&p).await.expect("balance");
+    assert_eq!(
+        after_first.reserved_units, 1,
+        "one hold after the first reserve"
+    );
+    assert_eq!(
+        after_first.remaining(),
+        4,
+        "one unit held against the quota of five"
+    );
+
+    // The SAME intent again — a redelivery. Idempotent: nothing more is held.
+    service
+        .reserve(&p, &i, CH, T0 + 1)
+        .await
+        .expect("a redelivered reserve is a no-op, not an error");
+    let after_second = service.balance(&p).await.expect("balance");
+    assert_eq!(
+        after_second.reserved_units, 1,
+        "still ONE hold, not two, after the redelivery"
+    );
+    assert_eq!(
+        after_second.remaining(),
+        4,
+        "the quota was not decremented a second time"
+    );
+}
+
 /// The gate's second clause: an exhausted quota is refused BEFORE a metered step,
 /// with a typed denial — and it does not partially charge.
 #[tokio::test]

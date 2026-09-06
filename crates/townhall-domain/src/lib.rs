@@ -5051,6 +5051,47 @@ mod characterization {
         );
     }
 
+    /// The fee ceiling is a `>` boundary, not `>=` — a fee EXACTLY at the
+    /// effective ceiling (min of the requirement's 5,000p and the authority's
+    /// 5,000p) must be ALLOWED, and one penny over must be refused. An off-by-one
+    /// to `>=` would refuse a booking the caller can exactly afford, silently;
+    /// this brackets the edge so that regression is caught.
+    #[tokio::test]
+    async fn a_fee_exactly_at_the_ceiling_is_allowed_and_one_penny_over_is_not() {
+        let at_ceiling = verify_fact(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &authority(),
+            VenueFacts {
+                fee: Money::from_pence(5_000),
+                ..good_facts()
+            },
+        )
+        .await;
+        assert!(
+            matches!(at_ceiling, FactResolution::Ready(_)),
+            "a fee exactly at the ceiling must be allowed, got {at_ceiling:?}"
+        );
+
+        let one_over = verify_fact(
+            venue_selected(),
+            BookingProposal::VerifySlot,
+            &authority(),
+            VenueFacts {
+                fee: Money::from_pence(5_001),
+                ..good_facts()
+            },
+        )
+        .await;
+        assert_eq!(
+            one_over,
+            FactResolution::Denied(BookingError::FeeExceeded {
+                ceiling: FeeCeiling::Authority,
+            }),
+            "one penny over the ceiling must be refused"
+        );
+    }
+
     /// WHICH ceiling refused is derived, never guessed (ADR-021): the
     /// authority's when the delegated maximum is exceeded (even when both
     /// are), the requirement's when only the booking's own budget is.

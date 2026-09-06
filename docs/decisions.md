@@ -3634,3 +3634,64 @@ property of the BLD boundary.
 |---|---|---|
 | M12's real messaging channel is **Telegram** (a `telegram-client` crate: `send_message` + long-poll `get_updates`), not an SMS provider | §M12 ("one real SMS provider") / §21 | Owner-directed. Real SMS to a UK phone is gated behind an unbounded telecom-compliance chain (templates → KYC → UK regulatory bundle → US-can't-reach-UK), each with review delays and none a boundary property. Telegram is a free, compliance-free real two-way channel; the boundary is channel-agnostic, so it proves the same thing. `twilio-client` is retained for SMS/WhatsApp. |
 | Telegram inbound is **long-polling** (`getUpdates`), so M12 increments 2–3 need **no webhook, tunnel, or signature verification** | §M12 "webhook/… adapter, verification where supported" | The bot pulls rather than being pushed to, so there is no push endpoint to expose or authenticate — a strictly simpler inbound path than a signed SMS webhook. |
+
+## ADR-034 — M13's forged-evidence decision: transport `verified`/`signature` are recorded, not enforced
+
+§M13 requires evidence-forgery tests and §2 promises "forged evidence … cannot
+bypass deterministic boundaries." An M13 adversarial audit asked the sharpest
+version of that question against the inbound-evidence path: an
+`InboundEvidenceRecord` carries transport-supplied `verified` / `signature`
+fields; they are **written** to the evidence row (`townhall-authority` store) but
+**never read as a gate** — a deposit whose `verified` is `false` answers a
+challenge exactly as one whose `verified` is `true`. The decision recorded here:
+**this is correct, and it is documented as a known limitation of the SMS-reply
+assurance level — not enforced.**
+
+- **The spec already grades this exactly.** §3.2 Trust boundary rates *"SMS
+  provider metadata"* as **"Transport evidence; useful but not high-assurance
+  identity by itself"**, may-mutate-authoritative-state = **No**. The `verified` /
+  `signature` fields *are* that provider metadata. Gating a transition on
+  `verified == true` would **promote transport metadata to an authority signal** —
+  the precise thing §3.2 forbids and §2 warns against ("The communication channel
+  does not create authority"). Enforcing the flag would be *more* wrong, not safer.
+
+- **The real gate is provenance, not the flag** — exactly as §14 requires
+  ("Evidence is valid because of provenance, not shape … field-perfect model
+  forgeries must fail"). Two deterministic checks, neither of which the transport
+  can forge, stand in front of every consequential transition:
+  1. **Binding resolution.** `deposit_evidence` / `deposit_control_evidence` refuse
+     any sender that does not resolve to a *live channel binding*
+     (`ApprovalDenied::WrongChannel`). An unbound number lands no evidence row at
+     all — a forged `verified: true` on an unbound sender is refused before it is
+     stored.
+  2. **The one-time code.** Answering a challenge requires the code that was sent
+     **to the bound holder's own device**, attempt-limited
+     (`ApprovalError::WrongCode { attempts_left }`). An attacker who does not hold
+     the device cannot produce it, whatever the transport claims about `verified`.
+
+  So a `verified: false` deposit bypasses nothing: it must already be on a bound
+  channel *and* still produce a code it does not have. The flag is decoration on a
+  door that is locked by the binding and the code.
+
+- **Why not enforce it anyway (belt-and-suspenders)?** Because it would encode a
+  false assurance. The M7B/M7C relay cannot *cryptographically* bind an inbound SMS
+  sender — that is the definition of `AssuranceLevel::SmsReply`. Making
+  `verified == true` a hard gate would let a lying provider (or a future
+  higher-assurance channel that fills the field differently) silently change the
+  security model, and would invite readers to trust a field that carries no
+  cryptographic weight. The honest posture is: record it as audit metadata, gate on
+  provenance, and **say so in the open** (see `docs/known-limitations.md`, M13
+  stream D).
+
+- **What this is not.** It is not a gap in forged-*identity* defence, which the
+  audit found strongly covered: a forged `claimed_sender` is defeated by binding
+  resolution; a forged approval is defeated by the code; a field-perfect forged
+  *payment* evidence is defeated by provenance binding + dedupe (§14, M10). This
+  decision is scoped strictly to the transport `verified` / `signature` fields on
+  inbound challenge/control evidence.
+
+### The amendment trail
+
+| Clarified (not deviated) | Where | By |
+|---|---|---|
+| Transport `verified` / `signature` on inbound evidence are recorded as audit metadata and **not** enforced as a transition gate; provenance (live binding + one-time code) is the gate | §3.2 (SMS provider metadata = "not high-assurance identity by itself", may-mutate = No), §14 ("valid because of provenance, not shape"), §M13 (forged-evidence) | Owner-directed (M13 stream A). Confirms the spec's existing stance rather than changing it; enforcing the flag would contradict §3.2 by promoting transport metadata to an authority signal. Documented as a known limitation of `AssuranceLevel::SmsReply` in `docs/known-limitations.md`. |

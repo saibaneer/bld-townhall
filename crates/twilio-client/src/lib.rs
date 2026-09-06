@@ -6,7 +6,7 @@
 //! canonical outbound reply to Twilio and returns the provider's raw observation
 //! (the message SID and queue status). It asserts nothing about identity — that
 //! authority stays in the channel/domain layers — and it holds the one secret
-//! (the Auth Token) behind a type whose `Debug` never reveals it.
+//! (an Auth Token or API Key Secret) behind a type whose `Debug` never reveals it.
 //!
 //! Two operations, both Twilio's protocol, not ours:
 //! - [`TwilioClient::send_sms`] — a basic-auth `POST` to `Messages.json`.
@@ -24,20 +24,18 @@ use serde::Deserialize;
 use sha1::Sha1;
 use thiserror::Error;
 
-/// A Twilio Auth Token whose `Debug` never reveals the secret.
-///
-/// It does double duty: it authenticates our outbound sends AND it is the key
-/// Twilio signs inbound webhooks with — so the SAME secret verifies inbound.
+/// A Twilio API secret whose `Debug` never reveals it — either an Account **Auth
+/// Token** or an **API Key Secret**, depending on which credential is configured.
 #[derive(Clone)]
-pub struct TwilioAuthToken(String);
+pub struct TwilioSecret(String);
 
-impl TwilioAuthToken {
+impl TwilioSecret {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
-    /// The raw token, for the one place it must cross a boundary: HTTP basic auth
+    /// The raw secret, for the one place it must cross a boundary: HTTP basic auth
     /// and signature verification. Named to make its use conspicuous at call
     /// sites, the way `stripe-client` guards its secret key.
     #[must_use]
@@ -46,19 +44,29 @@ impl TwilioAuthToken {
     }
 }
 
-impl fmt::Debug for TwilioAuthToken {
+impl fmt::Debug for TwilioSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TwilioAuthToken(****)")
+        f.write_str("TwilioSecret(****)")
     }
 }
 
 /// Everything the adapter needs told to it, never assumed.
+///
+/// Twilio supports two credential shapes, and they differ in a way that matters:
+/// the resource URL always carries the **Account SID** (`AC…`), while the
+/// basic-auth username is either that same Account SID (Auth-Token auth) OR a
+/// separate **API Key SID** (`SK…`, the recommended, revocable credential). So
+/// the path SID and the auth username are two distinct fields — conflating them
+/// is exactly what makes an API Key return `401` "no requested permission".
 #[derive(Clone, Debug)]
 pub struct TwilioConfig {
-    /// The Account SID (`AC…`) — an identifier that appears in the API URL.
+    /// The Account SID (`AC…`) — the resource owner, in the API URL path.
     pub account_sid: String,
-    /// The Auth Token — secret; authenticates sends and verifies webhooks.
-    pub auth_token: TwilioAuthToken,
+    /// The basic-auth username: the API Key SID (`SK…`) or, in Auth-Token auth,
+    /// the Account SID again.
+    pub auth_sid: String,
+    /// The basic-auth password: the API Key Secret or the Account Auth Token.
+    pub auth_secret: TwilioSecret,
     /// The SMS-capable number we send FROM, in E.164 (e.g. `+447723317807`).
     pub from_number: String,
 }
@@ -67,21 +75,31 @@ impl TwilioConfig {
     /// Read the config from a getter (usually `|n| std::env::var(n).ok()`), so a
     /// test can supply values without touching the process environment.
     ///
-    /// The env names match the running `.env`: `TWILIO_SID`,
-    /// `TWILIO_CLIENT_SECRET` (the Auth Token) and `TWILIO_FROM_NUMBER`. An empty
-    /// value is treated as unset — a blank secret must never silently "work".
+    /// Env names match the running `.env`: `TWILIO_SID` (the basic-auth username —
+    /// an `SK…` API Key SID or an `AC…` Account SID), `TWILIO_CLIENT_SECRET` (its
+    /// secret) and `TWILIO_FROM_NUMBER`. The URL-path Account SID comes from
+    /// `TWILIO_ACCOUNT_SID` when set, else falls back to `TWILIO_SID` (the
+    /// Auth-Token case, where the two coincide). An empty value is treated as
+    /// unset — a blank secret must never silently "work".
     ///
     /// # Errors
-    /// [`TwilioError::Config`] naming the first variable that is unset or empty.
+    /// [`TwilioError::Config`] naming a missing variable, or
+    /// [`TwilioError::AccountSid`] when the path SID is not an `AC…` Account SID
+    /// (the tell-tale of an API Key SID left in `TWILIO_SID` with no
+    /// `TWILIO_ACCOUNT_SID` to accompany it).
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, TwilioError> {
-        let read = |name: &'static str| -> Result<String, TwilioError> {
-            get(name)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or(TwilioError::Config(name))
-        };
+        let present = |name: &str| get(name).filter(|value| !value.trim().is_empty());
+        let read = |name: &'static str| present(name).ok_or(TwilioError::Config(name));
+
+        let auth_sid = read("TWILIO_SID")?;
+        let account_sid = present("TWILIO_ACCOUNT_SID").unwrap_or_else(|| auth_sid.clone());
+        if !account_sid.starts_with("AC") {
+            return Err(TwilioError::AccountSid);
+        }
         Ok(Self {
-            account_sid: read("TWILIO_SID")?,
-            auth_token: TwilioAuthToken::new(read("TWILIO_CLIENT_SECRET")?),
+            account_sid,
+            auth_sid,
+            auth_secret: TwilioSecret::new(read("TWILIO_CLIENT_SECRET")?),
             from_number: read("TWILIO_FROM_NUMBER")?,
         })
     }
@@ -102,6 +120,12 @@ pub enum TwilioError {
     /// A required config value is unset or empty.
     #[error("{0} is unset")]
     Config(&'static str),
+    /// The URL-path Account SID is not an `AC…` value — usually an API Key SID
+    /// (`SK…`) left in `TWILIO_SID` without a `TWILIO_ACCOUNT_SID` beside it.
+    #[error(
+        "TWILIO_ACCOUNT_SID must be the AC… Account SID (TWILIO_SID looks like an API Key SID)"
+    )]
+    AccountSid,
     /// The HTTP call itself failed (DNS, TLS, connection).
     #[error("twilio transport error: {0}")]
     Transport(String),
@@ -154,8 +178,8 @@ impl TwilioClient {
             .http
             .post(&url)
             .basic_auth(
-                &self.config.account_sid,
-                Some(self.config.auth_token.expose_secret()),
+                &self.config.auth_sid,
+                Some(self.config.auth_secret.expose_secret()),
             )
             .form(&[
                 ("To", to),
@@ -305,42 +329,73 @@ mod tests {
         ));
     }
 
+    fn from(env: &[(&str, &str)]) -> Result<TwilioConfig, TwilioError> {
+        let map: BTreeMap<&str, &str> = env.iter().copied().collect();
+        TwilioConfig::from_env(|name| map.get(name).map(|v| (*v).to_owned()))
+    }
+
     #[test]
-    fn config_reads_the_env_names_the_dotenv_uses() {
-        let env: BTreeMap<&str, &str> = [
-            ("TWILIO_SID", "AC123"),
-            ("TWILIO_CLIENT_SECRET", "shh"),
+    fn api_key_auth_keeps_the_account_sid_and_the_key_sid_apart() {
+        // The recommended shape: an SK… key SID authenticates, but the AC… Account
+        // SID owns the resource path. Conflating them is the 401 we hit for real.
+        let config = from(&[
+            ("TWILIO_SID", "SK999"),
+            ("TWILIO_CLIENT_SECRET", "key-secret"),
+            ("TWILIO_ACCOUNT_SID", "AC123"),
             ("TWILIO_FROM_NUMBER", "+447723317807"),
-        ]
-        .into_iter()
-        .collect();
-        let config = TwilioConfig::from_env(|name| env.get(name).map(|v| (*v).to_owned()))
-            .expect("all three present");
-        assert_eq!(config.account_sid, "AC123");
-        assert_eq!(config.auth_token.expose_secret(), "shh");
+        ])
+        .expect("all four present");
+        assert_eq!(config.account_sid, "AC123", "the AC… owns the URL path");
+        assert_eq!(
+            config.auth_sid, "SK999",
+            "the SK… is the basic-auth username"
+        );
+        assert_eq!(config.auth_secret.expose_secret(), "key-secret");
         assert_eq!(config.from_number, "+447723317807");
     }
 
     #[test]
+    fn auth_token_auth_lets_the_account_sid_stand_in_for_both() {
+        // The simpler shape: an AC… Account SID + Auth Token, no separate key. The
+        // path SID falls back to TWILIO_SID when TWILIO_ACCOUNT_SID is absent.
+        let config = from(&[
+            ("TWILIO_SID", "AC123"),
+            ("TWILIO_CLIENT_SECRET", "auth-token"),
+            ("TWILIO_FROM_NUMBER", "+441"),
+        ])
+        .expect("present");
+        assert_eq!(config.account_sid, "AC123");
+        assert_eq!(config.auth_sid, "AC123");
+    }
+
+    #[test]
+    fn config_refuses_an_api_key_sid_with_no_account_sid_beside_it() {
+        // Exactly the misconfiguration behind the live 401: an SK… in TWILIO_SID
+        // and no TWILIO_ACCOUNT_SID, so the path SID would not be an Account SID.
+        assert!(matches!(
+            from(&[
+                ("TWILIO_SID", "SK999"),
+                ("TWILIO_CLIENT_SECRET", "key-secret"),
+                ("TWILIO_FROM_NUMBER", "+441"),
+            ]),
+            Err(TwilioError::AccountSid)
+        ));
+    }
+
+    #[test]
     fn config_refuses_a_missing_or_blank_value_naming_it() {
-        // Missing token.
-        let env: BTreeMap<&str, &str> = [("TWILIO_SID", "AC1"), ("TWILIO_FROM_NUMBER", "+441")]
-            .into_iter()
-            .collect();
-        match TwilioConfig::from_env(|name| env.get(name).map(|v| (*v).to_owned())) {
+        // Missing secret: the error NAMES the variable.
+        match from(&[("TWILIO_SID", "AC1"), ("TWILIO_FROM_NUMBER", "+441")]) {
             Err(TwilioError::Config("TWILIO_CLIENT_SECRET")) => {}
-            other => panic!("must name the missing token: {other:?}"),
+            other => panic!("must name the missing secret: {other:?}"),
         }
         // A blank secret is treated as unset, not accepted.
-        let blank: BTreeMap<&str, &str> = [
-            ("TWILIO_SID", "AC1"),
-            ("TWILIO_CLIENT_SECRET", "   "),
-            ("TWILIO_FROM_NUMBER", "+441"),
-        ]
-        .into_iter()
-        .collect();
         assert!(matches!(
-            TwilioConfig::from_env(|name| blank.get(name).map(|v| (*v).to_owned())),
+            from(&[
+                ("TWILIO_SID", "AC1"),
+                ("TWILIO_CLIENT_SECRET", "   "),
+                ("TWILIO_FROM_NUMBER", "+441"),
+            ]),
             Err(TwilioError::Config("TWILIO_CLIENT_SECRET"))
         ));
     }
@@ -393,9 +448,12 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
 
+        // API-key shape: the AC… owns the path, the SK… authenticates — the two
+        // must NOT be conflated (the real 401 was exactly that conflation).
         let config = TwilioConfig {
             account_sid: "AC777".to_owned(),
-            auth_token: TwilioAuthToken::new("tok-secret"),
+            auth_sid: "SK999".to_owned(),
+            auth_secret: TwilioSecret::new("key-secret"),
             from_number: "+447723317807".to_owned(),
         };
         let client = TwilioClient::new(reqwest::Client::new(), config)
@@ -409,11 +467,14 @@ mod tests {
         assert_eq!(sent.status, "queued");
 
         let c = captured.lock().expect("lock");
-        assert_eq!(c.sid_in_path, "AC777", "the account SID is in the URL path");
+        assert_eq!(
+            c.sid_in_path, "AC777",
+            "the ACCOUNT SID is in the URL path, not the key SID"
+        );
         assert_eq!(
             c.authorization,
-            format!("Basic {}", BASE64.encode("AC777:tok-secret")),
-            "basic auth is SID:token"
+            format!("Basic {}", BASE64.encode("SK999:key-secret")),
+            "basic auth is the KEY SID and its secret, not the account SID"
         );
         // The three form fields, url-encoded exactly as Twilio's API expects.
         assert!(c.body.contains("To=%2B447760805996"), "To: {}", c.body);
@@ -426,13 +487,14 @@ mod tests {
     }
 
     #[test]
-    fn the_auth_token_never_prints_itself() {
-        let token = TwilioAuthToken::new("super-secret-value");
-        assert_eq!(format!("{token:?}"), "TwilioAuthToken(****)");
+    fn the_secret_never_prints_itself() {
+        let secret = TwilioSecret::new("super-secret-value");
+        assert_eq!(format!("{secret:?}"), "TwilioSecret(****)");
         // And the whole config's Debug carries no secret.
         let config = TwilioConfig {
             account_sid: "AC1".to_owned(),
-            auth_token: token,
+            auth_sid: "SK1".to_owned(),
+            auth_secret: secret,
             from_number: "+441".to_owned(),
         };
         assert!(!format!("{config:?}").contains("super-secret-value"));

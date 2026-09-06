@@ -3536,12 +3536,21 @@ provider. This records the choice and the decisions the code makes before the co
   exactly as the Stripe signature is — an independent reference is as decisive as a
   real provider signature for the bytes it signs.
 
-- **The Auth Token is the one secret, loaded from the environment, redacted in
-  `Debug`.** Env names match the running `.env`: `TWILIO_SID`,
-  `TWILIO_CLIENT_SECRET` (the Auth Token) and `TWILIO_FROM_NUMBER`. The token does
-  double duty — it authenticates outbound sends AND verifies inbound webhooks — so
-  there is no separate webhook secret to hold. It never appears in argv, a URL, a
-  log, or the repo.
+- **Both Twilio credential shapes are supported, and the path SID is kept
+  distinct from the auth username.** Twilio's REST URL always carries the **Account
+  SID** (`AC…`), while the basic-auth username is either that same Account SID
+  (Auth-Token auth) or a separate **API Key SID** (`SK…`, the recommended, scoped,
+  revocable credential). Conflating the two — using one field for both — makes an
+  API Key return `401` "no requested permission" (found the hard way against real
+  Twilio during increment 1). So `TwilioConfig` holds `account_sid` (the `AC…`
+  path) apart from `auth_sid` (the basic-auth username); env names match the
+  running `.env` — `TWILIO_SID` (username), `TWILIO_CLIENT_SECRET` (its secret),
+  `TWILIO_ACCOUNT_SID` (the `AC…` path, falling back to `TWILIO_SID` for Auth-Token
+  auth), `TWILIO_FROM_NUMBER`. The secret is loaded from the environment, held
+  behind a `Debug`-redacted `TwilioSecret`, and never appears in argv, a URL, a
+  log, or the repo. **Caveat:** `X-Twilio-Signature` (increment 2) is signed with
+  the **Account Auth Token specifically**, never an API Key Secret — so the inbound
+  path will require the Auth Token even when sending uses an API Key.
 
 - **The `twilio-live` lane** (opt-in feature, mirrors ADR-030's `stripe-live`)
   sends ONE real SMS through `api.twilio.com` to prove request-encoding and

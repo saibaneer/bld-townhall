@@ -1072,3 +1072,88 @@ async fn w7_a_crash_between_yes_and_booked_resumes_and_books_once() {
         "the completed booking is marked booked, off the resume list"
     );
 }
+
+/// B2 — a redelivered inbound BOOK is absorbed ABOVE the usage layer. Once the
+/// channel's in-memory replay window has expired (a restart), the SAME inbound
+/// flows into `book()` a second time, derives the SAME message-keyed booking id,
+/// and the durable `FileContinuation` UPSERTS by that id — so the on-disk store
+/// keeps exactly ONE continuation, not two. Stream A witnessed the usage-layer
+/// reservation dedupe; this witnesses the orchestrator's OWN redelivery
+/// absorption, end to end, against the real file store the server ships.
+#[tokio::test]
+async fn a_redelivered_inbound_book_leaves_one_continuation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("continuation.jsonl");
+    let continuations = Arc::new(
+        townhall_orchestrator::FileContinuation::open(path.clone())
+            .expect("open continuation store"),
+    );
+
+    let suppression: Arc<InMemorySuppression> = Arc::new(InMemorySuppression::default());
+    let channel = Arc::new(SmsSimulator::new(
+        ChannelConfig::default(),
+        Arc::clone(&suppression) as Arc<dyn SuppressionStore>,
+    ));
+    // Kept so `begins` is readable — the anti-fake guard below.
+    let approvals = Arc::new(StubApprovals::default());
+    let dispatcher = Dispatcher::new(
+        Arc::clone(&channel),
+        Arc::new(FixedDirectory(vec![("+447700900123", "lucy")])),
+        Arc::new(FixedCredentials),
+        Arc::new(UnmeteredLedger),
+        Arc::new(ScriptedProposer),
+        suppression,
+        // BOOK creates no booking (§23.1) but does READ current state to project
+        // the proposer's context, so a real (empty) council stands in.
+        Arc::new(MockFactory(Arc::new(MockCouncil::default()))),
+        Arc::clone(&approvals) as Arc<dyn townhall_orchestrator::ApprovalPort>,
+        Arc::new(StubEvidence::default()),
+        Arc::clone(&continuations) as Arc<dyn townhall_orchestrator::ContinuationStore>,
+    );
+
+    // One inbound identity, delivered twice — the carrier redelivery. The id the
+    // continuation is keyed on is derived from this identity, deterministically.
+    let expected_id = InboundIdentity::new("sim", "acct", "redeliver-1").booking_id();
+    let book = || RawInbound {
+        identity: InboundIdentity::new("sim", "acct", "redeliver-1"),
+        channel: ChannelKind::SmsSimulator,
+        from: "+447700900123".to_owned(),
+        body: "BOOK date=2026-09-10 from=14:00 to=17:00 people=20 accessible=yes max=5000"
+            .to_owned(),
+        received_at_ms: 0,
+        evidence: TransportEvidence::new("sim", "+447700900123", true),
+    };
+
+    dispatcher.handle(book()).await.expect("first BOOK handled");
+    // The restart the code names: the in-memory replay window empties, so the
+    // redelivery is NOT swallowed by the channel and genuinely re-enters book().
+    channel.advance_ms(ChannelConfig::default().replay_window_ms + 1);
+    dispatcher
+        .handle(book())
+        .await
+        .expect("redelivered BOOK handled");
+
+    // Anti-fake guard: BOTH BOOKs actually reached book(). Without this, a channel
+    // window that swallowed the second delivery would leave one row on disk and the
+    // `== 1` assertion below would pass even with the upsert deleted.
+    assert_eq!(
+        approvals.begins.load(Ordering::SeqCst),
+        2,
+        "both BOOKs reached book(); the replay window did not swallow the redelivery"
+    );
+
+    // The authoritative witness: the real on-disk continuation file (re-read with
+    // the same parse `FileContinuation::open` uses) holds exactly ONE row for the
+    // message-derived booking id.
+    let rows = std::fs::read_to_string(&path)
+        .expect("read the continuation file")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Continuation>(line).ok())
+        .filter(|c| c.booking_id.as_str() == expected_id.as_str())
+        .count();
+    assert_eq!(
+        rows, 1,
+        "a redelivered BOOK collapses to one continuation on disk, not two"
+    );
+}

@@ -86,6 +86,10 @@ split-debuginfo = "packed"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `kani` is set by the Kani model checker (cargo kani), not by Cargo, so declare
+# it as a known cfg — the kernel's `#[cfg(kani)]` proof harnesses would otherwise
+# trip `unexpected_cfgs` under `-D warnings`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

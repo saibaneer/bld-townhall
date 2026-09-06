@@ -36,6 +36,11 @@
 use async_trait::async_trait;
 use bld_types::{BoundedString as BoundedDetail, EffectAttempt};
 
+/// Kani formal-verification proof harnesses (a PoC). Compiled only under
+/// `cfg(kani)`; invisible to a normal build, clippy, or `cargo test`.
+#[cfg(kani)]
+mod verification;
+
 /// What a whole turn through the boundary amounted to.
 ///
 /// [`Resolution`] and [`FactResolution`] are what a *door* answers, before

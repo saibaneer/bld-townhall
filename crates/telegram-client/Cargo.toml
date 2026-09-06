@@ -1,0 +1,31 @@
+[package]
+name = "telegram-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# reqwest 0.13 names its rustls-backed TLS feature `rustls` (ADR-030). `json`
+# encodes the sendMessage body and decodes every Bot API response.
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+# The isolated live lane (M12, ADR-032/-033), mirroring twilio-client's
+# `twilio-live`: opt-in, never part of a normal `cargo test`. It sends ONE real
+# message through api.telegram.org to whichever chat has messaged the bot — the
+# one thing no hermetic test can prove. Needs TELEGRAM_BOT_TOKEN and a user who
+# has sent the bot `/start`, plus network.
+telegram-live = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# A oneshot in-process mock of the Bot API, so request ENCODING (the token in the
+# path, the JSON body) and response PARSING are proven hermetically — no network.
+axum = { workspace = true }
+
+[lints]
+workspace = true

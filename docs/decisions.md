@@ -3589,3 +3589,48 @@ provider. This records the choice and the decisions the code makes before the co
 | **HMAC-SHA1** is used for `X-Twilio-Signature` verification | §M12 "verification where supported" | Twilio's fixed algorithm — a compatibility requirement, not a security choice. It authenticates an inbound webhook against the account's own Auth Token only; locked against an independent OpenSSL vector, as the Stripe HMAC is. |
 | A `twilio-live` opt-in lane sends one real SMS; recipient read from `TWILIO_TEST_TO` | §M12 acceptance / ADR-030 precedent | Proves real request/response encoding the mock cannot; fail-loud on missing config; keeps personal numbers out of the repo. |
 | **WhatsApp** is added as a second channel of the same adapter (`send_whatsapp`, `whatsapp:` addressing, `TWILIO_WHATSAPP_FROM`) beside SMS | §M12 ("one real SMS provider") | Twilio's SMS path to a UK phone is blocked by a chain of telecom gates (trial templates, KYC, UK regulatory bundle, US→UK routing); the WhatsApp Sandbox reaches the phone with no number/bundle over the same endpoint + signature scheme, so the conversational demo is achievable. Owner-directed. |
+
+## ADR-033 — M12's real channel is Telegram (the SMS providers' telecom wall)
+
+The spec (§M12) names "one real SMS provider". Reaching a real UK phone over
+Twilio SMS/WhatsApp proved to require an unbounded chain of telecom compliance —
+proven live, each gate cleared only to reveal the next: trial message-template
+restriction (572006) → Trust Hub KYC approval (20003) → a UK **regulatory bundle**
+for any UK mobile number → and US numbers that cannot route SMS to the UK at all
+(21612). Each is real telephony bureaucracy with its own review delay; none is a
+property of the BLD boundary.
+
+- **The real channel is Telegram** — a `telegram-client` crate, trusted transport
+  behind the same `HumanChannel` seam, in the exact shape of `twilio-client`. A bot
+  token from `@BotFather` (no number, no KYC, no bundle, free) authenticates by
+  sitting in the request path; `send_message` is the outbound leg and `get_updates`
+  (**long-polling**) is the inbound leg.
+
+- **Long-polling removes the webhook/tunnel entirely.** Where SMS/WhatsApp inbound
+  needs a public endpoint and an `X-Twilio-Signature` check, the Telegram bot
+  *pulls* its updates — so M12's increments 2 and 3 (inbound + the acceptance gate)
+  need no ngrok, no webhook route, and no signature verification. Simpler, and with
+  fewer moving parts to get wrong.
+
+- **This is a channel substitution, not a boundary change** (the same reasoning as
+  ADR-031's model-hosting relaxation). The property §M12 protects is "a real
+  two-way human channel drives the conversational boundary flow to a real device";
+  "SMS" specifically was demo convenience, and one gated behind telephony
+  compliance that is out of scope for a POC. The boundary is channel-agnostic;
+  Telegram text is provider transport-evidence exactly as SMS is. `twilio-client`
+  stays as a proven SMS/WhatsApp adapter for whenever that compliance is cleared —
+  nothing is discarded.
+
+- **The bot token is the one secret**, held behind a `Debug`-redacted
+  `TelegramBotToken`, read from `TELEGRAM_BOT_TOKEN`, never committed. Because the
+  token rides in the URL path, transport errors are stripped of their URL
+  (`reqwest::Error::without_url`) so it cannot leak into a log. A `telegram-live`
+  opt-in lane (mirroring `twilio-live`) sends one real message to the chat that has
+  messaged the bot — fail-loud on a missing token or an un-started bot.
+
+### The amendment trail
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| M12's real messaging channel is **Telegram** (a `telegram-client` crate: `send_message` + long-poll `get_updates`), not an SMS provider | §M12 ("one real SMS provider") / §21 | Owner-directed. Real SMS to a UK phone is gated behind an unbounded telecom-compliance chain (templates → KYC → UK regulatory bundle → US-can't-reach-UK), each with review delays and none a boundary property. Telegram is a free, compliance-free real two-way channel; the boundary is channel-agnostic, so it proves the same thing. `twilio-client` is retained for SMS/WhatsApp. |
+| Telegram inbound is **long-polling** (`getUpdates`), so M12 increments 2–3 need **no webhook, tunnel, or signature verification** | §M12 "webhook/… adapter, verification where supported" | The bot pulls rather than being pushed to, so there is no push endpoint to expose or authenticate — a strictly simpler inbound path than a signed SMS webhook. |

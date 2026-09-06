@@ -16,6 +16,7 @@ members = [
   "crates/stripe-client",
   "crates/twilio-client",
   "crates/telegram-client",
+  "crates/townhall-telegram-channel",
   "crates/townhall-effects-router",
   "crates/townhall-usage",
   "crates/townhall-channel",

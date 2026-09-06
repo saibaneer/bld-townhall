@@ -2773,6 +2773,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "townhall-telegram-channel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "telegram-client",
+ "tokio",
+ "townhall-channel",
+]
+
+[[package]]
 name = "townhall-testkit"
 version = "0.1.0"
 dependencies = [

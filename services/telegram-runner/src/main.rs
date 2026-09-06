@@ -161,11 +161,18 @@ async fn main() -> ExitCode {
 /// not read as a booking), then feed each new inbound message to the dispatcher
 /// and deliver the convergence follow-ups it owes. Never returns.
 async fn poll_forever(dispatcher: Dispatcher<TelegramChannel>, client: Arc<TelegramClient>) -> ! {
-    let mut offset = None;
-    match client.get_updates(None).await {
-        Ok(updates) => offset = updates.iter().map(|u| u.update_id + 1).max(),
-        Err(error) => eprintln!("telegram-runner: initial get_updates: {error}"),
-    }
+    // Drain the pre-launch backlog, RETRYING until it succeeds: a failed drain
+    // would leave the offset unset and reprocess the person's earlier messages out
+    // of context (a transient TLS blip on the first request must not do that).
+    let mut offset = loop {
+        match client.get_updates(None).await {
+            Ok(updates) => break updates.iter().map(|u| u.update_id + 1).max(),
+            Err(error) => {
+                eprintln!("telegram-runner: initial get_updates (retrying): {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
     loop {
         match client.get_updates(offset).await {
             Ok(updates) => {

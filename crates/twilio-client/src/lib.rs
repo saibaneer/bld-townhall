@@ -68,7 +68,13 @@ pub struct TwilioConfig {
     /// The basic-auth password: the API Key Secret or the Account Auth Token.
     pub auth_secret: TwilioSecret,
     /// The SMS-capable number we send FROM, in E.164 (e.g. `+447723317807`).
-    pub from_number: String,
+    /// `None` when this deployment only sends WhatsApp.
+    pub from_number: Option<String>,
+    /// The WhatsApp-enabled sender in E.164 (e.g. the Sandbox `+14155238886`),
+    /// carried on the wire as `whatsapp:<number>`. `None` when only sending SMS.
+    /// WhatsApp sidesteps SMS's per-country number/regulatory routing, so it is
+    /// the reachable channel when an SMS number for the destination isn't.
+    pub whatsapp_from: Option<String>,
 }
 
 impl TwilioConfig {
@@ -76,11 +82,13 @@ impl TwilioConfig {
     /// test can supply values without touching the process environment.
     ///
     /// Env names match the running `.env`: `TWILIO_SID` (the basic-auth username —
-    /// an `SK…` API Key SID or an `AC…` Account SID), `TWILIO_CLIENT_SECRET` (its
-    /// secret) and `TWILIO_FROM_NUMBER`. The URL-path Account SID comes from
+    /// an `SK…` API Key SID or an `AC…` Account SID) and `TWILIO_CLIENT_SECRET`
+    /// (its secret) are required; the URL-path Account SID comes from
     /// `TWILIO_ACCOUNT_SID` when set, else falls back to `TWILIO_SID` (the
-    /// Auth-Token case, where the two coincide). An empty value is treated as
-    /// unset — a blank secret must never silently "work".
+    /// Auth-Token case, where the two coincide). The two SENDERS are optional —
+    /// `TWILIO_FROM_NUMBER` (SMS) and `TWILIO_WHATSAPP_FROM` (WhatsApp) — a
+    /// deployment configures whichever channel(s) it uses. An empty value is
+    /// treated as unset — a blank secret must never silently "work".
     ///
     /// # Errors
     /// [`TwilioError::Config`] naming a missing variable, or
@@ -100,7 +108,8 @@ impl TwilioConfig {
             account_sid,
             auth_sid,
             auth_secret: TwilioSecret::new(read("TWILIO_CLIENT_SECRET")?),
-            from_number: read("TWILIO_FROM_NUMBER")?,
+            from_number: present("TWILIO_FROM_NUMBER"),
+            whatsapp_from: present("TWILIO_WHATSAPP_FROM"),
         })
     }
 }
@@ -161,15 +170,49 @@ impl TwilioClient {
         self
     }
 
-    /// Send one SMS: a basic-auth `POST` to `Messages.json`, form-encoded exactly
-    /// as Twilio's REST API expects. Returns the provider's raw observation.
+    /// Send one SMS from the configured [`TwilioConfig::from_number`].
     ///
-    /// A non-2xx is an [`TwilioError::Api`], not a panic — Twilio's error body
-    /// (e.g. an unverified trial recipient) is information the caller must see.
+    /// # Errors
+    /// [`TwilioError::Config`] if no `from_number` is configured, plus the
+    /// transport/API errors of [`Self::send`].
+    pub async fn send_sms(&self, to: &str, body: &str) -> Result<SentMessage, TwilioError> {
+        let from = self
+            .config
+            .from_number
+            .as_deref()
+            .ok_or(TwilioError::Config("TWILIO_FROM_NUMBER"))?;
+        self.send(from, to, body).await
+    }
+
+    /// Send one WhatsApp message from the configured [`TwilioConfig::whatsapp_from`]
+    /// to `to` (an E.164 number). Both addresses go on the wire with the
+    /// `whatsapp:` prefix Twilio's Programmable Messaging API expects; everything
+    /// else — endpoint, basic auth, response shape — is identical to SMS.
+    ///
+    /// # Errors
+    /// [`TwilioError::Config`] if no `whatsapp_from` is configured, plus the
+    /// transport/API errors of [`Self::send`].
+    pub async fn send_whatsapp(&self, to: &str, body: &str) -> Result<SentMessage, TwilioError> {
+        let from = self
+            .config
+            .whatsapp_from
+            .as_deref()
+            .ok_or(TwilioError::Config("TWILIO_WHATSAPP_FROM"))?;
+        self.send(&format!("whatsapp:{from}"), &format!("whatsapp:{to}"), body)
+            .await
+    }
+
+    /// The shared send: a basic-auth `POST` to `Messages.json`, form-encoded
+    /// exactly as Twilio's REST API expects, returning the provider's raw
+    /// observation. `from`/`to` are already fully qualified (a bare E.164 for SMS,
+    /// a `whatsapp:`-prefixed address for WhatsApp).
+    ///
+    /// A non-2xx is a [`TwilioError::Api`], not a panic — Twilio's error body
+    /// (an unverified recipient, a blocked route) is information the caller needs.
     ///
     /// # Errors
     /// [`TwilioError::Transport`], [`TwilioError::Api`], [`TwilioError::BadResponse`].
-    pub async fn send_sms(&self, to: &str, body: &str) -> Result<SentMessage, TwilioError> {
+    pub async fn send(&self, from: &str, to: &str, body: &str) -> Result<SentMessage, TwilioError> {
         let url = format!(
             "{}/2010-04-01/Accounts/{}/Messages.json",
             self.base_url, self.config.account_sid
@@ -181,11 +224,7 @@ impl TwilioClient {
                 &self.config.auth_sid,
                 Some(self.config.auth_secret.expose_secret()),
             )
-            .form(&[
-                ("To", to),
-                ("From", self.config.from_number.as_str()),
-                ("Body", body),
-            ])
+            .form(&[("To", to), ("From", from), ("Body", body)])
             .send()
             .await
             .map_err(|error| TwilioError::Transport(error.to_string()))?;
@@ -351,7 +390,22 @@ mod tests {
             "the SK… is the basic-auth username"
         );
         assert_eq!(config.auth_secret.expose_secret(), "key-secret");
-        assert_eq!(config.from_number, "+447723317807");
+        assert_eq!(config.from_number.as_deref(), Some("+447723317807"));
+        assert_eq!(config.whatsapp_from, None, "no WhatsApp sender configured");
+    }
+
+    #[test]
+    fn both_senders_are_optional_and_independently_read() {
+        // WhatsApp-only: no SMS number, a WhatsApp sender. Neither is required by
+        // from_env; a deployment configures whichever channel(s) it uses.
+        let config = from(&[
+            ("TWILIO_SID", "AC1"),
+            ("TWILIO_CLIENT_SECRET", "s"),
+            ("TWILIO_WHATSAPP_FROM", "+14155238886"),
+        ])
+        .expect("credentials alone are enough");
+        assert_eq!(config.from_number, None, "no SMS sender configured");
+        assert_eq!(config.whatsapp_from.as_deref(), Some("+14155238886"));
     }
 
     #[test]
@@ -400,8 +454,17 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn send_sms_encodes_the_request_twilio_expects() {
+    // What the client actually put on the wire, captured by an in-process mock.
+    #[derive(Default)]
+    struct Captured {
+        sid_in_path: String,
+        authorization: String,
+        body: String,
+    }
+
+    /// Spawn a oneshot mock of `Messages.json` that records the request and
+    /// answers a fixed Message resource; returns its base URL and the capture.
+    async fn capture_mock() -> (String, std::sync::Arc<std::sync::Mutex<Captured>>) {
         use std::sync::{Arc, Mutex};
 
         use axum::extract::{Path, State};
@@ -409,15 +472,7 @@ mod tests {
         use axum::routing::post;
         use axum::{Json, Router};
 
-        // The mock captures what our client actually put on the wire.
-        #[derive(Default)]
-        struct Captured {
-            sid_in_path: String,
-            authorization: String,
-            body: String,
-        }
         let captured = Arc::new(Mutex::new(Captured::default()));
-
         let app = Router::new()
             .route(
                 "/2010-04-01/Accounts/{sid}/Messages.json",
@@ -439,7 +494,6 @@ mod tests {
                 ),
             )
             .with_state(Arc::clone(&captured));
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -447,17 +501,22 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
+        (format!("http://{addr}"), captured)
+    }
 
+    #[tokio::test]
+    async fn send_sms_encodes_the_request_twilio_expects() {
+        let (base, captured) = capture_mock().await;
         // API-key shape: the AC… owns the path, the SK… authenticates — the two
         // must NOT be conflated (the real 401 was exactly that conflation).
         let config = TwilioConfig {
             account_sid: "AC777".to_owned(),
             auth_sid: "SK999".to_owned(),
             auth_secret: TwilioSecret::new("key-secret"),
-            from_number: "+447723317807".to_owned(),
+            from_number: Some("+447723317807".to_owned()),
+            whatsapp_from: None,
         };
-        let client = TwilioClient::new(reqwest::Client::new(), config)
-            .with_base_url(format!("http://{addr}"));
+        let client = TwilioClient::new(reqwest::Client::new(), config).with_base_url(base);
 
         let sent = client
             .send_sms("+447760805996", "hello from the boundary")
@@ -476,7 +535,6 @@ mod tests {
             format!("Basic {}", BASE64.encode("SK999:key-secret")),
             "basic auth is the KEY SID and its secret, not the account SID"
         );
-        // The three form fields, url-encoded exactly as Twilio's API expects.
         assert!(c.body.contains("To=%2B447760805996"), "To: {}", c.body);
         assert!(c.body.contains("From=%2B447723317807"), "From: {}", c.body);
         assert!(
@@ -484,6 +542,58 @@ mod tests {
             "Body: {}",
             c.body
         );
+    }
+
+    #[tokio::test]
+    async fn send_whatsapp_prefixes_both_addresses() {
+        let (base, captured) = capture_mock().await;
+        let config = TwilioConfig {
+            account_sid: "AC777".to_owned(),
+            auth_sid: "AC777".to_owned(),
+            auth_secret: TwilioSecret::new("tok"),
+            from_number: None,
+            whatsapp_from: Some("+14155238886".to_owned()),
+        };
+        let client = TwilioClient::new(reqwest::Client::new(), config).with_base_url(base);
+
+        let sent = client
+            .send_whatsapp("+447760805996", "hi over whatsapp")
+            .await
+            .expect("the mock accepts the send");
+        assert_eq!(sent.sid, "SM_MOCK_1");
+
+        let c = captured.lock().expect("lock");
+        // Both endpoints carry the `whatsapp:` prefix (url-encoded `whatsapp%3A`),
+        // over the SAME Messages.json endpoint and basic auth as SMS.
+        assert!(
+            c.body.contains("From=whatsapp%3A%2B14155238886"),
+            "From: {}",
+            c.body
+        );
+        assert!(
+            c.body.contains("To=whatsapp%3A%2B447760805996"),
+            "To: {}",
+            c.body
+        );
+        assert!(c.body.contains("Body=hi+over+whatsapp"), "Body: {}", c.body);
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_sender_is_a_named_config_error() {
+        // WhatsApp configured, SMS not: send_sms names the missing SMS sender
+        // rather than sending a malformed request.
+        let config = TwilioConfig {
+            account_sid: "AC1".to_owned(),
+            auth_sid: "AC1".to_owned(),
+            auth_secret: TwilioSecret::new("t"),
+            from_number: None,
+            whatsapp_from: Some("+14155238886".to_owned()),
+        };
+        let client = TwilioClient::new(reqwest::Client::new(), config);
+        assert!(matches!(
+            client.send_sms("+441", "x").await,
+            Err(TwilioError::Config("TWILIO_FROM_NUMBER"))
+        ));
     }
 
     #[test]
@@ -495,7 +605,8 @@ mod tests {
             account_sid: "AC1".to_owned(),
             auth_sid: "SK1".to_owned(),
             auth_secret: secret,
-            from_number: "+441".to_owned(),
+            from_number: Some("+441".to_owned()),
+            whatsapp_from: None,
         };
         assert!(!format!("{config:?}").contains("super-secret-value"));
     }

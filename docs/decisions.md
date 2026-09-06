@@ -3568,6 +3568,19 @@ provider. This records the choice and the decisions the code makes before the co
   gate — a real phone completes the happy path and a replayed provider retry does
   not duplicate work.
 
+- **WhatsApp is a channel of the SAME adapter, and the reachable one in practice.**
+  Getting real SMS to a UK phone runs a gauntlet of Twilio telecom gates — trial
+  message-template restrictions, Trust Hub KYC, a UK regulatory bundle for a UK
+  number, and the fact that US numbers cannot route SMS to the UK at all. Twilio's
+  **WhatsApp Sandbox** sidesteps every one: no number purchase, no bundle, no
+  per-country routing, two-way free-form messaging to any recipient who has joined
+  the sandbox. It is the SAME `Messages.json` endpoint, basic auth, and
+  `X-Twilio-Signature` verification — only the addressing differs (`whatsapp:<E.164>`
+  on both `From` and `To`). So `send_sms` and `send_whatsapp` share one internal
+  `send`, `from_number` and `whatsapp_from` are independent optional senders, and a
+  deployment picks whichever channel actually reaches its user. The boundary is
+  unchanged — WhatsApp text is provider transport-evidence exactly as SMS is.
+
 ### The amendment trail
 
 | Added / deviated (not superseded) | Where | By |
@@ -3575,3 +3588,4 @@ provider. This records the choice and the decisions the code makes before the co
 | The real SMS provider is **Twilio**; a new **`twilio-client`** crate provides the REST send (`Messages.json`) and the `X-Twilio-Signature` verification primitive, as trusted transport behind the `HumanChannel` seam | §M12 ("one real SMS provider") / §3.2 transport-evidence | Twilio is the only credible option fully CLI-provisionable (owner sets it up from a terminal) with signed inbound webhooks; the adapter mints no fact, so the choice binds nothing. |
 | **HMAC-SHA1** is used for `X-Twilio-Signature` verification | §M12 "verification where supported" | Twilio's fixed algorithm — a compatibility requirement, not a security choice. It authenticates an inbound webhook against the account's own Auth Token only; locked against an independent OpenSSL vector, as the Stripe HMAC is. |
 | A `twilio-live` opt-in lane sends one real SMS; recipient read from `TWILIO_TEST_TO` | §M12 acceptance / ADR-030 precedent | Proves real request/response encoding the mock cannot; fail-loud on missing config; keeps personal numbers out of the repo. |
+| **WhatsApp** is added as a second channel of the same adapter (`send_whatsapp`, `whatsapp:` addressing, `TWILIO_WHATSAPP_FROM`) beside SMS | §M12 ("one real SMS provider") | Twilio's SMS path to a UK phone is blocked by a chain of telecom gates (trial templates, KYC, UK regulatory bundle, US→UK routing); the WhatsApp Sandbox reaches the phone with no number/bundle over the same endpoint + signature scheme, so the conversational demo is achievable. Owner-directed. |

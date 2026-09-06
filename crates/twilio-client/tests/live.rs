@@ -29,26 +29,31 @@ use twilio_client::{TwilioClient, TwilioConfig};
 /// lets "the live lane is green" quietly mean "the live lane never ran".
 fn client() -> TwilioClient {
     let config = TwilioConfig::from_env(|name| std::env::var(name).ok()).expect(
-        "the twilio-live lane needs TWILIO_SID, TWILIO_CLIENT_SECRET and TWILIO_FROM_NUMBER \
-         in the environment (source your .env first)",
+        "the twilio-live lane needs TWILIO_SID and TWILIO_CLIENT_SECRET, plus a sender \
+         (TWILIO_WHATSAPP_FROM for WhatsApp or TWILIO_FROM_NUMBER for SMS), in the environment \
+         (source your .env first)",
     );
     TwilioClient::new(reqwest::Client::new(), config)
 }
 
 #[tokio::test]
-async fn a_real_sms_sends_and_returns_a_message_sid() {
-    let to = std::env::var("TWILIO_TEST_TO").expect(
-        "set TWILIO_TEST_TO to your verified recipient number (a trial account can only text \
-         verified numbers)",
-    );
+async fn a_real_message_sends_and_returns_a_message_sid() {
+    let to = std::env::var("TWILIO_TEST_TO")
+        .expect("set TWILIO_TEST_TO to your verified/joined recipient number");
+    let body = "BLD boundary — M12 live adapter is up. (twilio-live lane)";
 
-    let sent = client()
-        .send_sms(
-            &to,
-            "BLD boundary — M12 live SMS adapter is up. (twilio-live lane)",
-        )
-        .await
-        .expect("a real send to a verified number succeeds");
+    // Prefer WhatsApp when a WhatsApp sender is configured: it sidesteps SMS's
+    // per-country number/regulatory routing (a US number can't SMS the UK; a UK
+    // number needs a regulatory bundle), so it is the channel that actually
+    // reaches the phone in this setup. Falls back to SMS otherwise.
+    let sent = if std::env::var("TWILIO_WHATSAPP_FROM").is_ok() {
+        eprintln!("twilio-live: channel = WhatsApp");
+        client().send_whatsapp(&to, body).await
+    } else {
+        eprintln!("twilio-live: channel = SMS");
+        client().send_sms(&to, body).await
+    }
+    .expect("a real send to a joined/verified number succeeds");
 
     eprintln!(
         "twilio-live: sent SID {} (status {})",

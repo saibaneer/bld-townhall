@@ -70,3 +70,39 @@ proves exactly the property §M12 protects. `twilio-client` is retained unchange
 whenever that compliance is cleared — nothing is discarded.
 
 **Recorded in.** ADR-032, ADR-033.
+
+---
+
+## 3. Observability is the audit trail + request-id correlation, not distributed tracing
+
+**What.** The POC carries no `tracing` / `tracing-subscriber` crate and emits no
+structured (JSON) logs or distributed spans. Its observability is three concrete,
+deliberately-scoped things:
+
+- **The `audit_events` trail** — every consequential transition is recorded with its
+  identifiers, versions, provenance (which *fact* or *proposal* drove it), outcome and
+  effect reference. This is the substantive, replayable record of what the boundary did,
+  and the reconciler keys its retries on it. It is witnessed in the store's Phase-C tests
+  (e.g. `a_confirmation_commits_state_status_and_provenance_together`).
+- **`X-Request-ID` correlation** — the HTTP `request_id` middleware echoes a caller-supplied
+  id or mints one, and always rides it back on the response, so a request and its answer
+  share one handle. This holds across the gateway hop (a caller's id survives to the server
+  and back into `Gateway::last_request_id`) and on a **refused** response, not only a
+  successful one. Witnessed by `headers_and_browse_behave`,
+  `a_refused_request_still_carries_its_request_id` (server) and
+  `a14b_request_ids_survive_the_round_trip` (gateway).
+- **Opt-in request logging** — `TOWNHALL_LOG_REQUESTS` turns on a one-line
+  `[id] method path -> status` to stderr for a demo or debugging session; a normal
+  run (tests, CI) stays silent.
+
+**Why this is sound.** The spec's observability requirement is the **audit trail**
+(§ audit_events / provenance), which is present and witnessed; request-id correlation is
+the operational handle that ties an external request to its audit rows. Distributed
+tracing (spans, a collector, cross-service trace propagation) is production operations
+infrastructure, not a property of the deterministic boundary — adding it would change no
+boundary behaviour. It can be layered in later at the composition root without touching
+the kernel or domain, exactly as the channel and model-hosting substitutions were
+(ADR-031/033).
+
+**Recorded in.** M13 stream C (owner decision: document, do not build). Spec: audit_events
+/ provenance.

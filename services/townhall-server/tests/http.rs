@@ -1654,6 +1654,36 @@ fn headers_and_browse_behave() {
     );
 }
 
+/// A REFUSED request is still correlatable. The `request_id` middleware wraps the
+/// auth gate, so even a 401 carries the caller's `X-Request-ID` back — and the
+/// failed request is the one you most want to trace, so correlation must survive
+/// refusal, not only success.
+#[test]
+fn a_refused_request_still_carries_its_request_id() {
+    let world = world();
+    let _etag = awaiting(&world, "BKG-REFUSE-REQID");
+
+    // No `authorization` header: the auth gate refuses with 401 before any lookup.
+    let reply = http()
+        .get(format!(
+            "{}/booking-intents/BKG-REFUSE-REQID",
+            world.server_url
+        ))
+        .header("x-request-id", "req-refused-9")
+        .send()
+        .expect("answer");
+
+    assert_eq!(reply.status().as_u16(), 401, "a missing bearer is refused");
+    assert_eq!(
+        reply
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-refused-9"),
+        "the request-id rides back on the refusal — a failed request stays correlatable"
+    );
+}
+
 /// GET mid-escalation (ADR-019's deliberate shape, documented and pinned):
 /// 200, the in-flight state, the SAME `ETag` as before escalation — the
 /// pursuit projection is M6's, and this test is the contract until then.

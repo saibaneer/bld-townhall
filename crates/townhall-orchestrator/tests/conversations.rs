@@ -229,7 +229,28 @@ fn talk_at(
 }
 
 impl Talk {
+    /// Send `body` from `from` and return the reply, draining any convergence
+    /// follow-ups the dispatcher owes until the outcome is terminal.
+    ///
+    /// On the synchronous path the first reply is already terminal and nothing
+    /// drains. Under load an outside-reaching turn (book, cancel) first replies
+    /// "Booking now."/"Cancelling now." and its outcome ("… Council ref …")
+    /// arrives when the queue drains — which the real scheduler does on a timer,
+    /// and which this reproduces on demand. Reading the immediate interim as if
+    /// it were the outcome is what makes these conversations flake under CI load.
+    /// Use [`Talk::say_raw`] where the interim reply itself is the subject.
     async fn say(&self, from: &str, body: &str) -> String {
+        let immediate = self.say_raw(from, body).await;
+        if is_in_flight(&immediate) {
+            return self.settled(from).await;
+        }
+        immediate
+    }
+
+    /// As [`Talk::say`], but WITHOUT draining follow-ups — the raw immediate
+    /// reply, for the tests whose subject is the async interim itself (the
+    /// STOP-gated convergence turn).
+    async fn say_raw(&self, from: &str, body: &str) -> String {
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
         let raw = RawInbound {
             identity: InboundIdentity::new("sim", "acct", format!("m-{from}-{n}")),
@@ -241,6 +262,22 @@ impl Talk {
         };
         self.dispatcher.handle(raw).await.expect("handled");
         self.last_text_to(from)
+    }
+
+    /// Drain owed convergence follow-ups until the latest reply to `from` is no
+    /// longer an in-flight "…now." interim (bounded). The drain runs the real
+    /// [`Dispatcher::run_followups`] the scheduler runs, so a suppressed (STOP)
+    /// follow-up never converges here either.
+    async fn settled(&self, from: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let reply = self.last_text_to(from);
+            if !is_in_flight(&reply) || std::time::Instant::now() >= deadline {
+                return reply;
+            }
+            self.dispatcher.run_followups().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     fn last_text_to(&self, from: &str) -> String {
@@ -282,6 +319,13 @@ impl Talk {
     fn gateway_for(&self, principal: &str) -> Gateway {
         Gateway::new(self.base.clone(), WORKLOAD, principal)
     }
+}
+
+/// The two in-flight interim replies an outside-reaching turn gives when it took
+/// the async path (202 Accepted) instead of settling in-band — the dispatcher's
+/// own words, before its convergence follow-up delivers the outcome.
+fn is_in_flight(reply: &str) -> bool {
+    reply == "Booking now." || reply == "Cancelling now."
 }
 
 /// The random code out of a preview — the digits after `Reply YES `.
@@ -492,11 +536,17 @@ async fn b7b_stop_skips_the_turn_and_start_restores_it() {
         "drop_response",
     )
     .await;
-    let reply = talk.say(LUCY_PHONE, &format!("CANCEL {first}")).await;
+    // say_raw, not say: this leg's SUBJECT is the interim reply and the gated
+    // convergence turn, so it must not auto-drain the follow-up.
+    let reply = talk.say_raw(LUCY_PHONE, &format!("CANCEL {first}")).await;
     assert_eq!(reply, "Cancelling now.");
+    // A DELTA around this drain: an async book during `book_and_approve` above
+    // may itself have converged (incrementing the counter) under load, so only
+    // the change across THIS suppressed drain is the property under test.
+    let converges_before = talk.converges.load(Ordering::SeqCst);
     talk.dispatcher.run_followups().await;
     assert_eq!(
-        talk.converges.load(Ordering::SeqCst),
+        talk.converges.load(Ordering::SeqCst) - converges_before,
         0,
         "a suppressed follow-up must not run its turn"
     );
@@ -516,11 +566,12 @@ async fn b7b_stop_skips_the_turn_and_start_restores_it() {
         "drop_response",
     )
     .await;
-    let reply = talk.say(LUCY_PHONE, &format!("CANCEL {second}")).await;
+    let reply = talk.say_raw(LUCY_PHONE, &format!("CANCEL {second}")).await;
     assert_eq!(reply, "Cancelling now.");
+    let converges_before = talk.converges.load(Ordering::SeqCst);
     talk.dispatcher.run_followups().await;
     assert_eq!(
-        talk.converges.load(Ordering::SeqCst),
+        talk.converges.load(Ordering::SeqCst) - converges_before,
         1,
         "after START the follow-up turn runs"
     );

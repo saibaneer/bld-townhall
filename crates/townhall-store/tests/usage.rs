@@ -254,6 +254,61 @@ fn rate(principal_max: i64, channel_max: i64, global_max: i64, window_ms: u64) -
     }
 }
 
+/// Reservation idempotency over real SQLite (M13): a REDELIVERED reserve for one
+/// intent holds once AND spends no second rate token. With a principal ceiling of
+/// 2 per window: reserve A, reserve A AGAIN (a carrier redelivery), then reserve a
+/// distinct B — B must still be admitted, which is only true if the duplicate A
+/// consumed no second token. A wrong impl that re-incremented the rate counter on
+/// the retry would exhaust the ceiling and refuse B. Complements the in-memory
+/// witness with the durable rate-counter path.
+#[tokio::test]
+async fn a_redelivered_reserve_over_sqlite_holds_and_spends_once() {
+    let (store, _pool, _dir) = store().await;
+    store
+        .open_account(&account(), &lucy(), 1_000_000, NOW)
+        .await
+        .expect("account");
+    let limits = rate(2, 1_000_000, 1_000_000, TTL);
+
+    let a = intent("a");
+    store
+        .reserve(&lucy(), &a, CH, 1, NOW, NOW + TTL, limits)
+        .await
+        .expect("first reserve of A");
+    // The SAME intent again — a redelivery. Idempotent: no second hold, no token.
+    store
+        .reserve(&lucy(), &a, CH, 1, NOW + 1, NOW + 1 + TTL, limits)
+        .await
+        .expect("a redelivered reserve of A is a no-op, not an error");
+    assert_eq!(
+        store
+            .load_balance(&lucy())
+            .await
+            .unwrap()
+            .expect("account")
+            .reserved_units,
+        1,
+        "one hold for A, not two, after the redelivery"
+    );
+
+    // A distinct B still fits under the 2/window ceiling — proof the duplicate A
+    // burned no second rate token.
+    store
+        .reserve(&lucy(), &intent("b"), CH, 1, NOW + 2, NOW + 2 + TTL, limits)
+        .await
+        .expect("B is still admitted; the redelivery did not double-spend the rate token");
+    assert_eq!(
+        store
+            .load_balance(&lucy())
+            .await
+            .unwrap()
+            .expect("account")
+            .reserved_units,
+        2,
+        "A and B hold; the redelivery of A added nothing"
+    );
+}
+
 /// The rate gate over real SQLite: the (N+1)th turn in a window is refused as a
 /// rate limit, and the next window recovers. The account quota is generous, so
 /// only the rate can refuse.

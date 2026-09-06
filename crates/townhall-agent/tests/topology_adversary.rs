@@ -14,7 +14,7 @@
 //! test derives its attacks from the exported topology, it stays honest if the
 //! graph ever changes.
 
-use bld_client::{BldClient, ClientError, discover};
+use bld_client::{BldClient, ClientError, Fetched, discover};
 use bld_manifest::signing_key_from_hex;
 use std::collections::{BTreeMap, BTreeSet};
 use townhall_testkit::{MANIFEST_KEY_HEX, world_discoverable};
@@ -100,6 +100,47 @@ async fn read_state(client: &BldClient, id: &str) -> String {
         .read(RESOURCE, id)
         .await
         .map_or_else(|_| "<unreadable>".to_owned(), |f| f.state)
+}
+
+/// Drive an outside-reaching behaviour and settle at a known state, tolerating
+/// the async path. `VerifySlot`/`Book` reach the council: they normally commit
+/// in-band, but under load the boundary answers 202 ("accepted; reconciliation
+/// owns it", ADR-019), whose body `BldClient::drive` cannot read as a projection.
+/// Either way, poll the projection until it reaches `want` and return that
+/// settled read — its version is what the next change must match. A genuine
+/// refusal (a real 4xx/5xx) still surfaces; only the async-accept shape is
+/// absorbed.
+async fn drive_to(
+    client: &BldClient,
+    id: &str,
+    behaviour: &str,
+    body: serde_json::Value,
+    version: Option<u64>,
+    want: &str,
+) -> Fetched {
+    match client.drive(RESOURCE, id, behaviour, body, version).await {
+        // Committed in-band, OR the 202 "accepted" shape that drive() cannot read
+        // as a projection — both mean "not refused". The poll below reads the real
+        // outcome; only a genuine refusal (a real 4xx/5xx) is a failure here.
+        Ok(_) | Err(ClientError::BadResponse(_)) => {}
+        Err(other) => panic!("{behaviour} was refused, not accepted: {other:?}"),
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let fetched = client
+            .read(RESOURCE, id)
+            .await
+            .expect("read while settling");
+        if fetched.state == want {
+            return fetched;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{id} never reached {want} after {behaviour} (stuck at {})",
+            fetched.state
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Fire every illegal edge the exported graph declares from `state`, and assert
@@ -188,16 +229,15 @@ async fn no_illegal_edge_is_reachable_from_any_state_the_adversary_can_stand_in(
             )
             .await
             .expect("select");
-        let f = c
-            .drive(
-                RESOURCE,
-                "TOPO-AB",
-                "VerifySlot",
-                serde_json::json!({}),
-                f.version,
-            )
-            .await
-            .expect("verify");
+        let f = drive_to(
+            &c,
+            "TOPO-AB",
+            "VerifySlot",
+            serde_json::json!({}),
+            f.version,
+            "AwaitingBooking",
+        )
+        .await;
         assert_eq!(f.state, "AwaitingBooking");
         probe_illegal_edges(&c, "TOPO-AB", "AwaitingBooking").await;
     }
@@ -218,31 +258,25 @@ async fn no_illegal_edge_is_reachable_from_any_state_the_adversary_can_stand_in(
             )
             .await
             .expect("select");
-        let f = c
-            .drive(
-                RESOURCE,
-                "TOPO-BK",
-                "VerifySlot",
-                serde_json::json!({}),
-                f.version,
-            )
-            .await
-            .expect("verify");
-        let _ = c
-            .drive(
-                RESOURCE,
-                "TOPO-BK",
-                "Book",
-                serde_json::json!({}),
-                f.version,
-            )
-            .await
-            .expect("book");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while read_state(&c, "TOPO-BK").await != "Booked" && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert_eq!(read_state(&c, "TOPO-BK").await, "Booked", "reached Booked");
+        let f = drive_to(
+            &c,
+            "TOPO-BK",
+            "VerifySlot",
+            serde_json::json!({}),
+            f.version,
+            "AwaitingBooking",
+        )
+        .await;
+        let f = drive_to(
+            &c,
+            "TOPO-BK",
+            "Book",
+            serde_json::json!({}),
+            f.version,
+            "Booked",
+        )
+        .await;
+        assert_eq!(f.state, "Booked", "reached Booked");
         probe_illegal_edges(&c, "TOPO-BK", "Booked").await;
     }
 }

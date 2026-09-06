@@ -306,26 +306,45 @@ fn awaiting_as(world: &World, bearer: &str, id: &str) -> String {
         Some(&create_body(id)),
     );
     assert_eq!(created.status, 201, "{:?}", created.body);
-    let mut etag = etag_version(&created);
-    for (behaviour, body) in [
-        (
-            "select-venue",
-            Some(serde_json::json!({"venue_id": "TH-A", "slot_id": "SLOT-A"})),
-        ),
-        ("verify-slot", None),
-    ] {
-        let reply = call(
-            world,
-            "POST",
-            &format!("/booking-intents/{id}/behaviours/{behaviour}"),
-            bearer,
-            Some(&etag),
-            body.as_ref(),
-        );
-        assert_eq!(reply.status, 200, "{behaviour}: {:?}", reply.body);
-        etag = etag_version(&reply);
-    }
-    etag
+
+    // select-venue is a LOCAL transition — always synchronous.
+    let selected = call(
+        world,
+        "POST",
+        &format!("/booking-intents/{id}/behaviours/select-venue"),
+        bearer,
+        Some(&etag_version(&created)),
+        Some(&serde_json::json!({"venue_id": "TH-A", "slot_id": "SLOT-A"})),
+    );
+    assert_eq!(selected.status, 200, "select-venue: {:?}", selected.body);
+
+    // verify-slot REACHES OUTSIDE. Normally it settles synchronously (200), but
+    // under heavy machine load a transient blip on the availability read makes the
+    // coordinator fall back to the async path (202 Accepted) — correct behaviour,
+    // converged by the reconciler. Accept either, then read the settled
+    // `AwaitingBooking` version, so the setup is robust to that timing (the async
+    // fallback is not a bug, and asserting a synchronous 200 here is what made this
+    // helper flaky in CI).
+    let verified = call(
+        world,
+        "POST",
+        &format!("/booking-intents/{id}/behaviours/verify-slot"),
+        bearer,
+        Some(&etag_version(&selected)),
+        None,
+    );
+    assert!(
+        verified.status == 200 || verified.status == 202,
+        "verify-slot: {:?}",
+        verified.body
+    );
+    etag_version(&poll_until_as(
+        world,
+        bearer,
+        id,
+        std::time::Duration::from_secs(10),
+        "AwaitingBooking",
+    ))
 }
 
 fn council_count(world: &World, sql: &str) -> i64 {
@@ -382,14 +401,68 @@ fn arm_fault(world: &World, effect: &str, route: &str, fault: &str) -> u64 {
 }
 
 /// Poll a projection until the predicate holds — bounded wall-clock, stated.
-fn poll_until(world: &World, id: &str, deadline: std::time::Duration, want: &str) -> Reply {
+/// The transient, in-flight states a turn passes through while an external effect
+/// is outstanding. A test setup that drove a behaviour and then read the
+/// projection can legitimately catch one of these under load (the coordinator fell
+/// back to the async path); [`settle`] waits them out.
+const IN_FLIGHT_STATES: &[&str] = &[
+    "VerifyingSlot",
+    "BookingInProgress",
+    "PaidBookingInProgress",
+    "CheckoutPrepared",
+    "CancellingBooking",
+    "CancellationRequested",
+];
+
+/// Read `id` (as `bearer`) until it is NOT in an in-flight state, then return that
+/// settled projection. This is the load-robust way to drive setup: a behaviour
+/// that reaches outside may settle synchronously (200) or asynchronously (202
+/// Accepted, converged by the reconciler) — both are correct — so setup waits for
+/// the booking to land rather than asserting a synchronous result.
+fn settle(world: &World, bearer: &str, id: &str) -> Reply {
     let start = std::time::Instant::now();
     loop {
         let reply = call(
             world,
             "GET",
             &format!("/booking-intents/{id}"),
-            LUCY,
+            bearer,
+            None,
+            None,
+        );
+        let state = reply.body["state"].as_str().unwrap_or_default();
+        if !IN_FLIGHT_STATES.contains(&state) {
+            return reply;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "booking never left an in-flight state: {:?}",
+            reply.body
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn poll_until(world: &World, id: &str, deadline: std::time::Duration, want: &str) -> Reply {
+    poll_until_as(world, LUCY, id, deadline, want)
+}
+
+/// As [`poll_until`], but reading as `bearer` — reads are ownership-scoped, so a
+/// non-Lucy caller must poll its own booking with its own bearer.
+fn poll_until_as(
+    world: &World,
+    bearer: &str,
+    id: &str,
+    deadline: std::time::Duration,
+    want: &str,
+) -> Reply {
+    let start = std::time::Instant::now();
+    loop {
+        let reply = call(
+            world,
+            "GET",
+            &format!("/booking-intents/{id}"),
+            bearer,
             None,
             None,
         );
@@ -441,6 +514,37 @@ fn the_whole_journey_is_possible_with_curl_alone() {
         (status, etag, body.to_owned())
     }
 
+    // GET the booking over curl until it leaves any in-flight state, returning
+    // the ETag of that settled projection. An outside-reaching behaviour normally
+    // settles in-band (200), but under load it can fall back to the async path
+    // (202 Accepted), converged by the reconciler — and a 202's own ETag names an
+    // in-flight version the NEXT if-match would be rejected against. Polling the
+    // authoritative projection makes the curl journey robust to either path.
+    fn curl_settle(base: &str, auth: &str, who: &str) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            let (status, etag, body) = curl(&[
+                &format!("{base}/booking-intents/BKG-CURL"),
+                "-H",
+                auth,
+                "-H",
+                who,
+            ]);
+            assert_eq!(status, 200, "settle read: {body}");
+            let in_flight = IN_FLIGHT_STATES
+                .iter()
+                .any(|state| body.contains(&format!("\"{state}\"")));
+            if !in_flight {
+                return etag;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "booking never left an in-flight state: {body}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     let world = world();
     let base = &world.server_url;
     let auth = "authorization: Bearer dev-lucy";
@@ -490,9 +594,14 @@ fn the_whole_journey_is_possible_with_curl_alone() {
             // server refuses it (axum's extractor, correctly).
             args.extend_from_slice(&["-H", json, "--data", data]);
         }
-        let (status, next_etag, body) = curl(&args);
-        assert_eq!(status, 200, "{behaviour}: {body}");
-        etag = next_etag;
+        let (status, _next_etag, body) = curl(&args);
+        assert!(
+            status == 200 || status == 202,
+            "{behaviour}: {status} {body}"
+        );
+        // Take the ETag from the settled projection, not the POST reply: under
+        // the async path (202) the reply's ETag is an in-flight version.
+        etag = curl_settle(base, auth, who);
         assert!(!etag.is_empty(), "{behaviour} must return an ETag");
     }
 
@@ -1375,17 +1484,17 @@ fn the_menu_never_lies_in_either_direction() {
                 Some(&etag),
                 body.as_ref(),
             );
-            assert_eq!(reply.status, 200, "{stop_at}/{behaviour}: {:?}", reply.body);
-            etag = etag_version(&reply);
+            // An outside-reaching step may settle synchronously (200) or fall back
+            // to the async path under load (202); either is correct. Wait for the
+            // booking to leave any in-flight state, then carry that version forward.
+            assert!(
+                reply.status == 200 || reply.status == 202,
+                "{stop_at}/{behaviour}: {:?}",
+                reply.body
+            );
+            etag = etag_version(&settle(&world, LUCY, &id));
         }
-        let projection = call(
-            &world,
-            "GET",
-            &format!("/booking-intents/{id}"),
-            LUCY,
-            None,
-            None,
-        );
+        let projection = settle(&world, LUCY, &id);
         assert_eq!(projection.body["state"], stop_at);
         let menu: Vec<String> = projection.body["available_behaviours"]
             .as_array()

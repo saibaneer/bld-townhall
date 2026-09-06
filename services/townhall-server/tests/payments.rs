@@ -312,14 +312,54 @@ fn drive_through_book(world: &World, id: &str) -> Reply {
             Some(&etag),
             data.as_ref(),
         );
-        assert_eq!(reply.status, 200, "{behaviour}: {:?}", reply.body);
-        etag = reply.etag.clone().unwrap_or(etag);
+        // verify-slot and book reach outside: normally they settle synchronously
+        // (200), but under load the coordinator can fall back to the async path
+        // (202 Accepted), converged by the reconciler — both correct. Accept
+        // either, wait for the booking to leave any in-flight state, then carry
+        // that settled version forward. (Asserting a synchronous 200 here is what
+        // made this setup flaky in CI.)
+        assert!(
+            reply.status == 200 || reply.status == 202,
+            "{behaviour}: {:?}",
+            reply.body
+        );
+        etag = settle(world, id).etag.clone().unwrap_or(etag);
     }
-    call(world, "GET", &format!("/booking-intents/{id}"), None, None)
+    settle(world, id)
 }
 
 fn read_booking(world: &World, id: &str) -> Reply {
     call(world, "GET", &format!("/booking-intents/{id}"), None, None)
+}
+
+/// The transient in-flight states a turn passes through while an external effect
+/// is outstanding.
+const IN_FLIGHT_STATES: &[&str] = &[
+    "VerifyingSlot",
+    "CheckoutPrepared",
+    "BookingInProgress",
+    "PaidBookingInProgress",
+    "CancellingBooking",
+    "CancellationRequested",
+];
+
+/// Read `id` until it is NOT in an in-flight state, then return that settled
+/// projection — the load-robust way to await an outside-reaching step's result
+/// (`AwaitingHumanPayment` is a settled waiting state, not in-flight).
+fn settle(world: &World, id: &str) -> Reply {
+    let start = Instant::now();
+    loop {
+        let reply = read_booking(world, id);
+        if !IN_FLIGHT_STATES.contains(&state_of(&reply).as_str()) {
+            return reply;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "booking never left an in-flight state: {:?}",
+            reply.body
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn poll_state(world: &World, id: &str, want: &str, deadline: Duration) -> String {

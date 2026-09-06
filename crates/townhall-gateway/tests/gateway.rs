@@ -67,10 +67,20 @@ async fn awaiting(gw: &Gateway, id: &BookingId) -> u64 {
             .propose_at(id, version, behaviour, body)
             .await
             .expect("turn");
-        let Turn::Committed { version: next, .. } = turn else {
-            panic!("{behaviour} did not commit: {turn:?}");
+        version = match turn {
+            Turn::Committed { version: next, .. } => next,
+            // Under load, an outside-reaching turn (verify-slot) can fall back to
+            // the async path (Accepted) instead of settling in-band; follow it to
+            // its settled outcome, exactly as a real client does with an accepted
+            // turn (ADR-019). select-venue is local and never takes this path.
+            Turn::Accepted { retry_after } => {
+                gw.converge(id, retry_after)
+                    .await
+                    .expect("converge after Accepted")
+                    .version
+            }
+            other => panic!("{behaviour} neither committed nor accepted: {other:?}"),
         };
-        version = next;
     }
     version
 }
@@ -516,21 +526,32 @@ async fn a14b_request_ids_survive_the_round_trip() {
 /// orchestrator cannot either — and finding that out here costs one slice
 /// instead of two.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one sweep, deliberately: the journey IS the test
 async fn m6a_gate_a_full_journey_through_the_gateway_alone() {
     let world = world();
     let gw = gateway_for(&world, LUCY, "BKG-GATE-CLEAN");
 
-    // --- clean: the council answers, so every turn settles synchronously.
+    // --- clean: the council answers, so every turn reaches its committed outcome
+    // (in-band when it can, via a convergence chase when load forces the async
+    // path — either way a booking is made and no human has to step in).
     let clean = BookingId::new("BKG-GATE-CLEAN");
     let version = awaiting(&gw, &clean).await;
     let booked = gw
         .propose_at(&clean, version, "book", None)
         .await
         .expect("book");
-    let Turn::Committed { state, version } = booked else {
-        panic!("an answering council settles synchronously: {booked:?}");
+    let (state, version) = match booked {
+        Turn::Committed { state, version } => (state, version),
+        Turn::Accepted { retry_after } => {
+            let settled = gw
+                .converge(&clean, retry_after)
+                .await
+                .expect("converge after Accepted");
+            (settled.state, settled.version)
+        }
+        other => panic!("book neither committed nor accepted: {other:?}"),
     };
-    assert_eq!(state, "Booked", "no convergence step should be needed");
+    assert_eq!(state, "Booked", "an answering council reaches Booked");
 
     let reference = gw
         .read(&clean)

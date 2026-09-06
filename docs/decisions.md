@@ -3503,3 +3503,66 @@ editing the spec:
 | The reference proposer may be any **open-weight** model over an OpenAI-compatible endpoint — **cloud-hosted or local**, not only "locally hosted"; model/provider stays swappable configuration; a proprietary frontier model stays optional-comparison-only | §1.3 / §18.2 / §21 "locally hosted/open-source" | Owner-directed. The requirement protects independence from a proprietary frontier model and boundary-safety-independent-of-model — both hold for any open-weight swappable model. Local hosting is offline-reproducibility convenience, kept available (qwen3:4b) as a swap, not required for the reference. |
 | A new **`townhall-agent`** crate: the untrusted proposer, the `Proposer` seam, the `LlmProposer` (structured-JSON over an OpenAI-compatible endpoint), and the deterministic `HostileProposer`; it depends only on `bld-client` | §3 Figure 1 / §18 | Realizes "Rig Agent Runtime → BLD Client → typed proposal"; the agent names only the public surface, so the same adversarial suite runs against any proposer and the framework never touches the boundary. |
 | The agent talks to the model through a **thin, hand-rolled OpenAI-compatible `reqwest` client**, NOT `rig-core` — a deviation from the spec's named "Rig" framework | §2 principles ("Agent framework: Rig") / §18 | Owner-approved. The need is narrow (POST chat messages, parse a validated JSON proposal); `rig-core` is a heavy 0.x dependency used only in sliver, and reqwest is already in the tree. The provider abstraction Rig offered is the `AGENT_BASE_URL`/`AGENT_MODEL` config seam. Safety is unaffected — the model is untrusted either way and the parser + boundary dispose. |
+
+## ADR-032 — M12: the real SMS provider is Twilio, adapted as trusted transport
+
+The spec (§M12) requires "one real SMS provider webhook/REST adapter, verification
+where supported, E.164 normalization, delivery handling and dedupe" but names no
+provider. This records the choice and the decisions the code makes before the code.
+
+- **The provider is Twilio.** Of the credible options it is the only one whose
+  entire account/number/webhook setup is drivable from a **CLI** (so the owner
+  provisions it from a terminal, not a console the agent cannot see), its inbound
+  webhooks are **signed** (`X-Twilio-Signature`) so authenticity is verifiable
+  after the fact rather than trusted from the transport — the same stance the
+  council's ed25519 and Stripe's HMAC take — and two-way SMS on one number is
+  first-class. It records nothing that binds the POC to Twilio: the provider is an
+  adapter behind the existing `HumanChannel` seam.
+
+- **The adapter is trusted transport, not a fact source** (mirrors ADR-030's
+  `stripe-client`). The new **`twilio-client`** crate carries a canonical outbound
+  reply to Twilio and returns the provider's raw observation (the message SID and
+  queue status). It mints no domain fact and asserts no identity — that authority
+  stays in the channel/domain layers. `TransportEvidence` already grades a
+  provider's claims as evidence-not-identity (spec §3.2); Twilio is one more source
+  of exactly that.
+
+- **`X-Twilio-Signature` is the inbound-authentication primitive.** It is
+  `base64(HMAC-SHA1(auth_token, url + params-sorted-by-key))`, verified in constant
+  time. **SHA-1 here is Twilio's fixed choice, a compatibility requirement, not a
+  security preference** — the MAC only authenticates a webhook against the
+  account's own Auth Token, and is never used for our own integrity anywhere. Its
+  format is locked against an **independent OpenSSL vector** in the crate's tests,
+  exactly as the Stripe signature is — an independent reference is as decisive as a
+  real provider signature for the bytes it signs.
+
+- **The Auth Token is the one secret, loaded from the environment, redacted in
+  `Debug`.** Env names match the running `.env`: `TWILIO_SID`,
+  `TWILIO_CLIENT_SECRET` (the Auth Token) and `TWILIO_FROM_NUMBER`. The token does
+  double duty — it authenticates outbound sends AND verifies inbound webhooks — so
+  there is no separate webhook secret to hold. It never appears in argv, a URL, a
+  log, or the repo.
+
+- **The `twilio-live` lane** (opt-in feature, mirrors ADR-030's `stripe-live`)
+  sends ONE real SMS through `api.twilio.com` to prove request-encoding and
+  response-parsing match real Twilio — the one thing the hermetic mock cannot. It
+  **fails loudly** on missing config (a silent skip would let "green" mean "never
+  ran") and reads its recipient from `TWILIO_TEST_TO`, so no personal number is
+  committed. It is never part of a normal `cargo test`.
+
+- **The simulator stays the default.** Twilio is a second `HumanChannel` beside
+  `SmsSimulator` (the seam's own comment reserved "M12 adds a real provider beside
+  it"), selected only when configured, so CI and hermetic tests never touch the
+  network. Increment 1 (this ADR) lands the REST send + the signature primitive;
+  increment 2 adds the inbound webhook adapter with **dedupe on Twilio's
+  `MessageSid`** through the existing replay window; increment 3 is the acceptance
+  gate — a real phone completes the happy path and a replayed provider retry does
+  not duplicate work.
+
+### The amendment trail
+
+| Added / deviated (not superseded) | Where | By |
+|---|---|---|
+| The real SMS provider is **Twilio**; a new **`twilio-client`** crate provides the REST send (`Messages.json`) and the `X-Twilio-Signature` verification primitive, as trusted transport behind the `HumanChannel` seam | §M12 ("one real SMS provider") / §3.2 transport-evidence | Twilio is the only credible option fully CLI-provisionable (owner sets it up from a terminal) with signed inbound webhooks; the adapter mints no fact, so the choice binds nothing. |
+| **HMAC-SHA1** is used for `X-Twilio-Signature` verification | §M12 "verification where supported" | Twilio's fixed algorithm — a compatibility requirement, not a security choice. It authenticates an inbound webhook against the account's own Auth Token only; locked against an independent OpenSSL vector, as the Stripe HMAC is. |
+| A `twilio-live` opt-in lane sends one real SMS; recipient read from `TWILIO_TEST_TO` | §M12 acceptance / ADR-030 precedent | Proves real request/response encoding the mock cannot; fail-loud on missing config; keeps personal numbers out of the repo. |

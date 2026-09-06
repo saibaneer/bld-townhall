@@ -14,6 +14,7 @@ members = [
   "crates/townhall-authority",
   "crates/townhall-payment",
   "crates/stripe-client",
+  "crates/twilio-client",
   "crates/townhall-effects-router",
   "crates/townhall-usage",
   "crates/townhall-channel",
@@ -51,6 +52,11 @@ axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 base64 = "0.23"
 sha2 = "0.11"
+# SHA-1 for Twilio's `X-Twilio-Signature` (M12). Twilio fixed this webhook MAC as
+# HMAC-SHA1 years ago; the algorithm is theirs, not ours, so SHA-1 here is a
+# compatibility requirement, not a security choice — it authenticates an inbound
+# webhook against the account's own Auth Token, nothing more.
+sha1 = "0.11"
 # HMAC for the delegation envelope's authentication tag (M7B).
 #
 # A MAC rather than the council's ed25519: the server both writes and verifies

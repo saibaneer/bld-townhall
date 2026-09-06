@@ -248,6 +248,50 @@ fn deposit_receipt(client: &reqwest::blocking::Client, url: &str, msg: &str) -> 
         .to_owned()
 }
 
+/// Read `booking` as lucy until it leaves any in-flight state, returning
+/// `(state, version)` from that settled projection. An outside-reaching turn
+/// (verify-slot, book) normally settles in-band (200), but under load the
+/// coordinator can fall back to the async path (202 Accepted), converged by the
+/// reconciler — both correct. Polling the authoritative projection to a settled
+/// state makes the drive robust to either, where reading the version straight off
+/// a POST reply assumed the synchronous path and made this lane flaky in CI.
+fn settle_as_lucy(client: &reqwest::blocking::Client, lane: &Lane, booking: &str) -> (String, u64) {
+    const IN_FLIGHT: &[&str] = &[
+        "VerifyingSlot",
+        "CheckoutPrepared",
+        "BookingInProgress",
+        "PaidBookingInProgress",
+        "CancellingBooking",
+        "CancellationRequested",
+    ];
+    let start = std::time::Instant::now();
+    loop {
+        let read = client
+            .get(format!("{}/booking-intents/{booking}", lane.url))
+            .header("authorization", AGENT)
+            .header("x-bld-principal", "lucy")
+            .send()
+            .expect("read while settling");
+        assert_eq!(read.status().as_u16(), 200, "read while settling");
+        let version = read
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim_matches('"').parse().ok())
+            .expect("an ETag on read");
+        let body: serde_json::Value = read.json().expect("json");
+        let state = body["state"].as_str().unwrap_or_default().to_owned();
+        if !IN_FLIGHT.contains(&state.as_str()) {
+            return (state, version);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "booking never left an in-flight state: {state}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// A change requires a challenge, answered against a live binding.
 ///
 /// # What this proves, and what it does NOT
@@ -408,13 +452,13 @@ fn a_change_requires_a_challenge_answered_against_a_live_binding() {
             .json(&body)
             .send()
             .expect("answer");
-        assert_eq!(reply.status().as_u16(), 200, "{behaviour}");
-        version = reply
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim_matches('"').parse().ok())
-            .unwrap_or_else(|| panic!("{behaviour} must return an ETag"));
+        let status = reply.status().as_u16();
+        assert!(status == 200 || status == 202, "{behaviour}: {status}");
+        // Carry the authoritative settled version forward rather than the POST
+        // reply's ETag: a 202 settles asynchronously, so its ETag names an
+        // in-flight version, not the one the next behaviour must match against.
+        let (_state, settled) = settle_as_lucy(&client, &lane, booking);
+        version = settled;
     }
 
     let read = client

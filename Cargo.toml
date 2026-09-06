@@ -30,6 +30,7 @@ members = [
   "services/townhall-server",
   "services/sms-simulator",
   "services/telegram-runner",
+  "services/bind-channel",
 ]
 
 [workspace.package]

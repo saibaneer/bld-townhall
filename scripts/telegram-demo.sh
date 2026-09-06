@@ -52,8 +52,8 @@ echo "==> starting mock council on :${COUNCIL_PORT}"
   >"$WORK/council.log" 2>&1 &
 COUNCIL_PID=$!
 
-echo "==> starting townhall-server on :${SERVER_PORT}"
-./target/debug/townhall-server \
+echo "==> starting townhall-server on :${SERVER_PORT} (request logging on)"
+TOWNHALL_LOG_REQUESTS=1 ./target/debug/townhall-server \
   --db "$WORK/townhall.sqlite" --denials-db "$WORK/denials.sqlite" \
   --council-url "$COUNCIL_URL" --key-hex "$COUNCIL_KEY" --authority-key "$AUTHORITY_KEY" \
   --port "$SERVER_PORT" --reconcile-interval-ms 50 \

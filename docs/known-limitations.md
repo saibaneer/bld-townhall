@@ -106,3 +106,48 @@ the kernel or domain, exactly as the channel and model-hosting substitutions wer
 
 **Recorded in.** M13 stream C (owner decision: document, do not build). Spec: audit_events
 / provenance.
+
+---
+
+## 4. The external counterparties are local mocks, not real third-party integrations
+
+**What.** The authorities the boundary disposes *against* are run by this repository, not by
+their real-world owners: `services/mock-council` (the venue-booking authority),
+`services/mock-stripe` (the payment provider), and the SMS simulator. No commercial council
+API, and no production Stripe account, is integrated. (M10's `stripe-live` and M12's
+`telegram-live` opt-in lanes do reach the *real* Stripe sandbox and the *real* Telegram Bot
+API respectively — so those two protocols are proven against the genuine service — but the
+council remains a local simulation.)
+
+**Why this is sound.** The POC's thesis is that a *deterministic boundary correctly disposes
+over an external effect's protocol*; proving that needs a **faithful** counterparty, not a
+commercial one. `mock-council` was deliberately built as a real out-of-process HTTP service
+with its own SQLite database, catalogue, clock and signing key — so effect identity, expiry,
+durable tombstones, idempotent-on-effect creation and signed council-owned facts are
+genuinely exercised, not stubbed. Swapping it for a real council API is an adapter change at
+the `council-client` seam; the kernel and domain do not move.
+
+**Recorded in.** `services/mock-council/src/lib.rs` (its own preamble on why it is a real
+service, not a fake); ADR-030/031 (the same reasoning for `mock-stripe`).
+
+---
+
+## 5. `mock-stripe` also dedups on a `payment_intent_id` index, looser than real Stripe
+
+**What.** On checkout-session creation the hermetic `mock-stripe` resolves an existing
+session by the `Idempotency-Key` index **or**, failing that, by a second index keyed on the
+request's `payment_intent_id` metadata. Real Stripe deduplicates only on the
+`Idempotency-Key` header. So the mock alone cannot prove that idempotent session creation is
+actually *driven by* the header — it would still return the existing session even if the
+client stopped sending the key.
+
+**Why this is sound.** It is a belt-and-suspenders in a **test double**, not the production
+path: `stripe-client` always sends `Idempotency-Key = attempt.id`
+(`crates/stripe-client/src/lib.rs`), so the key index is what fires in real operation, and
+the extra `payment_intent_id` index only adds safety in the mock. The property the mock
+cannot prove — that the encoding is the `Idempotency-Key` — is exactly what the opt-in
+`stripe-live` lane proves against real Stripe (ADR-030). Stated here so the mock's fidelity
+caveat is in the open rather than implied by its ADR ("idempotent-on-key").
+
+**Recorded in.** `services/mock-stripe/src/lib.rs` (the `by_key` / `by_payment` fallback);
+`crates/stripe-client/src/lib.rs` (the client always sends the key); ADR-030.

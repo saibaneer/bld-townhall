@@ -1,6 +1,6 @@
 # RFC — A BLD MCP: help other teams map their domain and replicate the boundary
 
-**Status:** Draft for owner review · **Audience decision:** Rust-first · **Scope:** productization adjacent to the POC, not a spec amendment (so it lives here, not in `decisions.md`).
+**Status:** Direction approved (owner) · **Audience:** Rust-first · **Home:** its **own repo** (depends on the kernel, does not live in the town-hall workspace) · **Scope:** productization adjacent to the POC, not a spec amendment (so this note lives here, not in `decisions.md`).
 
 ## 1. What this is for
 
@@ -132,7 +132,7 @@ the source of truth either way.
 | **1** | Domain-spec format + `bld topology validate` + `bld topology render` | The owner's floor: **map a domain, get the topology, prove totality/illegal-edge soundness** — before any code |
 | **2** | `bld scaffold domain` + `bld scaffold adversarial` | A compiling `BoundaryDomain` skeleton + their adversarial suite |
 | **3** | The MCP server (`rmcp`) wrapping the CLI + resources + the map-your-domain prompt | Any agent can drive it |
-| **4** | A `TopologyProbe` trait (`all_states()`, `all_inputs()`) + `bld topology verify` | Proves the *shipped Rust* still matches the spec — closes the loop the way `topology.rs` does for town-hall |
+| **4** | A `TopologyProbe` trait (`all_states()`, `all_inputs()`) + `bld topology verify`; **publish `bld-kernel`** (§10.4) | Proves the *shipped Rust* still matches the spec — closes the loop the way `topology.rs` does for town-hall — and this is the first stage that links the kernel, so it is when publishing pays off |
 
 ## 8. What needs extraction vs what is ready
 
@@ -153,14 +153,29 @@ the source of truth either way.
   reference for wiring the rest.
 - **No spec edits.** This introduces nothing into `technical-spec-v0.4.2.md`.
 
-## 10. Open questions for review
+## 10. Resolved decisions (owner review, this iteration)
 
-1. **Home of the code.** A new workspace member (`crates/bld-cli`, `crates/bld-topology`) here,
-   or a separate repo that depends on the published `bld-kernel`? (Recommendation: prototype here
-   for Stage 1–2, extract to its own repo at Stage 3.)
-2. **Spec surface.** Is the §4.1 shape the right vocabulary, or should it mirror the Rust types
-   more literally (e.g. name `Resolution` outcomes explicitly per cell)?
-3. **How far scaffolding goes.** Skeleton-only (types + `todo!()` guards) vs. also generating
-   guard stubs and evidence/fact plumbing.
-4. **Publishing.** Is publishing `bld-kernel` to crates.io in-scope now, or vendored until the
-   API stabilises?
+1. **Home of the code — its own repo.** The MCP + `bld` CLI live in a **new repository**, not as
+   workspace members here. They need `bld-kernel` only at Stage 4 (§7); Stages 1–3 operate on the
+   YAML spec alone, so the new repo is standalone until then (git-depends on the kernel when Stage
+   4 lands, or the published crate once it exists).
+2. **Spec surface — YAML, and as generic as possible.** The domain spec is YAML (§4.1). The
+   vocabulary stays domain-neutral; concrete domains (loan-approval, town-hall) appear only as
+   **inline example comments** in the spec template and the generated skeleton — guidance an
+   adopting agent can follow — never baked into the format.
+3. **Scaffolding — generic skeleton + guidance comments.** `scaffold.domain` emits the most
+   generic `impl BoundaryDomain` it can (types + `todo!()` guards), with example comments showing
+   how a real domain fills each seam, rather than domain-specific stubs. Same for the adversarial
+   harness.
+4. **Publishing `bld-kernel` — deferred, and not a blocker.** Stages 1–3 never link the kernel
+   (pure YAML → `topology.json` + generated text); only Stage 4 does. Publishing waits until Stage
+   4 or the first real adopter, after one API-stability pass. Mechanics for then: crates.io forbids
+   path deps, so `bld-types` publishes first (as a version), then `bld-kernel`; licensing is
+   already dual MIT/Apache (`LICENSE-APACHE` + `LICENSE-MIT`).
+
+### Benefits of eventually publishing the kernel (why Stage 4 ends in a publish)
+Frictionless adoption (`bld-kernel = "0.1"`, no git URLs or repo access); a semver-stable
+`BoundaryDomain` contract adopters can pin; discoverability + rendered docs on docs.rs; and the
+MCP's generated `Cargo.toml` referencing a real version so an adopter's scaffold compiles at once.
+The cost that justifies deferral: versions are permanent and the name is a public commitment, so
+the API-stability pass must come first.

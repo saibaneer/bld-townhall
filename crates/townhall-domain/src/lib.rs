@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use async_trait::async_trait;
 use bld_kernel::{
     BoundaryDomain, FactResolution, Resolution, SystemEventResolution, TransitionPlan, Verified,
 };
@@ -2886,7 +2885,6 @@ impl TownHallDomain {
     }
 }
 
-#[async_trait]
 impl BoundaryDomain for TownHallDomain {
     type State = Booking;
     type Proposal = BookingProposal;
@@ -2898,7 +2896,7 @@ impl BoundaryDomain for TownHallDomain {
     type FactContext = FactContext;
     type Error = BookingError;
 
-    async fn resolve_proposal(
+    fn resolve_proposal(
         &self,
         booking: &Self::State,
         proposal: Self::Proposal,
@@ -3006,7 +3004,7 @@ impl BoundaryDomain for TownHallDomain {
     /// D. Dispatch: Waiting derives the state-relative meaning; Settled asks
     ///    whether the state already reflects the fact.
     /// ```
-    async fn resolve_fact(
+    fn resolve_fact(
         &self,
         booking: &Self::State,
         fact: Verified<Self::ProviderFact>,
@@ -3069,7 +3067,7 @@ impl BoundaryDomain for TownHallDomain {
     /// (a `BookingExists` from `BookingInProgress` means `Booked`; from
     /// `CancellationRequested` it means "now cancel it") and made its own
     /// idempotency out of that destruction. ADR-019 records why that died.
-    async fn resolve_system_event(
+    fn resolve_system_event(
         &self,
         booking: &Self::State,
         event: Self::SystemEvent,
@@ -3561,7 +3559,7 @@ mod topology {
         }
     }
 
-    async fn sweep(
+    fn sweep(
         label: &str,
         authority: &VerifiedAuthority,
         context: &BookingContext,
@@ -3582,9 +3580,7 @@ mod topology {
                 );
                 let booking = booking_of(state.clone(), requirements.clone());
 
-                let got = domain
-                    .resolve_proposal(&booking, proposal.clone(), authority, context)
-                    .await;
+                let got = domain.resolve_proposal(&booking, proposal.clone(), authority, context);
                 let is_undefined = matches!(got, Resolution::Undefined);
 
                 assert_eq!(
@@ -3610,15 +3606,14 @@ mod topology {
     }
 
     /// The whole matrix, under a fixture where every guard passes.
-    #[tokio::test]
-    async fn topology_matches_the_pinned_matrix() {
+    #[test]
+    fn topology_matches_the_pinned_matrix() {
         sweep(
             "permissive",
             &permissive_authority(),
             &permissive_context(),
             &permissive_requirements(),
-        )
-        .await;
+        );
     }
 
     /// The same matrix under a fixture where every guard fails. A behaviour
@@ -3626,15 +3621,14 @@ mod topology {
     ///
     /// This is what catches the guide's Mistake 13: collapsing `Undefined` into
     /// `Denied` would light up all 66 impossible cells at once.
-    #[tokio::test]
-    async fn topology_does_not_depend_on_authority_or_context() {
+    #[test]
+    fn topology_does_not_depend_on_authority_or_context() {
         sweep(
             "hostile",
             &hostile_authority(),
             &hostile_context(),
             &permissive_requirements(),
-        )
-        .await;
+        );
     }
 
     /// And it must not depend on the booking's own requirements either.
@@ -3643,8 +3637,8 @@ mod topology {
     /// sweep above no longer varies them — a guard reading them is now reading
     /// *state*. Requirements decide whether an existing behaviour is permitted,
     /// never whether it exists, so an unsatisfiable set must change nothing here.
-    #[tokio::test]
-    async fn topology_does_not_depend_on_requirements() {
+    #[test]
+    fn topology_does_not_depend_on_requirements() {
         let unsatisfiable = BookingRequirements {
             attendees: 9_999,
             max_fee: Money::from_pence(0),
@@ -3655,16 +3649,15 @@ mod topology {
             &permissive_authority(),
             &permissive_context(),
             &unsatisfiable,
-        )
-        .await;
+        );
     }
 
     /// Under the permissive fixture a legal cell must actually reach `Ready`.
     ///
     /// Without this, a future guard change could make every cell `Denied` and
     /// both sweeps above would still pass while proving nothing.
-    #[tokio::test]
-    async fn permissive_fixture_reaches_ready_on_legal_cells() {
+    #[test]
+    fn permissive_fixture_reaches_ready_on_legal_cells() {
         let domain = TownHallDomain;
         let authority = permissive_authority();
         let context = permissive_context();
@@ -3675,9 +3668,7 @@ mod topology {
                     continue;
                 }
                 let booking = booking_of(state.clone(), permissive_requirements());
-                let got = domain
-                    .resolve_proposal(&booking, proposal.clone(), &authority, &context)
-                    .await;
+                let got = domain.resolve_proposal(&booking, proposal.clone(), &authority, &context);
                 assert!(
                     matches!(got, Resolution::Ready(_)),
                     "permissive fixture no longer reaches Ready on {} + {}; the opposed-fixture \
@@ -3857,25 +3848,26 @@ mod characterization {
     /// mutates. B3a changed what a turn *produces*: the complete next booking
     /// rather than the state discriminator, which is what lets these tests pin
     /// every business field instead of one enum tag.
-    async fn turn(
+    // A test helper: callers pass owned fixtures, so by-value is ergonomic even
+    // though the resolver only borrows the booking.
+    #[allow(clippy::needless_pass_by_value)]
+    fn turn(
         booking: Booking,
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
         context: &BookingContext,
     ) -> Resolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        TownHallDomain
-            .resolve_proposal(&booking, proposal, authority, context)
-            .await
+        TownHallDomain.resolve_proposal(&booking, proposal, authority, context)
     }
 
-    async fn verify_fact(
+    fn verify_fact(
         booking: Booking,
         proposal: BookingProposal,
         authority: &VerifiedAuthority,
         facts: VenueFacts,
     ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
         let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) =
-            turn(booking.clone(), proposal, authority, &context()).await
+            turn(booking.clone(), proposal, authority, &context())
         else {
             panic!("verification must first persist a Verify intent");
         };
@@ -3898,20 +3890,18 @@ mod characterization {
             created_at_ms: 1_000_000_000,
             updated_at_ms: 1_000_000_000,
         };
-        TownHallDomain
-            .resolve_fact(
-                &next_state,
-                Verified::assert_verified(VerifiedProviderFact::AvailabilityVerified {
-                    effect_intent_id,
-                    facts,
-                    grant: AvailabilityGrant::new("grant"),
-                }),
-                &FactContext {
-                    intent: Some(intent),
-                    pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-PAY-1")),
-                },
-            )
-            .await
+        TownHallDomain.resolve_fact(
+            &next_state,
+            Verified::assert_verified(VerifiedProviderFact::AvailabilityVerified {
+                effect_intent_id,
+                facts,
+                grant: AvailabilityGrant::new("grant"),
+            }),
+            &FactContext {
+                intent: Some(intent),
+                pending_effect: Some(EffectIntentId::new("EFF-BKG-1001-PAY-1")),
+            },
+        )
     }
 
     /// A local transition to `next`, which is what most cells produce.
@@ -3933,8 +3923,8 @@ mod characterization {
     /// coordinator would thread them: the second turn starts from what the
     /// first one produced, which is the only way the patch can be observed at
     /// all.
-    #[tokio::test]
-    async fn a_raised_headcount_is_revalidated_against_the_new_number() {
+    #[test]
+    fn a_raised_headcount_is_revalidated_against_the_new_number() {
         let Resolution::Ready(first) = turn(
             awaiting_booking(),
             BookingProposal::UpdateRequirements {
@@ -3942,9 +3932,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await
-        else {
+        ) else {
             panic!("UpdateRequirements must be legal at AwaitingBooking");
         };
         let after_patch = first.next_state().clone();
@@ -3962,8 +3950,7 @@ mod characterization {
             BookingProposal::RevalidateVenue,
             &authority(),
             too_small,
-        )
-        .await;
+        );
 
         assert_eq!(
             got,
@@ -3976,15 +3963,14 @@ mod characterization {
     }
 
     /// `None` means "leave it alone", not "reset it".
-    #[tokio::test]
-    async fn an_empty_requirements_patch_changes_nothing() {
+    #[test]
+    fn an_empty_requirements_patch_changes_nothing() {
         let got = turn(
             venue_selected(),
             BookingProposal::UpdateRequirements { attendees: None },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(got, committed_local(needs_revalidation()));
     }
 
@@ -3994,8 +3980,8 @@ mod characterization {
     ///
     /// Swept rather than sampled: this is the field a future arm is most likely
     /// to clobber by rebuilding a `Booking` from scratch instead of carrying it.
-    #[tokio::test]
-    async fn only_external_transitions_touch_the_effect_pointer() {
+    #[test]
+    fn only_external_transitions_touch_the_effect_pointer() {
         let external = [
             ("VenueSelected", "VerifySlot"),
             ("NeedsRevalidation", "RevalidateVenue"),
@@ -4028,7 +4014,7 @@ mod characterization {
             ] {
                 let cell = (source.state.name(), proposal.name());
                 let Resolution::Ready(plan) =
-                    turn(source.clone(), proposal, &authority(), &context()).await
+                    turn(source.clone(), proposal, &authority(), &context())
                 else {
                     continue;
                 };
@@ -4063,8 +4049,8 @@ mod characterization {
     /// Every plan the domain produces must be self-consistent, or the store
     /// will refuse to persist it. Swept, because this is the property each new
     /// transition arm has to uphold and none of them is reminded to.
-    #[tokio::test]
-    async fn every_transition_produces_a_coherent_booking() {
+    #[test]
+    fn every_transition_produces_a_coherent_booking() {
         for source in [
             draft(),
             venue_selected(),
@@ -4094,7 +4080,7 @@ mod characterization {
             ] {
                 let cell = format!("{} + {}", source.state.name(), proposal.name());
                 if let Resolution::Ready(plan) =
-                    turn(source.clone(), proposal, &authority(), &context()).await
+                    turn(source.clone(), proposal, &authority(), &context())
                 {
                     plan.next_state().coherent().unwrap_or_else(|why| {
                         panic!("{cell} produced an incoherent booking: {why}")
@@ -4385,8 +4371,8 @@ mod characterization {
     /// a phantom reference could take Cancel into Cancelled — whose reference
     /// is legitimately unconstrained — and the phantom became terminal history
     /// indistinguishable from a real cancellation.
-    #[tokio::test]
-    async fn the_proposal_door_refuses_an_incoherent_booking_too() {
+    #[test]
+    fn the_proposal_door_refuses_an_incoherent_booking_too() {
         // A phantom reference laundered through Cancel.
         let phantom = Booking {
             booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
@@ -4399,8 +4385,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert!(
             matches!(
                 got,
@@ -4425,8 +4410,7 @@ mod characterization {
             BookingProposal::ChangeVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert!(
             matches!(
                 got,
@@ -4449,8 +4433,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             Resolution::Denied(BookingError::InconsistentEffectIdentity)
@@ -4461,13 +4444,13 @@ mod characterization {
     /// on (state, proposal) alone, so an Undefined cell stays Undefined no
     /// matter how broken the aggregate is. Coherence turns Ready into Denied;
     /// it must never turn Undefined into anything.
-    #[tokio::test]
-    async fn incoherence_cannot_make_an_undefined_cell_exist() {
+    #[test]
+    fn incoherence_cannot_make_an_undefined_cell_exist() {
         let phantom = Booking {
             booking_ref: Some(CouncilBookingRef::new("TH-PHANTOM")),
             ..draft()
         };
-        let got = turn(phantom, BookingProposal::Book, &authority(), &context()).await;
+        let got = turn(phantom, BookingProposal::Book, &authority(), &context());
         assert!(
             matches!(got, Resolution::Undefined),
             "Draft has no book; a phantom reference must not conjure one, got {got:?}"
@@ -4483,8 +4466,8 @@ mod characterization {
     /// adding a third external edge would leave the coordinator deriving a
     /// `Book` identity for a `Cancel` effect — and the store would refuse it,
     /// correctly but confusingly, one layer away from the mistake.
-    #[tokio::test]
-    async fn the_intended_effect_kind_agrees_with_the_topology() {
+    #[test]
+    fn the_intended_effect_kind_agrees_with_the_topology() {
         let mut external_cells = 0_usize;
         for source in [
             draft(),
@@ -4509,7 +4492,7 @@ mod characterization {
             ] {
                 let cell = format!("{} + {}", source.state.name(), proposal.name());
                 let predicted = TownHallDomain::intended_effect_kind(&source.state, &proposal);
-                let got = turn(source.clone(), proposal, &authority(), &context()).await;
+                let got = turn(source.clone(), proposal, &authority(), &context());
 
                 match got {
                     Resolution::Ready(TransitionPlan::ExternalEffect { effect, .. }) => {
@@ -4583,8 +4566,8 @@ mod characterization {
     }
 
     /// A transition changes a booking; it never changes which booking.
-    #[tokio::test]
-    async fn no_transition_changes_the_identity() {
+    #[test]
+    fn no_transition_changes_the_identity() {
         for source in [
             draft(),
             venue_selected(),
@@ -4609,7 +4592,7 @@ mod characterization {
                 let name = proposal.name();
                 let state_name = source.state.name();
                 if let Resolution::Ready(plan) =
-                    turn(source.clone(), proposal, &authority(), &context()).await
+                    turn(source.clone(), proposal, &authority(), &context())
                 {
                     assert_eq!(
                         plan.next_state().id,
@@ -4626,8 +4609,8 @@ mod characterization {
     // These twelve must produce byte-identical outcomes after slice B. They are
     // the regression surface for the refactor.
 
-    #[tokio::test]
-    async fn draft_select_venue() {
+    #[test]
+    fn draft_select_venue() {
         let got = turn(
             draft(),
             BookingProposal::SelectVenue {
@@ -4636,13 +4619,12 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(got, committed_local(venue_selected()));
     }
 
-    #[tokio::test]
-    async fn draft_cancel() {
+    #[test]
+    fn draft_cancel() {
         let got = turn(
             draft(),
             BookingProposal::Cancel {
@@ -4650,8 +4632,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             committed_local(Booking {
@@ -4661,15 +4642,14 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn venue_selected_verify_slot() {
+    #[test]
+    fn venue_selected_verify_slot() {
         let got = turn(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got else {
             panic!("VerifySlot must persist an external Verify intent");
         };
@@ -4677,15 +4657,14 @@ mod characterization {
         assert_eq!(effect.operation_kind(), OperationKind::Verify);
     }
 
-    #[tokio::test]
-    async fn venue_selected_change_venue() {
+    #[test]
+    fn venue_selected_change_venue() {
         let got = turn(
             venue_selected(),
             BookingProposal::ChangeVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         // Starting over abandons the selection, so the loaded facts describe a
         // venue nobody has chosen. Both must go, or a later revalidation could
         // bind to them.
@@ -4706,8 +4685,8 @@ mod characterization {
     /// B3a adds the other half: the *patch* must be carried forward too. Before
     /// B3a the 25 was destructured away, so the next capacity check validated
     /// against the old headcount.
-    #[tokio::test]
-    async fn venue_selected_update_requirements_carries_the_selection_and_the_patch() {
+    #[test]
+    fn venue_selected_update_requirements_carries_the_selection_and_the_patch() {
         let got = turn(
             venue_selected(),
             BookingProposal::UpdateRequirements {
@@ -4715,8 +4694,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             committed_local(Booking {
@@ -4729,8 +4707,8 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn venue_selected_cancel() {
+    #[test]
+    fn venue_selected_cancel() {
         let got = turn(
             venue_selected(),
             BookingProposal::Cancel {
@@ -4738,8 +4716,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         // Abandoning keeps the selection: it records what was being attempted,
         // and `Cancelled` has no behaviour that could act on it.
         assert_eq!(
@@ -4751,15 +4728,14 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn needs_revalidation_revalidate_venue() {
+    #[test]
+    fn needs_revalidation_revalidate_venue() {
         let got = turn(
             needs_revalidation(),
             BookingProposal::RevalidateVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         let Resolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got else {
             panic!("RevalidateVenue must persist an external Verify intent");
         };
@@ -4767,15 +4743,14 @@ mod characterization {
         assert_eq!(effect.operation_kind(), OperationKind::Verify);
     }
 
-    #[tokio::test]
-    async fn needs_revalidation_change_venue() {
+    #[test]
+    fn needs_revalidation_change_venue() {
         let got = turn(
             needs_revalidation(),
             BookingProposal::ChangeVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             committed_local(Booking {
@@ -4787,8 +4762,8 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn needs_revalidation_cancel() {
+    #[test]
+    fn needs_revalidation_cancel() {
         let got = turn(
             needs_revalidation(),
             BookingProposal::Cancel {
@@ -4796,8 +4771,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             committed_local(Booking {
@@ -4807,15 +4781,14 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn awaiting_booking_change_venue() {
+    #[test]
+    fn awaiting_booking_change_venue() {
         let got = turn(
             awaiting_booking(),
             BookingProposal::ChangeVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         // Starting over abandons the selection, so the loaded facts describe a
         // venue nobody has chosen. Both must go, or a later revalidation could
         // bind to them.
@@ -4830,8 +4803,8 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn awaiting_booking_update_requirements_carries_the_selection_and_the_patch() {
+    #[test]
+    fn awaiting_booking_update_requirements_carries_the_selection_and_the_patch() {
         let got = turn(
             awaiting_booking(),
             BookingProposal::UpdateRequirements {
@@ -4839,8 +4812,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         // `availability` was verified against 20 people; it says nothing about
         // 25, so it must not survive the change.
         assert_eq!(
@@ -4904,20 +4876,19 @@ mod characterization {
     // thing, so the expected error is forced by meaning rather than by which
     // guard the implementation happens to check first.
 
-    #[tokio::test]
-    async fn verify_slot_denies_when_no_facts_were_loaded() {
+    #[test]
+    fn verify_slot_denies_when_no_facts_were_loaded() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
             &authority(),
             good_facts(),
-        )
-        .await;
+        );
         assert!(matches!(got, FactResolution::Ready(_)));
     }
 
-    #[tokio::test]
-    async fn verify_slot_denies_facts_for_a_different_venue() {
+    #[test]
+    fn verify_slot_denies_facts_for_a_different_venue() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -4926,16 +4897,15 @@ mod characterization {
                 venue_id: VenueId::new("TH-B"),
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectPlanMismatch { field: "selection" })
         );
     }
 
-    #[tokio::test]
-    async fn verify_slot_denies_an_unavailable_slot() {
+    #[test]
+    fn verify_slot_denies_an_unavailable_slot() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -4944,13 +4914,12 @@ mod characterization {
                 available: false,
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(got, FactResolution::Denied(BookingError::SlotUnavailable));
     }
 
-    #[tokio::test]
-    async fn verify_slot_denies_insufficient_capacity() {
+    #[test]
+    fn verify_slot_denies_insufficient_capacity() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -4959,8 +4928,7 @@ mod characterization {
                 capacity: 12,
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::CapacityInsufficient {
@@ -4970,8 +4938,8 @@ mod characterization {
         );
     }
 
-    #[tokio::test]
-    async fn verify_slot_denies_an_inaccessible_venue() {
+    #[test]
+    fn verify_slot_denies_an_inaccessible_venue() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -4980,8 +4948,7 @@ mod characterization {
                 wheelchair_accessible: false,
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::AccessibilityRequired)
@@ -5005,8 +4972,8 @@ mod characterization {
     /// A provider that cannot be ASKED is not one that answered "nothing":
     /// the refusal carries its own name, because the wire maps the two to
     /// different worlds — 503 versus 422 (ADR-021).
-    #[tokio::test]
-    async fn verify_slot_refuses_when_the_provider_cannot_be_asked() {
+    #[test]
+    fn verify_slot_refuses_when_the_provider_cannot_be_asked() {
         let mut ctx = context();
         ctx.selected_facts = ObservedAvailability::Unavailable;
         let got = turn(
@@ -5014,8 +4981,7 @@ mod characterization {
             BookingProposal::VerifySlot,
             &authority(),
             &ctx,
-        )
-        .await;
+        );
         // The pre-M10 contract, preserved: an unreachable provider is a
         // synchronous refusal (FactsUnavailable), NOT a minted effect that parks
         // the booking in `VerifyingSlot` — otherwise the gateway can no longer
@@ -5029,8 +4995,8 @@ mod characterization {
 
     /// The £45 / £50 / £90 case from the spec: the effective ceiling is the
     /// tighter of the user's requirement and the delegated authority.
-    #[tokio::test]
-    async fn verify_slot_denies_a_fee_over_the_ceiling() {
+    #[test]
+    fn verify_slot_denies_a_fee_over_the_ceiling() {
         let got = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -5039,8 +5005,7 @@ mod characterization {
                 fee: Money::from_pence(9_000),
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::FeeExceeded {
@@ -5056,8 +5021,8 @@ mod characterization {
     /// 5,000p) must be ALLOWED, and one penny over must be refused. An off-by-one
     /// to `>=` would refuse a booking the caller can exactly afford, silently;
     /// this brackets the edge so that regression is caught.
-    #[tokio::test]
-    async fn a_fee_exactly_at_the_ceiling_is_allowed_and_one_penny_over_is_not() {
+    #[test]
+    fn a_fee_exactly_at_the_ceiling_is_allowed_and_one_penny_over_is_not() {
         let at_ceiling = verify_fact(
             venue_selected(),
             BookingProposal::VerifySlot,
@@ -5066,8 +5031,7 @@ mod characterization {
                 fee: Money::from_pence(5_000),
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert!(
             matches!(at_ceiling, FactResolution::Ready(_)),
             "a fee exactly at the ceiling must be allowed, got {at_ceiling:?}"
@@ -5081,8 +5045,7 @@ mod characterization {
                 fee: Money::from_pence(5_001),
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             one_over,
             FactResolution::Denied(BookingError::FeeExceeded {
@@ -5095,8 +5058,8 @@ mod characterization {
     /// WHICH ceiling refused is derived, never guessed (ADR-021): the
     /// authority's when the delegated maximum is exceeded (even when both
     /// are), the requirement's when only the booking's own budget is.
-    #[tokio::test]
-    async fn the_ceiling_that_refused_is_named() {
+    #[test]
+    fn the_ceiling_that_refused_is_named() {
         // Under Option A (ADR-030) the fee refusal is INERT at the proposal door:
         // the synchronous guard sees the observed £90 and refuses `VerifySlot`
         // before any `VerifyingSlot` is committed — a driver is never parked
@@ -5118,8 +5081,7 @@ mod characterization {
             BookingProposal::VerifySlot,
             &generous,
             &expensive(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             Resolution::Denied(BookingError::FeeExceeded {
@@ -5140,8 +5102,7 @@ mod characterization {
             BookingProposal::VerifySlot,
             &restricted,
             &expensive(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             Resolution::Denied(BookingError::FeeExceeded {
@@ -5153,8 +5114,8 @@ mod characterization {
 
     /// A legacy row decoded with no selection cannot revalidate — fail closed
     /// rather than trust whatever the context happens to carry.
-    #[tokio::test]
-    async fn revalidate_denies_when_the_state_carries_no_selection() {
+    #[test]
+    fn revalidate_denies_when_the_state_carries_no_selection() {
         let legacy = Booking {
             state: BookingState::NeedsRevalidation(NeedsRevalidation { selected: None }),
             ..needs_revalidation()
@@ -5164,13 +5125,12 @@ mod characterization {
             BookingProposal::RevalidateVenue,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(got, Resolution::Denied(BookingError::VenueFactsMissing));
     }
 
-    #[tokio::test]
-    async fn revalidate_denies_facts_for_a_different_venue() {
+    #[test]
+    fn revalidate_denies_facts_for_a_different_venue() {
         let got = verify_fact(
             needs_revalidation(),
             BookingProposal::RevalidateVenue,
@@ -5179,8 +5139,7 @@ mod characterization {
                 venue_id: VenueId::new("TH-B"),
                 ..good_facts()
             },
-        )
-        .await;
+        );
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectPlanMismatch { field: "selection" })
@@ -5190,12 +5149,12 @@ mod characterization {
     /// Exactly one defect: booking authority is absent, and everything else is
     /// valid. A fixture that also blanked the facts would pin whichever guard
     /// runs first.
-    #[tokio::test]
-    async fn book_denies_without_booking_authority() {
+    #[test]
+    fn book_denies_without_booking_authority() {
         // A grant that names Cancel and not Book — the delegated shape, rather
         // than a capability flag turned off.
         let auth = issued(&[Behaviour::Cancel], 5_000);
-        let got = turn(awaiting_booking(), BookingProposal::Book, &auth, &context()).await;
+        let got = turn(awaiting_booking(), BookingProposal::Book, &auth, &context());
         assert_eq!(
             got,
             Resolution::Denied(BookingError::BookingAuthorityRequired)
@@ -5204,8 +5163,8 @@ mod characterization {
 
     /// The fee changed between verification and booking. `AwaitingBooking`
     /// carries the fee it verified precisely so this is detectable.
-    #[tokio::test]
-    async fn book_denies_when_the_fee_moved_since_verification() {
+    #[test]
+    fn book_denies_when_the_fee_moved_since_verification() {
         let mut ctx = context();
         ctx.selected_facts = ObservedAvailability::of(observed(VenueFacts {
             fee: Money::from_pence(4_600),
@@ -5216,13 +5175,12 @@ mod characterization {
             BookingProposal::Book,
             &authority(),
             &ctx,
-        )
-        .await;
+        );
         assert_eq!(got, Resolution::Denied(BookingError::VenueFactsMissing));
     }
 
-    #[tokio::test]
-    async fn cancel_denies_a_booked_resource_without_cancellation_authority() {
+    #[test]
+    fn cancel_denies_a_booked_resource_without_cancellation_authority() {
         let auth = issued(&[Behaviour::Book], 5_000);
         let got = turn(
             booked(),
@@ -5231,8 +5189,7 @@ mod characterization {
             },
             &auth,
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             Resolution::Denied(BookingError::CancellationAuthorityRequired)
@@ -5250,15 +5207,14 @@ mod characterization {
 
     /// `Book` stops at `BookingInProgress`: the effect intent is committed
     /// before the council is called (ADR-014).
-    #[tokio::test]
-    async fn book_stops_at_booking_in_progress_with_an_effect_to_persist() {
+    #[test]
+    fn book_stops_at_booking_in_progress_with_an_effect_to_persist() {
         let got = turn(
             awaiting_booking(),
             BookingProposal::Book,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         let Resolution::Ready(plan) = &got else {
             panic!("Book must resolve to a plan, got {got:?}");
         };
@@ -5302,8 +5258,7 @@ mod characterization {
             BookingProposal::Book,
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(got, again, "classification must be a pure function");
     }
 
@@ -5311,8 +5266,8 @@ mod characterization {
     /// cancellation path, not the in-flight one — had it stayed local, an
     /// ordinary cancel would commit `Cancelled` while the council booking
     /// stayed live for every slice between the coordinator landing and F.
-    #[tokio::test]
-    async fn booked_cancel_stops_at_cancelling_booking_with_an_effect() {
+    #[test]
+    fn booked_cancel_stops_at_cancelling_booking_with_an_effect() {
         // A cancellation is its own effect with its own identity — reusing the
         // booking's id would make "has this effect completed?" unanswerable.
         let ctx = BookingContext {
@@ -5326,8 +5281,7 @@ mod characterization {
             },
             &authority(),
             &ctx,
-        )
-        .await;
+        );
         // Full equality, not just the variant. The reference must be carried
         // through from `Booked` — cancelling the wrong council booking is
         // exactly what this state exists to make impossible.
@@ -5357,8 +5311,8 @@ mod characterization {
     // variant, so it did. Recovery is runtime machinery now, reached through the
     // verified-fact door in B3, never proposed.
 
-    #[tokio::test]
-    async fn awaiting_booking_cancel() {
+    #[test]
+    fn awaiting_booking_cancel() {
         let got = turn(
             awaiting_booking(),
             BookingProposal::Cancel {
@@ -5366,8 +5320,7 @@ mod characterization {
             },
             &authority(),
             &context(),
-        )
-        .await;
+        );
         assert_eq!(
             got,
             committed_local(Booking {
@@ -6196,27 +6149,25 @@ mod fact_topology {
         (booking, fact_of(fact_ix, id), context)
     }
 
-    async fn classify(
+    fn classify(
         booking: &Booking,
         fact: VerifiedProviderFact,
         context: &FactContext,
     ) -> FactResolution<TransitionPlan<Booking, BookingEffect>, BookingError> {
-        TownHallDomain
-            .resolve_fact(booking, Verified::assert_verified(fact), context)
-            .await
+        TownHallDomain.resolve_fact(booking, Verified::assert_verified(fact), context)
     }
 
     /// The whole matrix under the fully-bound fixture. Every `Ready` output is
     /// also checked coherent — an incoherent plan could never be committed, so
     /// producing one would make the cell a lie.
-    #[tokio::test]
-    async fn fact_topology_matches_the_pinned_matrix() {
+    #[test]
+    fn fact_topology_matches_the_pinned_matrix() {
         let mut checked = 0_usize;
         for (state_name, row) in LOCKED_FACTS {
             for (fact_ix, expected) in row.iter().enumerate() {
                 let (booking, fact, context) = bound_cell(state_name, fact_ix);
                 let fact_name = fact.name();
-                let got = classify(&booking, fact, &context).await;
+                let got = classify(&booking, fact, &context);
 
                 // U and C arms are identical bodies by design: one row per
                 // outcome pairing keeps the table readable.
@@ -6254,8 +6205,8 @@ mod fact_topology {
         assert_eq!(checked, 128, "the matrix must cover every cell");
     }
 
-    #[tokio::test]
-    async fn verified_fee_uses_the_frozen_threshold_policy() {
+    #[test]
+    fn verified_fee_uses_the_frozen_threshold_policy() {
         let (booking, fact, mut context) = bound_cell("VerifyingSlot", 4);
         let intent = context.intent.as_mut().expect("fixture intent");
         let BookingEffect::VerifyAvailability {
@@ -6269,7 +6220,7 @@ mod fact_topology {
         *payment_threshold = Money::from_pence(4_000);
         *threshold_policy_version = "threshold-v7".to_owned();
 
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
             panic!("a verified high fee must select the payment offer: {got:?}");
         };
@@ -6284,10 +6235,10 @@ mod fact_topology {
         );
     }
 
-    #[tokio::test]
-    async fn session_creation_hands_off_to_the_resolve_only_payment_intent() {
+    #[test]
+    fn session_creation_hands_off_to_the_resolve_only_payment_intent() {
         let (booking, fact, context) = bound_cell("CheckoutPrepared", 5);
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got
         else {
             panic!("SessionCreated must mint the await-payment successor: {got:?}");
@@ -6307,10 +6258,10 @@ mod fact_topology {
         ));
     }
 
-    #[tokio::test]
-    async fn confirmed_payment_mints_one_paid_booking_effect() {
+    #[test]
+    fn confirmed_payment_mints_one_paid_booking_effect() {
         let (booking, fact, context) = bound_cell("AwaitingHumanPayment", 6);
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(TransitionPlan::ExternalEffect { next_state, effect }) = got
         else {
             panic!("PaymentConfirmed must resume with the frozen council booking: {got:?}");
@@ -6326,10 +6277,10 @@ mod fact_topology {
         assert_eq!(grant, AvailabilityGrant::new("grant"));
     }
 
-    #[tokio::test]
-    async fn terminal_payment_abandonment_returns_only_to_offer_selected() {
+    #[test]
+    fn terminal_payment_abandonment_returns_only_to_offer_selected() {
         let (booking, fact, context) = bound_cell("AwaitingHumanPayment", 7);
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
             panic!("terminal abandonment must be a local exit: {got:?}");
         };
@@ -6337,10 +6288,10 @@ mod fact_topology {
         assert!(next_state.active_effect.is_none());
     }
 
-    #[tokio::test]
-    async fn paid_council_rejection_never_reopens_checkout() {
+    #[test]
+    fn paid_council_rejection_never_reopens_checkout() {
         let (booking, fact, context) = bound_cell("PaidBookingInProgress", 3);
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(TransitionPlan::Local { next_state }) = got else {
             panic!("paid council rejection must settle locally: {got:?}");
         };
@@ -6353,15 +6304,15 @@ mod fact_topology {
     /// directly, so the helper could answer `None` for the one external cell and
     /// every domain test would still pass — while the coordinator denied the
     /// handoff with `EffectIdentityMissing`, one layer away from the mistake.
-    #[tokio::test]
-    async fn the_fact_intended_effect_kind_agrees_with_the_topology() {
+    #[test]
+    fn the_fact_intended_effect_kind_agrees_with_the_topology() {
         let mut external_cells = 0_usize;
         for (state_name, _) in LOCKED_FACTS {
             for fact_ix in 0..FACT_COUNT {
                 let (booking, fact, context) = bound_cell(state_name, fact_ix);
                 let fact_name = fact.name();
                 let predicted = TownHallDomain::fact_intended_effect_kind(&booking.state, &fact);
-                let got = classify(&booking, fact, &context).await;
+                let got = classify(&booking, fact, &context);
 
                 match got {
                     FactResolution::Ready(TransitionPlan::ExternalEffect { effect, .. }) => {
@@ -6394,8 +6345,8 @@ mod fact_topology {
     /// exhaustion recorded as `Absent`, a later confirmation for that identity
     /// would be refused as contradictory, when it is exactly the news a human is
     /// waiting for.
-    #[tokio::test]
-    async fn an_abandoned_effect_makes_no_claim_a_fact_could_contradict() {
+    #[test]
+    fn an_abandoned_effect_makes_no_claim_a_fact_could_contradict() {
         let (booking, fact, _) = bound_cell("BookingInProgress", 0);
 
         // Tombstoned, then "it exists" — a genuine contradiction.
@@ -6409,7 +6360,7 @@ mod fact_topology {
             pending_effect: None,
         };
         assert_eq!(
-            classify(&booking, fact.clone(), &tombstoned).await,
+            classify(&booking, fact.clone(), &tombstoned),
             FactResolution::Denied(BookingError::ContradictoryProviderFact),
             "a tombstone genuinely contradicts an existence fact"
         );
@@ -6427,7 +6378,7 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact, &escalated).await;
+        let got = classify(&booking, fact, &escalated);
         assert!(
             got.is_ready(),
             "a confirmation for an escalated effect is news, not a contradiction, got {got:?}"
@@ -6487,10 +6438,10 @@ mod fact_topology {
 
     /// Booking confirmed: `Booked` carries the council's reference in both
     /// copies, the effect pointer clears, and nothing else moves.
-    #[tokio::test]
-    async fn a_confirmed_booking_commits_the_reference_and_clears_the_pointer() {
+    #[test]
+    fn a_confirmed_booking_commits_the_reference_and_clears_the_pointer() {
         let (booking, fact, context) = bound_cell("BookingInProgress", 0);
-        let plan = ready_of(classify(&booking, fact, &context).await);
+        let plan = ready_of(classify(&booking, fact, &context));
         assert_eq!(
             plan,
             TransitionPlan::Local {
@@ -6509,12 +6460,12 @@ mod fact_topology {
     /// The booking never happened: back to `AwaitingBooking`, rebuilt from the
     /// persisted plan — and the reference slot is empty, because a tombstoned
     /// intent has nothing to refer to.
-    #[tokio::test]
-    async fn an_absent_booking_returns_to_awaiting_from_the_persisted_plan() {
+    #[test]
+    fn an_absent_booking_returns_to_awaiting_from_the_persisted_plan() {
         for fact_ix in [2, 3] {
             let (booking, fact, context) = bound_cell("BookingInProgress", fact_ix);
             let fact_name = fact.name();
-            let plan = ready_of(classify(&booking, fact, &context).await);
+            let plan = ready_of(classify(&booking, fact, &context));
             assert_eq!(
                 plan,
                 TransitionPlan::Local {
@@ -6540,10 +6491,10 @@ mod fact_topology {
     /// out to exist, so a cancellation is planned against it — carrying the
     /// council reference into both copies, adopting the FRESH identity in both
     /// copies, and shipping a `CancelBooking` bound to the fact's reference.
-    #[tokio::test]
-    async fn a_found_booking_under_cancellation_plans_the_cancel_effect() {
+    #[test]
+    fn a_found_booking_under_cancellation_plans_the_cancel_effect() {
         let (booking, fact, context) = bound_cell("CancellationRequested", 0);
-        let plan = ready_of(classify(&booking, fact, &context).await);
+        let plan = ready_of(classify(&booking, fact, &context));
         assert_eq!(
             plan,
             TransitionPlan::ExternalEffect {
@@ -6566,12 +6517,12 @@ mod fact_topology {
 
     /// The booking never happened while a cancellation was wanted: `Cancelled`
     /// with nothing to show for it — no reference anywhere, pointer cleared.
-    #[tokio::test]
-    async fn an_absent_booking_under_cancellation_is_simply_cancelled() {
+    #[test]
+    fn an_absent_booking_under_cancellation_is_simply_cancelled() {
         for fact_ix in [2, 3] {
             let (booking, fact, context) = bound_cell("CancellationRequested", fact_ix);
             let fact_name = fact.name();
-            let plan = ready_of(classify(&booking, fact, &context).await);
+            let plan = ready_of(classify(&booking, fact, &context));
             assert_eq!(
                 plan,
                 TransitionPlan::Local {
@@ -6589,10 +6540,10 @@ mod fact_topology {
 
     /// Cancellation confirmed: `Cancelled`, keeping the reference of what was
     /// cancelled — the convergence reading of this very state depends on it.
-    #[tokio::test]
-    async fn a_confirmed_cancellation_keeps_the_reference_it_cancelled() {
+    #[test]
+    fn a_confirmed_cancellation_keeps_the_reference_it_cancelled() {
         let (booking, fact, context) = bound_cell("CancellingBooking", 1);
-        let plan = ready_of(classify(&booking, fact, &context).await);
+        let plan = ready_of(classify(&booking, fact, &context));
         assert_eq!(
             plan,
             TransitionPlan::Local {
@@ -6607,12 +6558,12 @@ mod fact_topology {
 
     /// The cancellation never happened: still booked, both reference copies
     /// intact, pointer cleared.
-    #[tokio::test]
-    async fn an_absent_cancellation_returns_to_booked() {
+    #[test]
+    fn an_absent_cancellation_returns_to_booked() {
         for fact_ix in [2, 3] {
             let (booking, fact, context) = bound_cell("CancellingBooking", fact_ix);
             let fact_name = fact.name();
-            let plan = ready_of(classify(&booking, fact, &context).await);
+            let plan = ready_of(classify(&booking, fact, &context));
             assert_eq!(
                 plan,
                 TransitionPlan::Local {
@@ -6635,8 +6586,8 @@ mod fact_topology {
     /// The four identities varied independently: the state's, the aggregate's
     /// `active_effect`, the fact's, and the supplied intent's. Lockstep
     /// fixtures cannot tell which comparison actually fired.
-    #[tokio::test]
-    async fn a_fact_about_some_other_effect_is_refused() {
+    #[test]
+    fn a_fact_about_some_other_effect_is_refused() {
         // Fact and intent agree with each other (bind cleanly) but name an
         // effect this state is not waiting on.
         for state_name in ["BookingInProgress", "CancellationRequested"] {
@@ -6651,7 +6602,7 @@ mod fact_topology {
                 )),
                 pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
             };
-            let got = classify(&booking, fact_of(0, stranger), &context).await;
+            let got = classify(&booking, fact_of(0, stranger), &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::EffectMismatch),
@@ -6670,14 +6621,14 @@ mod fact_topology {
             )),
             pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
         };
-        let got = classify(&booking, fact_of(1, stranger), &context).await;
+        let got = classify(&booking, fact_of(1, stranger), &context);
         assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
     }
 
     /// The supplied intent is not the fact's — caught before anything else is
     /// trusted about it.
-    #[tokio::test]
-    async fn an_intent_that_is_not_the_facts_is_refused() {
+    #[test]
+    fn an_intent_that_is_not_the_facts_is_refused() {
         let (booking, fact, _) = bound_cell("BookingInProgress", 0);
         let context = FactContext {
             intent: Some(intent(
@@ -6688,30 +6639,30 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
     }
 
     /// The intent belongs to a different booking. The comparison target is the
     /// authoritative loaded aggregate's id — which is why `Booking` carries it.
-    #[tokio::test]
-    async fn an_intent_for_another_booking_is_refused() {
+    #[test]
+    fn an_intent_for_another_booking_is_refused() {
         let (booking, fact, mut context) = bound_cell("BookingInProgress", 0);
         if let Some(intent) = context.intent.as_mut() {
             intent.booking_id = BookingId::new("BKG-9999");
         }
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
     }
 
     /// C1 on the fact door: the state's copy and `active_effect` disagreeing is
     /// refused before any meaning is derived. The store cannot produce this
     /// shape, but this door must not assume its caller went through the store.
-    #[tokio::test]
-    async fn a_self_contradictory_aggregate_is_refused_by_the_fact_door() {
+    #[test]
+    fn a_self_contradictory_aggregate_is_refused_by_the_fact_door() {
         let (mut booking, fact, context) = bound_cell("BookingInProgress", 0);
         booking.active_effect = Some(EffectIntentId::new("EFF-SOMETHING-ELSE"));
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::InconsistentEffectIdentity)
@@ -6721,8 +6672,8 @@ mod fact_topology {
     /// The check the kind-agnostic facts cannot get from B3: an intent of the
     /// WRONG KIND carrying the right identity. "The cancellation never
     /// happened" must never be read as "the booking never happened".
-    #[tokio::test]
-    async fn an_absence_of_the_wrong_kind_cannot_answer_a_waiting_state() {
+    #[test]
+    fn an_absence_of_the_wrong_kind_cannot_answer_a_waiting_state() {
         // BookingInProgress waits on a Book; hand it a Cancel intent under the
         // same id, with an EffectAbsent fact (which implies no kind at all).
         let (booking, _, _) = bound_cell("BookingInProgress", 2);
@@ -6735,7 +6686,7 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact_of(2, BOOK_ID), &context).await;
+        let got = classify(&booking, fact_of(2, BOOK_ID), &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectKindMismatch),
@@ -6755,7 +6706,7 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact_of(2, CANCEL_ID), &context).await;
+        let got = classify(&booking, fact_of(2, CANCEL_ID), &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectKindMismatch)
@@ -6764,8 +6715,8 @@ mod fact_topology {
 
     /// B6, one defect per fixture: each consequential field of `BookingExists`
     /// flipped in turn, asserting the SPECIFIC field named in the refusal.
-    #[tokio::test]
-    async fn every_consequential_field_is_bound_against_the_plan() {
+    #[test]
+    fn every_consequential_field_is_bound_against_the_plan() {
         let (booking, _, context) = bound_cell("BookingInProgress", 0);
         let base = |mutate: &dyn Fn(&mut VerifiedProviderFact)| {
             let mut fact = fact_of(0, BOOK_ID);
@@ -6817,7 +6768,7 @@ mod fact_topology {
         ];
 
         for (field, fact) in cases {
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::EffectPlanMismatch { field }),
@@ -6828,14 +6779,14 @@ mod fact_topology {
 
     /// The cancellation half of the binding, which revision 1 left untested:
     /// `CancellationExists.booking_ref` against the persisted cancel plan.
-    #[tokio::test]
-    async fn a_cancellation_for_a_different_reference_is_refused() {
+    #[test]
+    fn a_cancellation_for_a_different_reference_is_refused() {
         let (booking, _, context) = bound_cell("CancellingBooking", 1);
         let fact = VerifiedProviderFact::CancellationExists {
             effect_intent_id: EffectIntentId::new(CANCEL_ID),
             booking_ref: CouncilBookingRef::new("TH-00000"),
         };
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectPlanMismatch {
@@ -6848,15 +6799,15 @@ mod fact_topology {
     /// with both the fact and its own plan. At a settled state nothing after
     /// B3 would notice — the convergence table dispatches on the plan, so
     /// without the column check a corrupt row would happily converge.
-    #[tokio::test]
-    async fn a_corrupt_intent_column_cannot_converge() {
+    #[test]
+    fn a_corrupt_intent_column_cannot_converge() {
         let (booking, fact, mut context) = bound_cell("Cancelled", 1);
         if let Some(stored) = context.intent.as_mut() {
             // Plan and fact still agree (CancelBooking, TH-92718); only the
             // column lies.
             stored.operation_kind = OperationKind::Book;
         }
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectKindMismatch),
@@ -6868,13 +6819,13 @@ mod fact_topology {
     /// row, refused rather than guessed about — and refused as an *incoherent
     /// intent*, not as a plan mismatch. The distinction is worth the words: the
     /// fact is fine, the record it was compared against is not.
-    #[tokio::test]
-    async fn an_intent_whose_kind_and_plan_disagree_is_refused() {
+    #[test]
+    fn an_intent_whose_kind_and_plan_disagree_is_refused() {
         let (booking, fact, mut context) = bound_cell("BookingInProgress", 0);
         if let Some(intent) = context.intent.as_mut() {
             intent.canonical_plan = cancel_plan(); // column says Book
         }
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::IncoherentIntent(
@@ -6888,8 +6839,8 @@ mod fact_topology {
 
     /// Every participating cell with no intent supplied: refused, never
     /// guessed. Swept, not sampled.
-    #[tokio::test]
-    async fn no_participating_cell_proceeds_without_the_persisted_intent() {
+    #[test]
+    fn no_participating_cell_proceeds_without_the_persisted_intent() {
         for (state_name, _) in LOCKED_FACTS {
             for fact_ix in 0..FACT_COUNT {
                 let (booking, fact, _) = bound_cell(state_name, fact_ix);
@@ -6901,7 +6852,7 @@ mod fact_topology {
                     intent: None,
                     pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
                 };
-                let got = classify(&booking, fact, &context).await;
+                let got = classify(&booking, fact, &context);
                 assert_eq!(
                     got,
                     FactResolution::Denied(BookingError::EffectPlanMissing),
@@ -6914,8 +6865,8 @@ mod fact_topology {
     /// The regression test for revision 2's over-correction: an Absent state
     /// stays `Undefined` even when the context carries a deliberately
     /// mismatched intent. Irrelevant context must not manufacture behaviour.
-    #[tokio::test]
-    async fn garbage_context_cannot_manufacture_behaviour_in_an_absent_state() {
+    #[test]
+    fn garbage_context_cannot_manufacture_behaviour_in_an_absent_state() {
         for state_name in ["Draft", "VenueSelected", "NeedsRevalidation", "NeedsHuman"] {
             for fact_ix in 0..FACT_COUNT {
                 let (booking, fact, _) = bound_cell(state_name, fact_ix);
@@ -6934,7 +6885,7 @@ mod fact_topology {
                     }),
                     pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
                 };
-                let got = classify(&booking, fact, &garbage).await;
+                let got = classify(&booking, fact, &garbage);
                 assert!(
                     got.is_undefined(),
                     "{state_name} + {fact_name} must be Undefined regardless of context, got {got:?}"
@@ -6948,8 +6899,8 @@ mod fact_topology {
     /// B4's shape table, every row: a malformed status/reference pair is
     /// refused before it can be used as a wildcard. `Confirmed` without its
     /// reference is the dangerous one — it would converge against anything.
-    #[tokio::test]
-    async fn a_malformed_intent_record_is_never_a_wildcard() {
+    #[test]
+    fn a_malformed_intent_record_is_never_a_wildcard() {
         let rows: &[(EffectStatus, Option<&str>)] = &[
             (EffectStatus::Confirmed, None),
             (EffectStatus::Prepared, Some(REF)),
@@ -6963,7 +6914,7 @@ mod fact_topology {
                 intent: Some(intent(BOOK_ID, OperationKind::Book, *status, *reference)),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert!(
                 matches!(
                     got,
@@ -6981,8 +6932,8 @@ mod fact_topology {
     /// outcome is refused loudly no matter which state it lands in — checked at
     /// a Waiting state and at a Settled one, because the dangerous arrival
     /// order (ADR-016's race) does not get to choose its landing state.
-    #[tokio::test]
-    async fn a_fact_contradicting_the_durable_outcome_is_refused_everywhere() {
+    #[test]
+    fn a_fact_contradicting_the_durable_outcome_is_refused_everywhere() {
         // Tombstoned, then "it exists": the catastrophic case.
         for (state_name, fact_ix, id, kind) in [
             ("BookingInProgress", 0, BOOK_ID, OperationKind::Book),
@@ -6996,7 +6947,7 @@ mod fact_topology {
                 intent: Some(intent(id, kind, EffectStatus::Absent, None)),
                 pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7015,7 +6966,7 @@ mod fact_topology {
                 )),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact)
@@ -7034,7 +6985,7 @@ mod fact_topology {
                 )),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7047,8 +6998,8 @@ mod fact_topology {
     /// places a reference lives: the intent's record, the state's copy, and the
     /// aggregate's copy. Varied independently — a lockstep fixture proves only
     /// whichever comparison runs first.
-    #[tokio::test]
-    async fn one_identity_two_references_is_duplication_wherever_it_shows() {
+    #[test]
+    fn one_identity_two_references_is_duplication_wherever_it_shows() {
         // Intent recorded TH-00000; the fact claims TH-92718. Caught at B5,
         // so it holds at Waiting and Settled states alike.
         {
@@ -7062,7 +7013,7 @@ mod fact_topology {
                 )),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::DuplicateProviderEffect),
@@ -7091,7 +7042,7 @@ mod fact_topology {
                 )),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::DuplicateProviderEffect),
@@ -7105,7 +7056,7 @@ mod fact_topology {
         {
             let (mut booking, fact, context) = bound_cell("Booked", 0);
             booking.booking_ref = Some(CouncilBookingRef::new("TH-99999"));
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert!(
                 matches!(
                     got,
@@ -7122,8 +7073,8 @@ mod fact_topology {
     /// converged is a contradiction once the history it claims is the wrong
     /// operation. This is what makes `Converged` mean "already applied" rather
     /// than "close enough".
-    #[tokio::test]
-    async fn a_flipped_intent_kind_turns_convergence_into_contradiction() {
+    #[test]
+    fn a_flipped_intent_kind_turns_convergence_into_contradiction() {
         // (state, fact_ix, flipped kind, id under the flipped kind)
         let cells: &[(&str, usize, OperationKind, &str)] = &[
             ("AwaitingBooking", 2, OperationKind::Cancel, CANCEL_ID),
@@ -7151,7 +7102,7 @@ mod fact_topology {
                 intent: Some(intent(id, *kind, status, reference)),
                 pending_effect: Some(EffectIntentId::new(FRESH_CANCEL_ID)),
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert!(
                 matches!(
                     got,
@@ -7169,15 +7120,15 @@ mod fact_topology {
     /// not convergence: the repository commits state and status in one
     /// transaction, so this shape cannot arise honestly. Calling it converged
     /// would launder a broken atomicity guarantee into a repair path.
-    #[tokio::test]
-    async fn a_live_intent_at_a_settled_state_is_not_convergence() {
+    #[test]
+    fn a_live_intent_at_a_settled_state_is_not_convergence() {
         for status in [EffectStatus::Prepared, EffectStatus::Unknown] {
             let (booking, fact, _) = bound_cell("Booked", 0);
             let context = FactContext {
                 intent: Some(intent(BOOK_ID, OperationKind::Book, status, None)),
                 pending_effect: None,
             };
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7189,8 +7140,8 @@ mod fact_topology {
     /// The reflection table, one mutated comparison per fixture — where the
     /// fact carries nothing, the STATE is compared against the PLAN, and each
     /// leg of that comparison must be able to fail alone.
-    #[tokio::test]
-    async fn reflection_compares_real_data_in_every_row() {
+    #[test]
+    fn reflection_compares_real_data_in_every_row() {
         // AwaitingBooking vs the Book plan: venue, slot, fee — each alone.
         {
             let (_, fact, context) = bound_cell("AwaitingBooking", 2);
@@ -7214,7 +7165,7 @@ mod fact_topology {
             mismatched
                 .coherent()
                 .expect("one defect per fixture: the plan is the mismatch, not the booking");
-            let got = classify(&mismatched, fact, &context).await;
+            let got = classify(&mismatched, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7234,7 +7185,7 @@ mod fact_topology {
                 None,
                 None,
             );
-            let got = classify(&mismatched, fact, &context).await;
+            let got = classify(&mismatched, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact)
@@ -7251,7 +7202,7 @@ mod fact_topology {
                     principal: PrincipalId::new("lucy"),
                 };
             }
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7262,7 +7213,7 @@ mod fact_topology {
         {
             let (_, fact, context) = bound_cell("Cancelled", 1);
             let mismatched = booking_at(BookingState::Cancelled(Cancelled), Some("TH-00000"), None);
-            let got = classify(&mismatched, fact, &context).await;
+            let got = classify(&mismatched, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::DuplicateProviderEffect),
@@ -7274,7 +7225,7 @@ mod fact_topology {
         {
             let (_, fact, context) = bound_cell("Cancelled", 2);
             let contradictory = booking_at(BookingState::Cancelled(Cancelled), Some(REF), None);
-            let got = classify(&contradictory, fact, &context).await;
+            let got = classify(&contradictory, fact, &context);
             assert_eq!(
                 got,
                 FactResolution::Denied(BookingError::ContradictoryProviderFact),
@@ -7288,8 +7239,8 @@ mod fact_topology {
     /// refused, never silently cleared or overwritten by a transition. A bad
     /// write laundered into a clean state is how the next reader never learns
     /// anything was wrong.
-    #[tokio::test]
-    async fn a_phantom_reference_is_refused_not_laundered() {
+    #[test]
+    fn a_phantom_reference_is_refused_not_laundered() {
         // Each of these transitions would have cleared or overwritten the
         // phantom: absence clears it, confirmation overwrites it, the found
         // booking under cancellation overwrites it, and the AwaitingBooking
@@ -7305,7 +7256,7 @@ mod fact_topology {
             let (mut booking, fact, context) = bound_cell(state_name, *fact_ix);
             let fact_name = fact.name();
             booking.booking_ref = Some(CouncilBookingRef::new("TH-PHANTOM"));
-            let got = classify(&booking, fact, &context).await;
+            let got = classify(&booking, fact, &context);
             assert!(
                 matches!(
                     got,
@@ -7321,8 +7272,8 @@ mod fact_topology {
     /// The ‡ cell's other reading: the OLD booking intent's confirmation
     /// re-arriving at `CancellingBooking` — which is how this state was reached —
     /// is convergence, not an answer to the cancellation in flight.
-    #[tokio::test]
-    async fn the_old_bookings_confirmation_converges_at_cancelling_booking() {
+    #[test]
+    fn the_old_bookings_confirmation_converges_at_cancelling_booking() {
         let (booking, _, _) = bound_cell("CancellingBooking", 0);
         let fact = fact_of(0, BOOK_ID); // the BOOK intent's id, not the cancel's
         let context = FactContext {
@@ -7334,7 +7285,7 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         assert!(
             got.is_converged(),
             "the fact that created this state must read as already applied, got {got:?}"
@@ -7345,8 +7296,8 @@ mod fact_topology {
     /// contradiction or convergence machinery can break it: the fact arrives
     /// while the intent still says Unknown, because nothing has recorded the
     /// outcome yet. That is the ordinary happy path, not an edge case.
-    #[tokio::test]
-    async fn the_ordinary_happy_path_never_touches_the_contradiction_machinery() {
+    #[test]
+    fn the_ordinary_happy_path_never_touches_the_contradiction_machinery() {
         let (booking, fact, _) = bound_cell("BookingInProgress", 0);
         let context = FactContext {
             intent: Some(intent(
@@ -7357,7 +7308,7 @@ mod fact_topology {
             )),
             pending_effect: None,
         };
-        let got = classify(&booking, fact, &context).await;
+        let got = classify(&booking, fact, &context);
         let FactResolution::Ready(plan) = got else {
             panic!("the happy path must be Ready, got {got:?}");
         };
@@ -7371,14 +7322,14 @@ mod fact_topology {
     /// a plan whose old and new effects share one identity is structurally
     /// invalid, and the boundary must not emit it even though the store would
     /// catch it later.
-    #[tokio::test]
-    async fn the_fact_driven_cancellation_demands_a_fresh_identity() {
+    #[test]
+    fn the_fact_driven_cancellation_demands_a_fresh_identity() {
         let (booking, fact, context) = bound_cell("CancellationRequested", 0);
         let no_identity = FactContext {
             pending_effect: None,
             ..context.clone()
         };
-        let got = classify(&booking, fact.clone(), &no_identity).await;
+        let got = classify(&booking, fact.clone(), &no_identity);
         assert_eq!(
             got,
             FactResolution::Denied(BookingError::EffectIdentityMissing)
@@ -7388,7 +7339,7 @@ mod fact_topology {
             pending_effect: Some(EffectIntentId::new(BOOK_ID)),
             ..context
         };
-        let got = classify(&booking, fact, &reused).await;
+        let got = classify(&booking, fact, &reused);
         assert_eq!(got, FactResolution::Denied(BookingError::EffectMismatch));
     }
 
@@ -7398,8 +7349,8 @@ mod fact_topology {
     /// state reaches `Booked` or `NeedsHuman` — the model cannot announce its
     /// own success — and no provider fact reaches `NeedsHuman`, because the
     /// council cannot conclude our retry budget is exhausted.
-    #[tokio::test]
-    async fn no_door_reaches_a_state_that_is_not_its_to_reach() {
+    #[test]
+    fn no_door_reaches_a_state_that_is_not_its_to_reach() {
         let authority = issued(ALL, 5_000);
         let proposal_context = BookingContext {
             selected_facts: ObservedAvailability::of(observed(good_facts())),
@@ -7432,10 +7383,12 @@ mod fact_topology {
             let (booking, _, _) = bound_cell(state_name, 0);
             for proposal in proposals() {
                 let name = proposal.name();
-                if let Resolution::Ready(plan) = TownHallDomain
-                    .resolve_proposal(&booking, proposal, &authority, &proposal_context)
-                    .await
-                {
+                if let Resolution::Ready(plan) = TownHallDomain.resolve_proposal(
+                    &booking,
+                    proposal,
+                    &authority,
+                    &proposal_context,
+                ) {
                     let next = plan.next_state().state.name();
                     assert!(
                         next != "Booked" && next != "NeedsHuman",
@@ -7448,7 +7401,7 @@ mod fact_topology {
             for fact_ix in 0..FACT_COUNT {
                 let (booking, fact, context) = bound_cell(state_name, fact_ix);
                 let fact_name = fact.name();
-                if let FactResolution::Ready(plan) = classify(&booking, fact, &context).await {
+                if let FactResolution::Ready(plan) = classify(&booking, fact, &context) {
                     if plan.next_state().state.name() == "NeedsHuman" {
                         assert_eq!(state_name, &"PaidBookingInProgress");
                         assert!(matches!(fact_name, "EffectAbsent" | "ProviderRejected"));
@@ -7461,20 +7414,20 @@ mod fact_topology {
     /// Both new doors classify; they never mutate, and asking twice gives the
     /// same answer — which is what lets a coordinator reload and re-classify
     /// after losing a compare-and-set.
-    #[tokio::test]
-    async fn both_doors_are_pure_and_repeatable() {
+    #[test]
+    fn both_doors_are_pure_and_repeatable() {
         let (booking, fact, context) = bound_cell("BookingInProgress", 0);
         let before = booking.clone();
-        let first = classify(&booking, fact.clone(), &context).await;
-        let second = classify(&booking, fact, &context).await;
+        let first = classify(&booking, fact.clone(), &context);
+        let second = classify(&booking, fact, &context);
         assert_eq!(first, second);
         assert_eq!(booking, before, "the caller's booking is untouched");
 
         let event = || SystemEvent::ReconciliationExhausted {
             effect_intent_id: EffectIntentId::new(BOOK_ID),
         };
-        let first = TownHallDomain.resolve_system_event(&booking, event()).await;
-        let second = TownHallDomain.resolve_system_event(&booking, event()).await;
+        let first = TownHallDomain.resolve_system_event(&booking, event());
+        let second = TownHallDomain.resolve_system_event(&booking, event());
         assert_eq!(first, second);
         assert_eq!(booking, before);
     }
@@ -7608,14 +7561,14 @@ mod system_event_topology {
     /// is, which is what makes `BookingExists`-after-giving-up land as `Booked`
     /// from `BookingInProgress` and as a cancellation handoff from
     /// `CancellationRequested`, through the ordinary fact arms.
-    #[tokio::test]
-    async fn exhaustion_records_at_exactly_the_in_flight_states() {
+    #[test]
+    fn exhaustion_records_at_exactly_the_in_flight_states() {
         let mut checked = 0_usize;
         for booking in all_states() {
             let state_name = booking.state.name();
             let in_flight = booking.state.effect_intent_id().cloned();
             let event = exhausted(in_flight.as_ref().map_or(BOOK_ID, EffectIntentId::as_str));
-            let got = TownHallDomain.resolve_system_event(&booking, event).await;
+            let got = TownHallDomain.resolve_system_event(&booking, event);
 
             if in_flight.is_some() {
                 assert!(
@@ -7636,15 +7589,13 @@ mod system_event_topology {
     /// Exhaustion of some OTHER effect says nothing about this state: refused
     /// with a reason, never a silent gap — and never a giving-up on the wrong
     /// effect's behalf.
-    #[tokio::test]
-    async fn exhaustion_of_a_different_effect_is_refused() {
+    #[test]
+    fn exhaustion_of_a_different_effect_is_refused() {
         for booking in all_states() {
             if booking.state.effect_intent_id().is_none() {
                 continue;
             }
-            let got = TownHallDomain
-                .resolve_system_event(&booking, exhausted("EFF-SOMEBODY-ELSE"))
-                .await;
+            let got = TownHallDomain.resolve_system_event(&booking, exhausted("EFF-SOMEBODY-ELSE"));
             assert_eq!(
                 got,
                 SystemEventResolution::Denied(BookingError::EffectMismatch),
@@ -7656,8 +7607,8 @@ mod system_event_topology {
 
     /// C1 holds on this door too: a state whose two effect pointers disagree
     /// is refused before the event is interpreted.
-    #[tokio::test]
-    async fn a_self_contradictory_aggregate_is_refused_by_the_event_door() {
+    #[test]
+    fn a_self_contradictory_aggregate_is_refused_by_the_event_door() {
         let mut booking = booking_of(
             BookingState::BookingInProgress(BookingInProgress {
                 effect_intent_id: EffectIntentId::new(BOOK_ID),
@@ -7666,9 +7617,7 @@ mod system_event_topology {
             Some(BOOK_ID),
         );
         booking.active_effect = Some(EffectIntentId::new("EFF-SOMETHING-ELSE"));
-        let got = TownHallDomain
-            .resolve_system_event(&booking, exhausted(BOOK_ID))
-            .await;
+        let got = TownHallDomain.resolve_system_event(&booking, exhausted(BOOK_ID));
         assert_eq!(
             got,
             SystemEventResolution::Denied(BookingError::InconsistentEffectIdentity)

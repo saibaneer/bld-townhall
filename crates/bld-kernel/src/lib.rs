@@ -289,7 +289,13 @@ impl<S, E> TransitionPlan<S, E> {
 ///
 /// Note what is absent: no `execute`, no `validate`, no `&mut` anything. The
 /// domain decides *meaning*; it neither performs effects nor persists results.
-#[async_trait]
+///
+/// The resolvers are deliberately **synchronous**: a decision is a pure function
+/// of its inputs, so there is nothing to `await`. Making that structural — rather
+/// than a rule the docs ask for — means no I/O, clock or randomness can hide
+/// inside a resolver, which is exactly what lets the boundary be enumerated and
+/// formally verified. Effects that *do* touch the world live behind `Capability`,
+/// which is async.
 pub trait BoundaryDomain: Send + Sync {
     type State: Clone + Send + Sync;
     type Proposal: Send;
@@ -315,7 +321,7 @@ pub trait BoundaryDomain: Send + Sync {
     /// Whether a behaviour *exists* must depend on `(state, proposal)` alone.
     /// Authority and context decide whether an existing behaviour is permitted
     /// — they may turn `Ready` into `Denied`, never into `Undefined`.
-    async fn resolve_proposal(
+    fn resolve_proposal(
         &self,
         state: &Self::State,
         proposal: Self::Proposal,
@@ -330,7 +336,7 @@ pub trait BoundaryDomain: Send + Sync {
     /// helpful model, a hostile model, or no model at all (ADR-012). The
     /// `principal` a fact must match comes from the persisted canonical plan —
     /// which is why the plan is persisted.
-    async fn resolve_fact(
+    fn resolve_fact(
         &self,
         state: &Self::State,
         fact: Verified<Self::ProviderFact>,
@@ -346,7 +352,7 @@ pub trait BoundaryDomain: Send + Sync {
     ///
     /// Returns [`SystemEventResolution`], not a plan: per ADR-019 a runtime
     /// fact records a pursuit decision against the effect and moves no state.
-    async fn resolve_system_event(
+    fn resolve_system_event(
         &self,
         state: &Self::State,
         event: Self::SystemEvent,
@@ -378,7 +384,7 @@ pub struct Kernel;
 impl Kernel {
     /// Classify a proposal. Returns a plan for the coordinator to commit — the
     /// kernel neither mutates state nor persists anything.
-    pub async fn resolve_proposal<D: BoundaryDomain>(
+    pub fn resolve_proposal<D: BoundaryDomain>(
         &self,
         domain: &D,
         state: &D::State,
@@ -386,31 +392,29 @@ impl Kernel {
         authority: &D::Authority,
         context: &D::Context,
     ) -> Resolution<TransitionPlan<D::State, D::Effect>, D::Error> {
-        domain
-            .resolve_proposal(state, proposal, authority, context)
-            .await
+        domain.resolve_proposal(state, proposal, authority, context)
     }
 
     /// Classify a verified provider fact. Returns a plan or `Converged` — the
     /// kernel neither mutates state nor persists anything.
-    pub async fn resolve_fact<D: BoundaryDomain>(
+    pub fn resolve_fact<D: BoundaryDomain>(
         &self,
         domain: &D,
         state: &D::State,
         fact: Verified<D::ProviderFact>,
         context: &D::FactContext,
     ) -> FactResolution<TransitionPlan<D::State, D::Effect>, D::Error> {
-        domain.resolve_fact(state, fact, context).await
+        domain.resolve_fact(state, fact, context)
     }
 
     /// Classify a deterministic runtime fact.
-    pub async fn resolve_system_event<D: BoundaryDomain>(
+    pub fn resolve_system_event<D: BoundaryDomain>(
         &self,
         domain: &D,
         state: &D::State,
         event: D::SystemEvent,
     ) -> SystemEventResolution<D::Error> {
-        domain.resolve_system_event(state, event).await
+        domain.resolve_system_event(state, event)
     }
 }
 
@@ -467,7 +471,6 @@ mod tests {
 
     struct Domain;
 
-    #[async_trait]
     impl BoundaryDomain for Domain {
         type State = State;
         type Proposal = Proposal;
@@ -482,7 +485,7 @@ mod tests {
         // One arm per (state, proposal) pair, deliberately - see the same note
         // on TownHallDomain::resolve_proposal. The match IS the topology.
         #[allow(clippy::match_same_arms)]
-        async fn resolve_proposal(
+        fn resolve_proposal(
             &self,
             state: &Self::State,
             proposal: Self::Proposal,
@@ -510,7 +513,7 @@ mod tests {
         // The four outcomes, minimally: a fact answers `Reaching` if it names
         // the in-flight effect; `Done` already reflects any arrival; `Start`
         // has no fact-shaped behaviour at all.
-        async fn resolve_fact(
+        fn resolve_fact(
             &self,
             state: &Self::State,
             fact: Verified<Self::ProviderFact>,
@@ -530,7 +533,7 @@ mod tests {
             }
         }
 
-        async fn resolve_system_event(
+        fn resolve_system_event(
             &self,
             state: &Self::State,
             event: Self::SystemEvent,
@@ -543,40 +546,41 @@ mod tests {
         }
     }
 
-    async fn classify(
+    // A test helper: callers pass owned fixtures, so by-value is the ergonomic
+    // signature even though the resolver only borrows the state.
+    #[allow(clippy::needless_pass_by_value)]
+    fn classify(
         state: State,
         proposal: Proposal,
         allowed: bool,
     ) -> Resolution<TransitionPlan<State, Effect>, Error> {
-        Domain
-            .resolve_proposal(&state, proposal, &Authority { allowed }, &Context)
-            .await
+        Domain.resolve_proposal(&state, proposal, &Authority { allowed }, &Context)
     }
 
     /// A behaviour that does not exist here yields no plan at all. Nothing to
     /// commit, nothing to execute — the distinction from `Denied` is that no
     /// guard was even consulted.
-    #[tokio::test]
-    async fn undefined_yields_no_plan() {
-        let got = classify(State::Start, Proposal::Impossible, true).await;
+    #[test]
+    fn undefined_yields_no_plan() {
+        let got = classify(State::Start, Proposal::Impossible, true);
         assert!(got.is_undefined());
         assert!(!got.is_ready(), "Undefined must never carry a plan");
     }
 
     /// The behaviour exists but a guard refused it. Also no plan — but for a
     /// different, typed reason.
-    #[tokio::test]
-    async fn denied_yields_no_plan() {
-        let got = classify(State::Start, Proposal::Go, false).await;
+    #[test]
+    fn denied_yields_no_plan() {
+        let got = classify(State::Start, Proposal::Go, false);
         assert_eq!(got, Resolution::Denied(Error::Denied));
         assert!(!got.is_ready(), "Denied must never carry a plan");
     }
 
     /// A local transition carries its next state and no effect. Committing it
     /// requires nothing external.
-    #[tokio::test]
-    async fn a_local_transition_carries_a_next_state_and_no_effect() {
-        let Resolution::Ready(plan) = classify(State::Start, Proposal::Go, true).await else {
+    #[test]
+    fn a_local_transition_carries_a_next_state_and_no_effect() {
+        let Resolution::Ready(plan) = classify(State::Start, Proposal::Go, true) else {
             panic!("expected Ready");
         };
         assert_eq!(*plan.next_state(), State::Done);
@@ -585,9 +589,9 @@ mod tests {
 
     /// An external-effect transition carries both. The effect is what must be
     /// durably persisted before any capability is invoked (ADR-014).
-    #[tokio::test]
-    async fn an_external_transition_carries_an_effect_to_persist_first() {
-        let Resolution::Ready(plan) = classify(State::Start, Proposal::Reach, true).await else {
+    #[test]
+    fn an_external_transition_carries_an_effect_to_persist_first() {
+        let Resolution::Ready(plan) = classify(State::Start, Proposal::Reach, true) else {
             panic!("expected Ready");
         };
         assert_eq!(*plan.next_state(), State::Reaching);
@@ -597,11 +601,11 @@ mod tests {
     /// The kernel does not own state. Classification is a pure question about a
     /// state value, so asking twice cannot change anything — which is what lets
     /// a coordinator reload and re-classify after losing a compare-and-set.
-    #[tokio::test]
-    async fn classification_does_not_mutate_and_is_repeatable() {
+    #[test]
+    fn classification_does_not_mutate_and_is_repeatable() {
         let state = State::Start;
-        let first = classify(state.clone(), Proposal::Go, true).await;
-        let second = classify(state.clone(), Proposal::Go, true).await;
+        let first = classify(state.clone(), Proposal::Go, true);
+        let second = classify(state.clone(), Proposal::Go, true);
         assert_eq!(first, second);
         assert_eq!(state, State::Start, "the caller's state is untouched");
     }
@@ -609,61 +613,53 @@ mod tests {
     /// The fact door has a fourth outcome the proposal door must not have:
     /// a state that already reflects the fact is convergence, not breakage.
     /// This is what lets a reconciler re-apply a fact after losing a CAS.
-    #[tokio::test]
-    async fn a_fact_the_state_already_reflects_converges() {
-        let got = Kernel
-            .resolve_fact(
-                &Domain,
-                &State::Done,
-                Verified::assert_verified(Arrived { effect_id: 7 }),
-                &FactContext { in_flight: None },
-            )
-            .await;
+    #[test]
+    fn a_fact_the_state_already_reflects_converges() {
+        let got = Kernel.resolve_fact(
+            &Domain,
+            &State::Done,
+            Verified::assert_verified(Arrived { effect_id: 7 }),
+            &FactContext { in_flight: None },
+        );
         assert!(got.is_converged());
         assert!(!got.is_ready(), "Converged must never carry a plan");
     }
 
     /// A fact where no fact-shaped behaviour exists is Undefined — exactly the
     /// proposal door's distinction, preserved across doors.
-    #[tokio::test]
-    async fn a_fact_with_no_edge_here_is_undefined() {
-        let got = Kernel
-            .resolve_fact(
-                &Domain,
-                &State::Start,
-                Verified::assert_verified(Arrived { effect_id: 7 }),
-                &FactContext { in_flight: None },
-            )
-            .await;
+    #[test]
+    fn a_fact_with_no_edge_here_is_undefined() {
+        let got = Kernel.resolve_fact(
+            &Domain,
+            &State::Start,
+            Verified::assert_verified(Arrived { effect_id: 7 }),
+            &FactContext { in_flight: None },
+        );
         assert!(got.is_undefined());
     }
 
     /// A fact that fails its binding is Denied with a typed reason — the
     /// behaviour exists, the evidence does not fit.
-    #[tokio::test]
-    async fn a_fact_naming_the_wrong_effect_is_denied() {
-        let got = Kernel
-            .resolve_fact(
-                &Domain,
-                &State::Reaching,
-                Verified::assert_verified(Arrived { effect_id: 9 }),
-                &FactContext { in_flight: Some(7) },
-            )
-            .await;
+    #[test]
+    fn a_fact_naming_the_wrong_effect_is_denied() {
+        let got = Kernel.resolve_fact(
+            &Domain,
+            &State::Reaching,
+            Verified::assert_verified(Arrived { effect_id: 9 }),
+            &FactContext { in_flight: Some(7) },
+        );
         assert_eq!(got, FactResolution::Denied(Error::WrongEffect));
     }
 
     /// A bound fact at the waiting state yields the transition.
-    #[tokio::test]
-    async fn a_bound_fact_at_the_waiting_state_yields_a_plan() {
-        let got = Kernel
-            .resolve_fact(
-                &Domain,
-                &State::Reaching,
-                Verified::assert_verified(Arrived { effect_id: 7 }),
-                &FactContext { in_flight: Some(7) },
-            )
-            .await;
+    #[test]
+    fn a_bound_fact_at_the_waiting_state_yields_a_plan() {
+        let got = Kernel.resolve_fact(
+            &Domain,
+            &State::Reaching,
+            Verified::assert_verified(Arrived { effect_id: 7 }),
+            &FactContext { in_flight: Some(7) },
+        );
         let FactResolution::Ready(plan) = got else {
             panic!("expected Ready");
         };
@@ -672,16 +668,12 @@ mod tests {
 
     /// The system-event door: recordable only where something is in flight —
     /// and it records rather than transitions (ADR-019).
-    #[tokio::test]
-    async fn a_system_event_records_only_at_an_in_flight_state() {
-        let recorded = Kernel
-            .resolve_system_event(&Domain, &State::Reaching, Event::GaveUp)
-            .await;
+    #[test]
+    fn a_system_event_records_only_at_an_in_flight_state() {
+        let recorded = Kernel.resolve_system_event(&Domain, &State::Reaching, Event::GaveUp);
         assert!(recorded.is_record());
 
-        let nowhere = Kernel
-            .resolve_system_event(&Domain, &State::Done, Event::GaveUp)
-            .await;
+        let nowhere = Kernel.resolve_system_event(&Domain, &State::Done, Event::GaveUp);
         assert!(nowhere.is_undefined());
     }
 

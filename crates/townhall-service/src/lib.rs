@@ -512,10 +512,9 @@ where
             .proposal_context(&booking, &proposal, aggregate.version)
             .await;
 
-        let resolved = self
-            .kernel
-            .resolve_proposal(&self.domain, &booking, proposal, authority, &context)
-            .await;
+        let resolved =
+            self.kernel
+                .resolve_proposal(&self.domain, &booking, proposal, authority, &context);
 
         match resolved {
             // Nothing ran and nothing was touched — counted, never rowed:
@@ -859,10 +858,9 @@ where
                     .map(|kind| derive_effect_intent_id(id, kind, aggregate.version)),
             };
 
-            let classified = self
-                .kernel
-                .resolve_fact(&self.domain, &booking, fact.clone(), &context)
-                .await;
+            let classified =
+                self.kernel
+                    .resolve_fact(&self.domain, &booking, fact.clone(), &context);
 
             let attempt = match classified {
                 FactResolution::Undefined => {
@@ -1327,12 +1325,11 @@ where
         let event = SystemEvent::ReconciliationExhausted {
             effect_intent_id: id.clone(),
         };
-        match self
-            .coordinator
-            .kernel
-            .resolve_system_event(&self.coordinator.domain, &booking, event)
-            .await
-        {
+        match self.coordinator.kernel.resolve_system_event(
+            &self.coordinator.domain,
+            &booking,
+            event,
+        ) {
             bld_kernel::SystemEventResolution::Record => {
                 let wrote = repository
                     .mark_escalated(

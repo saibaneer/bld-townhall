@@ -451,7 +451,7 @@ fn classify_plan(plan: &TransitionPlan<Booking, BookingEffect>) -> Cell {
     }
 }
 
-async fn proposal_door() -> Door {
+fn proposal_door() -> Door {
     let mut cells = Vec::new();
     for state in all_states() {
         let booking = booking_for(&state);
@@ -473,9 +473,8 @@ async fn proposal_door() -> Door {
                 },
             };
             let proposal_name = proposal.name();
-            let resolved = TownHallDomain
-                .resolve_proposal(&booking, proposal, &authority(), &context)
-                .await;
+            let resolved =
+                TownHallDomain.resolve_proposal(&booking, proposal, &authority(), &context);
             // The export's second witness (the LOCKED-table test is the
             // first): the menu the domain EXPORTS must equal what the domain
             // DOES, cell by cell, in the same run that generates the docs.
@@ -509,7 +508,7 @@ async fn proposal_door() -> Door {
     }
 }
 
-async fn fact_door() -> Door {
+fn fact_door() -> Door {
     let mut cells = Vec::new();
     for state in all_states() {
         let booking = booking_for(&state);
@@ -538,9 +537,8 @@ async fn fact_door() -> Door {
                 pending_effect: TownHallDomain::fact_intended_effect_kind(&state, &fact)
                     .map(|_| EffectIntentId::new(SUCCESSOR_EFFECT)),
             };
-            let resolved = TownHallDomain
-                .resolve_fact(&booking, Verified::assert_verified(fact), &context)
-                .await;
+            let resolved =
+                TownHallDomain.resolve_fact(&booking, Verified::assert_verified(fact), &context);
             row.push(match resolved {
                 FactResolution::Undefined => Cell::NoEdge,
                 FactResolution::Denied(error) => Cell::Guarded {
@@ -606,7 +604,7 @@ fn fact_inputs(effect: &str) -> Vec<(OperationKind, EffectStatus, VerifiedProvid
     .collect()
 }
 
-async fn system_event_door() -> Door {
+fn system_event_door() -> Door {
     let mut cells = Vec::new();
     for state in all_states() {
         let booking = booking_for(&state);
@@ -619,7 +617,7 @@ async fn system_event_door() -> Door {
         let event = SystemEvent::ReconciliationExhausted {
             effect_intent_id: EffectIntentId::new(effect),
         };
-        let resolved = TownHallDomain.resolve_system_event(&booking, event).await;
+        let resolved = TownHallDomain.resolve_system_event(&booking, event);
         cells.push(vec![match resolved {
             bld_kernel::SystemEventResolution::Undefined => Cell::NoEdge,
             bld_kernel::SystemEventResolution::Denied(error) => Cell::Guarded {
@@ -866,14 +864,10 @@ fn artifact_path(name: &str) -> PathBuf {
 ///
 /// Not "regenerate on demand": a topology change that nobody looked at is exactly
 /// what this is for. Committing the artifact puts the change in the diff.
-#[tokio::test]
-async fn the_committed_topology_matches_the_domain() {
+#[test]
+fn the_committed_topology_matches_the_domain() {
     let states: Vec<String> = all_states().iter().map(|s| s.name().to_owned()).collect();
-    let doors = vec![
-        proposal_door().await,
-        fact_door().await,
-        system_event_door().await,
-    ];
+    let doors = vec![proposal_door(), fact_door(), system_event_door()];
 
     // Totality: the property the whole artifact is for. Every state, every input,
     // an entry — so no input sequence can reach a cell nobody specified.

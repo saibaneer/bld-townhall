@@ -95,6 +95,39 @@ bld-townhall/
 9. **Money moves only on independently verified provider evidence** (a signed Stripe webhook) — never on an agent's claim or a success redirect.
 10. **The proposer — including an LLM — is untrusted and outside the commit path.** The boundary refuses out-of-menu, over-authority, stale, and forged proposals *regardless of the model*. A prompt injection can manipulate the model; it cannot bypass the boundary.
 
+## How a request flows through the boundary
+
+The coordinator assembles the inputs, asks the domain for a decision, and enacts it.
+**The domain decides; the coordinator does.**
+
+```text
+API request
+   │
+   ▼
+Coordinator ── assembles the four inputs ──►  domain.resolve_proposal(
+   │            • state       (loads from the DB)        state, proposal,
+   │            • proposal    (from the request body)    authority, context)
+   │            • authority   (from the session/auth)          │
+   │            • context     (loads what it needs)            ▼
+   │                                              Resolution (the decision)
+   ◄──────────────────  returns to the caller  ──────────┘
+   │
+   ▼   the coordinator ENACTS the decision:
+   ├─ Ready(plan)  → commit to the DB (version check) + dispatch the effect → 200/201
+   ├─ Denied(why)  → 403  (it exists, but you can't)
+   └─ Undefined    → 404  (that action doesn't exist in this state)
+   │
+   ▼
+API response
+```
+
+The `Resolution` never leaves the building — it is an internal decision the coordinator
+translates into an HTTP response. A `Ready(ExternalEffect { .. })` is a *plan*, not a
+done deal: the coordinator commits the intent, invokes the capability, and the transition
+finishes when the provider's confirmation returns as a **verified fact** through
+`resolve_fact` (M4/M10). This is why the kernel is a pure, synchronous decision function
+and the capabilities are async — see [`docs/decisions.md`](docs/decisions.md).
+
 ## Quick start
 
 Requires a stable Rust toolchain.

@@ -1,0 +1,536 @@
+openapi: 3.0.3
+
+info:
+  title: BLD Town Hall API
+  version: "0.1.0"
+  description: |
+    The HTTP surface of the Boundary-Led Development (BLD) Town Hall reference service.
+
+    **A probabilistic component proposes; a deterministic boundary disposes.** Every
+    mutating request is a *proposal* — an intent the boundary may refuse; it is never an
+    instruction. State only advances when the deterministic domain returns a plan and the
+    repository commits it under a version check, or when an independently *verified fact*
+    (a signed provider webhook) arrives.
+
+    - **Mutations** (`POST …/behaviours/{behaviour}`, `POST /booking-intents`) go through the
+      **proposal door**. They require `If-Match` with the version last observed.
+    - **`POST /webhooks/stripe`** is the **fact door**: a signature-verified provider
+      confirmation. It is the only unauthenticated write, and the only path that can advance a
+      booking to a paid state — never a caller's proposal.
+    - **`GET /.well-known/bld`** is a signed discovery manifest a generic client bootstraps
+      from (M9); it precedes credentials and is unauthenticated.
+
+    This document is hand-authored from the routes, the gateway DTOs and spec §17/§10; the
+    authoritative contract is `docs/technical-spec-v0.4.2.md` and the `http.rs` acceptance
+    tests.
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local server (READY <port> is printed on start)
+
+tags:
+  - name: discovery
+  - name: catalogue
+  - name: bookings
+  - name: behaviours
+  - name: payments
+  - name: authority
+  - name: usage
+
+security:
+  - bearerAuth: []
+
+paths:
+  /.well-known/bld:
+    get:
+      tags: [discovery]
+      summary: The signed BLD discovery manifest
+      description: |
+        A generic client bootstraps the whole API from this: resource bases and the
+        behaviour-name → URL-segment table, plus a signature. Deliberately unauthenticated —
+        it precedes credentials.
+      security: []
+      responses:
+        "200":
+          description: The signed manifest.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /venues:
+    get:
+      tags: [catalogue]
+      summary: Browse the venue catalogue (filtered)
+      description: A read. No `If-Match`, no `ETag` — a list has no single version.
+      parameters:
+        - { name: attendees, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: accessible, in: query, required: false, schema: { type: boolean } }
+        - { name: max_fee_pence, in: query, required: false, schema: { type: integer, minimum: 0 } }
+      responses:
+        "200":
+          description: Matching catalogue rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  venues: { type: array, items: { $ref: "#/components/schemas/VenueRow" } }
+                  browse_only: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /venues/{venue}/slots/{slot}:
+    get:
+      tags: [catalogue]
+      summary: Read one slot's facts
+      parameters:
+        - { name: venue, in: path, required: true, schema: { type: string } }
+        - { name: slot, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The slot facts (grants never ride a response).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SlotFacts" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /booking-intents:
+    post:
+      tags: [bookings]
+      summary: Create a booking intent (proposal door)
+      description: |
+        Opens a booking in `Draft`. `Idempotency-Key` is accepted and inert — the same key
+        does not dedupe a different id, and a different key does not replay the same id;
+        a duplicate booking id is a `409`.
+      parameters:
+        - $ref: "#/components/parameters/XBldPrincipal"
+        - $ref: "#/components/parameters/XBldDelegation"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBooking" }
+      responses:
+        "201":
+          description: Created. Carries the booking's version as an `ETag`.
+          headers: { ETag: { $ref: "#/components/headers/ETag" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Projection" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /booking-intents/{id}:
+    get:
+      tags: [bookings]
+      summary: Read a booking (its current projection)
+      description: |
+        Scoped by the caller's identity. A junk `X-BLD-Delegation` on a read is simply not
+        consulted (the header matters where a *change* is attempted). Returns the current
+        state, version (as `ETag`), and `available_behaviours` — the moves legal right now.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/XBldPrincipal"
+      responses:
+        "200":
+          description: The booking.
+          headers: { ETag: { $ref: "#/components/headers/ETag" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Projection" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /booking-intents/{id}/audit:
+    get:
+      tags: [bookings]
+      summary: The booking's append-only audit trail
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/XBldPrincipal"
+      responses:
+        "200":
+          description: Every committed transition, with its provenance.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditRow" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /booking-intents/{id}/behaviours/{behaviour}:
+    post:
+      tags: [behaviours]
+      summary: Propose a behaviour on a booking (the proposal door)
+      description: |
+        The one mutating endpoint for a booking. `{behaviour}` selects the proposal; the body
+        carries its parameters. The boundary classifies it:
+
+        - **committed** → `200` with the new projection (and a bumped `ETag`);
+        - **effect in flight** (external verify/book/cancel that did not answer synchronously)
+          → `202` with the in-flight projection; a reconciler converges it — poll the booking;
+        - **exists but refused** by a guard (`Denied`) → `422` with `{ error, detail }` + `ETag`;
+        - **does not exist in this state** (`Undefined`) → `409`.
+
+        `book` and `cancel` reach the world; their outcome is committed by the **fact door**
+        once the council confirms, not by this proposal.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - name: behaviour
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [select-venue, verify-slot, change-venue, update-requirements, revalidate-venue, book, cancel]
+        - $ref: "#/components/parameters/XBldPrincipal"
+        - $ref: "#/components/parameters/XBldDelegation"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { $ref: "#/components/schemas/SelectVenue" }
+                - { $ref: "#/components/schemas/UpdateRequirements" }
+                - { $ref: "#/components/schemas/EmptyBody" }
+      responses:
+        "200":
+          description: Committed. The new projection, with a bumped `ETag`.
+          headers: { ETag: { $ref: "#/components/headers/ETag" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Projection" }
+        "202":
+          description: |
+            Accepted; an external effect is in flight and its outcome is not yet knowable.
+            The reconciler converges it — poll `GET /booking-intents/{id}`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Projection" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "422": { $ref: "#/components/responses/DomainDenied" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/CouncilUnavailable" }
+
+  /webhooks/stripe:
+    post:
+      tags: [payments]
+      summary: Stripe payment webhook (the fact door)
+      description: |
+        A signature-verified provider confirmation — the only path that advances a booking to a
+        paid state. Verified against the webhook secret (HMAC over the raw body) before it
+        touches any state; a forged or replayed event advances nothing (replays are idempotent).
+        Bearer auth does not apply — provenance is the signature.
+      security: []
+      parameters:
+        - { name: Stripe-Signature, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: A Stripe event envelope. }
+      responses:
+        "200": { description: Accepted (or a duplicate, idempotently). }
+        "400": { description: Missing or invalid signature — nothing advanced. }
+
+  /approvals:
+    post:
+      tags: [authority]
+      summary: Begin an approval challenge (approve-first authority)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        "201": { description: A challenge was raised (carries a challenge id + preview). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /approvals/{id}/reply:
+    post:
+      tags: [authority]
+      summary: Answer an approval challenge (YES/NO + code)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                answer: { type: string }
+                code: { type: string }
+                receipt: { type: string }
+      responses:
+        "201": { description: A delegation was minted (an approval → VerifiedAuthority). }
+        "200": { description: Accepted, no delegation (e.g. a NO). }
+        "403": { description: Wrong code (attempt-limited). }
+        "404": { description: Unknown challenge. }
+        "410": { description: The challenge is gone (expired/used). }
+
+  /inbound-evidence:
+    post:
+      tags: [authority]
+      summary: Deposit an inbound message's transport evidence
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        "200": { description: Deposited under a one-use receipt. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /revocations:
+    post:
+      tags: [authority]
+      summary: Revoke every live grant a sender authorized (idempotent sweep)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        "200":
+          description: The count swept (0 for an unbound/forged sender — anti-enumeration).
+          content:
+            application/json:
+              schema: { type: object, properties: { revoked: { type: integer } } }
+
+  /usage/reserve:
+    post:
+      tags: [usage]
+      summary: Reserve one usage unit (idempotent on the intent)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        "200": { description: Reserved (or a no-op for a redelivered intent). }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /usage/debit:
+    post:
+      tags: [usage]
+      summary: Debit a reserved unit
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses: { "200": { description: Debited (idempotent). } }
+
+  /usage/release:
+    post:
+      tags: [usage]
+      summary: Release a reservation
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses: { "200": { description: Released (idempotent). } }
+
+  /usage/balance:
+    post:
+      tags: [usage]
+      summary: Describe the remaining balance
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        "200":
+          description: The balance.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  remaining: { type: integer }
+                  limit: { type: integer }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Agent/service authentication (spec §10.1). It authenticates the caller and authorizes
+        nothing — a consequential change also needs a delegation (`X-BLD-Delegation`).
+
+  parameters:
+    XBldPrincipal:
+      name: X-BLD-Principal
+      in: header
+      required: false
+      description: The principal the request acts for.
+      schema: { type: string }
+    XBldDelegation:
+      name: X-BLD-Delegation
+      in: header
+      required: false
+      description: |
+        Carries or references the verified delegation envelope — the *authorization* half.
+        A consequential change is refused unless a delegation an approval produced rides with
+        it. On a read it is not consulted.
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: |
+        The strong version `ETag` last observed, e.g. `"5"`. Every mutation is version-checked;
+        a stale value is `412`, an absent one is `428`, a wildcard or weak validator is `400`.
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Accepted and inert — it dedupes nothing; identity is the id.
+      schema: { type: string }
+
+  headers:
+    ETag:
+      description: The booking's current version, as a strong validator (e.g. `"6"`).
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: No verified caller identity (missing or unknown bearer).
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    Forbidden:
+      description: A delegation reference that resolves to nothing (unknown/expired/revoked/not-yours).
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    NotFound:
+      description: No such resource for this caller.
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    BadRequest:
+      description: Malformed body or header (no `ETag`; an `error` is prose, not a domain name).
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    Conflict:
+      description: |
+        The behaviour does not exist in this state (`Undefined`), or a duplicate id. It is
+        *absent*, not refused — a path that does not exist.
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    PreconditionRequired:
+      description: A mutation without `If-Match`.
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    PreconditionFailed:
+      description: A stale `If-Match` — the booking moved since you observed it. Reload and retry.
+      content: { application/json: { schema: { $ref: "#/components/schemas/PlainError" } } }
+    DomainDenied:
+      description: |
+        The behaviour exists but a deterministic guard refused it (`Denied`). Carries a typed
+        error *name* + detail and an `ETag`, which is what distinguishes it from a malformed
+        request.
+      headers: { ETag: { $ref: "#/components/headers/ETag" } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/DomainError" } } }
+    RateLimited:
+      description: A usage quota / rate limit refused the turn (never a safety exit).
+      headers:
+        Retry-After: { description: Seconds until the window recovers., schema: { type: integer } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/DomainError" } } }
+    CouncilUnavailable:
+      description: The external council is unreachable for an ask; the effect stays in flight.
+
+  schemas:
+    CreateBooking:
+      type: object
+      required: [purpose, requested_date, from, to, attendees, wheelchair_accessible, max_fee_pence]
+      properties:
+        purpose: { type: string }
+        requested_date: { type: string, example: "2026-09-10" }
+        from: { type: string, example: "14:00" }
+        to: { type: string, example: "17:00" }
+        attendees: { type: integer, minimum: 1 }
+        wheelchair_accessible: { type: boolean }
+        max_fee_pence: { type: integer, minimum: 0 }
+    SelectVenue:
+      type: object
+      required: [venue_id, slot_id]
+      description: Body for the `select-venue` behaviour.
+      properties:
+        venue_id: { type: string }
+        slot_id: { type: string }
+    UpdateRequirements:
+      type: object
+      description: Body for the `update-requirements` behaviour (all fields optional).
+      properties:
+        purpose: { type: string }
+        requested_date: { type: string }
+        from: { type: string }
+        to: { type: string }
+        attendees: { type: integer, minimum: 1 }
+        wheelchair_accessible: { type: boolean }
+        max_fee_pence: { type: integer, minimum: 0 }
+    EmptyBody:
+      type: object
+      description: Behaviours that carry no parameters (`verify-slot`, `revalidate-venue`, `book`, `cancel`, `change-venue`).
+    Projection:
+      type: object
+      required: [id, version, state, requirements, available_behaviours]
+      properties:
+        id: { type: string }
+        version: { type: integer, format: int64 }
+        state:
+          type: string
+          description: The booking's current state.
+          enum: [Draft, VenueSelected, NeedsRevalidation, VerifyingSlot, AwaitingBooking, OfferSelected, CheckoutPrepared, AwaitingHumanPayment, PaymentConfirmed, BookingInProgress, PaidBookingInProgress, CancellationRequested, Booked, CancellingBooking, Cancelled, NeedsHuman]
+        requirements: { $ref: "#/components/schemas/Requirements" }
+        selected_venue:
+          allOf: [ { $ref: "#/components/schemas/SelectedVenue" } ]
+          nullable: true
+        booking_ref: { type: string, nullable: true }
+        available_behaviours:
+          type: array
+          items: { type: string }
+          description: The behaviours legal in this state right now.
+        checkout_url:
+          type: string
+          nullable: true
+          description: The Stripe checkout URL, present only while `AwaitingHumanPayment`.
+    Requirements:
+      type: object
+      required: [purpose, requested_date, from, to, attendees, wheelchair_accessible, max_fee_pence]
+      properties:
+        purpose: { type: string }
+        requested_date: { type: string }
+        from: { type: string }
+        to: { type: string }
+        attendees: { type: integer }
+        wheelchair_accessible: { type: boolean }
+        max_fee_pence: { type: integer }
+    SelectedVenue:
+      type: object
+      required: [venue_id, slot_id]
+      properties:
+        venue_id: { type: string }
+        slot_id: { type: string }
+    VenueRow:
+      type: object
+      required: [venue_id, slot_id, capacity, accessible, fee_pence, available]
+      properties:
+        venue_id: { type: string }
+        slot_id: { type: string }
+        capacity: { type: integer }
+        accessible: { type: boolean }
+        fee_pence: { type: integer }
+        available: { type: boolean }
+    SlotFacts:
+      allOf: [ { $ref: "#/components/schemas/VenueRow" } ]
+    AuditRow:
+      type: object
+      properties:
+        driver_kind: { type: string, description: "Provenance: Proposal, Fact, or SystemEvent." }
+        driver_detail: { type: string }
+        outcome: { type: string }
+        from_version: { type: integer, format: int64 }
+        to_version: { type: integer, format: int64 }
+        at_ms: { type: integer, format: int64 }
+    DomainError:
+      type: object
+      required: [error, detail]
+      description: A typed domain refusal — a name, not prose, so a client can act on it.
+      properties:
+        error: { type: string, example: FeeExceededAuthority }
+        detail: { type: string }
+    PlainError:
+      type: object
+      required: [error]
+      description: A transport/shape error — prose, no `ETag`.
+      properties:
+        error: { type: string }

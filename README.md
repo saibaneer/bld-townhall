@@ -147,6 +147,21 @@ A telling signal of the design: **`bld-kernel` has not changed since M4.** Every
 
 Remaining: **M13 stream D** — release packaging ([`docs/known-limitations.md`](docs/known-limitations.md) and this refresh).
 
+## API reference
+
+The HTTP surface is documented as OpenAPI 3.0 in [`docs/openapi.yaml`](docs/openapi.yaml) — the
+booking endpoints (the proposal door), `/webhooks/stripe` (the fact door), the auth headers
+(`Authorization` + `X-BLD-Principal` + `X-BLD-Delegation`), the `ETag`/`If-Match` concurrency
+contract, and the §10.2 status mapping. View it with any Swagger UI, e.g.:
+
+```bash
+docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml \
+  -v "$PWD/docs:/spec" swaggerapi/swagger-ui   # then open http://localhost:8081
+```
+
+The authoritative contract remains the spec + the `http.rs` acceptance tests; `openapi.yaml`
+is hand-authored from the routes and gateway DTOs.
+
 ## Specification and decisions
 
 The execution contract is [`docs/technical-spec-v0.4.2.md`](docs/technical-spec-v0.4.2.md) — it is **never edited**. Amendments and every consequential engineering decision live in [`docs/decisions.md`](docs/decisions.md) (ADR-001–034), the amendment trail against the spec.
